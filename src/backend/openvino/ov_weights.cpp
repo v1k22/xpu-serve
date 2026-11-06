@@ -13,7 +13,9 @@ namespace xs::ov_backend {
 
 namespace {
 
-ov::Shape to_static_shape(const Dims& dims) { return ov::Shape(dims.begin(), dims.end()); }
+ov::Shape to_static_shape(const Dims& dims) {
+    return ov::Shape(dims.begin(), dims.end());
+}
 
 // Constant over `data`; `owner` (may be null) keeps the memory alive as long as the constant.
 std::shared_ptr<ov::op::v0::Constant> shared_constant(DType dtype, const Dims& shape, const void* data,

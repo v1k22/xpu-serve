@@ -23,8 +23,12 @@ inline std::string device() {
     return d != nullptr && *d != '\0' ? d : "CPU";
 }
 
-inline DType precision() { return device() == "CPU" ? DType::F32 : DType::F16; }
-inline bool is_f16() { return precision() == DType::F16; }
+inline DType precision() {
+    return device() == "CPU" ? DType::F32 : DType::F16;
+}
+inline bool is_f16() {
+    return precision() == DType::F16;
+}
 
 inline SessionOptions options(int64_t max_context = 4096) {
     SessionOptions o;
@@ -50,7 +54,9 @@ struct Tolerance {
 };
 
 // Picks the tolerance for the precision under test.
-inline Tolerance tolerance(Tolerance f32, Tolerance f16) { return is_f16() ? f16 : f32; }
+inline Tolerance tolerance(Tolerance f32, Tolerance f16) {
+    return is_f16() ? f16 : f32;
+}
 
 // all_close with the error recorded under `op`. max_rel is max |a - e| / max |e| (a per-element ratio is
 // meaningless next to zeros).
@@ -58,7 +64,8 @@ inline bool close(const std::string& op, const HostTensor& actual, const Tensor6
     if (actual.shape() != expected.shape) return false;
     const double max_abs = max_abs_diff(actual, expected);
     double scale = 0;
-    for (double e : expected.data) scale = std::max(scale, std::abs(e));
+    for (double e : expected.data)
+        scale = std::max(scale, std::abs(e));
     const bool ok = all_close(actual, expected, tol.atol, tol.rtol);
     const char* report = std::getenv("XS_OV_TEST_REPORT");
     if (report != nullptr && std::string(report) == "1") {

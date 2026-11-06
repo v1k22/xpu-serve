@@ -6,6 +6,7 @@
 
 #include "ov_test_support.h"
 #include "ov_tiny_model.h"
+#include "util/error.h"
 #include "util/timer.h"
 
 using namespace xs;
@@ -20,7 +21,8 @@ bool bench_enabled() {
 
 size_t weight_bytes(const test::MemoryWeights& w) {
     size_t total = 0;
-    for (const std::string& name : w.names()) total += w.tensor(name).nbytes();
+    for (const std::string& name : w.names())
+        total += w.tensor(name).nbytes();
     return total;
 }
 
@@ -38,7 +40,8 @@ void time_decode(const char* what, const ovt::TinyModelSpec& spec) {
     constexpr int32_t kSteps = 50;
     TensorMap out;
     session->run(ovt::tiny_inputs(spec, 0, kContext), out);
-    for (int32_t i = kContext; i < kContext + kWarmup; ++i) session->run(ovt::tiny_inputs(spec, i, i + 1), out);
+    for (int32_t i = kContext; i < kContext + kWarmup; ++i)
+        session->run(ovt::tiny_inputs(spec, i, i + 1), out);
     Timer timer;
     for (int32_t i = kContext + kWarmup; i < kContext + kWarmup + kSteps; ++i) {
         session->run(ovt::tiny_inputs(spec, i, i + 1), out);
@@ -46,8 +49,10 @@ void time_decode(const char* what, const ovt::TinyModelSpec& spec) {
     const double step_ms = timer.elapsed_ms() / kSteps;
     // bf16 weight bytes equal the f16 bytes the device reads per step.
     const double gb_per_s = static_cast<double>(weight_bytes(weights)) / (step_ms * 1e6);
-    MESSAGE("ov-timing ", what, " on ", ovt::device(), ": ", step_ms, " ms/step at context ", kContext,
-            " (weights ", weight_bytes(weights) / 1e9, " GB, ", gb_per_s, " GB/s), compile ", compile_ms, " ms");
+    const std::string line =
+        str_cat("ov-timing ", what, " on ", ovt::device(), ": ", step_ms, " ms/step at context ", kContext,
+                " (weights ", weight_bytes(weights) / 1e9, " GB, ", gb_per_s, " GB/s), compile ", compile_ms, " ms");
+    MESSAGE(line);
 }
 
 }  // namespace

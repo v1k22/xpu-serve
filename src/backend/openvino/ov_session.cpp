@@ -66,7 +66,8 @@ OvSession::OvSession(ov::CompiledModel compiled, std::vector<InputSpec> inputs, 
 
 int64_t OvSession::validate_inputs(const TensorMap& inputs) const {
     for (const auto& [name, tensor] : inputs) {
-        const bool known = std::any_of(inputs_.begin(), inputs_.end(), [&](const InputSpec& s) { return s.name == name; });
+        const bool known =
+            std::any_of(inputs_.begin(), inputs_.end(), [&](const InputSpec& s) { return s.name == name; });
         XS_CHECK(known, "input '", name, "' is not an input of this graph");
     }
     int64_t tokens = -1;
@@ -108,7 +109,8 @@ void OvSession::bind_inputs(const TensorMap& inputs) {
 
 void OvSession::read_outputs(TensorMap& outputs) {
     outputs.clear();
-    for (size_t i = 0; i < outputs_.size(); ++i) outputs[outputs_[i]] = to_host(request_.get_output_tensor(i));
+    for (size_t i = 0; i < outputs_.size(); ++i)
+        outputs[outputs_[i]] = to_host(request_.get_output_tensor(i));
 }
 
 void OvSession::run(const TensorMap& inputs, TensorMap& outputs) {
@@ -136,7 +138,8 @@ void OvSession::truncate(int64_t n) {
         return;
     }
     rethrow_openvino("truncate", [&] {
-        for (ov::VariableState& state : request_.query_state()) state.set_state(slice_state(state.get_state(), n));
+        for (ov::VariableState& state : request_.query_state())
+            state.set_state(slice_state(state.get_state(), n));
     });
     num_cached_ = n;
 }

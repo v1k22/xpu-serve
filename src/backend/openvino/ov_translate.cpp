@@ -24,7 +24,9 @@ struct Lowered {
     OvOutput heads;
 };
 
-bool is_float(const OvOutput& x) { return x.get_element_type().is_real(); }
+bool is_float(const OvOutput& x) {
+    return x.get_element_type().is_real();
+}
 
 OvOutput as_f32(const OvOutput& x) {
     if (x.get_element_type() == ov::element::f32) return x;
@@ -116,7 +118,9 @@ void Translator::lower(size_t index) {
     const std::string label = n.label.empty() ? str_cat(graph::op_name(n.kind), '_', index) : n.label;
     auto set = [&](const OvOutput& out) { values_[index] = {Lowered{out, {}}}; };
     switch (n.kind) {
-        case OpKind::Input: set(lower_input(n)); break;
+        case OpKind::Input:
+            set(lower_input(n));
+            break;
         case OpKind::Weight: {
             const std::string& name = std::get<graph::WeightAttrs>(n.attrs).name;
             set(make_weight(weights_.get(name), options_.precision, name, weight_bytes_));
@@ -130,23 +134,24 @@ void Translator::lower(size_t index) {
                       label));
             break;
         case OpKind::MatMul:
-            set(named(std::make_shared<ops::v0::MatMul>(float_value(n.inputs[0]), float_value(n.inputs[1]), false,
-                                                        true),
-                      label));
+            set(named(
+                std::make_shared<ops::v0::MatMul>(float_value(n.inputs[0]), float_value(n.inputs[1]), false, true),
+                label));
             break;
         case OpKind::Add:
             set(named(std::make_shared<ops::v1::Add>(float_value(n.inputs[0]), float_value(n.inputs[1])), label));
             break;
         case OpKind::Mul:
-            set(named(std::make_shared<ops::v1::Multiply>(float_value(n.inputs[0]), float_value(n.inputs[1])),
-                      label));
+            set(named(std::make_shared<ops::v1::Multiply>(float_value(n.inputs[0]), float_value(n.inputs[1])), label));
             break;
         case OpKind::Scale: {
             const float factor = std::get<graph::ScaleAttrs>(n.attrs).factor;
             set(named(std::make_shared<ops::v1::Multiply>(float_value(n.inputs[0]), f32_scalar(factor)), label));
             break;
         }
-        case OpKind::Tanh: set(named(std::make_shared<ops::v0::Tanh>(float_value(n.inputs[0])), label)); break;
+        case OpKind::Tanh:
+            set(named(std::make_shared<ops::v0::Tanh>(float_value(n.inputs[0])), label));
+            break;
         case OpKind::GeluTanh:
             set(named(std::make_shared<ops::v7::Gelu>(float_value(n.inputs[0]), ops::GeluApproximationMode::TANH),
                       label));
@@ -158,12 +163,24 @@ void Translator::lower(size_t index) {
             set(named(std::make_shared<ops::v1::Multiply>(tanh, f32_scalar(cap)), label));
             break;
         }
-        case OpKind::RmsNorm: set(lower_rms_norm(n, label)); break;
-        case OpKind::Reshape: set(lower_reshape(n, label)); break;
-        case OpKind::Slice: set(named(lower_slice(n).get_node_shared_ptr(), label)); break;
-        case OpKind::Rope: set(lower_rope(n, label)); break;
-        case OpKind::KvCache: lower_kv_cache(n, index, label); break;
-        case OpKind::Attention: set(lower_attention(n, label)); break;
+        case OpKind::RmsNorm:
+            set(lower_rms_norm(n, label));
+            break;
+        case OpKind::Reshape:
+            set(lower_reshape(n, label));
+            break;
+        case OpKind::Slice:
+            set(named(lower_slice(n).get_node_shared_ptr(), label));
+            break;
+        case OpKind::Rope:
+            set(lower_rope(n, label));
+            break;
+        case OpKind::KvCache:
+            lower_kv_cache(n, index, label);
+            break;
+        case OpKind::Attention:
+            set(lower_attention(n, label));
+            break;
     }
 }
 
@@ -214,7 +231,8 @@ OvOutput Translator::lower_reshape(const Node& n, const std::string& label) {
     OvOutput shape;
     if (symbols <= 1) {  // one unknown dim: let Reshape infer it
         std::vector<int64_t> dims(target.begin(), target.end());
-        for (int64_t& d : dims) d = d < 0 ? -1 : d;
+        for (int64_t& d : dims)
+            d = d < 0 ? -1 : d;
         shape = i64_constant(dims);
     } else {
         ov::OutputVector parts;
@@ -246,7 +264,7 @@ OvOutput Translator::lower_rope(const Node& n, const std::string& label) {
     const auto freq_full = std::make_shared<ops::v0::Concat>(ov::OutputVector{inv_freq, inv_freq}, 0);  // [D]
     const auto positions = std::make_shared<ops::v0::Convert>(value(n.inputs[1]), ov::element::f32);
     const auto positions_col = std::make_shared<ops::v0::Unsqueeze>(positions, i64_constant({1, 2}));  // [T, 1, 1]
-    const auto angles = std::make_shared<ops::v1::Multiply>(positions_col, freq_full);                // [T, 1, D]
+    const auto angles = std::make_shared<ops::v1::Multiply>(positions_col, freq_full);                 // [T, 1, D]
     const auto cos = std::make_shared<ops::v0::Cos>(angles);
     const auto sin = std::make_shared<ops::v0::Sin>(angles);
     for (const std::shared_ptr<ov::Node>& node :
@@ -335,8 +353,9 @@ OvOutput Translator::symbol(int64_t dim) const {
 OvOutput Translator::mask(int64_t sliding_window) {
     auto it = masks_.find(sliding_window);
     if (it == masks_.end()) {
-        it = masks_.emplace(sliding_window, attention_mask(symbol(graph::kT), symbol(graph::kL), sliding_window,
-                                                           "attention"))
+        it = masks_
+                 .emplace(sliding_window,
+                          attention_mask(symbol(graph::kT), symbol(graph::kL), sliding_window, "attention"))
                  .first;
     }
     return it->second;

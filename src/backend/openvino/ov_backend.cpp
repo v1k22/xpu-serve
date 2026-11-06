@@ -29,7 +29,7 @@ constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 // SessionOptions::extra keys this backend understands.
 struct ExtraOptions {
     std::optional<float> activations_scale_factor;  // ov::hint::activations_scale_factor (f16 overflow guard)
-    AttentionImpl attention = AttentionImpl::Auto;   // "auto", "sdpa" or "matmul"
+    AttentionImpl attention = AttentionImpl::Auto;  // "auto", "sdpa" or "matmul"
 };
 
 ExtraOptions parse_extra(const std::map<std::string, std::string>& extra) {
@@ -92,7 +92,8 @@ std::string runtime_op_summary(const ov::CompiledModel& compiled) {
         ++counts[it == info.end() ? op->get_type_name() : it->second.as<std::string>()];
     }
     std::string out;
-    for (const auto& [type, n] : counts) out += str_cat(out.empty() ? "" : ", ", type, " x", n);
+    for (const auto& [type, n] : counts)
+        out += str_cat(out.empty() ? "" : ", ", type, " x", n);
     return out;
 }
 
@@ -170,6 +171,8 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Backend> make_openvino_backend() { return std::make_unique<OpenVinoBackend>(); }
+std::unique_ptr<Backend> make_openvino_backend() {
+    return std::make_unique<OpenVinoBackend>();
+}
 
 }  // namespace xs

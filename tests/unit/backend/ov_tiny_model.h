@@ -23,7 +23,7 @@ struct TinyModelSpec {
     int64_t sliding_window = 4;  // used by every layer except each `global_every`-th
     int64_t global_every = 2;
     float attn_softcap = 0.0f;
-    bool logits = true;          // false: output the final hidden state instead of logits
+    bool logits = true;  // false: output the final hidden state instead of logits
 };
 
 inline void add_tiny_weights(const TinyModelSpec& s, MemoryWeights& w, TensorRng& rng) {
@@ -88,7 +88,8 @@ inline graph::Graph tiny_model(const TinyModelSpec& s, const WeightStore& w) {
 // ids and positions for tokens [begin, end) of a fixed pseudo-random prompt.
 inline TensorMap tiny_inputs(const TinyModelSpec& s, int32_t begin, int32_t end) {
     std::vector<int32_t> ids;
-    for (int32_t i = begin; i < end; ++i) ids.push_back(static_cast<int32_t>((i * 37 + 11) % s.vocab));
+    for (int32_t i = begin; i < end; ++i)
+        ids.push_back(static_cast<int32_t>((i * 37 + 11) % s.vocab));
     return {{"ids", HostTensor::from_vector(DType::I32, {end - begin}, ids)}, {"pos", arange_i32(begin, end)}};
 }
 

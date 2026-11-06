@@ -150,8 +150,8 @@ TEST_SUITE("openvino ops") {
             int64_t begin, end;
             int64_t ref_begin, ref_end;
         };
-        for (const Case& c : {Case{2, 2, 6, 2, 6}, Case{1, -3, kSliceEnd, 1, 4}, Case{0, -2, kSliceEnd, 3, 5},
-                              Case{2, 0, -1, 0, 7}}) {
+        for (const Case& c :
+             {Case{2, 2, 6, 2, 6}, Case{1, -3, kSliceEnd, 1, 4}, Case{0, -2, kSliceEnd, 3, 5}, Case{2, 0, -1, 0, 7}}) {
             CAPTURE(c.axis);
             CAPTURE(c.begin);
             Graph g;
@@ -184,8 +184,7 @@ TEST_SUITE("openvino ops") {
             const HostTensor pos = test::arange_i32(first_pos, first_pos + 5);
             Graph g;
             const Value freq = g.constant(HostTensor::from_vector(DType::F32, {dim / 2}, inv_freq));
-            g.output("out", g.rope(g.input("x", DType::F32, {kT, heads, dim}), g.input("pos", DType::I32, {kT}),
-                                   freq));
+            g.output("out", g.rope(g.input("x", DType::F32, {kT, heads, dim}), g.input("pos", DType::I32, {kT}), freq));
             const HostTensor out = run_out(g, test::MemoryWeights{}, {{"x", x}, {"pos", pos}});
             const std::vector<double> freq64(inv_freq.begin(), inv_freq.end());
             const Tensor64 expected = test::ref::rope(to_f64(x), test::to_ints(pos), freq64);
@@ -237,7 +236,8 @@ TEST_SUITE("openvino ops") {
         const HostTensor out = run_out(g, w, {{"x", x}});
         Tensor64 w_t = to_f64(w.tensor("w"));
         for (int64_t i = 0; i < 16; ++i) {
-            for (int64_t j = 0; j < i; ++j) std::swap(w_t[i * 16 + j], w_t[j * 16 + i]);
+            for (int64_t j = 0; j < i; ++j)
+                std::swap(w_t[i * 16 + j], w_t[j * 16 + i]);
         }
         CHECK(test::all_close(out, test::ref::matmul(to_f64(x), to_f64(w.tensor("w"))), 4e-3, 4e-3));
         CHECK_FALSE(test::all_close(out, test::ref::matmul(to_f64(x), w_t), 4e-3, 4e-3));

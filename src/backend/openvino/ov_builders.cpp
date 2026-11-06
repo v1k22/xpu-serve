@@ -27,14 +27,22 @@ public:
 
 ov::element::Type to_ov_type(DType t) {
     switch (t) {
-        case DType::F32: return ov::element::f32;
-        case DType::F16: return ov::element::f16;
-        case DType::BF16: return ov::element::bf16;
-        case DType::I64: return ov::element::i64;
-        case DType::I32: return ov::element::i32;
-        case DType::I8: return ov::element::i8;
-        case DType::U8: return ov::element::u8;
-        case DType::Bool: return ov::element::boolean;
+        case DType::F32:
+            return ov::element::f32;
+        case DType::F16:
+            return ov::element::f16;
+        case DType::BF16:
+            return ov::element::bf16;
+        case DType::I64:
+            return ov::element::i64;
+        case DType::I32:
+            return ov::element::i32;
+        case DType::I8:
+            return ov::element::i8;
+        case DType::U8:
+            return ov::element::u8;
+        case DType::Bool:
+            return ov::element::boolean;
     }
     fail("unknown dtype ", static_cast<int>(t));
 }
