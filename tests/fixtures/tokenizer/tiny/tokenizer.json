@@ -1,0 +1,196 @@
+{
+ "version": "1.0",
+ "truncation": null,
+ "padding": null,
+ "added_tokens": [
+  {
+   "id": 1,
+   "content": "<s>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 2,
+   "content": "</s>",
+   "single_word": false,
+   "lstrip": false,
+   "rstrip": false,
+   "normalized": false,
+   "special": true
+  },
+  {
+   "id": 3,
+   "content": "<mark>",
+   "single_word": false,
+   "lstrip": true,
+   "rstrip": true,
+   "normalized": false,
+   "special": false
+  }
+ ],
+ "normalizer": {
+  "type": "Replace",
+  "pattern": {
+   "String": " "
+  },
+  "content": "▁"
+ },
+ "pre_tokenizer": {
+  "type": "Split",
+  "pattern": {
+   "String": " "
+  },
+  "behavior": "MergedWithPrevious",
+  "invert": false
+ },
+ "post_processor": {
+  "type": "TemplateProcessing",
+  "single": [
+   {
+    "Sequence": {
+     "id": "A",
+     "type_id": 0
+    }
+   }
+  ],
+  "pair": [
+   {
+    "Sequence": {
+     "id": "A",
+     "type_id": 0
+    }
+   },
+   {
+    "Sequence": {
+     "id": "B",
+     "type_id": 1
+    }
+   }
+  ],
+  "special_tokens": {}
+ },
+ "decoder": {
+  "type": "Sequence",
+  "decoders": [
+   {
+    "type": "Replace",
+    "pattern": {
+     "String": "▁"
+    },
+    "content": " "
+   },
+   {
+    "type": "ByteFallback"
+   },
+   {
+    "type": "Fuse"
+   },
+   {
+    "type": "Strip",
+    "content": " ",
+    "start": 1,
+    "stop": 0
+   }
+  ]
+ },
+ "model": {
+  "type": "BPE",
+  "dropout": null,
+  "unk_token": "<unk>",
+  "continuing_subword_prefix": null,
+  "end_of_word_suffix": null,
+  "fuse_unk": true,
+  "byte_fallback": true,
+  "ignore_merges": false,
+  "vocab": {
+   "<unk>": 0,
+   "<s>": 1,
+   "</s>": 2,
+   "<mark>": 3,
+   "▁": 4,
+   "h": 5,
+   "e": 6,
+   "l": 7,
+   "o": 8,
+   "w": 9,
+   "r": 10,
+   "d": 11,
+   "!": 12,
+   "<0xC3>": 13,
+   "<0xA9>": 14,
+   "<0xE2>": 15,
+   "<0x82>": 16,
+   "<0xAC>": 17,
+   "he": 18,
+   "ll": 19,
+   "hell": 20,
+   "hello": 21,
+   "▁w": 22,
+   "or": 23,
+   "▁wor": 24,
+   "▁worl": 25,
+   "▁world": 26,
+   "lo": 27,
+   "▁h": 28,
+   "▁hello": 29,
+   "▁▁": 30
+  },
+  "merges": [
+   [
+    "h",
+    "e"
+   ],
+   [
+    "l",
+    "l"
+   ],
+   [
+    "he",
+    "ll"
+   ],
+   [
+    "hell",
+    "o"
+   ],
+   [
+    "▁",
+    "w"
+   ],
+   [
+    "o",
+    "r"
+   ],
+   [
+    "▁w",
+    "or"
+   ],
+   [
+    "▁wor",
+    "l"
+   ],
+   [
+    "▁worl",
+    "d"
+   ],
+   [
+    "l",
+    "o"
+   ],
+   [
+    "▁",
+    "h"
+   ],
+   [
+    "▁",
+    "hello"
+   ],
+   [
+    "▁",
+    "▁"
+   ]
+  ]
+ }
+}

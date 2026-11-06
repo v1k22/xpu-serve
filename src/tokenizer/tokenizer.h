@@ -48,7 +48,7 @@ public:
 private:
     const Tokenizer& tokenizer_;
     bool skip_special_;
-    std::vector<int32_t> context_;  // last few emitted tokens, decoded again for decoders that look back
+    std::vector<int32_t> context_;  // the last emitted chunk, decoded again for decoders that look back
     std::vector<int32_t> pending_;  // tokens whose text is not final yet
 };
 

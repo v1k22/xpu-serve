@@ -221,7 +221,7 @@ Value Graph::reshape(Value x, Dims shape) {
     const auto [out_prod, out_syms] = split_shape(shape);
     XS_CHECK(in_prod == out_prod && in_syms == out_syms, "reshape ", shape_to_string(xt.shape), " -> ",
              shape_to_string(shape), " changes the element count (", where(x), ")");
-    return add_node(OpKind::Reshape, {x}, ReshapeAttrs{shape}, {TensorType{xt.dtype, std::move(shape)}}, "reshape");
+    return add_node(OpKind::Reshape, {x}, ReshapeAttrs{shape}, {TensorType{xt.dtype, shape}}, "reshape");
 }
 
 Value Graph::slice(Value x, int axis, int64_t begin, int64_t end) {

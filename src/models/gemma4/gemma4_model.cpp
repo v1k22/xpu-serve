@@ -1,0 +1,262 @@
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+
+#include "models/config_util.h"
+#include "models/gemma4/gemma4.h"
+#include "util/error.h"
+#include "util/half.h"
+#include "util/log.h"
+
+namespace xs::gemma4 {
+namespace {
+
+using graph::Graph;
+using graph::kT;
+using graph::Value;
+
+// Scalars that the reference multiplies in the weight dtype (embedding scales) are rounded the same way here:
+// sqrt(1536) = 39.19 becomes 39.25 in bf16, and the checkpoint was trained with that value.
+float round_to_dtype(float v, DType dtype) {
+    if (dtype == DType::BF16) return bf16_to_f32(f32_to_bf16(v));
+    if (dtype == DType::F16) return f16_to_f32(f32_to_f16(v));
+    return v;
+}
+
+// One inverse frequency per rotary pair (head_dim / 2 entries). Proportional RoPE rotates only the first
+// partial_rotary_factor share of the pairs; the rest stay 0 (cos 1, sin 0: identity). Both use head_dim as the
+// exponent denominator, as transformers' default and proportional RoPE do.
+HostTensor rope_inv_freq(const RopeConfig& rope, int64_t head_dim) {
+    const int64_t pairs = head_dim / 2;
+    const auto rotated = rope.proportional
+                             ? static_cast<int64_t>(std::floor(rope.partial_rotary_factor * static_cast<double>(head_dim) / 2.0))
+                             : pairs;
+    XS_CHECK(rotated >= 0 && rotated <= pairs, "gemma4: rotary pairs ", rotated, " out of range for head_dim ", head_dim);
+    HostTensor t(DType::F32, {pairs});
+    float* f = t.data<float>();
+    for (int64_t i = 0; i < rotated; ++i) {
+        f[i] = static_cast<float>(1.0 / std::pow(rope.theta, static_cast<double>(2 * i) / static_cast<double>(head_dim)));
+    }
+    return t;
+}
+
+// Checkpoints of Gemma4ForConditionalGeneration keep the decoder under "model.language_model.", text-only ones
+// under "model.".
+std::string probe_prefix(const WeightStore& weights) {
+    for (const char* prefix : {"model.language_model.", "model."}) {
+        if (weights.contains(std::string(prefix) + "embed_tokens.weight")) return prefix;
+    }
+    fail("gemma4: no embed_tokens.weight under model.language_model. or model.; is this a Gemma 4 checkpoint?");
+}
+
+class Gemma4Model final : public Model {
+public:
+    Gemma4Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> weights)
+        : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)), prefix_(probe_prefix(*weights_)) {
+        if (cfg_.ple_dim > 0) {
+            ple_table_ = &weights_->get(w("embed_tokens_per_layer.weight"));
+            XS_CHECK(ple_table_->shape == (Dims{cfg_.ple_vocab_size, cfg_.num_layers * cfg_.ple_dim}),
+                     "gemma4: embed_tokens_per_layer has shape ", dims_to_string(ple_table_->shape));
+            ple_scale_ = round_to_dtype(std::sqrt(static_cast<float>(cfg_.ple_dim)), ple_table_->dtype);
+        }
+        build_graph();
+    }
+
+    const ModelInfo& info() const override { return info_; }
+    const graph::Graph& graph() const override { return graph_; }
+    const WeightStore& weights() const override { return *weights_; }
+
+    void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, TensorMap& inputs) const override {
+        const auto n = static_cast<int64_t>(tokens.size());
+        XS_CHECK(n > 0, "gemma4: a step needs at least one token");
+        HostTensor ids(DType::I32, {n});
+        HostTensor pos(DType::I32, {n});
+        for (int64_t i = 0; i < n; ++i) {
+            const int32_t t = tokens[static_cast<size_t>(i)];
+            if (t < 0 || t >= cfg_.vocab_size) fail("gemma4: token id ", t, " outside the vocabulary (", cfg_.vocab_size, ")");
+            ids.data<int32_t>()[i] = t;
+            pos.data<int32_t>()[i] = static_cast<int32_t>(start_pos + i);
+        }
+        inputs["token_ids"] = std::move(ids);
+        inputs["positions"] = std::move(pos);
+        if (ple_table_ != nullptr) inputs["ple"] = gather_ple_rows(tokens);
+    }
+
+private:
+    std::string w(const std::string& suffix) const { return prefix_ + suffix; }
+    Value weight(const std::string& suffix) { return graph_.weight(*weights_, w(suffix)); }
+    float eps() const { return static_cast<float>(cfg_.rms_norm_eps); }
+
+    // The token-identity half of the per-layer embeddings is a 262144 x (layers * 256) table (4.7 GB in bf16). Rows
+    // are gathered on the host so the table never has to live in device memory.
+    HostTensor gather_ple_rows(std::span<const int32_t> tokens) const {
+        const int64_t width = cfg_.num_layers * cfg_.ple_dim;
+        HostTensor out(DType::F32, {static_cast<int64_t>(tokens.size()), width});
+        const size_t row_bytes = static_cast<size_t>(width) * dtype_size(ple_table_->dtype);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            XS_CHECK(tokens[i] < cfg_.ple_vocab_size, "gemma4: token id ", tokens[i], " outside the PLE vocabulary");
+            const auto* row = static_cast<const std::byte*>(ple_table_->data) + static_cast<size_t>(tokens[i]) * row_bytes;
+            float* dst = out.data<float>() + static_cast<int64_t>(i) * width;
+            to_f32(row, ple_table_->dtype, dst, static_cast<size_t>(width));
+            for (int64_t j = 0; j < width; ++j) dst[j] *= ple_scale_;
+        }
+        return out;
+    }
+
+    static void to_f32(const std::byte* src, DType dtype, float* dst, size_t n) {
+        switch (dtype) {
+            case DType::BF16:
+                for (size_t j = 0; j < n; ++j) {
+                    uint16_t v;
+                    std::memcpy(&v, src + 2 * j, 2);
+                    dst[j] = bf16_to_f32(v);
+                }
+                return;
+            case DType::F16:
+                for (size_t j = 0; j < n; ++j) {
+                    uint16_t v;
+                    std::memcpy(&v, src + 2 * j, 2);
+                    dst[j] = f16_to_f32(v);
+                }
+                return;
+            case DType::F32: std::memcpy(dst, src, n * sizeof(float)); return;
+            default: fail("gemma4: per-layer embedding table has unsupported dtype ", dtype_name(dtype));
+        }
+    }
+
+    void build_graph() {
+        Graph& g = graph_;
+        const Value ids = g.input("token_ids", DType::I32, {kT});
+        const Value pos = g.input("positions", DType::I32, {kT});
+        const Value embed = weight("embed_tokens.weight");
+        const float embed_scale = round_to_dtype(std::sqrt(static_cast<float>(cfg_.hidden_size)), g.type(embed).dtype);
+        Value h = g.scale(g.gather(embed, ids), embed_scale);
+
+        const Value per_layer = cfg_.ple_dim > 0 ? per_layer_inputs(h) : Value{};
+        inv_freq_sliding_ = g.constant(rope_inv_freq(cfg_.rope_sliding, cfg_.head_dim));
+        inv_freq_full_ = g.constant(rope_inv_freq(cfg_.rope_full, cfg_.global_head_dim));
+        layer_kv_.assign(static_cast<size_t>(cfg_.num_layers), {});
+
+        for (int64_t i = 0; i < cfg_.num_layers; ++i) h = decoder_layer(i, h, pos, per_layer);
+
+        Graph::Scope head(g, "head");
+        Value last = g.rms_norm(g.slice(h, 0, -1), weight("norm.weight"), eps());
+        const Value lm_head = weights_->contains("lm_head.weight") ? g.weight(*weights_, "lm_head.weight") : embed;
+        Value logits = g.matmul(last, lm_head);
+        if (cfg_.final_logit_softcap > 0.0) logits = g.softcap(logits, static_cast<float>(cfg_.final_logit_softcap));
+        g.output("logits", logits);
+        g.validate();
+        log::debug("gemma4: step graph has ", g.nodes().size(), " nodes, ", g.kv_slots().size(), " kv slots");
+    }
+
+    // [T, layers, ple_dim]: (RMSNorm(W h / sqrt(hidden)) + token PLE rows) / sqrt(2).
+    Value per_layer_inputs(Value h) {
+        Graph& g = graph_;
+        Graph::Scope s(g, "ple");
+        const Value ple = g.input("ple", DType::F32, {kT, cfg_.num_layers * cfg_.ple_dim});
+        Value proj = g.matmul(h, weight("per_layer_model_projection.weight"));
+        proj = g.scale(proj, 1.0f / std::sqrt(static_cast<float>(cfg_.hidden_size)));
+        proj = g.reshape(proj, {kT, cfg_.num_layers, cfg_.ple_dim});
+        proj = g.rms_norm(proj, weight("per_layer_projection_norm.weight"), eps());
+        const Value tokens = g.reshape(ple, {kT, cfg_.num_layers, cfg_.ple_dim});
+        return g.scale(g.add(proj, tokens), static_cast<float>(1.0 / std::sqrt(2.0)));
+    }
+
+    Value decoder_layer(int64_t i, Value h, Value pos, Value per_layer) {
+        Graph& g = graph_;
+        const std::string L = "layers." + std::to_string(i) + ".";
+        Graph::Scope s(g, "layers." + std::to_string(i));
+
+        Value attn = attention(i, g.rms_norm(h, weight(L + "input_layernorm.weight"), eps()), pos);
+        h = g.add(h, g.rms_norm(attn, weight(L + "post_attention_layernorm.weight"), eps()));
+
+        const Value x = g.rms_norm(h, weight(L + "pre_feedforward_layernorm.weight"), eps());
+        Value mlp = g.mul(g.gelu_tanh(g.matmul(x, weight(L + "mlp.gate_proj.weight"))),
+                          g.matmul(x, weight(L + "mlp.up_proj.weight")));
+        mlp = g.matmul(mlp, weight(L + "mlp.down_proj.weight"));
+        h = g.add(h, g.rms_norm(mlp, weight(L + "post_feedforward_layernorm.weight"), eps()));
+
+        if (per_layer.valid()) {
+            Graph::Scope ps(g, "ple");
+            const Value p = g.reshape(g.slice(per_layer, 1, i, i + 1), {kT, cfg_.ple_dim});
+            Value gate = g.mul(g.gelu_tanh(g.matmul(h, weight(L + "per_layer_input_gate.weight"))), p);
+            gate = g.matmul(gate, weight(L + "per_layer_projection.weight"));
+            h = g.add(h, g.rms_norm(gate, weight(L + "post_per_layer_input_norm.weight"), eps()));
+        }
+        return g.mul(h, weight(L + "layer_scalar"));
+    }
+
+    Value attention(int64_t i, Value x, Value pos) {
+        Graph& g = graph_;
+        Graph::Scope s(g, "attn");
+        const std::string L = "layers." + std::to_string(i) + ".self_attn.";
+        const AttnKind kind = cfg_.layer_kinds[static_cast<size_t>(i)];
+        const int64_t hd = cfg_.layer_head_dim(i);
+        const Value inv_freq = kind == AttnKind::Full ? inv_freq_full_ : inv_freq_sliding_;
+
+        Value q = g.reshape(g.matmul(x, weight(L + "q_proj.weight")), {kT, cfg_.num_heads, hd});
+        q = g.rope(g.rms_norm(q, weight(L + "q_norm.weight"), eps()), pos, inv_freq);
+
+        std::pair<Value, Value> kv;
+        if (cfg_.is_kv_shared(i)) {
+            kv = layer_kv_[static_cast<size_t>(cfg_.kv_source_layer(i))];
+            XS_CHECK(kv.first.valid(), "gemma4: layer ", i, " shares the KV of a layer that has none");
+        } else {
+            Value k = g.reshape(g.matmul(x, weight(L + "k_proj.weight")), {kT, cfg_.num_kv_heads, hd});
+            k = g.rope(g.rms_norm(k, weight(L + "k_norm.weight"), eps()), pos, inv_freq);
+            Value v = g.reshape(g.matmul(x, weight(L + "v_proj.weight")), {kT, cfg_.num_kv_heads, hd});
+            v = g.rms_norm(v, eps());
+            const int64_t window = kind == AttnKind::Sliding ? cfg_.sliding_window : 0;
+            const int slot = g.add_kv_slot(cfg_.num_kv_heads, hd, window, "layers." + std::to_string(i));
+            kv = g.kv_cache(slot, k, v);
+            layer_kv_[static_cast<size_t>(i)] = kv;
+        }
+
+        graph::AttentionAttrs attrs;
+        attrs.scale = 1.0f;  // q_norm / k_norm carry the scale
+        attrs.sliding_window = kind == AttnKind::Sliding ? cfg_.sliding_window : 0;
+        const Value o = g.attention(q, kv.first, kv.second, attrs);
+        return g.matmul(g.reshape(o, {kT, cfg_.num_heads * hd}), weight(L + "o_proj.weight"));
+    }
+
+    Config cfg_;
+    ModelInfo info_;
+    std::unique_ptr<SafetensorsWeights> weights_;
+    std::string prefix_;
+    graph::Graph graph_;
+    const TensorView* ple_table_ = nullptr;
+    float ple_scale_ = 1.0f;
+    Value inv_freq_sliding_;
+    Value inv_freq_full_;
+    std::vector<std::pair<Value, Value>> layer_kv_;  // KvCache outputs of each non-shared layer
+};
+
+}  // namespace
+
+std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json) {
+    Config cfg = parse_config(config_json);
+
+    ModelInfo info;
+    info.arch = "gemma4";
+    info.id = std::filesystem::absolute(dir).lexically_normal().filename().string();
+    if (info.id.empty()) info.id = std::filesystem::absolute(dir).lexically_normal().parent_path().filename().string();
+    info.vocab_size = cfg.vocab_size;
+    info.max_position = cfg.max_position;
+    info.dialect = "gemma4";
+    std::vector<int32_t> gen_eos;
+    info.default_sampling = cfg::read_generation_defaults(dir, &gen_eos);
+    std::vector<int32_t> stops = cfg::get_int_list(config_json, "eos_token_id", "config.json");
+    if (config_json.contains("text_config")) {
+        const auto text_eos = cfg::get_int_list(config_json.at("text_config"), "eos_token_id", "config.json text_config");
+        stops.insert(stops.end(), text_eos.begin(), text_eos.end());
+    }
+    stops.insert(stops.end(), gen_eos.begin(), gen_eos.end());
+    std::sort(stops.begin(), stops.end());
+    stops.erase(std::unique(stops.begin(), stops.end()), stops.end());
+    info.stop_token_ids = std::move(stops);
+
+    auto weights = SafetensorsWeights::open_dir(dir);
+    return std::make_unique<Gemma4Model>(std::move(cfg), std::move(info), std::move(weights));
+}
+
+}  // namespace xs::gemma4

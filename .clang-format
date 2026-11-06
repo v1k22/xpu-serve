@@ -1,7 +1,7 @@
 BasedOnStyle: Google
 ColumnLimit: 120
 IndentWidth: 4
-AccessModifierOffset: -2
+AccessModifierOffset: -4
 DerivePointerAlignment: false
 PointerAlignment: Left
 AllowShortFunctionsOnASingleLine: Inline

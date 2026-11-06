@@ -32,6 +32,14 @@ public:
 };
 
 // Dialects: "gemma4", "plain" (everything is content). Throws xs::Error naming the known dialects otherwise.
-std::unique_ptr<OutputParser> make_output_parser(std::string_view dialect);
+// prompt_tail: the end of the rendered prompt (see prompt_tail()); the parser starts in the state it leaves open, e.g.
+// in reasoning when the prompt ends inside an opened thought channel.
+std::unique_ptr<OutputParser> make_output_parser(std::string_view dialect, std::string_view prompt_tail = {});
+
+// The end of a rendered prompt that make_output_parser needs; keeping only this avoids copying whole prompts.
+inline std::string_view prompt_tail(std::string_view rendered_prompt) {
+    constexpr size_t kTailBytes = 256;
+    return rendered_prompt.substr(rendered_prompt.size() > kTailBytes ? rendered_prompt.size() - kTailBytes : 0);
+}
 
 }  // namespace xs::chat

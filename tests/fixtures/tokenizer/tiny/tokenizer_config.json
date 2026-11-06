@@ -1,0 +1,7 @@
+{
+ "bos_token": "<s>",
+ "eos_token": {
+  "content": "</s>"
+ },
+ "unk_token": "<unk>"
+}

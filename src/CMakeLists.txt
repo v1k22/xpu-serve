@@ -47,9 +47,12 @@ endif()
 
 xs_add_library(xs_server DIRS server DEPS xs_core xs_tokenizer xs_chat xs_httplib)
 
+# The InferenceService that ties model, backend, tokenizer and chat template together.
+xs_add_library(xs_service DIRS service DEPS xs_core xs_backends xs_tokenizer xs_chat)
+
 add_executable(xpu-serve cli/main.cpp)
 file(GLOB xs_cli_extra CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cli/*.cpp)
 list(REMOVE_ITEM xs_cli_extra ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.cpp)
 target_sources(xpu-serve PRIVATE ${xs_cli_extra})
-target_link_libraries(xpu-serve PRIVATE xs_core xs_backends xs_tokenizer xs_chat xs_server xs_warnings)
+target_link_libraries(xpu-serve PRIVATE xs_service xs_server xs_warnings)
 target_compile_definitions(xpu-serve PRIVATE XS_VERSION="${PROJECT_VERSION}")
