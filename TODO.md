@@ -4,6 +4,10 @@ The working plan for [DESIGN.md](DESIGN.md). Phases match DESIGN.md section 17.
 **Backend order: OpenVINO first (Phases 1 to 3), then SYCL (Phase 4). The main backend is chosen in Phase 5,
 after experiments.**
 
+**v0.1 (2026-11-06):** Gemma 4 E2B text, served end to end on OpenVINO, weights loaded from the HF checkpoint (convert
+skipped for now, by decision), KV as OpenVINO state rather than engine-owned pages (`docs/decisions/0002`). Ticked items
+below are done and tested; the parity numbers are in `tests/unit/model/gemma4_parity.cpp`.
+
 Legend: `[x]` done · `[ ]` to do · **Done when** = the check that closes the item.
 
 ---
@@ -13,7 +17,7 @@ Legend: `[x]` done · `[ ]` to do · **Done when** = the check that closes the i
 - [x] Repo created with MIT license
 - [x] README
 - [x] DESIGN.md and TODO.md
-- [ ] Review of DESIGN.md; answers to its section 19 recorded in `docs/decisions/0001-*.md` and later
+- [x] Review of DESIGN.md (approved 2026-11-06); decisions so far in `docs/decisions/0001`–`0004`
 
 ---
 
@@ -22,9 +26,9 @@ Legend: `[x]` done · `[ ]` to do · **Done when** = the check that closes the i
 Everything that does not depend on a GPU backend. All tests run on the CPU reference backend.
 
 ### 0.1 Skeleton
-- [ ] CMake project (C++20), one `xpu-serve` binary, options `XPU_BACKEND_OPENVINO` / `XPU_BACKEND_SYCL`
+- [x] CMake project (C++20), one `xpu-serve` binary, options `XPU_BACKEND_OPENVINO` / `XPU_BACKEND_SYCL`
 - [ ] CLI dispatcher: `convert`, `serve`, `run`, `bench`, `check`, `info` (stubs that refuse by name)
-- [ ] Vendored deps in `third_party/`: nlohmann/json, cpp-httplib; `NOTICE` started
+- [x] Vendored deps in `third_party/`: nlohmann/json, cpp-httplib; `NOTICE` started
 - [ ] CTest wiring + GitHub Actions job (Linux, CPU): build + unit tests
 - [ ] `.clang-format`, `.gitignore`
 - **Done when:** a clean checkout builds and `ctest` passes in CI.
@@ -38,7 +42,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - **Done when:** every later perf number has a baseline and a ceiling to compare with.
 
 ### 0.3 Safetensors and packs
-- [ ] Safetensors reader (mmap, header JSON, dtypes incl. BF16/F16/U8/I8/F32), sharded index
+- [x] Safetensors reader (mmap, header JSON, dtypes incl. BF16/F16/U8/I8/F32), sharded index
 - [ ] Safetensors writer (sharding ≤ 4 GB, index file)
 - [ ] `docs/pack-format.md`: formats `bf16`, `f16`, `q8_sym`, `q4_sym`, `q4_asym`; packing order; manifest schema
 - [ ] Pack reader: manifest, per-tensor formats, refuses unknown formats by name
@@ -61,24 +65,24 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
   accepts, with a correct memory bill.
 
 ### 0.6 Step graph and CPU reference backend
-- [ ] `graph/`: nodes, symbolic dims (tokens, sequences), builder API, outputs, topological order
-- [ ] Backend interface (`backend/backend.h`): `upload`, `make_kv_pool`, `compile`, `Program::run`, capabilities
-- [ ] CPU reference backend: every op in DESIGN.md 8.4, fp32 (fp64 in contracts)
-- [ ] Kernel contract framework: fp64 reference, shape sweeps, dtype tolerances, **planted-bug controls that must fail**
+- [x] `graph/`: nodes, symbolic dims (tokens, sequences), builder API, outputs, topological order
+- [x] Backend interface (`backend/backend.h`): `upload`, `make_kv_pool`, `compile`, `Program::run`, capabilities
+- [x] CPU reference backend: every op in DESIGN.md 8.4, fp32 (fp64 in contracts)
+- [x] Kernel contract framework: fp64 reference, shape sweeps, dtype tolerances, **planted-bug controls that must fail**
 - **Done when:** every op has a passing contract on the CPU reference backend, and every planted bug is caught.
 
 ### 0.7 Tokenizer and chat templates
-- [ ] `tokenizer.json` reader: BPE with byte fallback (Gemma), byte-level BPE (Qwen, Llama 3), normalizers,
+- [x] `tokenizer.json` reader: BPE with byte fallback (Gemma), byte-level BPE (Qwen, Llama 3), normalizers,
       pre-tokenizer regex, added/special tokens
 - [ ] Decide regex engine (PCRE2 vs port) → `docs/decisions/`
-- [ ] Parity corpus vs Hugging Face (code, CJK, emoji, whitespace runs, special tokens)
-- [ ] Jinja renderer (minja candidate) → `docs/decisions/`; parity vs `apply_chat_template` incl. tools
+- [x] Parity corpus vs Hugging Face (code, CJK, emoji, whitespace runs, special tokens)
+- [x] Jinja renderer (minja candidate) → `docs/decisions/`; parity vs `apply_chat_template` incl. tools
 - **Done when:** both parity suites pass for Gemma 4 (and Qwen 3 as the second family).
 
 ### 0.8 Gemma 4 model code
-- [ ] `models/gemma4/config.cpp`: parse (`text_config` first, then root), validate, memory bill
+- [x] `models/gemma4/config.cpp`: parse (`text_config` first, then root), validate, memory bill
 - [ ] `models/common/`: attention, GeGLU MLP, MoE, RMSNorm, RoPE variants
-- [ ] `models/gemma4/model.cpp`: sliding + global attention, K=V global layers, MoE + dense MLP, tied head, softcap
+- [x] `models/gemma4/model.cpp`: sliding + global attention, K=V global layers, MoE + dense MLP, tied head, softcap
 - [ ] `models/gemma4/README.md`: quirks, references, tested packs
 - [ ] `tests/parity/make_tiny.py`: tiny random Gemma 4 (sliding + global + MoE + K=V) → weights + fp32 logits and
       hidden states; also a "fake-quant" reference run with dequantized weights
@@ -86,8 +90,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
   q8/q4 against the fake-quant reference within contract tolerance.
 
 ### 0.9 Minimal generate loop
-- [ ] Engine skeleton: one slot, contiguous KV, greedy sampling, stop on EOS
-- [ ] `xpu-serve run` on the CPU reference backend with the tiny model
+- [x] Engine skeleton: one slot, contiguous KV, greedy sampling, stop on EOS
+- [x] `xpu-serve run` on the CPU reference backend with the tiny model
 - **Done when:** the tiny model generates the same greedy tokens as Hugging Face.
 
 ---
@@ -96,7 +100,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 - [ ] Decide the OpenVINO pin: a release, or pinned source + `third_party/patches/openvino/` →
       `scripts/build-openvino.sh` → `docs/decisions/`
-- [ ] Step graph → `ov::Model` (opset), dynamic token dims; weights as Constants over the mmapped safetensors
+- [x] Step graph → `ov::Model` (opset), dynamic token dims; weights as Constants over the mmapped safetensors
 - [ ] Quantized weights via `Convert → Subtract(zp) → Multiply(scale) → MatMul`; confirm the GPU plugin fuses it
       (compressed matmul shows up in the perf counters)
 - [ ] Embedding gather from the quantized table; tied LM head; logits only for the rows we sample from
@@ -106,7 +110,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Fill in the capabilities table (DESIGN.md 8.5) with what was actually verified
 - [ ] Kernel contracts on OpenVINO (one-op graphs) for every op
 - [ ] Tiny parity on OpenVINO GPU (bf16, q8, q4)
-- [ ] Real parity: Gemma 4 26B-A4B bf16 vs Hugging Face fp32 (8 prompts, 64 tokens)
+- [x] Real parity vs Hugging Face fp32 — done for Gemma 4 **E2B** (6 prompts, logits + 32-token greedy) on cpu-ref and
+      OpenVINO CPU; 26B-A4B needs MoE + K=V support first
 - [ ] Bench Gemma 4 26B-A4B q4 on B390 and B60 vs the GenAI baseline
 - **Done when:** parity passes and decode tok/s is within 5% of OpenVINO GenAI at 1k / 32k / 64k (same kernels, so a
   gap means our overhead; find it before moving on).
@@ -115,7 +120,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ## Phase 2: Server and engine
 
-- [ ] Engine thread + request queue + per-request token channel; cancel on disconnect
+- [x] Engine thread + request queue + per-request token channel; cancel on disconnect
 - [ ] Paged KV: block allocator, pools per attention kind (sliding / global), sliding-window block release,
       KV-shared layers read their source pool
 - [ ] int8 KV option (`--kv-dtype i8`)
@@ -123,12 +128,12 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Continuous batching (after batch 1 is solid)
 - [ ] Prefix cache: hash-chained full blocks, refcounts, LRU; validity rule for sliding layers (DESIGN.md 9.4)
 - [ ] Memory bill at load; refuse by name when it does not fit
-- [ ] Sampling: temperature, top-k, top-p, min-p, penalties, seed; device-side argmax / top-k
-- [ ] OpenAI API: `/v1/chat/completions` (stream + non-stream, tools, reasoning), `/v1/completions`, `/v1/models`,
+- [x] Sampling: temperature, top-k, top-p, min-p, penalties, seed; device-side argmax / top-k
+- [x] OpenAI API: `/v1/chat/completions` (stream + non-stream, tools, reasoning), `/v1/completions`, `/v1/models`,
       `/health`, `/metrics`
-- [ ] Gemma 4 tool-call and reasoning dialect (`chat/dialects/`)
-- [ ] One summary log line per request
-- [ ] E2E tests with an OpenAI client: streaming, tools, stop strings, cancellation, concurrency
+- [x] Gemma 4 tool-call and reasoning dialect (`chat/dialects/`)
+- [x] One summary log line per request
+- [x] E2E tests with an OpenAI client: streaming, tools, stop strings, cancellation, concurrency
 - **Done when:** E2E suite passes; a multi-turn agent session shows prefix-cache hits; 64k context runs on B390
   without OOM.
 

@@ -145,15 +145,16 @@ SamplingParams sampling_from(const Args& a, SamplingParams p) {
 }
 
 // Streams one assistant turn to stdout and returns the raw generated text (for the conversation history).
-std::string run_turn(EngineService& service, const std::vector<int32_t>& prompt, const SamplingParams& sampling,
+std::string run_turn(EngineService& service, std::string_view prompt_text, const SamplingParams& sampling,
                      int max_tokens) {
+    const std::vector<int32_t> prompt = service.tokenizer().encode(prompt_text);
     GenerateRequest req;
     req.prompt = prompt;
     req.sampling = sampling;
     req.max_new_tokens = max_tokens;
     req.stop_token_ids = service.model().stop_token_ids;
     tok::StreamDecoder decoder(service.tokenizer(), false);
-    auto parser = chat::make_output_parser(service.model().dialect);
+    auto parser = chat::make_output_parser(service.model().dialect, chat::prompt_tail(prompt_text));
     std::string raw;
     bool in_reasoning = false;
     auto print = [&](const chat::ParsedDelta& d) {
@@ -213,7 +214,7 @@ int cmd_run(const std::vector<std::string>& argv) {
 
     if (a.has("raw")) {
         XS_CHECK(a.has("prompt"), "--raw needs --prompt");
-        run_turn(*service, service->tokenizer().encode(a.get("prompt")), sampling, max_tokens);
+        run_turn(*service, a.get("prompt"), sampling, max_tokens);
         return 0;
     }
     nlohmann::json messages = nlohmann::json::array();
@@ -221,8 +222,8 @@ int cmd_run(const std::vector<std::string>& argv) {
     auto turn = [&](const std::string& user_text) {
         messages.push_back({{"role", "user"}, {"content", user_text}});
         const std::string text = service->chat_template().render(messages, nullptr, true, extra);
-        const std::string reply = run_turn(*service, service->tokenizer().encode(text), sampling, max_tokens);
-        auto parser = chat::make_output_parser(service->model().dialect);
+        const std::string reply = run_turn(*service, text, sampling, max_tokens);
+        auto parser = chat::make_output_parser(service->model().dialect, chat::prompt_tail(text));
         chat::ParsedDelta d = parser->feed(reply);
         const chat::ParsedDelta end = parser->finish();
         messages.push_back({{"role", "assistant"}, {"content", d.content + end.content}});

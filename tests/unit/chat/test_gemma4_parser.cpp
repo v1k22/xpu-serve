@@ -1,5 +1,7 @@
 #include <doctest/doctest.h>
 
+#include <filesystem>
+#include <fstream>
 #include <random>
 #include <set>
 #include <string>
@@ -51,6 +53,24 @@ Collected parse_chunks(const std::vector<std::string>& chunks) {
 
 Collected parse(const std::string& text) {
     return parse_chunks({text});
+}
+
+Collected parse_after(std::string_view prompt, const std::string& text) {
+    auto parser = make_output_parser("gemma4", xs::chat::prompt_tail(prompt));
+    Collected out;
+    out.add(parser->feed(text));
+    out.add(parser->finish());
+    return out;
+}
+
+// The prompt Hugging Face renders for a named case of tests/fixtures/chat/gemma4_cases.json.
+std::string rendered_prompt(const std::string& case_name) {
+    std::ifstream in(std::filesystem::path(XS_SOURCE_DIR) / "tests/fixtures/chat/gemma4_cases.json");
+    for (const json& c : json::parse(in)) {
+        if (c["name"] == case_name) return c["expected"].get<std::string>();
+    }
+    FAIL("no fixture case ", case_name);
+    return {};
 }
 
 json args(std::string_view gemma) {
@@ -260,6 +280,56 @@ TEST_SUITE("chat gemma4 parser") {
     TEST_CASE("finish with nothing pending is empty") {
         auto parser = make_output_parser("gemma4");
         CHECK(parser->finish().empty());
+    }
+}
+
+TEST_SUITE("chat gemma4 parser prompt tail") {
+    TEST_CASE("after a tool response with thinking on, output starts in reasoning") {
+        const std::string prompt = rendered_prompt("openai_round_trip_thinking");
+        REQUIRE(prompt.ends_with("<tool_response|><|channel>thought\n"));
+        const Collected c = parse_after(prompt, "It is cloudy.\n<channel|>Paris is 18 C and cloudy.");
+        CHECK(c.reasoning == "It is cloudy.");
+        CHECK(c.content == "Paris is 18 C and cloudy.");
+    }
+
+    TEST_CASE("a first turn with thinking on starts in content; the model opens the channel itself") {
+        const std::string prompt = rendered_prompt("thinking_on");
+        REQUIRE(prompt.ends_with("<|turn>model\n"));
+        REQUIRE(prompt.find("<|think|>") != std::string::npos);
+        const Collected c = parse_after(prompt, "<|channel>thought\nHmm.\n<channel|>Sunny.");
+        CHECK(c.reasoning == "Hmm.");
+        CHECK(c.content == "Sunny.");
+    }
+
+    TEST_CASE("prompts without an open channel start in content") {
+        for (const std::string name : {"openai_round_trip", "user_only", "reasoning_content_after_last_user"}) {
+            CAPTURE(name);
+            const Collected c = parse_after(rendered_prompt(name), "Plain answer.");
+            CHECK(c.content == "Plain answer.");
+            CHECK(c.reasoning.empty());
+        }
+    }
+
+    TEST_CASE("prompt text is never emitted") {
+        const Collected open = parse_after("<|turn>model\n<|channel>thought\nI already thought\n", "more<channel|>ok");
+        CHECK(open.reasoning == "more");
+        CHECK(open.content == "ok");
+        const Collected closed = parse_after("<|channel>thought\nx<channel|>prefill <", "answer");
+        CHECK(closed.content == "answer");
+        CHECK(closed.reasoning.empty());
+    }
+
+    TEST_CASE("a prompt ending inside the channel opener completes it from the output") {
+        const Collected c = parse_after("<|turn>model\n<|channel>thou", "ght\nidea\n<channel|>done");
+        CHECK(c.reasoning == "idea");
+        CHECK(c.content == "done");
+    }
+
+    TEST_CASE("prompt_tail keeps only the end of a long prompt") {
+        const std::string prompt = std::string(10000, 'x') + "<|channel>thought\n";
+        CHECK(xs::chat::prompt_tail(prompt).size() < 1000);
+        CHECK(xs::chat::prompt_tail(prompt).ends_with("<|channel>thought\n"));
+        CHECK(parse_after(prompt, "r").reasoning == "r");
     }
 }
 

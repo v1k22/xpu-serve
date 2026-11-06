@@ -1162,5 +1162,252 @@
    "preserve_thinking": true
   },
   "expected": "<bos><|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Paris<|\"|>,type:<|\"|>STRING<|\"|>},unit:{description:<|\"|>Temperature unit<|\"|>,enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n<|channel>thought\nCalling the tool.\n<channel|><|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>21 C<|\"|>}<tool_response|>21 C.<turn|>\n<|turn>user\nok<turn|>\n<|turn>model\n"
+ },
+ {
+  "name": "openai_round_trip",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris right now? Use the tool."
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Paris\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp_c\": 18, \"sky\": \"cloudy\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Paris<|\"|>,type:<|\"|>STRING<|\"|>},unit:{description:<|\"|>Temperature unit<|\"|>,enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris right now? Use the tool.<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp_c\": 18, \"sky\": \"cloudy\"}<|\"|>}<tool_response|>"
+ },
+ {
+  "name": "openai_round_trip_null_content",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris right now? Use the tool."
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Paris\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp_c\": 18, \"sky\": \"cloudy\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Paris<|\"|>,type:<|\"|>STRING<|\"|>},unit:{description:<|\"|>Temperature unit<|\"|>,enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris right now? Use the tool.<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp_c\": 18, \"sky\": \"cloudy\"}<|\"|>}<tool_response|>"
+ },
+ {
+  "name": "openai_round_trip_thinking",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris right now? Use the tool."
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Paris\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp_c\": 18, \"sky\": \"cloudy\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": true
+  },
+  "expected": "<bos><|turn>system\n<|think|>\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Paris<|\"|>,type:<|\"|>STRING<|\"|>},unit:{description:<|\"|>Temperature unit<|\"|>,enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris right now? Use the tool.<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp_c\": 18, \"sky\": \"cloudy\"}<|\"|>}<tool_response|><|channel>thought\n"
+ },
+ {
+  "name": "openai_round_trip_answered",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris right now? Use the tool."
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "c1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\":\"Paris\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c1",
+    "content": "{\"temp_c\": 18, \"sky\": \"cloudy\"}"
+   },
+   {
+    "role": "assistant",
+    "content": "It is 18 C and cloudy."
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Current weather for a city.<|\"|>,parameters:{properties:{city:{description:<|\"|>City name, e.g. Paris<|\"|>,type:<|\"|>STRING<|\"|>},unit:{description:<|\"|>Temperature unit<|\"|>,enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris right now? Use the tool.<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp_c\": 18, \"sky\": \"cloudy\"}<|\"|>}<tool_response|>It is 18 C and cloudy.<turn|>\n<|turn>user\nThanks<turn|>\n<|turn>model\n"
  }
 ]

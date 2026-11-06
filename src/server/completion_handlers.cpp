@@ -28,6 +28,7 @@ struct CompletionHandlers::Job {
     GenerateRequest request;
     GenerationOptions options;
     std::string dialect;  // output parser; raw completions are always "plain"
+    std::string prompt_tail;  // chat::prompt_tail of the prompt text: the parser's start state
 };
 
 namespace {
@@ -154,9 +155,10 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
     const ModelCard& card = service_.model();
     ChatRequest chat = parse_chat_request(parse_json_body(req.body), card.default_sampling);
     std::vector<int32_t> prompt;
+    std::string text;
     try {
-        const std::string text = service_.chat_template().render(chat.messages, chat.tools,
-                                                                 /*add_generation_prompt=*/true, chat.template_kwargs);
+        text = service_.chat_template().render(chat.messages, chat.tools, /*add_generation_prompt=*/true,
+                                               chat.template_kwargs);
         prompt = service_.tokenizer().encode(text, /*parse_special=*/true);
     } catch (const std::exception& e) {
         throw InvalidRequest(str_cat("could not render the chat template: ", e.what()), "messages");
@@ -165,7 +167,8 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
             .meta = {random_id("chatcmpl-"), card.id, unix_seconds_now()},
             .request = make_generate_request(std::move(prompt), chat.options, card, "messages"),
             .options = std::move(chat.options),
-            .dialect = card.dialect};
+            .dialect = card.dialect,
+            .prompt_tail = std::string(chat::prompt_tail(text))};
     respond(job, req, res);
 }
 
@@ -182,7 +185,8 @@ void CompletionHandlers::completion(const httplib::Request& req, httplib::Respon
             .meta = {random_id("cmpl-"), card.id, unix_seconds_now()},
             .request = make_generate_request(std::move(prompt), completion.options, card, "prompt"),
             .options = std::move(completion.options),
-            .dialect = "plain"};
+            .dialect = "plain",
+            .prompt_tail = std::string(chat::prompt_tail(completion.prompt))};
     respond(job, req, res);
 }
 
@@ -198,7 +202,7 @@ void CompletionHandlers::respond(const Job& job, const httplib::Request& req, ht
 }
 
 void CompletionHandlers::write_full(const Job& job, const httplib::Request& req, httplib::Response& res) const {
-    TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect), job.options.stop);
+    TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop);
     chat::ParsedDelta message;
     const GenerationOutcome outcome = run_generation(
         service_, job.request, output,
@@ -225,7 +229,7 @@ bool CompletionHandlers::write_stream(const Job& job, const httplib::Request& re
     GenerationOutcome outcome;
     bool has_tool_calls = false;
     try {
-        TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect), job.options.stop);
+        TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop);
         outcome = run_generation(
             service_, job.request, output,
             [&](const chat::ParsedDelta& delta) {

@@ -5,6 +5,8 @@ Writes tests/fixtures/chat/gemma4_cases.json. The model dir needs only chat_temp
 (plus tokenizer.json for AutoTokenizer); it defaults to the vendored fixture copy's source model.
 """
 
+import copy
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -192,13 +194,48 @@ def cases():
     ], [WEATHER], True, {"enable_thinking": True, "preserve_thinking": True}
 
 
+def openai_to_hf(messages):
+    """Mirror of ChatTemplate::render's normalization: tool_calls[].function.arguments given as JSON text (OpenAI)
+    become the object HF templates expect when the text parses to a JSON object; everything else is unchanged."""
+    out = copy.deepcopy(messages)
+    for message in out:
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function", {})
+            if isinstance(function.get("arguments"), str):
+                try:
+                    parsed = json.loads(function["arguments"])
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    function["arguments"] = parsed
+    return out
+
+
+def openai_cases():
+    user = {"role": "user", "content": "What is the weather in Paris right now? Use the tool."}
+    text_call = {"id": "c1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}}
+    tool_reply = {"role": "tool", "tool_call_id": "c1", "content": "{\"temp_c\": 18, \"sky\": \"cloudy\"}"}
+    yield "openai_round_trip", [user, {"role": "assistant", "tool_calls": [text_call]}, tool_reply], [WEATHER], True, {}
+    yield "openai_round_trip_null_content", [
+        user, {"role": "assistant", "content": None, "tool_calls": [text_call]}, tool_reply,
+    ], [WEATHER], True, {}
+    yield "openai_round_trip_thinking", [
+        user, {"role": "assistant", "tool_calls": [text_call]}, tool_reply,
+    ], [WEATHER], True, {"enable_thinking": True}
+    yield "openai_round_trip_answered", [
+        user, {"role": "assistant", "tool_calls": [text_call]}, tool_reply,
+        {"role": "assistant", "content": "It is 18 C and cloudy."}, {"role": "user", "content": "Thanks"},
+    ], [WEATHER], True, {}
+
+
 def main():
     model = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_MODEL
     tok = AutoTokenizer.from_pretrained(model)
     out = []
-    for name, messages, tools, add_gen, extra in cases():
+    for name, messages, tools, add_gen, extra in itertools.chain(cases(), openai_cases()):
         expected = tok.apply_chat_template(
-            messages, tools=tools, add_generation_prompt=add_gen, tokenize=False, **extra)
+            openai_to_hf(messages), tools=tools, add_generation_prompt=add_gen, tokenize=False, **extra)
         out.append({"name": name, "messages": messages, "tools": tools, "add_generation_prompt": add_gen,
                     "extra": extra, "expected": expected})
     OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")

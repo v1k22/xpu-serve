@@ -17,4 +17,5 @@
 | `value.cpp` | `dictsort` honors `case_sensitive` (default false: string keys compare lowercased) and sorts stably | Jinja2's default; Gemma 4 sorts tool parameters with `dictsort`, so `URL`/`Limit` ordered differently from Hugging Face |
 | `value.cpp` | `map('<filter>', ...)` applies the named filter to each item (was "not implemented") | Gemma 4's template renders `items.type` lists with `map('upper')` |
 | `value.h`, `value.cpp` | Floats print as Python `repr` (`python_float_repr`: shortest round-trip, `1e-05`, `1e+20`) instead of `std::to_string` with trailing zeros trimmed | Byte parity with Hugging Face for numeric tool-call arguments (`2.5e-07` printed as `0.0`) |
+| `runtime.cpp` | Runtime errors put the engine's message first, on one line, then the template line and column | The message used to start with a newline, so callers that show the first line showed nothing |
 | `CMakeLists.txt` | New: static library `xs_jinja` | Our build |

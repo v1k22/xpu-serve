@@ -17,6 +17,9 @@ namespace {
 // Elementwise results of O(1) inputs: f32 rounding vs f16 rounding of inputs and output.
 const ovt::Tolerance kElementwise = ovt::tolerance({1e-5, 1e-5}, {2e-3, 2e-3});
 
+// Data movement only: exact in f32; f16 activations round each value once (half an f16 ulp).
+const ovt::Tolerance kStorage = ovt::tolerance({0, 0}, {0, 4.9e-4});
+
 HostTensor run_out(const Graph& g, const WeightStore& w, const TensorMap& inputs) {
     return ovt::run(g, w, inputs).at("out");
 }
@@ -155,7 +158,7 @@ TEST_SUITE("openvino ops") {
             g.output("out", g.slice(g.input("x", DType::F32, {kT, 4, 8}), c.axis, c.begin, c.end));
             const HostTensor out = run_out(g, test::MemoryWeights{}, {{"x", x}});
             const Tensor64 expected = test::ref::slice(x64, static_cast<size_t>(c.axis), c.ref_begin, c.ref_end);
-            CHECK(ovt::close("slice", out, expected, {0, 0}));
+            CHECK(ovt::close("slice", out, expected, kStorage));
         }
         Graph g;
         const Value flat = g.reshape(g.input("x", DType::F32, {kT, 4, 8}), {kT, 32});
@@ -163,7 +166,7 @@ TEST_SUITE("openvino ops") {
         const HostTensor out = run_out(g, test::MemoryWeights{}, {{"x", x}});
         Tensor64 expected = test::ref::map(x64, [](double v) { return 2 * v; });
         expected.shape = {2, 5, 16};
-        CHECK(ovt::close("reshape", out, expected, {0, 0}));
+        CHECK(ovt::close("reshape", out, expected, kStorage));
     }
 
     TEST_CASE("rope rotate-half with zero inv_freq entries, at small and large positions") {

@@ -117,10 +117,30 @@ TEST_SUITE("chat template") {
             {{"role", "assistant"},
              {"tool_calls",
               json::array(
-                  {{{"id", "c"}, {"type", "function"}, {"function", {{"name", "f"}, {"arguments", R"({"a": 1})"}}}}})}},
+                  {{{"id", "c"}, {"type", "function"}, {"function", {{"name", "f"}, {"arguments", "[1, 2]"}}}}})}},
         });
         CHECK_THROWS_WITH_AS(tmpl->render(messages, nullptr, true), doctest::Contains("must be a JSON object"),
                              xs::Error);
+        CHECK_THROWS_WITH_AS(tmpl->render(messages, nullptr, true), doctest::Contains("at line 257, column"),
+                             xs::Error);
+    }
+
+    TEST_CASE("OpenAI tool round trip: JSON-text arguments, no assistant content, tool_call_id only") {
+        const auto tmpl = xs::chat::ChatTemplate::load(kChatFixtures / "gemma4");
+        auto conversation = [](const json& arguments) {
+            return json::array({
+                {{"role", "user"}, {"content", "Weather in Paris?"}},
+                {{"role", "assistant"},
+                 {"tool_calls", json::array({{{"id", "c1"},
+                                              {"type", "function"},
+                                              {"function", {{"name", "get_weather"}, {"arguments", arguments}}}}})}},
+                {{"role", "tool"}, {"tool_call_id", "c1"}, {"content", R"({"temp_c": 18})"}},
+            });
+        };
+        const std::string from_text = tmpl->render(conversation(R"({"city": "Paris"})"), nullptr, true);
+        CHECK(from_text == tmpl->render(conversation({{"city", "Paris"}}), nullptr, true));
+        CHECK(from_text.find("<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>"
+                             "<|tool_response>response:get_weather{") != std::string::npos);
     }
 
     TEST_CASE("non-array messages are refused") {
