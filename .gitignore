@@ -1,0 +1,16 @@
+# build trees
+/build*/
+/out/
+compile_commands.json
+.cache/
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+# generated test fixtures that are too large to commit
+/tests/fixtures/generated/
+# editors
+.vscode/
+.idea/
+*.swp
