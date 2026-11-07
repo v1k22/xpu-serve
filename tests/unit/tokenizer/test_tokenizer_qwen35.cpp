@@ -1,6 +1,6 @@
 // Byte-level BPE (Qwen3.5) against Hugging Face, fixture from tests/parity/tokenizer/gen_qwen35_cases.py. The regex
 // splitter, NFC and byte-level tests are hermetic; the whole-tokenizer tests need Qwen/Qwen3.5-4B's tokenizer.json
-// in XS_QWEN35_DIR (default /root/workspace/models/Qwen3.5-4B) and skip without it.
+// in XS_QWEN35_DIR (a Qwen/Qwen3.5-4B checkpoint directory) and skip without it.
 
 #include <doctest/doctest.h>
 
@@ -35,7 +35,8 @@ const nlohmann::json& fixture() {
 
 std::optional<std::filesystem::path> qwen35_dir() {
     const char* env = std::getenv("XS_QWEN35_DIR");
-    std::filesystem::path dir = env != nullptr && *env != '\0' ? env : "/root/workspace/models/Qwen3.5-4B";
+    if (env == nullptr || *env == '\0') return std::nullopt;
+    std::filesystem::path dir = env;
     if (!std::filesystem::exists(dir / "tokenizer.json")) return std::nullopt;
     return dir;
 }

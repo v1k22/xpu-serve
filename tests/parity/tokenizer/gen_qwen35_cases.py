@@ -1,6 +1,6 @@
 """Writes tests/fixtures/tokenizer/qwen35_cases.json: Hugging Face reference outputs for the byte-level BPE tokenizer.
 
-Run: /root/workspace/xs-ref/venv/bin/python -I tests/parity/tokenizer/gen_qwen35_cases.py [model_dir]
+Run: python -I tests/parity/tokenizer/gen_qwen35_cases.py <model_dir>
 
 Besides whole-tokenizer cases for Qwen/Qwen3.5-4B (encode ids, decodes), it records outputs that need no model: the
 Split pre-tokenizer on the Qwen3.5, Qwen2 and Llama 3 regexes, and the NFC normalizer, on hand-picked and random text.
@@ -17,7 +17,6 @@ from transformers import AutoTokenizer
 
 REPO = Path(__file__).resolve().parents[3]
 OUT = REPO / "tests/fixtures/tokenizer/qwen35_cases.json"
-DEFAULT_MODEL = "/root/workspace/models/Qwen3.5-4B"
 
 CONTRACTIONS = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
 SPACES = r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
@@ -131,7 +130,9 @@ def random_texts(rng: random.Random, pool: list, count: int, max_len: int) -> li
 
 
 def main() -> None:
-    model_dir = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    model_dir = sys.argv[1]
     hf = AutoTokenizer.from_pretrained(model_dir)
     raw = RawTokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
     rng = random.Random(35)

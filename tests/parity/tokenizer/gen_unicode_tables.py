@@ -1,6 +1,6 @@
 """Writes src/tokenizer/unicode_tables.cpp: the Unicode data behind the NFC normalizer and the Split regex matcher.
 
-Run: /root/workspace/xs-ref/venv/bin/python -I tests/parity/tokenizer/gen_unicode_tables.py
+Run: python -I tests/parity/tokenizer/gen_unicode_tables.py
 
 The data comes from Python's unicodedata, aligned with what Hugging Face tokenizers actually uses, because parity with
 it is the goal and its Rust dependencies carry other Unicode versions:

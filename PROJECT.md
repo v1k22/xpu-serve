@@ -46,12 +46,9 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
   `src/cli/main.cpp` is the source of truth.
 - Run one test case: `build/tests/xs_tests -tc='model matches*'`. Environment for the tests that need files:
   `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref` or `openvino`),
-  `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`; `XS_QWEN35_DIR` (Qwen3.5 tokenizer parity,
-  default /root/workspace/models/Qwen3.5-4B). `XS_OV_PROFILE=1` logs the OpenVINO plugin's costliest op types per
-  decode step when a session ends.
-- Remote GPU machines: `scripts/dev/remote_build.sh <system> <tag>` copies this tree to `~/xpu-serve/src-<tag>` on a
-  machine reachable through the `remote` CLI and builds it there; `scripts/dev/remote_env.sh` sets up OpenVINO and
-  `XS_TEST_MODEL_DIR` on that machine.
+  `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`; `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for
+  tokenizer parity). `XS_OV_PROFILE=1` logs the OpenVINO plugin's costliest op types per decode step when a session
+  ends.
 
 ## 3. Repository map
 
@@ -63,7 +60,6 @@ xpu-serve/
 ├── DESIGN.md               the design (why), roadmap, open questions
 ├── TODO.md                 phase checklists; [x] = done and tested
 ├── docs/decisions/         one short record per decision (NNNN-title.md)
-├── scripts/dev/            remote_build.sh, remote_env.sh (remote GPU test machines)
 ├── third_party/            vendored header-only deps (see third_party/README.md)
 ├── src/                    everything that ships (section 4)
 └── tests/                  unit tests, parity scripts, fixtures (section 7)

@@ -1,9 +1,9 @@
 """Renders chat-template parity cases with Hugging Face for the C++ ChatTemplate test.
 
-Usage: /root/workspace/xs-ref/venv/bin/python -I tests/parity/chat/gen_cases.py [gemma4|qwen3_5[=model_dir]] ...
-Writes tests/fixtures/chat/<set>_cases.json for each set named (default: all). A model dir needs only
-chat_template.jinja and tokenizer_config.json (plus tokenizer.json for AutoTokenizer); it defaults to the vendored
-fixture copy's source model (see tests/fixtures/chat/<set>/SOURCE).
+Usage: python -I tests/parity/chat/gen_cases.py gemma4=<model_dir> qwen3_5=<model_dir> ...
+Writes tests/fixtures/chat/<set>_cases.json for each set named. A model dir needs only chat_template.jinja and
+tokenizer_config.json (plus tokenizer.json for AutoTokenizer): the Hugging Face checkpoint named in
+tests/fixtures/chat/<set>/SOURCE.
 """
 
 import copy
@@ -435,15 +435,15 @@ def qwen3_5_cases():
 
 
 SETS = {
-    "gemma4": (Path("/root/workspace/models/gemma-4-E2B-it"), lambda: itertools.chain(cases(), openai_cases())),
-    "qwen3_5": (Path("/root/workspace/models/Qwen3.5-4B"), qwen3_5_cases),
+    "gemma4": lambda: itertools.chain(cases(), openai_cases()),
+    "qwen3_5": qwen3_5_cases,
 }
 
 
 def write_set(name, model):
     tok = AutoTokenizer.from_pretrained(model)
     out = []
-    for case_name, messages, tools, add_gen, extra in SETS[name][1]():
+    for case_name, messages, tools, add_gen, extra in SETS[name]():
         expected = tok.apply_chat_template(
             openai_to_hf(messages), tools=tools, add_generation_prompt=add_gen, tokenize=False, **extra)
         out.append({"name": case_name, "messages": messages, "tools": tools, "add_generation_prompt": add_gen,
@@ -456,11 +456,13 @@ def write_set(name, model):
 
 
 def main():
-    for arg in sys.argv[1:] or list(SETS):
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    for arg in sys.argv[1:]:
         name, _, model = arg.partition("=")
-        if name not in SETS:
-            sys.exit(f"unknown set {name!r} (known: {', '.join(SETS)})")
-        write_set(name, Path(model) if model else SETS[name][0])
+        if name not in SETS or not model:
+            sys.exit(f"expected <set>=<model_dir> with a set in {', '.join(SETS)}, got {arg!r}")
+        write_set(name, Path(model))
 
 
 if __name__ == "__main__":

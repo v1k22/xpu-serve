@@ -1,6 +1,6 @@
 """Writes tests/fixtures/tokenizer/gemma4_cases.json: Hugging Face reference ids and decodes for the C++ tokenizer.
 
-Run: /root/workspace/xs-ref/venv/bin/python tests/parity/tokenizer/gen_cases.py [model_dir]
+Run: python tests/parity/tokenizer/gen_cases.py <model_dir>
 """
 
 import json
@@ -13,7 +13,6 @@ from transformers import AutoTokenizer
 
 REPO = Path(__file__).resolve().parents[3]
 OUT = REPO / "tests/fixtures/tokenizer/gemma4_cases.json"
-DEFAULT_MODEL = "/root/workspace/models/gemma-4-E2B-it"
 
 TEXTS = {
     "empty": "",
@@ -74,7 +73,9 @@ def long_text(rng: random.Random, target_chars: int) -> str:
 
 
 def main() -> None:
-    model_dir = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    model_dir = sys.argv[1]
     hf = AutoTokenizer.from_pretrained(model_dir)
     raw = RawTokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
 
