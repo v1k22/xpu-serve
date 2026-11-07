@@ -16,7 +16,7 @@ comes second and gives full control over every kernel. Both pass the same tests.
 backend only after many experiments** comparing them on the same model, packs and engine ([section 8.2](#82-how-we-choose-the-main-backend)).
 
 ```bash
-xpu-serve convert google/gemma-4-26B-A4B-it --quant q4_sym -o gemma4-26b-q4
+xpu-serve convert ~/models/gemma-4-26B-A4B-it --quant q4 --out gemma4-26b-q4
 xpu-serve serve gemma4-26b-q4            # OpenAI-compatible server on http://127.0.0.1:8080
 ```
 
@@ -176,7 +176,7 @@ removes a whole class of races and keeps per-step overhead predictable.
 ## 5. Command line
 
 ```text
-xpu-serve convert <hf-id | dir> [-o DIR] [--quant q4_sym|q4_asym|q8_sym|f16|bf16] [--group 32|64|128]
+xpu-serve convert <dir> --out DIR [--quant q4|q8] [--group 32|64|128] [--q8 name,...]
                   [--keep REGEX ...] [--revision REV] [--with-drafter <hf-id | dir>]
 xpu-serve serve   <pack | name> [--backend openvino|sycl] [--device GPU.0] [--host 127.0.0.1] [--port 8080]
                   [--ctx 65536] [--max-seqs 4] [--kv-dtype f16|i8]
@@ -244,22 +244,24 @@ Each quantized tensor is stored as plain safetensors tensors next to each other:
 
 | Tensor | dtype | Shape | Meaning |
 |---|---|---|---|
-| `X.weight` | `U8` | `[out, in * bits / 8]` | Packed codes, row-major, `in` contiguous |
+| `X.weight` | `I8` (q8) / `U8` (q4) | `[out, in]` / `[out, in / 2]` | Codes, row-major, `in` contiguous; q4: two per byte, low nibble = even column |
 | `X.weight.scales` | `F16` | `[out, in / group]` | One scale per group |
-| `X.weight.zeros` | `U8` | `[out, in / group]` | Only for `*_asym`: one integer zero point per group |
+| `X.weight.biases` | `F16` | `[out, in / group]` | q4 only: one bias per group |
 
-Formats in v1:
+Formats (as built, 2026-11-07):
 
 | Format | Dequant | Notes |
 |---|---|---|
-| `bf16`, `f16` | as is | Quality reference |
-| `q8_sym` | `w = s · q`, `q ∈ [-128, 127]` | Per group (default 128) or per channel |
-| `q4_sym` | `w = s · (q - 8)`, `q ∈ [0, 15]` | Two codes per byte, low nibble = even column |
-| `q4_asym` | `w = s · (q - z)`, `q, z ∈ [0, 15]` | Integer zero point per group |
+| `bf16`, `f16` | as is | Quality reference; tensors that are not quantized keep their checkpoint dtype |
+| `q8` | `w = s · q`, `q ∈ [-127, 127]` | Symmetric, round to nearest, `s = max|w| / 127` per group |
+| `q4` | `w = s · q + b`, `q ∈ [0, 15]` | Affine (MLX layout), round to nearest, `b = min`, `s = (max - min) / 15` per group |
 
-Why integer zero points (not MLX's float bias): `(q - z) · s` with integer `z` is the decompression pattern OpenVINO's
-GPU plugin fuses into its compressed matmul, it matches what NNCF produces (so accuracy is comparable with packs people
-use today), and it is simple for our SYCL kernels. Importing MLX-affine and GGUF packs is planned later (Phase 6).
+Groups of 32, 64 (default) or 128 columns. Codes are chosen against the f16-rounded scale and bias, so dequantization
+reproduces exactly what the rounding picked. q4 uses a float bias rather than an integer zero point: the integer form
+only mattered for OpenVINO's compressed matmul, and a float bias fits round-to-nearest and AWQ better and matches MLX
+packs. `convert` lets the model's step graph decide what to quantize: weights read as matmul weights take the
+requested format, gather tables (and so a tied LM head) take q8, matrices under 1M elements and everything else stay
+as they are, and `--q8 name,...` keeps chosen matmul weights at q8.
 
 **The format of every tensor is written down explicitly** in the manifest. Nothing is inferred from shapes. Guessing
 bits or group size from tensor geometry is a known source of silent bugs.
@@ -269,19 +271,18 @@ bits or group size from tensor geometry is a known source of silent bugs.
 ```json
 {
   "pack_version": 1,
-  "converter": "xpu-serve 0.1.0 (commit abc1234)",
-  "source": { "repo": "google/gemma-4-26B-A4B-it", "revision": "<sha>", "files_sha256": { "...": "..." } },
-  "arch": "gemma4",
-  "default_format": { "format": "q4_sym", "group": 128 },
+  "converter": "xpu-serve 0.4.0",
+  "source": { "name": "gemma-4-26B-A4B-it", "model_type": "gemma4" },
+  "quant": { "format": "q4", "group": 64, "method": "rtn", "min_elements": 1048576, "q8_names": [] },
   "tensors": {
-    "model.language_model.layers.0.self_attn.q_proj.weight": { "format": "q4_sym", "group": 128 },
-    "model.language_model.layers.0.input_layernorm.weight":  { "format": "bf16" }
+    "model.language_model.layers.0.self_attn.q_proj.weight": { "format": "q4", "group": 64, "shape": [2048, 1536] }
   },
-  "drafters": { "mtp": "drafters/mtp" }
 }
 ```
 
-The manifest makes a pack reproducible: same source revision + same converter version + same options = same bytes.
+Only quantized tensors are listed; every other tensor is a plain safetensors tensor. The manifest makes a pack
+reproducible: same source files + same converter version + same options = same bytes (recording the source revision
+and file hashes, and drafters, are still to come).
 
 ### 6.5 Quantization quality
 

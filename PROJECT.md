@@ -78,8 +78,10 @@ area).
 | Directory | Library | What lives there |
 |---|---|---|
 | `util/` | xs_core | `error.h` (`xs::Error`, `fail(...)`, `XS_CHECK`, `str_cat`), `log`, `timer.h`, `mmap_file`, `half` (f16/bf16 conversions), `base64` |
-| `tensor/` | xs_core | `DType`, `TensorView` (non-owning, e.g. into an mmap), `HostTensor` (owning), `TensorMap` (name -> HostTensor) |
-| `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped) |
+| `tensor/` | xs_core | `DType` (incl. `Q8` / `Q4` pack weights), `TensorView` (non-owning, e.g. into an mmap; `quant` points at a pack weight's scales and biases), `HostTensor` (owning), `TensorMap` (name -> HostTensor) |
+| `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped; a pack's quantized weights appear as one Q8 / Q4 view each); `safetensors_writer` (streamed writing) |
+| `quant/` | xs_core | round-to-nearest quantization into the pack formats (DESIGN.md 6.3) and dequantization |
+| `convert/` | xs_core | `convert_model`: checkpoint -> pack; the model's own graph decides which weights to quantize |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
 | `models/` | xs_core | `model.h` (the `Model` interface), `registry.cpp` (model_type -> code), `config_util` (checked JSON readers), one folder per architecture |
@@ -89,7 +91,7 @@ area).
 | `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls), `plain` |
 | `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming |
 | `service/` | xs_service | `EngineService`: loads tokenizer + template + model, compiles on a backend, owns the engine thread |
-| `cli/` | (exe) | `main.cpp` (commands serve, run, bench, info), `args` (flag parser) |
+| `cli/` | (exe) | `main.cpp` (commands serve, run, bench, convert, info), `args` (flag parser) |
 
 ### 4.1 Files that matter most
 
@@ -213,7 +215,11 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
    graph. Parity test modeled on `gemma4_vision_parity.cpp` + `hf_vision_reference.py`.
 7. Chat: if the model's output format needs parsing (thinking markers, tool-call syntax), add a dialect in `src/chat/`
    and set `ModelInfo::dialect`.
-8. Update TODO.md, this file's map, and README if users see the change.
+8. Quantized packs need nothing more: `convert` reads the new model's graph to find its matmul weights and gather
+   tables, and the loaded pack hands the same graph Q8 / Q4 weights. Only weights the model reads on the host (like
+   Qwen3.5's norm weights or Gemma 4's per-layer embedding table) must stay out of matmuls and gathers, which they
+   already are. Check quality with the parity test on a pack (`XS_TEST_MODEL_DIR=<pack>`).
+9. Update TODO.md, this file's map, and README if users see the change.
 
 ### 8.2 Add a graph op
 
@@ -256,6 +262,7 @@ Parse and validate it in `src/server/openai_request.cpp` (a bad value is a 400 n
 - Two model families: Gemma 4 E2B/E4B (text and images) and Qwen3.5 dense (text; its vision tower and MTP head
   are not loaded). No audio or video. Images only as base64 data: URLs.
 - Linear-attention models re-prefill when a new prompt does not extend the cached sequence (no state snapshots).
-- No `convert`/quantization: weights are converted from bf16 to f16 at load.
+- Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)
+  and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 before its GEMM.
 - One sequence at a time; no batching.
 - Sliding-window layers keep every key in memory (the kernels read only the window; memory still grows with context).

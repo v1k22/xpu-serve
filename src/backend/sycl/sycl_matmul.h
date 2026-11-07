@@ -21,6 +21,11 @@ public:
 template <typename W>
 void matmul(sycl::queue& q, Scratch& scratch, const float* x, const W* w, float* y, int64_t m, int64_t n, int64_t k);
 
+// y [M, N] = x [M, K] @ dequant(w)^T: the quantized GEMV up to kGemvMaxRows rows; beyond, w is dequantized once
+// (to f16, or f32 when `f32`) and multiplied with oneMKL's GEMM.
+void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantWeight& w, float* y, int64_t m,
+                  int64_t n, int64_t k, bool f32);
+
 // Auto: attention_rows up to kAttentionRowsMax queries, GEMMs beyond. Rows and Gemm force one (tests).
 enum class AttentionPath : uint8_t { Auto, Rows, Gemm };
 inline constexpr int64_t kAttentionRowsMax = 8;

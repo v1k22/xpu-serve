@@ -1,4 +1,4 @@
-// xpu-serve command line: serve | run | bench | info.
+// xpu-serve command line: serve | run | bench | convert | info.
 
 #include <cstdio>
 #include <fstream>
@@ -12,6 +12,7 @@
 #include "chat/chat_template.h"
 #include "chat/output_parser.h"
 #include "cli/args.h"
+#include "convert/convert.h"
 #include "server/server.h"
 #include "service/engine_service.h"
 #include "tokenizer/tokenizer.h"
@@ -32,9 +33,11 @@ const char* kUsage =
     "  xpu-serve serve <model-dir> [options]   OpenAI-compatible server\n"
     "  xpu-serve run   <model-dir> [options]   chat in the terminal (--prompt for one shot)\n"
     "  xpu-serve bench <model-dir> [options]   prefill / decode speed\n"
+    "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--group 64]   quantized pack\n"
     "  xpu-serve info                          backends and devices\n"
     "\n"
-    "<model-dir> is a Hugging Face model directory (config.json, *.safetensors, tokenizer.json).\n"
+    "<model-dir> is a Hugging Face model directory (config.json, *.safetensors, tokenizer.json) or a pack that\n"
+    "'xpu-serve convert' wrote from one.\n"
     "Run 'xpu-serve <command> --help' for the options of a command.\n";
 
 std::string default_backend() {
@@ -94,6 +97,39 @@ bool wants_help(const Args& a, const char* command, const char* summary) {
     if (!a.has("help")) return false;
     std::printf("usage: xpu-serve %s %s\n\noptions:\n%s", command, summary, a.usage().c_str());
     return true;
+}
+
+int cmd_convert(const std::vector<std::string>& argv) {
+    Args a;
+    a.value("out", "output directory for the pack (must not exist or be empty)")
+        .value("quant", "format of the matmul weights: q4 | q8 (embedding tables are always q8)", "q4")
+        .value("group", "columns per scale: 32 | 64 | 128", "64")
+        .value("q8", "comma-separated parts of weight names to keep at q8 (e.g. linear_attn,down_proj)")
+        .value("log-level", "debug | info | warn | error", "info")
+        .flag("help", "show this help");
+    a.parse(argv);
+    if (wants_help(a, "convert", "<model-dir> --out <dir> [options]")) return 0;
+    log::set_level(log::parse_level(a.get("log-level")));
+    ConvertOptions o;
+    o.source = model_dir_arg(a, "convert");
+    o.output = a.get("out");
+    if (o.output.empty()) fail("usage: xpu-serve convert <model-dir> --out <dir> [options]");
+    const std::string& quant = a.get("quant");
+    if (quant != "q4" && quant != "q8") fail("--quant must be q4 or q8, got '", quant, "'");
+    o.format = quant == "q4" ? DType::Q4 : DType::Q8;
+    o.group = a.get_int("group");
+    for (std::string list = a.get("q8"); !list.empty();) {
+        const size_t comma = list.find(',');
+        o.q8_names.push_back(list.substr(0, comma));
+        list = comma == std::string::npos ? std::string() : list.substr(comma + 1);
+    }
+    o.converter = std::string("xpu-serve ") + XS_VERSION;
+    const ConvertReport r = convert_model(o);
+    std::printf("wrote %s: %lld tensors q4, %lld q8, %lld kept; %.2f GB -> %.2f GB in %d shard(s)\n",
+                o.output.string().c_str(), static_cast<long long>(r.q4), static_cast<long long>(r.q8),
+                static_cast<long long>(r.kept), static_cast<double>(r.source_bytes) / 1e9,
+                static_cast<double>(r.output_bytes) / 1e9, r.shards);
+    return 0;
 }
 
 int cmd_info() {
@@ -322,6 +358,7 @@ int main(int argc, char** argv) {
         if (command == "serve") return cmd_serve(args);
         if (command == "run") return cmd_run(args);
         if (command == "bench") return cmd_bench(args);
+        if (command == "convert") return cmd_convert(args);
         if (command == "info") return cmd_info();
         if (command == "--version" || command == "version") {
             std::printf("xpu-serve %s\n", XS_VERSION);

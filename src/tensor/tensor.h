@@ -19,13 +19,23 @@ int64_t numel(const Dims& dims);
 std::string dims_to_string(const Dims& dims);
 
 // Non-owning, read-only view of dense row-major data (e.g. a tensor inside a memory-mapped safetensors file).
+// The scales and biases of a quantized (Q8 / Q4) weight [rows, cols]: one f16 of each per `group` columns of a row,
+// [rows, cols / group] row-major. Q8: w = scale * q (q int8). Q4: w = scale * q + bias (q in [0, 15]; two per byte,
+// the low nibble is the even column).
+struct QuantParams {
+    int64_t group = 0;
+    const void* scales = nullptr;  // f16
+    const void* biases = nullptr;  // f16, Q4 only
+};
+
 struct TensorView {
     DType dtype = DType::F32;
     Dims shape;
     const void* data = nullptr;
+    QuantParams quant;  // dtype Q8 / Q4 only
 
     int64_t numel() const { return xs::numel(shape); }
-    size_t nbytes() const { return static_cast<size_t>(numel()) * dtype_size(dtype); }
+    size_t nbytes() const { return storage_bytes(dtype, numel()); }
 };
 
 // Owning (or borrowing) dense row-major host tensor. Copies share storage; use clone() for a deep copy.

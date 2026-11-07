@@ -51,6 +51,36 @@ void matmul(sycl::queue& q, Scratch& scratch, const float* x, const W* w, float*
     }
 }
 
+void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantWeight& w, float* y, int64_t m,
+                  int64_t n, int64_t k, bool f32) {
+    if (m <= kGemvMaxRows) {
+        if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the kernel loads x in float4s
+            auto* aligned = static_cast<float*>(scratch.get(static_cast<size_t>(m * k) * sizeof(float)));
+            q.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
+            x = aligned;
+        }
+        gemv_quant(q, x, w, y, m, n, k);
+        return;
+    }
+    if (f32) {
+        auto* wf = static_cast<float*>(scratch.get(static_cast<size_t>(n * k) * sizeof(float)));
+        dequantize(q, w, wf, n, k);
+        ordered(q, [&](const std::vector<sycl::event>& deps) {
+            return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, 1.0f, x, k, wf, k, 0.0f, y, n, deps);
+        });
+        return;
+    }
+    const size_t w_bytes = align_up(static_cast<size_t>(n * k) * sizeof(half));
+    auto* base = static_cast<char*>(scratch.get(w_bytes + static_cast<size_t>(m * k) * sizeof(half)));
+    auto* wh = reinterpret_cast<half*>(base);
+    auto* xh = reinterpret_cast<half*>(base + w_bytes);
+    dequantize(q, w, wh, n, k);
+    to_half(q, x, xh, m * k);
+    ordered(q, [&](const std::vector<sycl::event>& deps) {
+        return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, 1.0f, xh, k, wh, k, 0.0f, y, n, deps);
+    });
+}
+
 template <typename KV>
 void attention(sycl::queue& q, Scratch& scratch, const float* qp, const KV* k, const KV* v, float* out,
                const AttentionShape& s, AttentionPath path) {

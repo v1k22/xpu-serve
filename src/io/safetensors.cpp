@@ -86,7 +86,55 @@ std::unique_ptr<SafetensorsWeights> SafetensorsWeights::open_dir(const std::file
         }
         weights->files_.push_back(std::move(file));
     }
+    if (fs::exists(dir / kPackManifest)) weights->apply_pack_manifest(dir / kPackManifest);
     return weights;
+}
+
+void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) {
+    std::ifstream in(path);
+    nlohmann::json manifest;
+    try {
+        manifest = nlohmann::json::parse(in);
+    } catch (const nlohmann::json::exception& e) {
+        fail("'", path.string(), "' is not valid JSON: ", e.what());
+    }
+    const int version = manifest.value("pack_version", 0);
+    if (version != kPackVersion) {
+        fail("'", path.string(), "' is pack version ", version, "; this build reads version ", kPackVersion);
+    }
+    const auto component = [&](const std::string& name, DType dtype, const Dims& shape) -> const TensorView& {
+        const auto it = index_.find(name);
+        if (it == index_.end()) fail("pack: tensor '", name, "' is missing");
+        if (it->second->dtype != dtype || it->second->shape != shape) {
+            fail("pack: tensor '", name, "' is ", dtype_name(it->second->dtype), " ", dims_to_string(it->second->shape),
+                 ", expected ", dtype_name(dtype), " ", dims_to_string(shape));
+        }
+        return *it->second;
+    };
+    for (const auto& [name, entry] : manifest.at("tensors").items()) {
+        const std::string format = entry.at("format").get<std::string>();
+        const DType dtype = format == "q4" ? DType::Q4 : format == "q8" ? DType::Q8 : DType::F32;
+        if (dtype == DType::F32) fail("pack: tensor '", name, "' has unknown format '", format, "'");
+        const int64_t group = entry.at("group").get<int64_t>();
+        const Dims shape = entry.at("shape").get<Dims>();
+        XS_CHECK(shape.size() == 2 && group > 0 && shape[1] % group == 0 && (dtype == DType::Q8 || shape[1] % 2 == 0),
+                 "pack: tensor '", name, "' has shape ", dims_to_string(shape), " and group ", group);
+        const Dims groups{shape[0], shape[1] / group};
+        TensorView v;
+        v.dtype = dtype;
+        v.shape = shape;
+        v.data = component(name, dtype == DType::Q4 ? DType::U8 : DType::I8,
+                           dtype == DType::Q4 ? Dims{shape[0], shape[1] / 2} : shape).data;
+        v.quant.group = group;
+        v.quant.scales = component(name + ".scales", DType::F16, groups).data;
+        index_.erase(name + ".scales");
+        if (dtype == DType::Q4) {
+            v.quant.biases = component(name + ".biases", DType::F16, groups).data;
+            index_.erase(name + ".biases");
+        }
+        index_[name] = &(quant_views_[name] = v);
+    }
+    is_pack_ = true;
 }
 
 const TensorView* SafetensorsWeights::find(const std::string& name) const {

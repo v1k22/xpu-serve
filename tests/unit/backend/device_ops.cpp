@@ -54,6 +54,35 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
+    TEST_CASE("matmul and gather on q8 / q4 pack weights against fp64 of the dequantized values") {
+        test::TensorRng rng(41);
+        const int64_t n = 96;
+        const int64_t k = 512;
+        for (const DType format : {DType::Q8, DType::Q4}) {
+            for (const int64_t group : {32, 128}) {
+                CAPTURE(dtype_name(format));
+                CAPTURE(group);
+                test::MemoryWeights w;
+                const HostTensor dense = rng.uniform(DType::F32, {n, k}, 1.0f / std::sqrt(static_cast<float>(k)));
+                w.add_quantized("w", quant::quantize(dense.view(), format, group));
+                for (const int64_t m : {1, 3, 8, 37}) {  // the GEMV for up to 8 rows, dequantize + GEMM beyond
+                    CAPTURE(m);
+                    const HostTensor x = rng.uniform(DType::F32, {m, k});
+                    Graph g;
+                    g.output("out", g.matmul(g.input("x", DType::F32, {kT, k}), g.weight(w, "w")));
+                    const Tensor64 expected = test::ref::matmul(to_f64(x), to_f64(w.tensor("w")));
+                    CHECK(dev::close("matmul_quant", run_out(g, w, {{"x", x}}), expected,
+                                     dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+                }
+                Graph g;
+                g.output("out", g.gather(g.weight(w, "w"), g.input("ids", DType::I32, {kT})));
+                const HostTensor ids = HostTensor::from_vector(DType::I32, {4}, std::vector<int32_t>{5, 0, 95, 17});
+                const Tensor64 expected = test::ref::gather(to_f64(w.tensor("w")), test::to_ints(ids));
+                CHECK(dev::close("gather_quant", run_out(g, w, {{"ids", ids}}), expected, {1e-6, 1e-6}));
+            }
+        }
+    }
+
     TEST_CASE("add and mul broadcast like numpy, including a dynamic T operand") {
         test::TensorRng rng(2);
         struct Case {

@@ -5,8 +5,8 @@ One repo, one binary: the model code, the engine, the tokenizer, chat templates 
 live here, and the math runs on Intel GPUs through our SYCL backend (our own kernels, oneMKL for large matmuls). Read
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
-**Status: v0.3.** Gemma 4 E2B / E4B (text and images) and Qwen3.5 (dense, text), weights loaded straight from the
-Hugging Face checkpoint (no convert step yet), one request at a time, on Intel GPUs through the SYCL backend.
+**Status: v0.4.** Gemma 4 E2B / E4B (text and images) and Qwen3.5 (dense, text), from the Hugging Face checkpoint or
+a q8 / q4 pack written by `xpu-serve convert`, one request at a time, on Intel GPUs through the SYCL backend.
 [PROJECT.md](PROJECT.md) maps the code.
 
 ## Build
@@ -40,6 +40,25 @@ build/src/xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1
 The server speaks the OpenAI API (`/v1/chat/completions` with streaming, tool calls and images, `/v1/completions`,
 `/v1/models`), so any OpenAI client can point at it. Images go in as `image_url` parts with a base64 `data:` URL
 (PNG, JPEG, BMP or GIF); the server does not fetch remote URLs.
+
+## Quantize (`convert`)
+
+`convert` writes a pack: the checkpoint with its matmul weights quantized, everything else copied. Every command
+takes a pack wherever it takes a model directory; the model code is the same.
+
+```bash
+build/src/xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q8 --quant q8
+build/src/xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --group 64
+build/src/xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
+```
+
+`q8` is symmetric int8, `q4` is 4-bit with a scale and bias per group (32, 64 or 128 columns), both round to nearest.
+Embedding tables are q8 in either case, small matrices and non-matmul tensors stay as they are, and `--q8 name,...`
+keeps chosen weights (parts of their names) at q8. The format of every tensor is in the pack's `xpu_pack.json`.
+
+On the Arc Pro B60, q8 decodes 1.5 to 1.7 times faster than f16 with no measurable quality loss; q4 decodes about
+twice as fast but round to nearest costs small models fidelity (Qwen3.5-4B logits cosine 0.87 to 0.99), so prefer q8
+until AWQ lands. Numbers: [docs/decisions/0009](docs/decisions/0009-quantized-packs.md).
 
 ## Correctness
 

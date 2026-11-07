@@ -326,6 +326,7 @@ private:
                 consumers[static_cast<size_t>(nodes[i].inputs[k].node)].emplace_back(i, k);
         }
         const auto device_type = [&](size_t i, DType t) {
+            if (is_quantized(t)) return t;  // check_ops makes sure only matmuls and gathers read it
             if (is_float(t)) return DType::F32;
             XS_CHECK(t == DType::I32 || t == DType::I64, where(i), ": dtype ", dtype_name(t), " is not supported");
             return t;
@@ -371,22 +372,32 @@ private:
             const auto is_int = [&](size_t k) { return dt(n.inputs[k]) == DType::I32 || dt(n.inputs[k]) == DType::I64; };
             const auto is_f32 = [&](size_t k) { return dt(n.inputs[k]) == DType::F32; };
             const auto is_fp = [&](size_t k) { return dt(n.inputs[k]) == DType::F32 || dt(n.inputs[k]) == DType::F16; };
+            // A quantized weight is read straight from its Weight node (no views) by a matmul or a gather.
+            const auto is_packed = [&](size_t k) {
+                return is_quantized(dt(n.inputs[k])) && graph_.node(n.inputs[k]).kind == OpKind::Weight;
+            };
             switch (n.kind) {
                 case OpKind::Input:
                 case OpKind::Weight:
                 case OpKind::Constant:
+                    break;
                 case OpKind::Reshape:
                 case OpKind::Slice:
                 case OpKind::Transpose:
+                    need(0, !is_quantized(dt(n.inputs[0])), "an unquantized tensor");
                     break;
                 case OpKind::Gather:
-                    need(0, is_fp(0), "f16 or f32");
+                    need(0, is_fp(0) || is_packed(0), "f16, f32, q8 or q4");
                     need(1, is_int(1), "i32 or i64");
                     break;
-                case OpKind::MatMul:
+                case OpKind::MatMul: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1), "f16 or f32");
+                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8 or q4");
+                    const int64_t k = graph_.type(n.inputs[1]).shape[1];
+                    XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized weight needs a multiple of 32 "
+                             "columns, got ", k);
                     break;
+                }
                 case OpKind::Rope:
                     need(0, is_f32(0), "f32");
                     need(1, is_int(1), "i32 or i64");
@@ -478,6 +489,25 @@ private:
         }
     }
 
+    // A pack's quantized weight: codes, scales and (Q4) biases as stored.
+    void upload_quantized(size_t node, const TensorView& view) {
+        const int64_t rows = view.shape[0];
+        const size_t scale_bytes = static_cast<size_t>(rows * (view.shape[1] / view.quant.group)) * sizeof(uint16_t);
+        const auto copy = [&](const void* src, size_t bytes) {
+            leaves_.emplace_back(q_, std::max<size_t>(bytes, 1));
+            q_.memcpy(leaves_.back().get(), src, bytes).wait();
+            return leaves_.back().get();
+        };
+        sycl_be::QuantWeight w;
+        w.q4 = view.dtype == DType::Q4;
+        w.group = view.quant.group;
+        w.codes = reinterpret_cast<const uint8_t*>(copy(view.data, view.nbytes()));
+        w.scales = reinterpret_cast<const half*>(copy(view.quant.scales, scale_bytes));
+        if (w.q4) w.biases = reinterpret_cast<const half*>(copy(view.quant.biases, scale_bytes));
+        leaf_ptr_[node] = const_cast<char*>(reinterpret_cast<const char*>(w.codes));
+        leaf_quant_[node] = w;
+    }
+
     DeviceBuffer upload(const std::string& name, const void* data, DType src, const Dims& shape, DType dst) {
         const size_t n = static_cast<size_t>(numel(shape));
         DeviceBuffer buf(q_, std::max<size_t>(n * dtype_size(dst), 1));
@@ -523,7 +553,8 @@ private:
     void upload_leaves(const WeightStore& weights) {
         const auto& nodes = graph_.nodes();
         leaf_ptr_.assign(nodes.size(), nullptr);
-        std::map<std::pair<std::string, DType>, char*> uploaded;
+        leaf_quant_.assign(nodes.size(), sycl_be::QuantWeight{});
+        std::map<std::pair<std::string, DType>, size_t> uploaded;  // first node of each weight and device dtype
         size_t bytes = 0;
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
@@ -531,15 +562,23 @@ private:
                 const std::string& name = std::get<graph::WeightAttrs>(n.attrs).name;
                 const auto key = std::make_pair(name, dtype_[i][0]);
                 if (const auto it = uploaded.find(key); it != uploaded.end()) {
-                    leaf_ptr_[i] = it->second;
+                    leaf_ptr_[i] = leaf_ptr_[it->second];
+                    leaf_quant_[i] = leaf_quant_[it->second];
                     continue;
                 }
                 const TensorView& view = weights.get(name);
                 XS_CHECK(view.shape == n.outputs[0].shape, "weight '", name, "' has shape ", dims_to_string(view.shape),
                          " but the graph was built for ", dims_to_string(n.outputs[0].shape));
-                leaves_.push_back(upload(name, view.data, view.dtype, view.shape, dtype_[i][0]));
-                bytes += leaves_.back().bytes();
-                leaf_ptr_[i] = uploaded[key] = leaves_.back().get();
+                uploaded[key] = i;
+                const size_t before = leaves_.size();
+                if (is_quantized(view.dtype)) {
+                    upload_quantized(i, view);
+                } else {
+                    leaves_.push_back(upload(name, view.data, view.dtype, view.shape, dtype_[i][0]));
+                    leaf_ptr_[i] = leaves_.back().get();
+                }
+                for (size_t b = before; b < leaves_.size(); ++b)
+                    bytes += leaves_[b].bytes();
             } else if (n.kind == OpKind::Constant) {
                 const HostTensor& value = std::get<graph::ConstantAttrs>(n.attrs).value;
                 leaves_.push_back(upload(n.label, value.raw(), value.dtype(), value.shape(), dtype_[i][0]));
@@ -838,6 +877,15 @@ private:
             case OpKind::Gather: {
                 const int64_t width = in_shape(0)[1];
                 const int64_t count = numel(in_shape(1));
+                if (is_quantized(in_dt(0))) {
+                    const sycl_be::QuantWeight& t = leaf_quant_[static_cast<size_t>(n.inputs[0].node)];
+                    if (in_dt(1) == DType::I32) {
+                        sycl_be::gather_quant(q_, t, reinterpret_cast<const int32_t*>(in_ptr(1)), out, count, width);
+                    } else {
+                        sycl_be::gather_quant(q_, t, reinterpret_cast<const int64_t*>(in_ptr(1)), out, count, width);
+                    }
+                    return;
+                }
                 const bool f16 = in_dt(0) == DType::F16;
                 if (in_dt(1) == DType::I32) {
                     const auto* ids = reinterpret_cast<const int32_t*>(in_ptr(1));
@@ -860,7 +908,10 @@ private:
                 const int64_t rows = in_shape(1)[0];
                 const int64_t k = in_shape(1)[1];
                 const int64_t m = numel(in_shape(0)) / k;
-                if (in_dt(1) == DType::F16) {
+                if (is_quantized(in_dt(1))) {
+                    sycl_be::matmul_quant(q_, *this, in_f32(0), leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out,
+                                          m, rows, k, precision_ == DType::F32);
+                } else if (in_dt(1) == DType::F16) {
                     sycl_be::matmul(q_, *this, in_f32(0), reinterpret_cast<const half*>(in_ptr(1)), out, m, rows, k);
                 } else {
                     sycl_be::matmul(q_, *this, in_f32(0), in_f32(1), out, m, rows, k);
@@ -1088,6 +1139,7 @@ private:
     std::vector<uint8_t> conv_silu_;         // CausalConv that applies the SiLU after it
     std::vector<DeviceBuffer> leaves_;
     std::vector<char*> leaf_ptr_;  // by node index, weights and constants
+    std::vector<sycl_be::QuantWeight> leaf_quant_;  // by node index, quantized weights
     std::vector<KvBuffers> kv_;
     std::vector<StateBuffers> fixed_state_;  // conv slots, then recurrent slots
     size_t conv_states_ = 0;

@@ -368,6 +368,102 @@ void gemv_t(sycl::queue& q, const float* x, const W* w, float* y, int64_t n, int
     });
 }
 
+// Quantized GEMV: a lane takes a chunk of kChunk columns (16 bytes of codes: 32 q4 or 16 q8 values) of each of the
+// sub-group's kQRows rows, so the chunk's x values load once for all of them. A chunk lies in one group (group >= 32),
+// so dot(w, x) = scale * dot(q, x) + bias * sum(x).
+constexpr int kQRows = 4;
+constexpr int kQSgPerWg = 8;
+
+template <bool Q4, int M>
+void gemv_quant_t(sycl::queue& q, const float* x, QuantWeight w, float* y, int64_t n, int64_t k) {
+    constexpr int kChunk = Q4 ? 32 : 16;
+    constexpr int64_t kRowsPerWg = kQSgPerWg * kQRows;
+    const int64_t wgs = ceil_div(n, kRowsPerWg);
+    const int64_t groups = k / w.group;
+    const int64_t row_bytes = Q4 ? k / 2 : k;
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(wgs * kQSgPerWg * kSubGroup), kQSgPerWg * kSubGroup),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const int64_t row0 = (static_cast<int64_t>(it.get_group(0)) * kQSgPerWg + sg.get_group_linear_id()) * kQRows;
+        int64_t rows[kQRows];
+        for (int r = 0; r < kQRows; ++r)
+            rows[r] = std::min<int64_t>(row0 + r, n - 1);
+        float acc[kQRows][M];
+        for (int r = 0; r < kQRows; ++r)
+            for (int mm = 0; mm < M; ++mm)
+                acc[r][mm] = 0.0f;
+        for (int64_t k0 = static_cast<int64_t>(lane) * kChunk; k0 < k; k0 += kSubGroup * kChunk) {
+            const int64_t g = k0 / w.group;
+            for (int mm = 0; mm < M; ++mm) {
+                float xv[kChunk];
+                const auto* xp = reinterpret_cast<const sycl::vec<float, 4>*>(x + mm * k + k0);
+                for (int i = 0; i < kChunk / 4; ++i) {
+                    const sycl::vec<float, 4> v = xp[i];
+                    xv[4 * i] = v[0];
+                    xv[4 * i + 1] = v[1];
+                    xv[4 * i + 2] = v[2];
+                    xv[4 * i + 3] = v[3];
+                }
+                float xsum = 0.0f;
+                if constexpr (Q4) {
+                    for (int i = 0; i < kChunk; ++i)
+                        xsum += xv[i];
+                }
+                for (int r = 0; r < kQRows; ++r) {
+                    const sycl::vec<uint8_t, 16> c =
+                        *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(w.codes + rows[r] * row_bytes + (Q4 ? k0 / 2 : k0));
+                    const float s = static_cast<float>(w.scales[rows[r] * groups + g]);
+                    float dot = 0.0f;
+                    if constexpr (Q4) {
+                        for (int i = 0; i < 16; ++i) {
+                            dot += static_cast<float>(c[i] & 0x0F) * xv[2 * i];
+                            dot += static_cast<float>(c[i] >> 4) * xv[2 * i + 1];
+                        }
+                        acc[r][mm] += s * dot + static_cast<float>(w.biases[rows[r] * groups + g]) * xsum;
+                    } else {
+                        for (int i = 0; i < 16; ++i)
+                            dot += static_cast<float>(static_cast<int8_t>(c[i])) * xv[i];
+                        acc[r][mm] += s * dot;
+                    }
+                }
+            }
+        }
+        for (int r = 0; r < kQRows; ++r) {
+            for (int mm = 0; mm < M; ++mm) {
+                const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
+                if (lane == 0 && row0 + r < n) y[mm * n + row0 + r] = sum;
+            }
+        }
+    });
+}
+
+template <bool Q4>
+void gemv_quant_q(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k) {
+    switch (m) {
+        case 1: return gemv_quant_t<Q4, 1>(q, x, w, y, n, k);
+        case 2: return gemv_quant_t<Q4, 2>(q, x, w, y, n, k);
+        case 3: return gemv_quant_t<Q4, 3>(q, x, w, y, n, k);
+        case 4: return gemv_quant_t<Q4, 4>(q, x, w, y, n, k);
+        case 5: return gemv_quant_t<Q4, 5>(q, x, w, y, n, k);
+        case 6: return gemv_quant_t<Q4, 6>(q, x, w, y, n, k);
+        case 7: return gemv_quant_t<Q4, 7>(q, x, w, y, n, k);
+        default: return gemv_quant_t<Q4, 8>(q, x, w, y, n, k);
+    }
+}
+
+// Dequantized value of column c of row r.
+inline float dequant_at(const QuantWeight& w, int64_t r, int64_t c, int64_t k) {
+    const int64_t sg = r * (k / w.group) + c / w.group;
+    const float s = static_cast<float>(w.scales[sg]);
+    if (w.q4) {
+        const uint8_t byte = w.codes[(r * k + c) / 2];
+        const int code = (c & 1) == 0 ? (byte & 0x0F) : (byte >> 4);
+        return s * static_cast<float>(code) + static_cast<float>(w.biases[sg]);
+    }
+    return s * static_cast<float>(static_cast<int8_t>(w.codes[r * k + c]));
+}
+
 template <typename W, int M>
 void gemv_m(sycl::queue& q, const float* x, const W* w, float* y, int64_t n, int64_t k) {
     const bool vec = k % 8 == 0 && reinterpret_cast<uintptr_t>(x) % 32 == 0 &&
@@ -653,6 +749,68 @@ void gemv(sycl::queue& q, const float* x, const W* w, float* y, int64_t m, int64
     }
 }
 
+void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k) {
+    if (w.q4) {
+        gemv_quant_q<true>(q, x, w, y, m, n, k);
+    } else {
+        gemv_quant_q<false>(q, x, w, y, m, n, k);
+    }
+}
+
+// One work item per 16 bytes of codes (32 q4 or 16 q8 values, all in one group), vector loads and stores.
+template <typename T, bool Q4>
+void dequantize_t(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k) {
+    constexpr int kChunk = Q4 ? 32 : 16;
+    const QuantWeight wc = w;
+    const int64_t chunks = k / kChunk;
+    const int64_t groups = k / w.group;
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n * chunks)), [=](sycl::id<1> idx) {
+        const int64_t i = static_cast<int64_t>(idx[0]);
+        const int64_t r = i / chunks;
+        const int64_t c0 = (i % chunks) * kChunk;
+        const sycl::vec<uint8_t, 16> c = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(wc.codes + i * 16);
+        const int64_t sg = r * groups + c0 / wc.group;
+        const float s = static_cast<float>(wc.scales[sg]);
+        sycl::vec<T, 16> v[kChunk / 16];  // sycl::vec holds at most 16 elements
+        if constexpr (Q4) {
+            const float b = static_cast<float>(wc.biases[sg]);
+            for (int j = 0; j < 16; ++j) {
+                v[j / 8][(2 * j) % 16] = static_cast<T>(s * static_cast<float>(c[j] & 0x0F) + b);
+                v[j / 8][(2 * j + 1) % 16] = static_cast<T>(s * static_cast<float>(c[j] >> 4) + b);
+            }
+        } else {
+            for (int j = 0; j < 16; ++j)
+                v[0][j] = static_cast<T>(s * static_cast<float>(static_cast<int8_t>(c[j])));
+        }
+        for (int h = 0; h < kChunk / 16; ++h)
+            *reinterpret_cast<sycl::vec<T, 16>*>(out + r * k + c0 + 16 * h) = v[h];
+    });
+}
+
+template <typename T>
+void dequantize(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k) {
+    if (w.q4) {
+        dequantize_t<T, true>(q, w, out, n, k);
+    } else {
+        dequantize_t<T, false>(q, w, out, n, k);
+    }
+}
+
+template void dequantize<half>(sycl::queue&, const QuantWeight&, half*, int64_t, int64_t);
+template void dequantize<float>(sycl::queue&, const QuantWeight&, float*, int64_t, int64_t);
+
+template <typename I>
+void gather_quant(sycl::queue& q, const QuantWeight& table, const I* ids, float* out, int64_t count, int64_t width) {
+    const QuantWeight t = table;
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(count), static_cast<size_t>(width)), [=](sycl::item<2> it) {
+        const int64_t i = static_cast<int64_t>(it[0]);
+        const int64_t c = static_cast<int64_t>(it[1]);
+        out[i * width + c] = dequant_at(t, static_cast<int64_t>(ids[i]), c, width);
+    });
+}
+
+template void gather_quant<int32_t>(sycl::queue&, const QuantWeight&, const int32_t*, float*, int64_t, int64_t);
+template void gather_quant<int64_t>(sycl::queue&, const QuantWeight&, const int64_t*, float*, int64_t, int64_t);
 template void gather<half, int32_t>(sycl::queue&, const half*, const int32_t*, float*, int64_t, int64_t);
 template void gather<half, int64_t>(sycl::queue&, const half*, const int64_t*, float*, int64_t, int64_t);
 template void gather<float, int32_t>(sycl::queue&, const float*, const int32_t*, float*, int64_t, int64_t);

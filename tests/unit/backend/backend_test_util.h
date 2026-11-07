@@ -15,6 +15,7 @@
 
 #include "backend/backend.h"
 #include "graph/graph.h"
+#include "quant/quant.h"
 #include "tensor/tensor.h"
 #include "util/half.h"
 
@@ -26,6 +27,15 @@ class MemoryWeights final : public WeightStore {
     void add(const std::string& name, HostTensor t) {
         tensors_[name] = std::move(t);
         views_[name] = tensors_[name].view();
+    }
+    // A Q8 / Q4 weight, as a pack holds it. tensor(name) is its dequantized f32 value (what a backend must compute
+    // with).
+    void add_quantized(const std::string& name, quant::Quantized q) {
+        HostTensor dense(DType::F32, {q.rows, q.cols});
+        quantized_[name] = std::move(q);
+        views_[name] = quantized_[name].view();
+        quant::dequantize_rows(views_[name], 0, dense.dim(0), dense.data<float>());
+        tensors_[name] = std::move(dense);
     }
     const TensorView* find(const std::string& name) const override {
         const auto it = views_.find(name);
@@ -41,6 +51,7 @@ class MemoryWeights final : public WeightStore {
 
   private:
     std::map<std::string, HostTensor> tensors_;
+    std::map<std::string, quant::Quantized> quantized_;
     std::map<std::string, TensorView> views_;
 };
 

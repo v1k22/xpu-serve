@@ -8,6 +8,7 @@
 
 #include "backend/cpu_ref/ops.h"
 #include "backend/cpu_ref/thread_pool.h"
+#include "quant/quant.h"
 #include "util/error.h"
 #include "util/half.h"
 
@@ -44,8 +45,12 @@ HostTensor weight_to_f32(const std::string& name, const TensorView& view) {
         case DType::BF16:
             convert_bf16_to_f32(static_cast<const uint16_t*>(view.data), out.data<float>(), n);
             break;
+        case DType::Q8:
+        case DType::Q4:
+            quant::dequantize_rows(view, 0, view.shape[0], out.data<float>());
+            break;
         default:
-            fail("cpu-ref: weight '", name, "' has dtype ", dtype_name(view.dtype), "; supported: f32, f16, bf16");
+            fail("cpu-ref: weight '", name, "' has dtype ", dtype_name(view.dtype), "; supported: f32, f16, bf16, q8, q4");
     }
     return out;
 }

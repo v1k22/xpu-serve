@@ -50,22 +50,25 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ### 0.3 Safetensors and packs
 - [x] Safetensors reader (mmap, header JSON, dtypes incl. BF16/F16/U8/I8/F32), sharded index
-- [ ] Safetensors writer (sharding ≤ 4 GB, index file)
-- [ ] `docs/pack-format.md`: formats `bf16`, `f16`, `q8_sym`, `q4_sym`, `q4_asym`; packing order; manifest schema
-- [ ] Pack reader: manifest, per-tensor formats, refuses unknown formats by name
+- [x] Safetensors writer (streamed, sharding ≤ 4 GB, index file)
+- [x] Pack format documented in DESIGN.md 6.3 / 6.4: `q8` (symmetric), `q4` (affine, f16 scale + bias), manifest
+- [x] Pack reader: manifest, per-tensor formats as Q8 / Q4 views, refuses unknown formats and versions by name
 - **Done when:** round-trip tests (write → read → identical bytes) pass for every format.
 
 ### 0.4 Quantizers
-- [ ] RTN `q8_sym` (per group, per channel), `q4_sym`, `q4_asym`, group 32 / 64 / 128
-- [ ] Dequant reference (fp64) used by tests and the CPU backend
-- [ ] Unit tests: known vectors, edge cases (all-zero group, outliers, odd `in` sizes refused by name)
+- [x] RTN `q8` (symmetric) and `q4` (affine), groups 32 / 64 / 128 (`src/quant/`)
+- [x] Dequantization used by tests and the CPU reference backend
+- [x] Unit tests: known vectors, nibble order (planted bug), all-zero and constant groups, bad shapes refused by name
 - **Done when:** quantize → dequantize error matches the analytic bound for each format.
 
 ### 0.5 `convert`
 - [ ] Hugging Face download: resumable, `HF_TOKEN`, pinned revision, sha256 recorded
-- [ ] Local-directory input
-- [ ] Per-arch plan hook (`models/<arch>/convert.cpp`): what to quantize, renames
-- [ ] Copy config / tokenizer / chat template / generation config unchanged; write `xpu_pack.json`
+- [x] Local-directory input
+- [x] What to quantize comes from the model's own step graph (matmul weights; gather tables at q8), no per-arch code;
+      `--q8 name,...` keeps chosen weights at q8
+- [x] Copy config / tokenizer / chat template / generation config unchanged; write `xpu_pack.json`
+- [x] End to end on a tiny Qwen3.5 written to disk (plan, layout, exact values, logits, GPU vs cpu-ref)
+- [ ] Quantize Gemma 4's per-layer embedding table (read on the host) and vision towers
 - [ ] `--with-drafter` → `drafters/<kind>/`
 - [ ] Reproducibility test: same input + options → same bytes
 - **Done when:** `xpu-serve convert google/gemma-4-26B-A4B-it --quant q4_sym` produces a pack that `xpu-serve check`
@@ -154,7 +157,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 - [x] Toolchain: oneAPI DPC++ build in CMake; device selection; USM allocation; in-order queues (2026-11-07, oneAPI 2026.2)
 - [ ] Bandwidth probe in SYCL (matches 0.2)
-- [ ] int4 / int8 GEMV for decode (target ≥ 85% of measured bandwidth), contracts for every format and group size
+- [x] int4 / int8 GEMV for decode; dequantize + GEMM for prefill; quantized gather (device suites, groups 32 / 128)
+- [ ] int4 / int8 GEMV at ≥ 85% of measured bandwidth; prefill without the f16 copy of each weight
 - [ ] MoE grouped GEMV (top-8 of 128) incl. the expert union at verify width k+1
 - [ ] Paged decode attention: head dims 256 / 512, GQA, sliding window, chain and **tree** masks
 - [x] Prefill: oneMKL GEMM (f16 x f16 -> f32); prefill attention through two batched GEMMs per query chunk

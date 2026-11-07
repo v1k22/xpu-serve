@@ -107,4 +107,22 @@ inline constexpr int64_t kGemvMaxRows = 8;
 template <typename W>
 void gemv(sycl::queue& q, const float* x, const W* w, float* y, int64_t m, int64_t n, int64_t k);
 
+// A quantized weight [N, K] on the device (pack formats, tensor.h QuantParams): Q8 codes int8 [N, K]; Q4 codes
+// [N, K / 2] with the even column in the low nibble; f16 scales and (Q4) biases [N, K / group]; group >= 32.
+struct QuantWeight {
+    bool q4 = true;
+    const uint8_t* codes = nullptr;
+    const half* scales = nullptr;
+    const half* biases = nullptr;
+    int64_t group = 0;
+};
+// y [M, N] = x [M, K] @ dequant(w)^T for M <= kGemvMaxRows; K a multiple of 32.
+void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k);
+// out [N, K] = dequant(w) as f16 or f32, for the GEMM path.
+template <typename T>
+void dequantize(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k);
+// Rows of a quantized table [rows, width] by id, as f32.
+template <typename I>
+void gather_quant(sycl::queue& q, const QuantWeight& table, const I* ids, float* out, int64_t count, int64_t width);
+
 }  // namespace xs::sycl_be
