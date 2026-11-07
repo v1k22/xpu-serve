@@ -3,6 +3,7 @@
 #include <vector>
 
 #include "tokenizer/json_fields.h"
+#include "tokenizer/unicode.h"
 #include "tokenizer/utf8.h"
 #include "util/error.h"
 
@@ -46,6 +47,11 @@ public:
 private:
     bool left_;
     bool right_;
+};
+
+class NfcNormalizer final : public Normalizer {
+public:
+    std::string normalize(std::string_view text) const override { return unicode::nfc(text); }
 };
 
 class SequenceNormalizer final : public Normalizer {
@@ -99,6 +105,7 @@ std::unique_ptr<Normalizer> make_normalizer(const nlohmann::json& config) {
         return std::make_unique<StripNormalizer>(bool_field_or(config, "strip_left", false, kWhat),
                                                  bool_field_or(config, "strip_right", false, kWhat));
     }
+    if (type == "NFC") return std::make_unique<NfcNormalizer>();
     if (type == "Sequence") return make_sequence(config);
     refuse_component(kWhat, type);
 }

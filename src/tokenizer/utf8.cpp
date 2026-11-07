@@ -44,6 +44,66 @@ bool is_valid(std::string_view s) {
     return true;
 }
 
+void append(std::string& out, char32_t c) {
+    if (c < 0x80) {
+        out.push_back(static_cast<char>(c));
+    } else if (c < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (c >> 6)));
+        out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    } else if (c < 0x10000) {
+        out.push_back(static_cast<char>(0xE0 | (c >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | (c >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((c >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+    }
+}
+
+std::string lossy(std::string_view s) {
+    if (is_valid(s)) return std::string(s);
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (size_t pos = 0; pos < s.size();) {
+        if (const size_t n = valid_char_length(s, pos); n != 0) {
+            out.append(s.substr(pos, n));
+            pos += n;
+            continue;
+        }
+        // Skip the lead byte and every continuation byte that could still have been part of a valid sequence.
+        const auto b0 = static_cast<uint8_t>(s[pos]);
+        size_t len = 0;
+        uint8_t lo = 0x80;
+        uint8_t hi = 0xBF;
+        if (b0 >= 0xC2 && b0 <= 0xDF) {
+            len = 2;
+        } else if (b0 >= 0xE0 && b0 <= 0xEF) {
+            len = 3;
+            if (b0 == 0xE0) lo = 0xA0;
+            if (b0 == 0xED) hi = 0x9F;
+        } else if (b0 >= 0xF0 && b0 <= 0xF4) {
+            len = 4;
+            if (b0 == 0xF0) lo = 0x90;
+            if (b0 == 0xF4) hi = 0x8F;
+        }
+        size_t skip = 1;
+        if (len > 0 && pos + 1 < s.size()) {
+            const auto b1 = static_cast<uint8_t>(s[pos + 1]);
+            if (b1 >= lo && b1 <= hi) {
+                skip = 2;
+                while (skip < len && pos + skip < s.size() && is_continuation(static_cast<uint8_t>(s[pos + skip]))) {
+                    ++skip;
+                }
+            }
+        }
+        out.append("\xEF\xBF\xBD");
+        pos += skip;
+    }
+    return out;
+}
+
 char32_t decode_at(std::string_view s, size_t pos) {
     const size_t len = valid_char_length(s, pos);
     const auto b0 = static_cast<uint8_t>(s[pos]);

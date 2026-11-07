@@ -1,7 +1,7 @@
 #pragma once
 
-// tokenizer.json pre-tokenizers: Split (string pattern, every split behavior) and Sequence. Others (ByteLevel,
-// Metaspace, Split with a Regex) are refused by name; byte-level BPE adds them.
+// tokenizer.json pre-tokenizers: Split (a string pattern, or one of the regexes in regex_split.h; every split
+// behavior), ByteLevel (without its own regex) and Sequence. Others are refused by name.
 
 #include <memory>
 #include <string_view>
@@ -16,6 +16,9 @@ public:
     virtual ~PreTokenizer() = default;
     // Splits each piece further; pieces are views into the caller's text, and empty pieces are dropped.
     virtual std::vector<std::string_view> split(const std::vector<std::string_view>& pieces) const = 0;
+    // True when the pieces must be mapped to the byte-level alphabet before the model (a final ByteLevel step). The
+    // mapping itself happens in the model, which then works on bytes.
+    virtual bool byte_level() const { return false; }
 };
 
 // Returns nullptr for a null pre-tokenizer; refuses unsupported types by name.

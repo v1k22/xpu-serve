@@ -3,6 +3,7 @@
 #include <optional>
 #include <utility>
 
+#include "tokenizer/byte_level.h"
 #include "tokenizer/json_fields.h"
 #include "tokenizer/normalizer.h"
 #include "tokenizer/utf8.h"
@@ -70,6 +71,31 @@ public:
         }
         flush_run();
         tokens = std::move(out);
+    }
+};
+
+// Maps each token's characters back to bytes (a token with a character outside the alphabet keeps its own UTF-8
+// bytes, as in Hugging Face) and joins everything into one string, invalid sequences becoming U+FFFD.
+class ByteLevelDecoder final : public Decoder {
+public:
+    void decode(std::vector<std::string>& tokens) const override {
+        std::string bytes;
+        for (const auto& token : tokens) {
+            const size_t start = bytes.size();
+            bool mapped = true;
+            for (size_t pos = 0; pos < token.size() && mapped;) {
+                const size_t len = utf8::valid_char_length(token, pos);
+                const auto byte = len == 0 ? std::nullopt : byte_level::char_to_byte(utf8::decode_at(token, pos));
+                if (byte) bytes.push_back(static_cast<char>(*byte));
+                mapped = byte.has_value();
+                pos += len;
+            }
+            if (!mapped) {
+                bytes.resize(start);
+                bytes += token;
+            }
+        }
+        tokens.assign(1, utf8::lossy(bytes));
     }
 };
 
@@ -151,6 +177,7 @@ std::unique_ptr<Decoder> make_decoder(const nlohmann::json& config) {
     }
     if (type == "ByteFallback") return std::make_unique<ByteFallbackDecoder>();
     if (type == "Fuse") return std::make_unique<FuseDecoder>();
+    if (type == "ByteLevel") return std::make_unique<ByteLevelDecoder>();
     if (type == "Strip") return make_strip(config);
     if (type == "Sequence") return make_sequence(config);
     refuse_component(kWhat, type);

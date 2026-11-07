@@ -2,6 +2,8 @@
 // pre-tokenizer -> model; decoder on the way back).
 
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -19,11 +21,12 @@
 namespace xs::tok {
 namespace {
 
-// Post-processors only add special tokens around an encoding; encode never does, so these are accepted and unused.
+// Post-processors only add special tokens around an encoding (TemplateProcessing) or adjust offsets (ByteLevel);
+// encode does neither, so these are accepted and unused.
 void check_post_processor(const nlohmann::json& config) {
     if (config.is_null()) return;
     const std::string type = component_type(config, "post_processor");
-    if (type != "TemplateProcessing") refuse_component("post_processor", type);
+    if (type != "TemplateProcessing" && type != "ByteLevel") refuse_component("post_processor", type);
 }
 
 // tokenizer_config.json writes a special token as "<bos>" or as {"content": "<bos>", ...}.
@@ -37,15 +40,46 @@ std::optional<std::string> config_token(const nlohmann::json& config, const char
     return std::nullopt;
 }
 
+// tokenizer.json added_tokens plus the tokenizer_config.json added_tokens_decoder entries it lacks: transformers
+// registers both (Qwen3.5 lists its audio and TTS markers only in tokenizer_config.json).
+nlohmann::json merged_added_tokens(const nlohmann::json& tokenizer_json, const nlohmann::json& tokenizer_config) {
+    nlohmann::json added = tokenizer_json.value("added_tokens", nlohmann::json::array());
+    if (!tokenizer_config.contains("added_tokens_decoder") || !added.is_array()) return added;
+    const auto& decoder = tokenizer_config.at("added_tokens_decoder");
+    if (!decoder.is_object()) fail("tokenizer_config.json 'added_tokens_decoder' must be an object");
+    std::unordered_set<int64_t> known;
+    for (const auto& entry : added) {
+        if (entry.is_object() && entry.contains("id") && entry.at("id").is_number_integer()) {
+            known.insert(entry.at("id").get<int64_t>());
+        }
+    }
+    for (const auto& [key, entry] : decoder.items()) {
+        int64_t id = 0;
+        try {
+            size_t used = 0;
+            id = std::stoll(key, &used);
+            if (used != key.size()) throw std::invalid_argument(key);
+        } catch (const std::exception&) {
+            fail("tokenizer_config.json added_tokens_decoder key '", key, "' is not a token id");
+        }
+        if (known.contains(id) || !entry.is_object()) continue;
+        nlohmann::json token = entry;
+        token["id"] = id;
+        added.push_back(std::move(token));
+    }
+    return added;
+}
+
 class HfTokenizer final : public Tokenizer {
 public:
     HfTokenizer(const nlohmann::json& tokenizer_json, const nlohmann::json& tokenizer_config)
-        : added_(tokenizer_json.value("added_tokens", nlohmann::json())),
+        : added_(merged_added_tokens(tokenizer_json, tokenizer_config)),
           normalizer_(make_normalizer(tokenizer_json.value("normalizer", nlohmann::json()))),
           pre_tokenizer_(make_pre_tokenizer(tokenizer_json.value("pre_tokenizer", nlohmann::json()))),
           model_(tokenizer_json.contains("model") ? tokenizer_json.at("model") : nlohmann::json()),
           decoder_(make_decoder(tokenizer_json.value("decoder", nlohmann::json()))) {
         check_post_processor(tokenizer_json.value("post_processor", nlohmann::json()));
+        if (pre_tokenizer_ && pre_tokenizer_->byte_level()) model_.use_byte_level_alphabet();
         id_limit_ = model_.id_limit();
         for (const AddedToken& token : added_.tokens()) {
             id_limit_ = std::max(id_limit_, token.id + 1);

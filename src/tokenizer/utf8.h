@@ -20,6 +20,13 @@ inline size_t char_length(std::string_view s, size_t pos) {
 
 bool is_valid(std::string_view s);
 
+// Appends the UTF-8 encoding of c (a Unicode scalar value).
+void append(std::string& out, char32_t c);
+
+// s with each invalid sequence replaced by U+FFFD, one per maximal prefix of a valid sequence (Rust's
+// String::from_utf8_lossy, the WHATWG rule).
+std::string lossy(std::string_view s);
+
 // Code point of the character at s[pos]; an invalid byte decodes to U+FFFD.
 char32_t decode_at(std::string_view s, size_t pos);
 

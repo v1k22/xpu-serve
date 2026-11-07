@@ -1,7 +1,7 @@
 #pragma once
 
 // The tokenizer.json "BPE" model: vocab, ranked merges, byte fallback and unk handling. Pieces are already normalized
-// and pre-tokenized; byte-level BPE plugs in at the pre-tokenizer, so this class needs no change for it.
+// and pre-tokenized. For byte-level BPE the model starts from one symbol per byte (its byte-level character).
 
 #include <array>
 #include <cstdint>
@@ -19,6 +19,9 @@ public:
     explicit BpeModel(const nlohmann::json& config);
     BpeModel(const BpeModel&) = delete;
     BpeModel& operator=(const BpeModel&) = delete;
+
+    // From now on, pieces are raw bytes to map through the byte-level alphabet (a ByteLevel pre-tokenizer).
+    void use_byte_level_alphabet();
 
     // Appends the ids of one pre-tokenized piece to `out`.
     void tokenize(std::string_view piece, std::vector<int32_t>& out) const;
@@ -54,6 +57,8 @@ private:
     std::unordered_map<std::string_view, int32_t> ids_;
     std::unordered_map<uint64_t, Merge> merges_;  // key: left id << 32 | right id
     std::array<int32_t, 256> byte_ids_{};          // "<0xXX>" ids for byte fallback; -1 when absent
+    std::array<int32_t, 256> byte_level_ids_{};    // ids of the byte-level characters
+    bool byte_level_ = false;
     std::optional<int32_t> unk_id_;
     bool byte_fallback_ = false;
     bool fuse_unk_ = false;

@@ -5,6 +5,7 @@
 #include <queue>
 #include <string>
 
+#include "tokenizer/byte_level.h"
 #include "tokenizer/json_fields.h"
 #include "tokenizer/utf8.h"
 #include "util/error.h"
@@ -118,6 +119,15 @@ void BpeModel::add_merge(std::string_view left, std::string_view right, int32_t 
     merges_.insert_or_assign(pair_key(*left_id, *right_id), Merge{rank, *new_id});
 }
 
+void BpeModel::use_byte_level_alphabet() {
+    byte_level_ = true;
+    for (int b = 0; b < 256; ++b) {
+        const auto symbol_id = id(byte_level::byte_piece(static_cast<uint8_t>(b)));
+        if (!symbol_id) fail("tokenizer.json BPE vocab has no byte-level character for byte ", b);
+        byte_level_ids_[b] = *symbol_id;
+    }
+}
+
 bool BpeModel::has_byte_tokens(std::string_view ch) const {
     return std::all_of(ch.begin(), ch.end(), [this](char b) { return byte_ids_[static_cast<uint8_t>(b)] >= 0; });
 }
@@ -141,7 +151,11 @@ const BpeModel::Merge* BpeModel::find_merge(int32_t left, int32_t right) const {
 void BpeModel::tokenize(std::string_view piece, std::vector<int32_t>& out) const {
     if (piece.empty()) return;
     if (ignore_merges_) {
-        if (const auto whole = id(piece)) {
+        std::string mapped;
+        if (byte_level_) {
+            for (const char b : piece) mapped += byte_level::byte_piece(static_cast<uint8_t>(b));
+        }
+        if (const auto whole = id(byte_level_ ? std::string_view(mapped) : piece)) {
             out.push_back(*whole);
             return;
         }
@@ -160,6 +174,11 @@ std::vector<BpeModel::Symbol> BpeModel::initial_symbols(std::string_view piece) 
         const auto pos = static_cast<int32_t>(symbols.size());
         symbols.push_back({symbol_id, pos - 1, pos + 1, false});
     };
+    if (byte_level_) {
+        for (const char b : piece) add(byte_level_ids_[static_cast<uint8_t>(b)]);
+        if (!symbols.empty()) symbols.back().next = -1;
+        return symbols;
+    }
     bool unk_pending = false;
     for (size_t pos = 0; pos < piece.size();) {
         const size_t len = utf8::char_length(piece, pos);

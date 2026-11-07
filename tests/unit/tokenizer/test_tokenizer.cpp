@@ -145,8 +145,8 @@ TEST_SUITE("tokenizer") {
         CHECK(load_error(j) == "tokenizer.json normalizer 'NFKC' is not supported");
 
         j = tiny_json();
-        j["pre_tokenizer"] = {{"type", "ByteLevel"}, {"add_prefix_space", false}};
-        CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'ByteLevel' is not supported");
+        j["pre_tokenizer"] = {{"type", "Metaspace"}};
+        CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'Metaspace' is not supported");
 
         j = tiny_json();
         j["decoder"]["decoders"][1] = {{"type", "WordPiece"}};
@@ -158,14 +158,14 @@ TEST_SUITE("tokenizer") {
 
         j = tiny_json();
         j["pre_tokenizer"]["pattern"] = {{"Regex", "\\s+"}};
-        CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'Split' with a Regex pattern is not supported");
+        CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'Split' Regex '\\s+' is not supported");
 
         j = tiny_json();
         j["model"]["dropout"] = 0.1;
         CHECK(load_error(j) == "tokenizer.json BPE option 'dropout' is not supported");
 
         j = tiny_json();
-        j["post_processor"] = {{"type", "ByteLevel"}};
-        CHECK(load_error(j) == "tokenizer.json post_processor 'ByteLevel' is not supported");
+        j["post_processor"] = {{"type", "RobertaProcessing"}};
+        CHECK(load_error(j) == "tokenizer.json post_processor 'RobertaProcessing' is not supported");
     }
 }

@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "tokenizer/json_fields.h"
+#include "tokenizer/regex_split.h"
 #include "util/error.h"
 
 namespace xs::tok {
@@ -29,16 +30,25 @@ struct Span {
 };
 
 // Alternating non-match / match spans covering the whole text (Hugging Face's Pattern::find_matches).
-std::vector<Span> find_matches(std::string_view text, std::string_view pattern, bool invert) {
+std::vector<Span> to_spans(std::string_view text, const std::vector<std::pair<size_t, size_t>>& matches, bool invert) {
     std::vector<Span> spans;
     size_t pos = 0;
-    for (size_t hit = text.find(pattern); hit != std::string_view::npos; hit = text.find(pattern, pos)) {
-        if (hit > pos) spans.push_back({pos, hit, invert});
-        spans.push_back({hit, hit + pattern.size(), !invert});
-        pos = hit + pattern.size();
+    for (const auto& [begin, end] : matches) {
+        if (begin > pos) spans.push_back({pos, begin, invert});
+        spans.push_back({begin, end, !invert});
+        pos = end;
     }
     if (pos < text.size() || spans.empty()) spans.push_back({pos, text.size(), invert});
     return spans;
+}
+
+std::vector<std::pair<size_t, size_t>> find_string(std::string_view text, std::string_view pattern) {
+    std::vector<std::pair<size_t, size_t>> matches;
+    for (size_t hit = text.find(pattern); hit != std::string_view::npos;) {
+        matches.emplace_back(hit, hit + pattern.size());
+        hit = text.find(pattern, hit + pattern.size());
+    }
+    return matches;
 }
 
 // Folds spans per behavior, mirroring Hugging Face's NormalizedString::split.
@@ -88,13 +98,15 @@ std::vector<Span> apply_behavior(std::vector<Span> spans, SplitBehavior behavior
 
 class SplitPreTokenizer final : public PreTokenizer {
 public:
-    SplitPreTokenizer(std::string pattern, SplitBehavior behavior, bool invert)
-        : pattern_(std::move(pattern)), behavior_(behavior), invert_(invert) {}
+    // Exactly one of `pattern` (non-empty) and `regex` is set.
+    SplitPreTokenizer(std::string pattern, std::unique_ptr<RegexSplitter> regex, SplitBehavior behavior, bool invert)
+        : pattern_(std::move(pattern)), regex_(std::move(regex)), behavior_(behavior), invert_(invert) {}
 
     std::vector<std::string_view> split(const std::vector<std::string_view>& pieces) const override {
         std::vector<std::string_view> out;
         for (std::string_view piece : pieces) {
-            for (const Span& s : apply_behavior(find_matches(piece, pattern_, invert_), behavior_)) {
+            const auto matches = regex_ ? regex_->find_matches(piece) : find_string(piece, pattern_);
+            for (const Span& s : apply_behavior(to_spans(piece, matches, invert_), behavior_)) {
                 if (s.end > s.begin) out.push_back(piece.substr(s.begin, s.end - s.begin));
             }
         }
@@ -103,28 +115,56 @@ public:
 
 private:
     std::string pattern_;
+    std::unique_ptr<RegexSplitter> regex_;
     SplitBehavior behavior_;
     bool invert_;
 };
 
+// Only marks the pieces as byte-level; with use_regex false it does not split.
+class ByteLevelPreTokenizer final : public PreTokenizer {
+public:
+    std::vector<std::string_view> split(const std::vector<std::string_view>& pieces) const override { return pieces; }
+    bool byte_level() const override { return true; }
+};
+
 class SequencePreTokenizer final : public PreTokenizer {
 public:
-    explicit SequencePreTokenizer(std::vector<std::unique_ptr<PreTokenizer>> steps) : steps_(std::move(steps)) {}
+    explicit SequencePreTokenizer(std::vector<std::unique_ptr<PreTokenizer>> steps) : steps_(std::move(steps)) {
+        for (size_t i = 0; i + 1 < steps_.size(); ++i) {
+            if (steps_[i]->byte_level()) fail("tokenizer.json pre_tokenizer 'ByteLevel' must be the last step");
+        }
+    }
 
     std::vector<std::string_view> split(const std::vector<std::string_view>& pieces) const override {
         std::vector<std::string_view> out = pieces;
         for (const auto& step : steps_) out = step->split(out);
         return out;
     }
+    bool byte_level() const override { return !steps_.empty() && steps_.back()->byte_level(); }
 
 private:
     std::vector<std::unique_ptr<PreTokenizer>> steps_;
 };
 
 std::unique_ptr<PreTokenizer> make_split(const nlohmann::json& config) {
-    return std::make_unique<SplitPreTokenizer>(string_pattern(config, kWhat),
-                                               parse_behavior(string_field(config, "behavior", kWhat)),
-                                               bool_field_or(config, "invert", false, kWhat));
+    const SplitBehavior behavior = parse_behavior(string_field(config, "behavior", kWhat));
+    const bool invert = bool_field_or(config, "invert", false, kWhat);
+    if (const auto regex = regex_pattern(config, kWhat)) {
+        auto splitter = RegexSplitter::for_pattern(*regex);
+        if (!splitter) fail("tokenizer.json pre_tokenizer 'Split' Regex '", *regex, "' is not supported");
+        return std::make_unique<SplitPreTokenizer>(std::string(), std::move(splitter), behavior, invert);
+    }
+    return std::make_unique<SplitPreTokenizer>(string_pattern(config, kWhat), nullptr, behavior, invert);
+}
+
+std::unique_ptr<PreTokenizer> make_byte_level(const nlohmann::json& config) {
+    if (bool_field_or(config, "add_prefix_space", true, kWhat)) {
+        fail("tokenizer.json pre_tokenizer 'ByteLevel' with add_prefix_space is not supported");
+    }
+    if (bool_field_or(config, "use_regex", true, kWhat)) {
+        fail("tokenizer.json pre_tokenizer 'ByteLevel' with use_regex is not supported");
+    }
+    return std::make_unique<ByteLevelPreTokenizer>();
 }
 
 std::unique_ptr<PreTokenizer> make_sequence(const nlohmann::json& config) {
@@ -144,6 +184,7 @@ std::unique_ptr<PreTokenizer> make_pre_tokenizer(const nlohmann::json& config) {
     if (config.is_null()) return nullptr;
     const std::string type = component_type(config, kWhat);
     if (type == "Split") return make_split(config);
+    if (type == "ByteLevel") return make_byte_level(config);
     if (type == "Sequence") return make_sequence(config);
     refuse_component(kWhat, type);
 }

@@ -1,8 +1,9 @@
 #pragma once
 
 // Hugging Face tokenizer.json tokenizers, implemented natively (no Python, no Rust).
-// v0.1 scope: BPE models as used by Gemma (Replace normalizer, Split pre-tokenizer, byte fallback, fuse_unk), with
-// added/special tokens. Byte-level BPE (Qwen, Llama 3) comes next; unsupported components are refused by name.
+// Scope: BPE models as used by Gemma (Replace normalizer, Split pre-tokenizer, byte fallback, fuse_unk) and byte-level
+// BPE as used by Qwen (NFC, regex Split, ByteLevel), with added/special tokens. Unsupported components are refused
+// by name.
 
 #include <cstdint>
 #include <filesystem>
@@ -36,7 +37,7 @@ public:
 };
 
 // Incremental detokenizer: turns a token stream into UTF-8 text deltas without ever splitting a multi-byte character
-// (byte-fallback tokens may carry partial characters).
+// (byte-fallback and byte-level tokens may carry partial characters).
 class StreamDecoder {
 public:
     explicit StreamDecoder(const Tokenizer& tokenizer, bool skip_special = false);
@@ -50,6 +51,7 @@ private:
     bool skip_special_;
     std::vector<int32_t> context_;  // the last emitted chunk, decoded again for decoders that look back
     std::vector<int32_t> pending_;  // tokens whose text is not final yet
+    size_t emitted_ = 0;            // bytes of the pending tokens' text already returned
 };
 
 }  // namespace xs::tok

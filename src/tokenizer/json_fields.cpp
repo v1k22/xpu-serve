@@ -30,6 +30,14 @@ std::string string_pattern(const nlohmann::json& component, std::string_view wha
     return text;
 }
 
+std::optional<std::string> regex_pattern(const nlohmann::json& component, std::string_view what) {
+    if (!component.contains("pattern") || !component.at("pattern").is_object()) return std::nullopt;
+    const auto& pattern = component.at("pattern");
+    if (!pattern.contains("Regex")) return std::nullopt;
+    if (!pattern.at("Regex").is_string()) fail("tokenizer.json ", what, ": 'Regex' pattern must be a string");
+    return pattern.at("Regex").get<std::string>();
+}
+
 std::string string_field(const nlohmann::json& component, const char* key, std::string_view what) {
     if (!component.contains(key) || !component.at(key).is_string()) {
         fail("tokenizer.json ", what, ": field '", key, "' must be a string");
