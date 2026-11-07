@@ -48,17 +48,19 @@ takes a pack wherever it takes a model directory; the model code is the same.
 
 ```bash
 build/src/xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q8 --quant q8
-build/src/xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --group 64
+build/src/xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --method awq
 build/src/xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
 ```
 
-`q8` is symmetric int8, `q4` is 4-bit with a scale and bias per group (32, 64 or 128 columns), both round to nearest.
+`q8` is symmetric int8; `q4` is 4-bit with a scale and bias per group of 32 columns. Both round to nearest by
+default; `--method awq` adds an AWQ-style search calibrated on the model itself (on the GPU, about a minute; `--calib
+file` brings your own text), which helps Qwen3.5 but not yet Gemma 4 (see the decision record).
 Embedding tables are q8 in either case, small matrices and non-matmul tensors stay as they are, and `--q8 name,...`
 keeps chosen weights (parts of their names) at q8. The format of every tensor is in the pack's `xpu_pack.json`.
 
 On the Arc Pro B60, q8 decodes 1.5 to 1.7 times faster than f16 with no measurable quality loss; q4 decodes about
-twice as fast but round to nearest costs small models fidelity (Qwen3.5-4B logits cosine 0.87 to 0.99), so prefer q8
-until AWQ lands. Numbers: [docs/decisions/0009](docs/decisions/0009-quantized-packs.md).
+twice as fast and keeps MMLU-Pro scores, with some loss of logit fidelity on small models (Qwen3.5-4B logits cosine
+0.90 to 0.96 at groups of 32, 0.92 to 0.96 with AWQ). Numbers: [docs/decisions/0009](docs/decisions/0009-quantized-packs.md).
 
 ## Correctness
 

@@ -22,10 +22,12 @@ std::string dims_to_string(const Dims& dims);
 // The scales and biases of a quantized (Q8 / Q4) weight [rows, cols]: one f16 of each per `group` columns of a row,
 // [rows, cols / group] row-major. Q8: w = scale * q (q int8). Q4: w = scale * q + bias (q in [0, 15]; two per byte,
 // the low nibble is the even column).
+// AWQ packs add input_scales (f32 [cols]): the weight a matmul uses is dequant(w)[r, c] * input_scales[c].
 struct QuantParams {
     int64_t group = 0;
-    const void* scales = nullptr;  // f16
-    const void* biases = nullptr;  // f16, Q4 only
+    const void* scales = nullptr;        // f16
+    const void* biases = nullptr;        // f16, Q4 only
+    const float* input_scales = nullptr;  // f32 [cols], or null
 };
 
 struct TensorView {

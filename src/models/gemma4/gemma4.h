@@ -29,6 +29,9 @@ struct RopeConfig {
 };
 
 struct Config {
+    // The checkpoint's dtype (config.json "dtype" / "torch_dtype"; bf16 when absent): the embedding scales round to it
+    // as transformers computes them in it, whatever dtype a pack stores the tables in.
+    DType checkpoint_dtype = DType::BF16;
     int64_t vocab_size = 0;
     int64_t hidden_size = 0;
     int64_t intermediate_size = 0;

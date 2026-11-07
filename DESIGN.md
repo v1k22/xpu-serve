@@ -286,10 +286,15 @@ and file hashes, and drafters, are still to come).
 
 ### 6.5 Quantization quality
 
-- v1: round-to-nearest (RTN) per group, symmetric or asymmetric, with sensible defaults per model (for example the
-  embedding / tied LM head at q8, everything else q4).
-- Later: data-aware methods (AWQ-style scale search, GPTQ). These need forward passes; `convert` runs them through **our
-  own engine and model code** (CPU reference or GPU backend). So they still live in this repo (P1).
+- Round to nearest per group by default (q4 in groups of 32, q8 in groups of 64); embedding tables and tied LM heads
+  at q8.
+- `--method awq` for q4: AWQ-style (built 2026-11-07). `convert` copies the model's graph with each quantized matmul's input as
+  an extra output, runs calibration text through **our own engine** (GPU or cpu-ref), and keeps each input channel's
+  mean square. Per weight it searches column scales `s = rms^alpha` and a per-group clip, minimizing the
+  activation-weighted error, and stores `1 / s` as `.input_scales`, which kernels apply to `x`; nothing is folded into
+  other weights, so no model needs AWQ code. Results: docs/decisions/0009.
+- Later: chat-formatted calibration (Gemma 4 drifted into its thinking channel when calibrated on plain prose),
+  GPTQ, AWQ against the full activation covariance, larger calibration sets.
 - Quality gates for every default preset are in [section 13](#13-accuracy-and-testing).
 
 ## 7. Model code

@@ -20,7 +20,7 @@ function(xs_add_library name)
 endfunction()
 
 # Core: utilities, host tensors, safetensors I/O, images, the step graph, model code and the engine.
-xs_add_library(xs_core DIRS util tensor io image graph quant models convert engine DEPS xs_json xs_stb_image Threads::Threads)
+xs_add_library(xs_core DIRS util tensor io image graph quant models engine DEPS xs_json xs_stb_image Threads::Threads)
 
 xs_add_library(xs_tokenizer DIRS tokenizer DEPS xs_core)
 
@@ -55,6 +55,9 @@ endif()
 
 xs_add_library(xs_server DIRS server DEPS xs_core xs_tokenizer xs_chat xs_httplib)
 
+# `convert`: checkpoint -> pack; AWQ calibration runs the model on a backend and needs the tokenizer.
+xs_add_library(xs_convert DIRS convert DEPS xs_core xs_backends xs_tokenizer)
+
 # The InferenceService that ties model, backend, tokenizer and chat template together.
 xs_add_library(xs_service DIRS service DEPS xs_core xs_backends xs_tokenizer xs_chat)
 
@@ -62,5 +65,5 @@ add_executable(xpu-serve cli/main.cpp)
 file(GLOB xs_cli_extra CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cli/*.cpp)
 list(REMOVE_ITEM xs_cli_extra ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.cpp)
 target_sources(xpu-serve PRIVATE ${xs_cli_extra})
-target_link_libraries(xpu-serve PRIVATE xs_service xs_server xs_warnings)
+target_link_libraries(xpu-serve PRIVATE xs_service xs_server xs_convert xs_warnings)
 target_compile_definitions(xpu-serve PRIVATE XS_VERSION="${PROJECT_VERSION}")

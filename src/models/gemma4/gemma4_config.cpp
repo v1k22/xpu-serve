@@ -62,6 +62,13 @@ Config parse_config(const nlohmann::json& config_json) {
     refuse_unsupported(t, where);
 
     Config c;
+    for (const nlohmann::json* j : {&t, &config_json}) {
+        for (const char* key : {"dtype", "torch_dtype"}) {
+            if (!j->contains(key) || !j->at(key).is_string()) continue;
+            const std::string d = j->at(key).get<std::string>();
+            c.checkpoint_dtype = d == "float32" ? DType::F32 : d == "float16" ? DType::F16 : DType::BF16;
+        }
+    }
     c.vocab_size = cfg::get_int(t, "vocab_size", where);
     c.hidden_size = cfg::get_int(t, "hidden_size", where);
     c.intermediate_size = cfg::get_int(t, "intermediate_size", where);

@@ -504,6 +504,10 @@ private:
         w.codes = reinterpret_cast<const uint8_t*>(copy(view.data, view.nbytes()));
         w.scales = reinterpret_cast<const half*>(copy(view.quant.scales, scale_bytes));
         if (w.q4) w.biases = reinterpret_cast<const half*>(copy(view.quant.biases, scale_bytes));
+        if (view.quant.input_scales != nullptr) {
+            w.input_scales = reinterpret_cast<const float*>(
+                copy(view.quant.input_scales, static_cast<size_t>(view.shape[1]) * sizeof(float)));
+        }
         leaf_ptr_[node] = const_cast<char*>(reinterpret_cast<const char*>(w.codes));
         leaf_quant_[node] = w;
     }

@@ -126,6 +126,32 @@ TEST_SUITE("quant") {
         CHECK_THROWS_AS(quant::quantize(f32_view(w, 2, 96), DType::Q4, 64), Error);
     }
 
+    TEST_CASE("awq: never worse than round to nearest on its objective; much better with outlier channels") {
+        const std::vector<float> w = random_matrix(16, 256, 21);
+        std::vector<double> flat(256, 1.0);
+        std::vector<double> outliers(256, 1.0);
+        for (int c = 0; c < 256; c += 37)
+            outliers[static_cast<size_t>(c)] = 400.0;  // a few channels carry most of the activation energy
+        for (const auto* ms : {&flat, &outliers}) {
+            quant::AwqReport r;
+            const quant::Quantized q = quant::quantize_awq(f32_view(w, 16, 256), 64, *ms, &r);
+            CHECK(r.error <= r.error_rtn);
+            CHECK(q.input_scales.size() == 256u);
+            // The reported error is what the stored weights give: sum ms[c] * (dequant(q) - w)^2.
+            const std::vector<float> d = dequantized(q);
+            double err = 0;
+            for (size_t i = 0; i < d.size(); ++i) {
+                const double diff = static_cast<double>(d[i]) - w[i];
+                err += (*ms)[i % 256] * diff * diff;
+            }
+            CHECK(err == doctest::Approx(r.error).epsilon(1e-6));
+        }
+        quant::AwqReport r;
+        quant::quantize_awq(f32_view(w, 16, 256), 64, outliers, &r);
+        CHECK(r.alpha > 0);
+        CHECK(r.error < 0.8 * r.error_rtn);
+    }
+
     TEST_CASE("planted bug: reading the high nibble as the even column must not reproduce the weights") {
         const std::vector<float> w = random_matrix(2, 64, 9);
         quant::Quantized q = quant::quantize(f32_view(w, 2, 64), DType::Q4, 32);

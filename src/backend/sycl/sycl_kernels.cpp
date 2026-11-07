@@ -405,6 +405,16 @@ void gemv_quant_t(sycl::queue& q, const float* x, QuantWeight w, float* y, int64
                     xv[4 * i + 2] = v[2];
                     xv[4 * i + 3] = v[3];
                 }
+                if (w.input_scales != nullptr) {  // (x * input_scales) . dequant(w) == x . (dequant(w) * input_scales)
+                    const auto* ip = reinterpret_cast<const sycl::vec<float, 4>*>(w.input_scales + k0);
+                    for (int i = 0; i < kChunk / 4; ++i) {
+                        const sycl::vec<float, 4> v = ip[i];
+                        xv[4 * i] *= v[0];
+                        xv[4 * i + 1] *= v[1];
+                        xv[4 * i + 2] *= v[2];
+                        xv[4 * i + 3] *= v[3];
+                    }
+                }
                 float xsum = 0.0f;
                 if constexpr (Q4) {
                     for (int i = 0; i < kChunk; ++i)
@@ -456,12 +466,13 @@ void gemv_quant_q(sycl::queue& q, const float* x, const QuantWeight& w, float* y
 inline float dequant_at(const QuantWeight& w, int64_t r, int64_t c, int64_t k) {
     const int64_t sg = r * (k / w.group) + c / w.group;
     const float s = static_cast<float>(w.scales[sg]);
+    const float in = w.input_scales != nullptr ? w.input_scales[c] : 1.0f;
     if (w.q4) {
         const uint8_t byte = w.codes[(r * k + c) / 2];
         const int code = (c & 1) == 0 ? (byte & 0x0F) : (byte >> 4);
-        return s * static_cast<float>(code) + static_cast<float>(w.biases[sg]);
+        return (s * static_cast<float>(code) + static_cast<float>(w.biases[sg])) * in;
     }
-    return s * static_cast<float>(static_cast<int8_t>(w.codes[r * k + c]));
+    return s * static_cast<float>(static_cast<int8_t>(w.codes[r * k + c])) * in;
 }
 
 template <typename W, int M>
@@ -772,15 +783,17 @@ void dequantize_t(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64
         const int64_t sg = r * groups + c0 / wc.group;
         const float s = static_cast<float>(wc.scales[sg]);
         sycl::vec<T, 16> v[kChunk / 16];  // sycl::vec holds at most 16 elements
+        const float* in = wc.input_scales != nullptr ? wc.input_scales + c0 : nullptr;
+        const auto col = [&](int j) { return in != nullptr ? in[j] : 1.0f; };
         if constexpr (Q4) {
             const float b = static_cast<float>(wc.biases[sg]);
             for (int j = 0; j < 16; ++j) {
-                v[j / 8][(2 * j) % 16] = static_cast<T>(s * static_cast<float>(c[j] & 0x0F) + b);
-                v[j / 8][(2 * j + 1) % 16] = static_cast<T>(s * static_cast<float>(c[j] >> 4) + b);
+                v[j / 8][(2 * j) % 16] = static_cast<T>((s * static_cast<float>(c[j] & 0x0F) + b) * col(2 * j));
+                v[j / 8][(2 * j + 1) % 16] = static_cast<T>((s * static_cast<float>(c[j] >> 4) + b) * col(2 * j + 1));
             }
         } else {
             for (int j = 0; j < 16; ++j)
-                v[0][j] = static_cast<T>(s * static_cast<float>(static_cast<int8_t>(c[j])));
+                v[0][j] = static_cast<T>(s * static_cast<float>(static_cast<int8_t>(c[j])) * col(j));
         }
         for (int h = 0; h < kChunk / 16; ++h)
             *reinterpret_cast<sycl::vec<T, 16>*>(out + r * k + c0 + 16 * h) = v[h];

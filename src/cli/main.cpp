@@ -33,7 +33,7 @@ const char* kUsage =
     "  xpu-serve serve <model-dir> [options]   OpenAI-compatible server\n"
     "  xpu-serve run   <model-dir> [options]   chat in the terminal (--prompt for one shot)\n"
     "  xpu-serve bench <model-dir> [options]   prefill / decode speed\n"
-    "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--group 64]   quantized pack\n"
+    "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--method rtn|awq]   quantized pack\n"
     "  xpu-serve info                          backends and devices\n"
     "\n"
     "<model-dir> is a Hugging Face model directory (config.json, *.safetensors, tokenizer.json) or a pack that\n"
@@ -103,8 +103,13 @@ int cmd_convert(const std::vector<std::string>& argv) {
     Args a;
     a.value("out", "output directory for the pack (must not exist or be empty)")
         .value("quant", "format of the matmul weights: q4 | q8 (embedding tables are always q8)", "q4")
-        .value("group", "columns per scale: 32 | 64 | 128", "64")
+        .value("group", "columns per scale: 32 | 64 | 128 (default: 32 for q4, 64 for q8)")
         .value("q8", "comma-separated parts of weight names to keep at q8 (e.g. linear_attn,down_proj)")
+        .value("method", "q4 quantization: rtn | awq (activation-aware, calibrates on a backend)", "rtn")
+        .value("calib", "AWQ: a text file to calibrate with (default: a built-in sample)")
+        .value("calib-tokens", "AWQ: calibration tokens, at most", "8192")
+        .value("backend", "AWQ: calibration backend (default: the first of this build)")
+        .value("device", "AWQ: calibration device")
         .value("log-level", "debug | info | warn | error", "info")
         .flag("help", "show this help");
     a.parse(argv);
@@ -117,18 +122,33 @@ int cmd_convert(const std::vector<std::string>& argv) {
     const std::string& quant = a.get("quant");
     if (quant != "q4" && quant != "q8") fail("--quant must be q4 or q8, got '", quant, "'");
     o.format = quant == "q4" ? DType::Q4 : DType::Q8;
-    o.group = a.get_int("group");
+    o.group = a.get("group").empty() ? (o.format == DType::Q4 ? 32 : 64) : a.get_int("group");
     for (std::string list = a.get("q8"); !list.empty();) {
         const size_t comma = list.find(',');
         o.q8_names.push_back(list.substr(0, comma));
         list = comma == std::string::npos ? std::string() : list.substr(comma + 1);
     }
+    const std::string& method = a.get("method");
+    if (method != "rtn" && method != "awq") fail("--method must be rtn or awq, got '", method, "'");
+    o.method = method == "awq" ? QuantMethod::Awq : QuantMethod::Rtn;
+    if (!a.get("calib").empty()) {
+        std::ifstream in(a.get("calib"));
+        if (!in) fail("cannot read --calib file '", a.get("calib"), "'");
+        o.calibration_text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    o.calibration_tokens = a.get_int("calib-tokens");
+    o.backend = a.get("backend");
+    o.device = a.get("device");
     o.converter = std::string("xpu-serve ") + XS_VERSION;
     const ConvertReport r = convert_model(o);
     std::printf("wrote %s: %lld tensors q4, %lld q8, %lld kept; %.2f GB -> %.2f GB in %d shard(s)\n",
                 o.output.string().c_str(), static_cast<long long>(r.q4), static_cast<long long>(r.q8),
                 static_cast<long long>(r.kept), static_cast<double>(r.source_bytes) / 1e9,
                 static_cast<double>(r.output_bytes) / 1e9, r.shards);
+    if (r.awq > 0) {
+        std::printf("awq: %lld q4 tensors, weighted error %.1f%% below round to nearest on average\n",
+                    static_cast<long long>(r.awq), 100.0 * r.awq_gain);
+    }
     return 0;
 }
 

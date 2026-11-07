@@ -64,7 +64,14 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
                 CAPTURE(group);
                 test::MemoryWeights w;
                 const HostTensor dense = rng.uniform(DType::F32, {n, k}, 1.0f / std::sqrt(static_cast<float>(k)));
-                w.add_quantized("w", quant::quantize(dense.view(), format, group));
+                if (format == DType::Q4 && group == 128) {  // with AWQ input scales
+                    std::vector<double> ms(static_cast<size_t>(k), 1.0);
+                    for (int64_t c = 0; c < k; c += 29)
+                        ms[static_cast<size_t>(c)] = 300.0;
+                    w.add_quantized("w", quant::quantize_awq(dense.view(), group, ms, nullptr));
+                } else {
+                    w.add_quantized("w", quant::quantize(dense.view(), format, group));
+                }
                 for (const int64_t m : {1, 3, 8, 37}) {  // the GEMV for up to 8 rows, dequantize + GEMM beyond
                     CAPTURE(m);
                     const HostTensor x = rng.uniform(DType::F32, {m, k});

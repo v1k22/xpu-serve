@@ -20,6 +20,7 @@ struct Quantized {
     std::vector<uint8_t> codes;
     std::vector<uint16_t> scales;
     std::vector<uint16_t> biases;  // Q4 only
+    std::vector<float> input_scales;  // AWQ: per column, multiplies the dequantized weight; empty otherwise
 
     // The logical view (dtype Q8 / Q4, shape [rows, cols]) over this storage.
     TensorView view() const;
@@ -33,7 +34,19 @@ std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t
 // against the f16-rounded scale and bias, so dequantization reproduces exactly the values the rounding picked.
 Quantized quantize(const TensorView& w, DType format, int64_t group);
 
-// Float values of rows [first, first + count) of a Q8 / Q4 view, row-major into `out`.
+// Activation-aware q4 (AWQ-style). `act_ms` is the mean square of each input channel over calibration data. For each
+// alpha in 0, 0.1, ..., 1 the columns are scaled by s = rms^alpha (geometric mean 1) before quantizing, every group
+// also tries clipping its range, and the choice minimizes sum_c act_ms[c] * (w_eff - w)^2, the matmul output error
+// under independent channels (w_eff = dequant(q) / s, stored as input_scales = 1 / s). alpha 0 without clipping is
+// round to nearest, so the result is never worse under that objective. `alpha` and the two errors are reported.
+struct AwqReport {
+    double alpha = 0;
+    double error_rtn = 0;
+    double error = 0;
+};
+Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<double>& act_ms, AwqReport* report);
+
+// Float values of rows [first, first + count) of a Q8 / Q4 view, row-major into `out` (input_scales applied).
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out);
 
 }  // namespace xs::quant

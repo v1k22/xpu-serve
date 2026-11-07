@@ -4,6 +4,7 @@
 
 #include "models/config_util.h"
 #include "models/gemma4/gemma4.h"
+#include "quant/quant.h"
 #include "util/error.h"
 #include "util/half.h"
 #include "util/log.h"
@@ -63,7 +64,7 @@ public:
             ple_table_ = &weights_->get(w("embed_tokens_per_layer.weight"));
             XS_CHECK(ple_table_->shape == (Dims{cfg_.ple_vocab_size, cfg_.num_layers * cfg_.ple_dim}),
                      "gemma4: embed_tokens_per_layer has shape ", dims_to_string(ple_table_->shape));
-            ple_scale_ = round_to_dtype(std::sqrt(static_cast<float>(cfg_.ple_dim)), ple_table_->dtype);
+            ple_scale_ = round_to_dtype(std::sqrt(static_cast<float>(cfg_.ple_dim)), cfg_.checkpoint_dtype);
         }
         if (vision) load_vision(*vision);
         build_graph();
@@ -72,6 +73,11 @@ public:
     const ModelInfo& info() const override { return info_; }
     const graph::Graph& graph() const override { return graph_; }
     const WeightStore& weights() const override { return *weights_; }
+    std::vector<std::string> host_tables() const override {
+        if (ple_table_ == nullptr) return {};
+        return {w("embed_tokens_per_layer.weight")};
+    }
+
     const VisionEncoder* vision() const override { return vision_.get(); }
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
@@ -132,12 +138,16 @@ private:
     HostTensor gather_ple_rows(std::span<const int32_t> tokens) const {
         const int64_t width = cfg_.num_layers * cfg_.ple_dim;
         HostTensor out(DType::F32, {static_cast<int64_t>(tokens.size()), width});
-        const size_t row_bytes = static_cast<size_t>(width) * dtype_size(ple_table_->dtype);
         for (size_t i = 0; i < tokens.size(); ++i) {
             XS_CHECK(tokens[i] < cfg_.ple_vocab_size, "gemma4: token id ", tokens[i], " outside the PLE vocabulary");
-            const auto* row = static_cast<const std::byte*>(ple_table_->data) + static_cast<size_t>(tokens[i]) * row_bytes;
             float* dst = out.data<float>() + static_cast<int64_t>(i) * width;
-            to_f32(row, ple_table_->dtype, dst, static_cast<size_t>(width));
+            if (is_quantized(ple_table_->dtype)) {  // a pack's q8 / q4 table
+                quant::dequantize_rows(*ple_table_, tokens[i], 1, dst);
+            } else {
+                const size_t row_bytes = static_cast<size_t>(width) * dtype_size(ple_table_->dtype);
+                const auto* row = static_cast<const std::byte*>(ple_table_->data) + static_cast<size_t>(tokens[i]) * row_bytes;
+                to_f32(row, ple_table_->dtype, dst, static_cast<size_t>(width));
+            }
             for (int64_t j = 0; j < width; ++j) dst[j] *= ple_scale_;
         }
         return out;
@@ -169,7 +179,7 @@ private:
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
         const Value embed = weight("embed_tokens.weight");
-        const float embed_scale = round_to_dtype(std::sqrt(static_cast<float>(cfg_.hidden_size)), g.type(embed).dtype);
+        const float embed_scale = round_to_dtype(std::sqrt(static_cast<float>(cfg_.hidden_size)), cfg_.checkpoint_dtype);
         Value h = g.scale(g.gather(embed, ids), embed_scale);
         if (vision_ != nullptr) {
             // Image soft tokens: keep is 0 and media holds the encoder's row; elsewhere keep is 1 and media 0.

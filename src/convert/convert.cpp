@@ -1,5 +1,10 @@
 #include "convert/convert.h"
 
+#include <set>
+
+#include "convert/calibrate.h"
+#include "tokenizer/tokenizer.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
@@ -25,18 +30,28 @@ using graph::OpKind;
 
 constexpr uint64_t kShardBytes = uint64_t{4} << 30;
 
-// The format each weight gets: what the graph does with it decides. A weight read only as a matmul weight takes the
-// requested format; one that is also (or only) a gather table takes q8; anything else is copied.
-std::map<std::string, DType> plan_formats(const graph::Graph& g, const WeightStore& weights, const ConvertOptions& o) {
+// Q8 / Q4 when `format` fits the tensor (a float matrix of at least min_elements); explains a refusal in the log.
+std::optional<DType> fitting(const std::string& name, const TensorView& v, DType format, const ConvertOptions& o) {
+    if (!is_float(v.dtype) || v.shape.size() != 2 || v.numel() < o.min_elements) return std::nullopt;
+    if (const std::string why = quant::unsupported_reason(format, v.shape[0], v.shape[1], o.group); !why.empty()) {
+        log::info("convert: keeping '", name, "' as ", dtype_name(v.dtype), ": ", why);
+        return std::nullopt;
+    }
+    return format;
+}
+
+// The format each weight of `g` gets: what the graph does with it decides. A weight read only as a matmul weight takes
+// `matmul_format`; one that is also (or only) a gather table takes q8; anything else is copied.
+void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_format, const ConvertOptions& o,
+                std::map<std::string, DType>& plan) {
     const auto& nodes = g.nodes();
-    std::vector<std::vector<std::pair<OpKind, size_t>>> readers(nodes.size());
+    std::vector<std::vector<std::pair<OpKind, size_t>>> readers(nodes.size());  // per node: (reader op, input index)
     for (const auto& n : nodes) {
         for (size_t k = 0; k < n.inputs.size(); ++k)
             readers[static_cast<size_t>(n.inputs[k].node)].emplace_back(n.kind, k);
     }
     for (const auto& out : g.outputs())
         readers[static_cast<size_t>(out.value.node)].emplace_back(OpKind::Input, 0);  // a graph output: keep
-    std::map<std::string, DType> plan;
     for (size_t i = 0; i < nodes.size(); ++i) {
         if (nodes[i].kind != OpKind::Weight || readers[i].empty()) continue;
         const std::string& name = std::get<graph::WeightAttrs>(nodes[i].attrs).name;
@@ -53,17 +68,23 @@ std::map<std::string, DType> plan_formats(const graph::Graph& g, const WeightSto
             }
         }
         if (other || (!matmul && !table)) continue;
-        const TensorView& v = weights.get(name);
-        if (!is_float(v.dtype) || v.shape.size() != 2 || v.numel() < o.min_elements) continue;
         const bool q8_by_name = std::any_of(o.q8_names.begin(), o.q8_names.end(), [&](const std::string& part) {
             return !part.empty() && name.find(part) != std::string::npos;
         });
-        const DType format = table || q8_by_name ? DType::Q8 : o.format;
-        if (const std::string why = quant::unsupported_reason(format, v.shape[0], v.shape[1], o.group); !why.empty()) {
-            log::info("convert: keeping '", name, "' as ", dtype_name(v.dtype), ": ", why);
-            continue;
+        if (const auto f = fitting(name, weights.get(name), table || q8_by_name ? DType::Q8 : matmul_format, o)) {
+            plan[name] = *f;
         }
-        plan[name] = format;
+    }
+}
+
+// The text decoder's graph at the requested format, the vision tower's at q8 (it runs once per image; its quality
+// is not measured at q4 yet), and the tables the model reads on the host at q8.
+std::map<std::string, DType> plan_formats(const Model& model, const ConvertOptions& o) {
+    std::map<std::string, DType> plan;
+    plan_graph(model.graph(), model.weights(), o.format, o, plan);
+    if (model.vision() != nullptr) plan_graph(model.vision()->graph(), model.weights(), DType::Q8, o, plan);
+    for (const std::string& name : model.host_tables()) {
+        if (const auto f = fitting(name, model.weights().get(name), DType::Q8, o)) plan[name] = *f;
     }
     return plan;
 }
@@ -77,20 +98,36 @@ OutUnit copy_unit(const std::string& name, const TensorView& v) {
     return u;
 }
 
-OutUnit quant_unit(const std::string& name, const TensorView& v, DType format, int64_t group) {
+// `act_ms` (AWQ calibration statistics) set: the q4 weight is quantized with quantize_awq and gets input_scales.
+OutUnit quant_unit(const std::string& name, const TensorView& v, DType format, int64_t group,
+                   const std::vector<double>* act_ms, ConvertReport* report) {
     const Dims groups{v.shape[0], v.shape[1] / group};
     OutUnit u;
     u.tensors.push_back(OutTensor{name, format == DType::Q4 ? DType::U8 : DType::I8,
                                   format == DType::Q4 ? Dims{v.shape[0], v.shape[1] / 2} : v.shape});
     u.tensors.push_back(OutTensor{name + ".scales", DType::F16, groups});
     if (format == DType::Q4) u.tensors.push_back(OutTensor{name + ".biases", DType::F16, groups});
-    u.write = [v, format, group](std::ostream& out) {
-        const quant::Quantized q = quant::quantize(v, format, group);
+    if (act_ms != nullptr) u.tensors.push_back(OutTensor{name + ".input_scales", DType::F32, {v.shape[1]}});
+    u.write = [v, format, group, act_ms, report, name](std::ostream& out) {
+        quant::Quantized q;
+        if (act_ms != nullptr) {
+            quant::AwqReport r;
+            q = quant::quantize_awq(v, group, *act_ms, &r);
+            const double gain = r.error_rtn > 0 ? 1.0 - r.error / r.error_rtn : 0.0;
+            report->awq_gain += gain;
+            log::debug("convert: awq '", name, "' alpha ", r.alpha, ", error ", r.error, " vs ", r.error_rtn, " (rtn)");
+        } else {
+            q = quant::quantize(v, format, group);
+        }
         out.write(reinterpret_cast<const char*>(q.codes.data()), static_cast<std::streamsize>(q.codes.size()));
         out.write(reinterpret_cast<const char*>(q.scales.data()), static_cast<std::streamsize>(q.scales.size() * 2));
         if (format == DType::Q4) {
             out.write(reinterpret_cast<const char*>(q.biases.data()),
                       static_cast<std::streamsize>(q.biases.size() * 2));
+        }
+        if (act_ms != nullptr) {
+            out.write(reinterpret_cast<const char*>(q.input_scales.data()),
+                      static_cast<std::streamsize>(q.input_scales.size() * sizeof(float)));
         }
     };
     return u;
@@ -119,13 +156,30 @@ ConvertReport convert_model(const ConvertOptions& o) {
     }
     if (fs::exists(o.output) && fs::equivalent(o.source, o.output)) fail("convert: the output is the source");
 
-    LoadOptions lo;
-    lo.vision = false;  // vision towers stay as they are; only the text decoder's graph is planned
-    const auto model = load_model(o.source, lo);
+    const auto model = load_model(o.source);
     const WeightStore& weights = model->weights();
-    const std::map<std::string, DType> plan = plan_formats(model->graph(), weights, o);
+    const std::map<std::string, DType> plan = plan_formats(*model, o);
 
     ConvertReport report;
+    // AWQ: activation statistics for the text decoder's q4 weights.
+    std::map<std::string, std::vector<double>> act_ms;
+    if (o.method == QuantMethod::Awq && o.format == DType::Q4) {
+        std::set<std::string> q4;
+        for (const auto& [name, format] : plan) {
+            if (format == DType::Q4) q4.insert(name);
+        }
+        std::vector<int32_t> tokens = o.calibration_ids;
+        if (tokens.empty()) {
+            const auto tokenizer = tok::Tokenizer::load(o.source);
+            tokens = tokenizer->encode(o.calibration_text.empty() ? builtin_calibration_text() : o.calibration_text,
+                                       false);
+        }
+        CalibrationOptions co;
+        co.backend = o.backend;
+        co.device = o.device;
+        co.max_tokens = o.calibration_tokens;
+        act_ms = input_channel_mean_squares(*model, tokens, q4, co);
+    }
     std::vector<OutUnit> units;
     std::vector<std::string> names = weights.names();
     std::sort(names.begin(), names.end());
@@ -139,8 +193,14 @@ ConvertReport convert_model(const ConvertOptions& o) {
             ++report.kept;
             continue;
         }
-        units.push_back(quant_unit(name, v, it->second, o.group));
+        const auto stats = act_ms.find(name);
+        const std::vector<double>* ms = stats == act_ms.end() ? nullptr : &stats->second;
+        units.push_back(quant_unit(name, v, it->second, o.group, ms, &report));
         tensors[name] = {{"format", it->second == DType::Q4 ? "q4" : "q8"}, {"group", o.group}, {"shape", v.shape}};
+        if (ms != nullptr) {
+            tensors[name]["input_scales"] = true;
+            ++report.awq;
+        }
         ++(it->second == DType::Q4 ? report.q4 : report.q8);
     }
 
@@ -180,6 +240,7 @@ ConvertReport convert_model(const ConvertOptions& o) {
         std::ofstream(o.output / "model.safetensors.index.json") << index.dump(2) << "\n";
     }
     copy_side_files(o.source, o.output);
+    if (report.awq > 0) report.awq_gain /= static_cast<double>(report.awq);
 
     const auto config = cfg::read_json(o.source / "config.json");
     nlohmann::ordered_json manifest;
@@ -190,7 +251,8 @@ ConvertReport convert_model(const ConvertOptions& o) {
     manifest["source"] = {{"name", source_dir.filename().string()},
                           {"model_type", config.value("model_type", "")}};
     manifest["quant"] = {{"format", o.format == DType::Q4 ? "q4" : "q8"}, {"group", o.group},
-                         {"method", "rtn"}, {"min_elements", o.min_elements}, {"q8_names", o.q8_names}};
+                         {"method", report.awq > 0 ? "awq" : "rtn"}, {"min_elements", o.min_elements},
+                         {"q8_names", o.q8_names}};
     manifest["tensors"] = tensors;
     std::ofstream(o.output / kPackManifest) << manifest.dump(1) << "\n";
     return report;

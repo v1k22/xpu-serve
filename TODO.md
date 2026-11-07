@@ -201,10 +201,38 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
 - [ ] Llama 3
 - [ ] Import MLX-affine packs; import GGUF (Q4_0 / Q8_0 / K-quants)
-- [ ] Data-aware quantization (AWQ-style scale search, GPTQ) in `convert`, running on our own engine
+- [x] Data-aware quantization: AWQ-style scale and clip search in `convert`, calibrated on our own engine
+- [ ] GPTQ; AWQ with the full activation covariance (not per channel); larger calibration sets
 - [ ] Anthropic `/v1/messages`, Ollama `/api/chat` and `/api/generate`
 - [ ] Constrained decoding (JSON schema / grammar), logprobs
 - **Done when:** each item lands as one PR with its parity and E2E tests.
+
+### Model enablement checklist
+
+Every model below is enabled the same way (PROJECT.md 8.1); a model is done when every box is ticked:
+
+1. Config parsed, unsupported variants refused by name (`models/<arch>/<arch>_config.cpp`, config test)
+2. Graph built from shared blocks (`models/common/`), new ops added to the IR, cpu-ref and SYCL first
+3. Weights load from the Hugging Face checkpoint (single and sharded)
+4. Parity vs Hugging Face fp32: logits cosine and greedy output on cpu-ref (f32) and SYCL (f16)
+5. Tokenizer and chat template byte-exact vs Hugging Face; output parser (thinking, tool calls) if the format needs one
+6. Packs: `convert` q8 and q4 (AWQ), quality on the parity prompts and MMLU-Pro (25 questions) through the server
+7. Fits and runs on the target device (Arc Pro B60, Panther Lake iGPU); bench decode / TTFT at 1k / 4k / 16k
+8. Docs: TODO, PROJECT.md map, README supported list
+
+| # | Model | Hugging Face ID | Notes |
+|---|---|---|---|
+| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | |
+| 2 | Qwen3.6-35B-A3B (preferred) | `Qwen/Qwen3.6-35B-A3B` | MoE (3B active) |
+| | Qwen3.5-35B-A3B (older) | `Qwen/Qwen3.5-35B-A3B` | MoE; the Qwen3.5 Gated DeltaNet hybrid |
+| 3 | Gemma 4 31B | `google/gemma-4-31B-it` | vision tower uses `standardize` |
+| 4 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` | MoE (4B active) |
+| 5 | Nemotron 3.5 Lightning (30B-A3B) | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE (3B active) |
+| | Nemotron 3.5 Super (120B-A12B, larger) | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16` | MoE + vision; int4 and two GPUs |
+| 6 | Muse Glimmer 30B | `meta-models/Muse-Glimmer-30B` | |
+| 7 | Gemma 4 12B | `google/gemma-4-12B-it` | |
+| 8 | Liquid LFM3-1.7B (main text model) | `LiquidAI/LFM3-1.7B` | small |
+| 9 | Flint | `RecursiveSI/flint` | |
 
 ---
 

@@ -114,6 +114,7 @@ struct QuantWeight {
     const uint8_t* codes = nullptr;
     const half* scales = nullptr;
     const half* biases = nullptr;
+    const float* input_scales = nullptr;  // AWQ: [K], multiplies column k of the dequantized weight; or null
     int64_t group = 0;
 };
 // y [M, N] = x [M, K] @ dequant(w)^T for M <= kGemvMaxRows; K a multiple of 32.

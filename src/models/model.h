@@ -61,6 +61,9 @@ public:
                                 std::span<const float* const> embeddings, TensorMap& inputs) const = 0;
     // Null for a text-only model, or when vision was not loaded.
     virtual const VisionEncoder* vision() const { return nullptr; }
+    // Weights the model reads on the host one row at a time (embedding tables kept out of device memory, like Gemma
+    // 4's per-layer embeddings). They never appear in a graph, so convert asks for them here; they may be Q8 / Q4.
+    virtual std::vector<std::string> host_tables() const { return {}; }
 };
 
 struct LoadOptions {

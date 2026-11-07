@@ -132,6 +132,10 @@ void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) 
             v.quant.biases = component(name + ".biases", DType::F16, groups).data;
             index_.erase(name + ".biases");
         }
+        if (entry.value("input_scales", false)) {
+            v.quant.input_scales = static_cast<const float*>(component(name + ".input_scales", DType::F32, {shape[1]}).data);
+            index_.erase(name + ".input_scales");
+        }
         index_[name] = &(quant_views_[name] = v);
     }
     is_pack_ = true;

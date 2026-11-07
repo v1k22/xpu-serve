@@ -200,6 +200,57 @@ TEST_SUITE("convert") {
         }
     }
 
+    TEST_CASE("awq q4 pack: input scales stored and used, logits at least as close as round to nearest") {
+        const TempDir work("xs_convert_awq");
+        const fs::path src = work.path / "tiny-qwen";
+        write_tiny_qwen(src, TinyQwen{}, 5);
+        const auto original = load_model(src);
+        const auto oracle = make_cpu_ref_backend();
+        SessionOptions so;
+        so.precision = DType::F32;
+        const std::vector<int32_t> ids{9, 31, 77, 140, 2, 201, 66, 13, 99, 180};
+        const std::vector<float> reference = last_logits(*oracle->compile(original->graph(), original->weights(), so),
+                                                         *original, ids);
+        std::vector<int32_t> calibration(1024);
+        for (size_t i = 0; i < calibration.size(); ++i)
+            calibration[i] = static_cast<int32_t>((i * 7919 + 13) % 256);
+        double cos_rtn = 0;
+        for (const QuantMethod method : {QuantMethod::Rtn, QuantMethod::Awq}) {
+            ConvertOptions o;
+            o.source = src;
+            o.output = work.path / (method == QuantMethod::Awq ? "awq" : "rtn");
+            o.format = DType::Q4;
+            o.group = 32;
+            o.min_elements = 0;
+            o.method = method;
+            o.backend = "cpu-ref";
+            o.calibration_ids = calibration;
+            const ConvertReport r = convert_model(o);
+            const auto pack = load_model(o.output);
+            const TensorView& up = pack->weights().get("model.layers.0.mlp.up_proj.weight");
+            CHECK((up.quant.input_scales != nullptr) == (method == QuantMethod::Awq));
+            const std::vector<float> logits =
+                last_logits(*oracle->compile(pack->graph(), pack->weights(), so), *pack, ids);
+            const double cos = cosine(logits, reference);
+            MESSAGE((method == QuantMethod::Awq ? "awq" : "rtn"), " q4 vs original: cosine ", cos);
+            if (method == QuantMethod::Rtn) {
+                cos_rtn = cos;
+                CHECK(r.awq == 0);
+            } else {
+                CHECK(r.awq == r.q4);
+                CHECK(r.awq_gain > 0);
+                CHECK(cos >= cos_rtn - 0.002);
+                if (dev::enabled()) {
+                    SessionOptions gpu = dev::options();
+                    gpu.precision = DType::F16;
+                    const std::vector<float> device_logits =
+                        last_logits(*dev::backend().compile(pack->graph(), pack->weights(), gpu), *pack, ids);
+                    CHECK(cosine(device_logits, logits) > 0.9999);
+                }
+            }
+        }
+    }
+
     TEST_CASE("refuses to overwrite, to convert a pack, and bad formats") {
         const TempDir work("xs_convert_refusals");
         const fs::path src = work.path / "tiny";
