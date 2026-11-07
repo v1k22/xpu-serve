@@ -1,10 +1,9 @@
 #pragma once
 
-// Shared setup for the OpenVINO backend tests: the device under test (XS_OV_TEST_DEVICE, default CPU), its
-// precision (f32 on CPU, f16 elsewhere; XS_DEVICE_TEST_PRECISION=f32|f16 overrides), per-precision tolerances and an
-// optional per-op error report (XS_OV_TEST_REPORT=1 prints "ov-error <op> max_abs=... max_rel=..." lines).
-// XS_DEVICE_TEST_BACKEND=sycl runs the backend-neutral suites (ops, attention, encoder ops, recurrent ops) against
-// another backend of this build.
+// Shared setup for the GPU backend tests (the SYCL backend): they run when XS_DEVICE_TEST_DEVICE names a device
+// (e.g. GPU.0) in a build with the SYCL backend, and skip otherwise. Precision f16, or f32 with
+// XS_DEVICE_TEST_PRECISION=f32; per-precision tolerances; XS_DEVICE_TEST_REPORT=1 prints
+// "device-error <op> max_abs=... max_rel=..." lines.
 
 #include <doctest/doctest.h>
 
@@ -19,28 +18,26 @@
 #include "backend_test_util.h"
 #include "util/log.h"
 
-namespace xs::test::ov {
+namespace xs::test::device {
 
-inline std::string backend_name() {
-    const char* name = std::getenv("XS_DEVICE_TEST_BACKEND");
-    return name != nullptr && *name != '\0' ? name : "openvino";
+inline std::string device() {
+    const char* d = std::getenv("XS_DEVICE_TEST_DEVICE");
+    return d != nullptr ? d : "";
+}
+
+inline bool enabled() {
+    const std::vector<std::string> built = available_backends();
+    return !device().empty() && std::find(built.begin(), built.end(), "sycl") != built.end();
 }
 
 // The two attention implementations to cover, as values of the backend's "attention" option.
 inline std::vector<std::string> attention_impls() {
-    if (backend_name() == "sycl") return {"rows", "gemm"};
-    return {"sdpa", "matmul"};
-}
-
-inline std::string device() {
-    const char* d = std::getenv("XS_OV_TEST_DEVICE");
-    return d != nullptr && *d != '\0' ? d : "CPU";
+    return {"rows", "gemm"};
 }
 
 inline DType precision() {
     const char* p = std::getenv("XS_DEVICE_TEST_PRECISION");
-    if (p != nullptr && *p != '\0') return std::string(p) == "f32" ? DType::F32 : DType::F16;
-    return device() == "CPU" ? DType::F32 : DType::F16;
+    return p != nullptr && std::string(p) == "f32" ? DType::F32 : DType::F16;
 }
 inline bool is_f16() {
     return precision() == DType::F16;
@@ -54,12 +51,11 @@ inline SessionOptions options(int64_t max_context = 4096) {
     return o;
 }
 
-// One backend (one ov::Core) for the whole test binary: creating a Core loads the device plugins. XS_OV_TEST_LOG
-// sets the log level (e.g. "debug" lists the ops each compiled model runs).
+// One backend for the whole test binary. XS_DEVICE_TEST_LOG sets the log level.
 inline Backend& backend() {
     static const std::unique_ptr<Backend> instance = [] {
-        if (const char* level = std::getenv("XS_OV_TEST_LOG")) log::set_level(log::parse_level(level));
-        return make_backend(backend_name());
+        if (const char* level = std::getenv("XS_DEVICE_TEST_LOG")) log::set_level(log::parse_level(level));
+        return make_backend("sycl");
     }();
     return *instance;
 }
@@ -83,9 +79,9 @@ inline bool close(const std::string& op, const HostTensor& actual, const Tensor6
     for (double e : expected.data)
         scale = std::max(scale, std::abs(e));
     const bool ok = all_close(actual, expected, tol.atol, tol.rtol);
-    const char* report = std::getenv("XS_OV_TEST_REPORT");
+    const char* report = std::getenv("XS_DEVICE_TEST_REPORT");
     if (report != nullptr && std::string(report) == "1") {
-        const std::string line = str_cat("ov-error ", op, " max_abs=", max_abs,
+        const std::string line = str_cat("device-error ", op, " max_abs=", max_abs,
                                          " max_rel=", scale > 0 ? max_abs / scale : 0.0, ok ? "" : " FAIL");
         MESSAGE(line);
     }
@@ -97,4 +93,4 @@ inline TensorMap run(const graph::Graph& g, const WeightStore& weights, const Te
     return run_once(backend(), g, weights, inputs, o);
 }
 
-}  // namespace xs::test::ov
+}  // namespace xs::test::device

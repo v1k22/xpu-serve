@@ -10,7 +10,7 @@
 #include "backend_test_util.h"
 #include "graph/graph.h"
 
-namespace xs::test::ov {
+namespace xs::test::device {
 
 struct TinyModelSpec {
     int64_t vocab = 64;
@@ -93,4 +93,4 @@ inline TensorMap tiny_inputs(const TinyModelSpec& s, int32_t begin, int32_t end)
     return {{"ids", HostTensor::from_vector(DType::I32, {end - begin}, ids)}, {"pos", arange_i32(begin, end)}};
 }
 
-}  // namespace xs::test::ov
+}  // namespace xs::test::device

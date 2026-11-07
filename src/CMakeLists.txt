@@ -32,16 +32,6 @@ xs_add_library(xs_chat DIRS chat DEPS ${xs_chat_deps})
 
 xs_add_library(xs_backend_cpu DIRS backend/cpu_ref DEPS xs_core)
 
-if(XS_WITH_OPENVINO)
-  xs_add_library(xs_backend_openvino DIRS backend/openvino DEPS xs_core openvino::runtime)
-  # ov::op::internal::GatedDeltaNet comes from a vendored dev-API header that must match the runtime version.
-  if(NOT OpenVINO_VERSION VERSION_EQUAL 2026.4.1)
-    message(FATAL_ERROR "the OpenVINO backend needs OpenVINO 2026.4.1 (found ${OpenVINO_VERSION}): "
-                        "third_party/openvino_dev holds headers of that version")
-  endif()
-  target_include_directories(xs_backend_openvino SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openvino_dev)
-endif()
-
 if(XS_WITH_SYCL)
   xs_add_library(xs_backend_sycl DIRS backend/sycl DEPS xs_core)
   set(xs_sycl_flags -fsycl)
@@ -58,10 +48,6 @@ endif()
 add_library(xs_backends STATIC backend/registry.cpp)
 target_include_directories(xs_backends PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xs_backends PUBLIC xs_core xs_backend_cpu PRIVATE xs_warnings)
-if(XS_WITH_OPENVINO)
-  target_link_libraries(xs_backends PUBLIC xs_backend_openvino)
-  target_compile_definitions(xs_backends PRIVATE XS_HAVE_OPENVINO=1)
-endif()
 if(XS_WITH_SYCL)
   target_link_libraries(xs_backends PUBLIC xs_backend_sycl)
   target_compile_definitions(xs_backends PRIVATE XS_HAVE_SYCL=1)

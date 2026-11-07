@@ -1,8 +1,9 @@
 # TODO
 
 The working plan for [DESIGN.md](DESIGN.md). Phases match DESIGN.md section 17.
-**Backend order: OpenVINO first (Phases 1 to 3), then SYCL (Phase 4). Decided 2026-11-07 after the first
-comparison: SYCL is the main GPU backend (`docs/decisions/0007`); OpenVINO stays for CPUs and as a second opinion.**
+**Backends: OpenVINO first (Phases 1 to 3), then SYCL (Phase 4). 2026-11-07: after the first comparison SYCL became
+the GPU backend (`docs/decisions/0007`) and the OpenVINO backend was removed (`docs/decisions/0008`). Open
+OpenVINO-only items were dropped; the rest live in Phase 4. OpenVINO GenAI stays as an external speed baseline.**
 
 **v0.1 (2026-11-06):** Gemma 4 E2B text, served end to end on OpenVINO, weights loaded from the HF checkpoint (convert
 skipped for now, by decision), KV as OpenVINO state rather than engine-owned pages (`docs/decisions/0002`). Ticked items
@@ -32,7 +33,7 @@ Legend: `[x]` done · `[ ]` to do · **Done when** = the check that closes the i
 Everything that does not depend on a GPU backend. All tests run on the CPU reference backend.
 
 ### 0.1 Skeleton
-- [x] CMake project (C++20), one `xpu-serve` binary, options `XPU_BACKEND_OPENVINO` / `XPU_BACKEND_SYCL`
+- [x] CMake project (C++20), one `xpu-serve` binary, options `XS_WITH_SYCL` (on with icpx), `XS_SYCL_TARGETS`
 - [ ] CLI dispatcher: `convert`, `serve`, `run`, `bench`, `check`, `info` (stubs that refuse by name)
 - [x] Vendored deps in `third_party/`: nlohmann/json, cpp-httplib; `NOTICE` started
 - [ ] CTest wiring + GitHub Actions job (Linux, CPU): build + unit tests
@@ -102,25 +103,14 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ---
 
-## Phase 1: OpenVINO backend, Gemma 4 end to end
+## Phase 1: first backend (OpenVINO, since removed), Gemma 4 end to end
 
-- [ ] Decide the OpenVINO pin: a release, or pinned source + `third_party/patches/openvino/` →
-      `scripts/build-openvino.sh` → `docs/decisions/`
 - [x] Step graph → `ov::Model` (opset), dynamic token dims; weights as Constants over the mmapped safetensors
-- [ ] Quantized weights via `Convert → Subtract(zp) → Multiply(scale) → MatMul`; confirm the GPU plugin fuses it
-      (compressed matmul shows up in the perf counters)
 - [ ] Embedding gather from the quantized table; tied LM head; logits only for the rows we sample from
-- [ ] PagedAttention adapter (`backend/openvino/paged_attention.cpp`): engine-owned KV tensors (remote context),
-      block tables, lengths; sliding window; GQA; head dims 256 and 512
-- [ ] Model cache (`CACHE_DIR`) for compile time
 - [ ] Fill in the capabilities table (DESIGN.md 8.5) with what was actually verified
-- [ ] Kernel contracts on OpenVINO (one-op graphs) for every op
-- [ ] Tiny parity on OpenVINO GPU (bf16, q8, q4)
 - [x] Real parity vs Hugging Face fp32 — done for Gemma 4 **E2B** (6 prompts, logits + 32-token greedy) on cpu-ref and
       OpenVINO CPU; 26B-A4B needs MoE + K=V support first
 - [ ] Bench Gemma 4 26B-A4B q4 on B390 and B60 vs the GenAI baseline
-- **Done when:** parity passes and decode tok/s is within 5% of OpenVINO GenAI at 1k / 32k / 64k (same kernels, so a
-  gap means our overhead; find it before moving on).
 
 ---
 
@@ -145,7 +135,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ---
 
-## Phase 3: Speculative decoding (on OpenVINO)
+## Phase 3: Speculative decoding
 
 - [ ] `engine/spec/`: drafter interface, verify step (k+1 positions), greedy acceptance, rejection sampling, KV rollback
 - [ ] Prompt lookup (n-gram) drafter
@@ -175,7 +165,6 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Tiny + real parity on SYCL: op suites at f32 and f16; Gemma 4 E2B and Qwen3.5-4B match HF (f32 cosine 1.0, greedy exact)
 - [ ] Multi-GPU: layer split and tensor split across two Arc Pro B60s in one process
 - [x] End-to-end comparison with OpenVINO 2026.4.1 (docs/decisions/0007); per-op profile with `XS_SYCL_PROFILE=1`
-- [ ] Per-op comparison with OpenVINO (same graph, same inputs) → `bench/`
 - [ ] Tree drafts end to end (capability only SYCL has at first)
 - **Done when:** every contract and parity test passes on SYCL, and the per-op comparison is published.
 

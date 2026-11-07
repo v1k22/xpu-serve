@@ -8,8 +8,7 @@ that moves, adds or renames a file updates the map below in the same commit.
 
 A C++20 LLM inference engine and OpenAI-compatible server for Intel GPUs. One repo, one binary (`xpu-serve`):
 model code, engine, tokenizer, chat templates and HTTP server all live here, and the math runs through a backend
-(SYCL with our own kernels, the main GPU backend; OpenVINO for CPUs and as a second opinion; and a CPU reference used
-as the test oracle).
+(SYCL with our own kernels on Intel GPUs, plus a CPU reference used as the test oracle).
 
 The rule that shapes everything: **one feature = one PR in this repo.** Supporting a model or a feature must never
 need changes in an exporter, a separate pipeline library and a separate server.
@@ -23,15 +22,14 @@ How that works:
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
 Status (see TODO.md): Gemma 4 E2B/E4B (text and images) and Qwen3.5 (dense, text; a hybrid of Gated DeltaNet
-linear attention and full attention), served end to end on OpenVINO (CPU, Arc B390, Arc Pro B60), matching Hugging
+linear attention and full attention), served end to end on the SYCL backend (Arc Pro B60), matching Hugging
 Face fp32 logits and greedy output. One sequence at a time, no quantization yet.
 
 ## 2. Build, run, test
 
 ```bash
 source /opt/intel/oneapi/setvars.sh                       # oneAPI 2026.2: icpx + oneMKL (SYCL backend)
-source /opt/intel/openvino_2026.4.1/setupvars.sh          # optional: OpenVINO 2026.4 runtime
-cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx -DOpenVINO_DIR=$INTEL_OPENVINO_DIR/runtime/cmake
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx
 cmake --build build
 build/tests/xs_tests                                      # every unit test (doctest); model tests skip without a model
 build/src/xpu-serve info                                  # backends and devices
@@ -42,28 +40,25 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
 ```
 
 - icpx turns the SYCL backend on (`XS_WITH_SYCL`); `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` compiles its kernels ahead
-  of time for the Arc Pro B60. Any other C++20 compiler builds OpenVINO and the CPU reference only; without OpenVINO
-  (`-DXS_WITH_OPENVINO=OFF`) only the CPU reference.
-- Useful flags: `--backend sycl|openvino|cpu-ref` (default: the first built, in that order), `--device GPU|GPU.1|CPU`
-  (CPU is OpenVINO or cpu-ref), `--precision f16|f32`, `--ctx N`, `--prefill-chunk N`, `--backend-opt key=value`
-  (SYCL: `attention=auto|rows|gemm`; OpenVINO: `attention=auto|sdpa|matmul`, `activations_scale_factor=F`),
-  `--no-vision`, `--log-level debug`. `xpu-serve <command> --help` lists all of them;
+  of time for the Arc Pro B60. Any other C++20 compiler builds only the CPU reference backend (the test oracle).
+- Useful flags: `--backend sycl|cpu-ref` (default: sycl when built), `--device GPU|GPU.0|GPU.1`, `--precision f16|f32`,
+  `--ctx N`, `--prefill-chunk N`, `--backend-opt attention=auto|rows|gemm`, `--no-vision`, `--log-level debug`. `xpu-serve <command> --help` lists all of them;
   `src/cli/main.cpp` is the source of truth.
 - Run one test case: `build/tests/xs_tests -tc='model matches*'`. Environment for the tests that need files:
-  `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref`, `sycl` or `openvino`),
+  `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref` or `sycl`),
   `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`; `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for
-  tokenizer parity). `XS_OV_PROFILE=1` logs the OpenVINO plugin's costliest op types per decode step when a session
-  ends.
+  tokenizer parity).
 - `XS_SYCL_PROFILE=1` logs the SYCL backend's per-op time per step (each op runs alone); `XS_SYCL_SYNC=1` waits after
   every op and names the op a device error comes from (`XS_SYCL_TRACE=1` also prints each op before it runs).
-- The backend op suites ("openvino ops", "openvino attention", ...) run against SYCL too:
-  `XS_DEVICE_TEST_BACKEND=sycl XS_OV_TEST_DEVICE=GPU.0 [XS_DEVICE_TEST_PRECISION=f32]`.
+- The GPU suites ("device ops", "device attention", "device session", "device vs cpu-ref", ...) run when
+  `XS_DEVICE_TEST_DEVICE=GPU.0` is set (`XS_DEVICE_TEST_PRECISION=f32` for f32; `XS_DEVICE_BENCH=1` adds the decode
+  timing case).
 
 ## 3. Repository map
 
 ```text
 xpu-serve/
-├── CMakeLists.txt          options XS_WITH_OPENVINO, XS_BUILD_TESTS, XS_WERROR; C++20; warnings target
+├── CMakeLists.txt          options XS_WITH_SYCL, XS_SYCL_TARGETS, XS_BUILD_TESTS, XS_WERROR; C++20; warnings target
 ├── README.md               user-facing intro and quick start
 ├── PROJECT.md              this file
 ├── DESIGN.md               the design (why), roadmap, open questions
@@ -89,7 +84,7 @@ area).
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
 | `models/` | xs_core | `model.h` (the `Model` interface), `registry.cpp` (model_type -> code), `config_util` (checked JSON readers), one folder per architecture |
 | `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop), `Sampler`, request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses) |
-| `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `openvino/`, `sycl/` |
+| `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `sycl/` |
 | `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
 | `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls), `plain` |
 | `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming |
@@ -109,8 +104,6 @@ area).
 | `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention |
 | `src/backend/backend.h` | `Backend::compile(graph, weights, options) -> Session`; `Session::run/reset/truncate` |
 | `src/backend/cpu_ref/ops.cpp` | f32/f64 reference kernels, one per op: the accuracy oracle |
-| `src/backend/openvino/ov_translate.cpp` | Step graph -> `ov::Model` (one lowering per op), KV as stateful variables |
-| `src/backend/openvino/ov_attention.cpp` | Attention lowering: mask, GQA by broadcast, SDPA or matmul path |
 | `src/backend/sycl/sycl_backend.cpp` | SYCL session: device dtypes, fusions, per-T memory plan (one arena), op dispatch, KV and state buffers |
 | `src/backend/sycl/sycl_kernels.cpp` | SYCL kernels: elementwise, norms, RoPE, gather, copies, causal conv, gated delta, decode attention, GEMV |
 | `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond) and Attention (per-row kernel with split-K, or GEMMs) |
@@ -173,7 +166,6 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 | Backend | Status | Notes |
 |---|---|---|
 | `cpu-ref` | test oracle | f32 values, f64 accumulation, threaded matmul. Slow by design; correctness only |
-| `openvino` | CPUs, and a second opinion on the GPU | Translates the graph to an `ov::Model` with the OpenVINO C++ opset API; KV and conv state as ReadValue/Assign variables; GatedDelta as OpenVINO's `PagedGatedDeltaNet` (internal op, header vendored in `third_party/openvino_dev`) with session-owned state tables updated in place; bf16 weights converted to f16 (or f32) at compile; runs on CPU and Intel GPUs. Options: `attention=auto|sdpa|matmul`, `gdn=paged|ref`, `activations_scale_factor` |
 | `sycl` | main GPU backend, the default when built (icpx turns it on) | Runs the graph op by op on an in-order Level Zero queue with its own kernels; oneMKL for prefill GEMMs. Weights and KV f16 (f32 at f32 precision), activations f32. Memory: one arena per step, planned per T from value lifetimes; KV slots grow by doubling; conv/recurrent state double-buffered so a failed step changes nothing. Fuses act(x)*gate and conv+SiLU. Decode attention reads only the sliding window and splits long caches across work-groups. Option `attention=auto|rows|gemm`. See docs/decisions/0007 |
 
 ## 7. Tests (`tests/`)
@@ -185,8 +177,8 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/test_graph.cpp`, `test_half.cpp`, `test_base64.cpp` | IR shape inference and validation; f16/bf16 conversions; base64 | hand-written expectations, RFC 4648 vectors |
 | `tests/unit/image/` | decoding, resize, hashing | Pillow-written images; torchvision resize outputs in `tests/fixtures/image/` (bit-exact) |
 | `tests/unit/backend/cpu_*.cpp` | each op on cpu-ref (`cpu_encoder_ops.cpp`: the encoder ops and stateless sessions), KV sessions, attention masks | fp64 references in `reference_ops.h`, with planted-bug controls |
-| `tests/unit/backend/ov_*.cpp` | each op on OpenVINO (`ov_encoder_ops.cpp` likewise), sessions, cross-backend agreement, decode timing | the same references; skip without OpenVINO |
-| `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on both backends | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |
+| `tests/unit/backend/device_*.cpp` | each op on the GPU backend (`device_encoder_ops.cpp` likewise), sessions, agreement with cpu-ref, decode timing | the same references; skip unless `XS_DEVICE_TEST_DEVICE` is set |
+| `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on cpu-ref and the GPU | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |
 | `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`; tables from `gen_unicode_tables.py`) |
 | `tests/unit/chat/` | template rendering, Gemma 4 and Qwen3.5 output parsing | `apply_chat_template` outputs in `tests/fixtures/chat/` |
 | `tests/unit/server/` | request parsing, response format, stop strings, HTTP end to end | a fake `InferenceService` (`fake_service.h`) |
@@ -231,15 +223,13 @@ Touch, in this order:
 2. `src/graph/graph.cpp`: `op_name`, builder with operand checks and shape inference; extend `tests/unit/test_graph.cpp`.
 3. `tests/unit/backend/reference_ops.h`: an fp64 reference.
 4. `src/backend/cpu_ref/ops.{h,cpp}` + the switch in `cpu_backend.cpp`; test in `tests/unit/backend/cpu_ops.cpp`.
-5. `src/backend/openvino/ov_translate.cpp` (and `ov_attention.cpp` for attention); test in
-   `tests/unit/backend/ov_ops.cpp` on CPU, then run the same test on both GPUs.
-6. `src/backend/sycl/`: a kernel in `sycl_kernels.cpp` and a case in `SyclSession::launch` (operand dtypes in
-   `check_ops`); run the same suites with `XS_DEVICE_TEST_BACKEND=sycl`.
+5. `src/backend/sycl/`: a kernel in `sycl_kernels.cpp` and a case in `SyclSession::launch` (operand dtypes in
+   `check_ops`); test in `tests/unit/backend/device_ops.cpp`, run with `XS_DEVICE_TEST_DEVICE=GPU.0` at f16 and f32.
 
 ### 8.3 Add a backend option
 
 `SessionOptions::extra` carries `--backend-opt key=value`. Each backend parses its own keys and refuses unknown ones by
-name (`parse_extra` in `ov_backend.cpp`).
+name (the option loop in `SyclBackend::compile`, `sycl_backend.cpp`).
 
 ### 8.4 Add an API field
 
@@ -267,5 +257,5 @@ Parse and validate it in `src/server/openai_request.cpp` (a bad value is a 400 n
   are not loaded). No audio or video. Images only as base64 data: URLs.
 - Linear-attention models re-prefill when a new prompt does not extend the cached sequence (no state snapshots).
 - No `convert`/quantization: weights are converted from bf16 to f16 at load.
-- One sequence at a time; no batching. KV lives in OpenVINO state; truncation copies through the host.
-- Sliding-window layers keep every key (memory grows with context).
+- One sequence at a time; no batching.
+- Sliding-window layers keep every key in memory (the kernels read only the window; memory still grows with context).

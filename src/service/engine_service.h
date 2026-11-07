@@ -15,7 +15,7 @@
 namespace xs {
 
 struct ServiceOptions {
-    std::string backend = "openvino";
+    std::string backend = "sycl";
     SessionOptions session;
     EngineOptions engine;
     std::string model_id;  // empty = the model directory name

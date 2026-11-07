@@ -1,8 +1,8 @@
-// Kernel contract for the OpenVINO backend: every op against an fp64 reference (reference_ops.h), on the device in
-// XS_OV_TEST_DEVICE at its precision.
+// Kernel contract for the GPU backend: every op against an fp64 reference (reference_ops.h), on the device in
+// XS_DEVICE_TEST_DEVICE at its precision.
 #include <doctest/doctest.h>
 
-#include "ov_test_support.h"
+#include "device_test_support.h"
 #include "reference_ops.h"
 #include "util/error.h"
 
@@ -10,23 +10,23 @@ using namespace xs;
 using namespace xs::graph;
 using xs::test::Tensor64;
 using xs::test::to_f64;
-namespace ovt = xs::test::ov;
+namespace dev = xs::test::device;
 
 namespace {
 
 // Elementwise results of O(1) inputs: f32 rounding vs f16 rounding of inputs and output.
-const ovt::Tolerance kElementwise = ovt::tolerance({1e-5, 1e-5}, {2e-3, 2e-3});
+const dev::Tolerance kElementwise = dev::tolerance({1e-5, 1e-5}, {2e-3, 2e-3});
 
 // Data movement only: exact in f32; f16 activations round each value once (half an f16 ulp).
-const ovt::Tolerance kStorage = ovt::tolerance({0, 0}, {0, 4.9e-4});
+const dev::Tolerance kStorage = dev::tolerance({0, 0}, {0, 4.9e-4});
 
 HostTensor run_out(const Graph& g, const WeightStore& w, const TensorMap& inputs) {
-    return ovt::run(g, w, inputs).at("out");
+    return dev::run(g, w, inputs).at("out");
 }
 
 }  // namespace
 
-TEST_SUITE("openvino ops") {
+TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
     TEST_CASE("matmul against fp64 for every weight dtype, static and dynamic T") {
         test::TensorRng rng(1);
         struct Case {
@@ -50,7 +50,7 @@ TEST_SUITE("openvino ops") {
             g.output("out", g.matmul(g.input("x", DType::F32, x_dims), g.weight(w, "w")));
             const HostTensor out = run_out(g, w, {{"x", x}});
             const Tensor64 expected = test::ref::matmul(to_f64(x), to_f64(w.tensor("w")));
-            CHECK(ovt::close("matmul", out, expected, ovt::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+            CHECK(dev::close("matmul", out, expected, dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
         }
     }
 
@@ -75,7 +75,7 @@ TEST_SUITE("openvino ops") {
                 const HostTensor out = run_out(g, test::MemoryWeights{}, {{"a", a}, {"b", b}});
                 const Tensor64 expected = test::ref::broadcast(
                     to_f64(a), to_f64(b), [kind](double x, double y) { return kind == OpKind::Add ? x + y : x * y; });
-                CHECK(ovt::close(kind == OpKind::Add ? "add" : "mul", out, expected, kElementwise));
+                CHECK(dev::close(kind == OpKind::Add ? "add" : "mul", out, expected, kElementwise));
             }
         }
     }
@@ -101,7 +101,7 @@ TEST_SUITE("openvino ops") {
             Graph g;
             g.output("out", c.build(g, g.input("x", DType::F32, {kT, 50})));
             const HostTensor out = run_out(g, test::MemoryWeights{}, {{"x", x}});
-            CHECK(ovt::close(c.name, out, test::ref::map(x64, c.ref), ovt::tolerance({1e-5, 1e-5}, {1e-2, 2e-3})));
+            CHECK(dev::close(c.name, out, test::ref::map(x64, c.ref), dev::tolerance({1e-5, 1e-5}, {1e-2, 2e-3})));
         }
     }
 
@@ -121,8 +121,8 @@ TEST_SUITE("openvino ops") {
                 const HostTensor out = run_out(g, w, {{"x", x}});
                 const Tensor64 weight = to_f64(w.tensor("norm"));
                 const Tensor64 expected = test::ref::rms_norm(to_f64(x), with_weight ? &weight : nullptr, 1e-6);
-                CHECK(ovt::close(magnitude > 1 ? "rms_norm_large" : "rms_norm", out, expected,
-                                 ovt::tolerance({1e-5, 1e-5}, {4e-3, 4e-3})));
+                CHECK(dev::close(magnitude > 1 ? "rms_norm_large" : "rms_norm", out, expected,
+                                 dev::tolerance({1e-5, 1e-5}, {4e-3, 4e-3})));
             }
         }
     }
@@ -137,7 +137,7 @@ TEST_SUITE("openvino ops") {
             g.output("out", g.gather(g.weight(w, "table"), g.input("ids", id_type, {kT})));
             const HostTensor out = run_out(g, w, {{"ids", ids}});
             // bf16 values are exact in f16 and f32, so a gather must be exact.
-            CHECK(ovt::close("gather", out, test::ref::gather(to_f64(w.tensor("table")), test::to_ints(ids)), {0, 0}));
+            CHECK(dev::close("gather", out, test::ref::gather(to_f64(w.tensor("table")), test::to_ints(ids)), {0, 0}));
         }
     }
 
@@ -158,7 +158,7 @@ TEST_SUITE("openvino ops") {
             g.output("out", g.slice(g.input("x", DType::F32, {kT, 4, 8}), c.axis, c.begin, c.end));
             const HostTensor out = run_out(g, test::MemoryWeights{}, {{"x", x}});
             const Tensor64 expected = test::ref::slice(x64, static_cast<size_t>(c.axis), c.ref_begin, c.ref_end);
-            CHECK(ovt::close("slice", out, expected, kStorage));
+            CHECK(dev::close("slice", out, expected, kStorage));
         }
         Graph g;
         const Value flat = g.reshape(g.input("x", DType::F32, {kT, 4, 8}), {kT, 32});
@@ -166,7 +166,7 @@ TEST_SUITE("openvino ops") {
         const HostTensor out = run_out(g, test::MemoryWeights{}, {{"x", x}});
         Tensor64 expected = test::ref::map(x64, [](double v) { return 2 * v; });
         expected.shape = {2, 5, 16};
-        CHECK(ovt::close("reshape", out, expected, kStorage));
+        CHECK(dev::close("reshape", out, expected, kStorage));
     }
 
     TEST_CASE("rope rotate-half with zero inv_freq entries, at small and large positions") {
@@ -189,9 +189,9 @@ TEST_SUITE("openvino ops") {
             const std::vector<double> freq64(inv_freq.begin(), inv_freq.end());
             const Tensor64 expected = test::ref::rope(to_f64(x), test::to_ints(pos), freq64);
             // At position 30000 an f32 angle is off by up to ~2e-3 rad (one f32 ulp of the product), as in HF.
-            const ovt::Tolerance tol =
-                first_pos > 0 ? ovt::tolerance({5e-3, 0}, {6e-3, 4e-3}) : ovt::tolerance({1e-5, 1e-5}, {4e-3, 4e-3});
-            CHECK(ovt::close(first_pos > 0 ? "rope_pos30000" : "rope", out, expected, tol));
+            const dev::Tolerance tol =
+                first_pos > 0 ? dev::tolerance({5e-3, 0}, {6e-3, 4e-3}) : dev::tolerance({1e-5, 1e-5}, {4e-3, 4e-3});
+            CHECK(dev::close(first_pos > 0 ? "rope_pos30000" : "rope", out, expected, tol));
             const Tensor64 interleaved =
                 test::ref::rope(to_f64(x), test::to_ints(pos), freq64, test::ref::RopeLayout::Interleaved);
             CHECK_FALSE(test::all_close(out, interleaved, 4e-3, 4e-3));
@@ -206,7 +206,7 @@ TEST_SUITE("openvino ops") {
             g.kv_cache(slot, g.input("k", DType::F32, {kT, 2, 8}), g.input("v", DType::F32, {kT, 2, 8}));
         g.output("k_all", k_all);
         g.output("v_all", g.scale(v_all, 1.0f));
-        const auto session = ovt::backend().compile(g, test::MemoryWeights{}, ovt::options());
+        const auto session = dev::backend().compile(g, test::MemoryWeights{}, dev::options());
         std::vector<HostTensor> ks, vs;
         for (const int64_t t : {3, 1, 2}) {
             ks.push_back(rng.uniform(DType::F32, {t, 2, 8}));
@@ -221,8 +221,8 @@ TEST_SUITE("openvino ops") {
                 v_expected.data.insert(v_expected.data.end(), v64.data.begin(), v64.data.end());
             }
             k_expected.shape = v_expected.shape = {session->num_cached(), 2, 8};
-            CHECK(ovt::close("kv_cache", out.at("k_all"), k_expected, kElementwise));
-            CHECK(ovt::close("kv_cache", out.at("v_all"), v_expected, kElementwise));
+            CHECK(dev::close("kv_cache", out.at("k_all"), k_expected, kElementwise));
+            CHECK(dev::close("kv_cache", out.at("v_all"), v_expected, kElementwise));
         }
     }
 

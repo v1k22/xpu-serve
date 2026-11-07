@@ -536,6 +536,8 @@ template <typename KV>
 void attention_rows(sycl::queue& q, const float* qp, const KV* k, const KV* v, float* out, const AttentionShape& s,
                     int64_t split, float* part) {
     switch (s.head_dim / kSubGroup) {
+        case 1: return attention_rows_t<KV, 1>(q, qp, k, v, out, s, split, part);
+        case 2: return attention_rows_t<KV, 2>(q, qp, k, v, out, s, split, part);
         case 4: return attention_rows_t<KV, 4>(q, qp, k, v, out, s, split, part);
         case 8: return attention_rows_t<KV, 8>(q, qp, k, v, out, s, split, part);
         case 16: return attention_rows_t<KV, 16>(q, qp, k, v, out, s, split, part);

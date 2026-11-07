@@ -2,7 +2,7 @@
 // (tests/parity/model/hf_reference.py), for whichever model XS_TEST_MODEL_DIR holds. Opt-in: needs XS_TEST_MODEL_DIR
 // and the generated fixtures.
 //
-//   XS_PARITY_BACKEND   cpu-ref (default) | openvino
+//   XS_PARITY_BACKEND   cpu-ref (default) | sycl
 //   XS_PARITY_DEVICE    backend device, e.g. GPU
 //   XS_PARITY_PRECISION f32 (default) | f16
 //   XS_PARITY_FIXTURES  default: <source>/tests/fixtures/generated/<model_type of the model>

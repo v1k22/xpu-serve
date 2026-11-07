@@ -10,7 +10,6 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-option(XS_WITH_OPENVINO "Build the OpenVINO backend" ON)
 # The SYCL backend (the main GPU backend) builds whenever the compiler is oneAPI's icpx.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
   set(xs_sycl_default ON)
@@ -37,15 +36,6 @@ if(XS_WITH_SYCL)
   find_package(MKL CONFIG REQUIRED)
 endif()
 
-if(XS_WITH_OPENVINO)
-  # Point OpenVINO_DIR at <openvino>/runtime/cmake, or source <openvino>/setupvars.sh first.
-  find_package(OpenVINO COMPONENTS Runtime)
-  if(NOT OpenVINO_FOUND)
-    message(WARNING "OpenVINO not found: building without the OpenVINO backend")
-    set(XS_WITH_OPENVINO OFF)
-  endif()
-endif()
-
 # Warnings for our own code only (third_party is compiled through its own targets).
 add_library(xs_warnings INTERFACE)
 target_compile_options(xs_warnings INTERFACE -Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor
@@ -62,5 +52,4 @@ if(XS_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-message(STATUS "xpu-serve ${PROJECT_VERSION}: OpenVINO backend = ${XS_WITH_OPENVINO}, SYCL backend = ${XS_WITH_SYCL}, "
-               "tests = ${XS_BUILD_TESTS}")
+message(STATUS "xpu-serve ${PROJECT_VERSION}: SYCL backend = ${XS_WITH_SYCL}, tests = ${XS_BUILD_TESTS}")

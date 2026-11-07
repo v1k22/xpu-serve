@@ -397,8 +397,8 @@ private:
                     need(1, is_fp(1), "f16 or f32");
                     need(2, dt(n.inputs[2]) == dt(n.inputs[1]), "the dtype of k");
                     const int64_t d = graph_.type(n.inputs[0]).shape.back();
-                    XS_CHECK(d == 64 || d == 128 || d == 192 || d == 256 || d == 512, where(i), ": head_dim ", d,
-                             " is not supported (64, 128, 192, 256, 512)");
+                    XS_CHECK(d == 16 || d == 32 || d == 64 || d == 128 || d == 192 || d == 256 || d == 512, where(i),
+                             ": head_dim ", d, " is not supported (16, 32, 64, 128, 192, 256, 512)");
                     break;
                 }
                 case OpKind::GatedDelta: {
@@ -605,24 +605,29 @@ private:
         for (const auto& [name, tensor] : inputs) {
             const bool known = std::any_of(graph_inputs.begin(), graph_inputs.end(),
                                            [&](const Value& v) { return input_name(v) == name; });
-            XS_CHECK(known, "input '", name, "' is not a graph input");
+            if (!known) fail("input '", name, "' is not an input of this graph");
         }
         Step step;
         bool have_tokens = false;
         for (const Value& v : graph_inputs) {
             const std::string& name = input_name(v);
             const auto it = inputs.find(name);
-            XS_CHECK(it != inputs.end(), "missing graph input '", name, "'");
+            if (it == inputs.end()) fail("graph input '", name, "' is missing");
             const graph::TensorType& type = graph_.type(v);
             const HostTensor& t = it->second;
-            XS_CHECK(t.dtype() == type.dtype, "input '", name, "' must be ", dtype_name(type.dtype), ", got ",
-                     dtype_name(t.dtype()));
-            XS_CHECK(t.rank() == type.shape.size(), "input '", name, "' must have shape ",
-                     graph::shape_to_string(type.shape), ", got ", dims_to_string(t.shape()));
+            if (t.dtype() != type.dtype) {
+                fail("input '", name, "' has dtype ", dtype_name(t.dtype()), "; the graph expects ",
+                     dtype_name(type.dtype));
+            }
+            if (t.rank() != type.shape.size()) {
+                fail("input '", name, "' has shape ", dims_to_string(t.shape()), "; the graph expects ",
+                     graph::shape_to_string(type.shape));
+            }
             for (size_t d = 0; d < type.shape.size(); ++d) {
                 if (type.shape[d] != kT) continue;
-                XS_CHECK(!have_tokens || t.dim(d) == step.tokens, "input '", name, "' has ", t.dim(d),
-                         " tokens; another input has ", step.tokens);
+                if (have_tokens && t.dim(d) != step.tokens) {
+                    fail("input '", name, "' has T = ", t.dim(d), " but another input has T = ", step.tokens);
+                }
                 step.tokens = t.dim(d);
                 have_tokens = true;
             }
@@ -630,9 +635,10 @@ private:
         step.kv_len = cached_ + step.tokens;
         for (const Value& v : graph_inputs) {
             const HostTensor& t = inputs.at(input_name(v));
-            XS_CHECK(t.shape() == resolve(graph_.type(v).shape, step), "input '", input_name(v), "' must have shape ",
-                     graph::shape_to_string(graph_.type(v).shape), " (T=", step.tokens, ", L=", step.kv_len, "), got ",
-                     dims_to_string(t.shape()));
+            if (t.shape() != resolve(graph_.type(v).shape, step)) {
+                fail("input '", input_name(v), "' has shape ", dims_to_string(t.shape()), "; the graph expects ",
+                     graph::shape_to_string(graph_.type(v).shape), " (T=", step.tokens, ", L=", step.kv_len, ")");
+            }
         }
         // Gather ids index device memory: check them here, where they are host data.
         for (const Node& n : graph_.nodes()) {
@@ -641,8 +647,10 @@ private:
             const int64_t rows = graph_.type(n.inputs[0]).shape[0];
             for (int64_t i = 0; i < ids.numel(); ++i) {
                 const int64_t id = ids.dtype() == DType::I32 ? ids.data<int32_t>()[i] : ids.data<int64_t>()[i];
-                XS_CHECK(id >= 0 && id < rows, "gather id ", id, " at index ", i, " is outside the table of ", rows,
-                         " rows");
+                if (id < 0 || id >= rows) {
+                    fail("input '", input_name(n.inputs[1]), "': id ", id, " at index ", i, " is outside the table of ",
+                         rows, " rows");
+                }
             }
         }
         return step;

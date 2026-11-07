@@ -52,7 +52,6 @@ void add_engine_options(Args& a) {
         .value("precision", "compute precision: f16 | f32", "f16")
         .value("ctx", "context length in tokens (prompt + output)", "8192")
         .value("prefill-chunk", "tokens per prefill step", "1024")
-        .value("cache-dir", "backend compile cache directory")
         .value("backend-opt", "backend options as key=value[,key=value]")
         .value("log-level", "debug | info | warn | error", "info")
         .flag("no-vision", "do not load the model's vision encoder (text only)")
@@ -74,7 +73,6 @@ ServiceOptions service_options(const Args& a) {
     o.vision = !a.has("no-vision");
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");
-    o.session.cache_dir = a.get("cache-dir");
     const std::string& opts = a.get("backend-opt");
     for (size_t pos = 0; pos < opts.size();) {
         const size_t comma = std::min(opts.find(',', pos), opts.size());

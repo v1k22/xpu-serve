@@ -1,13 +1,12 @@
 // Attention through the stateful KV cache against the fp64 reference: head dims 64/256/512, GQA, sliding window,
-// softcap, both lowerings (OpenVINO: ScaledDotProductAttention and MatMul/Softmax; SYCL: per-row kernel and GEMMs),
-// over several steps of different T.
+// softcap, both attention paths (the per-row kernel and GEMMs), over several steps of different T.
 #include <doctest/doctest.h>
 
 #include <cmath>
 #include <string>
 #include <vector>
 
-#include "ov_test_support.h"
+#include "device_test_support.h"
 #include "reference_ops.h"
 #include "util/error.h"
 
@@ -15,11 +14,11 @@ using namespace xs;
 using namespace xs::graph;
 using xs::test::Tensor64;
 using xs::test::to_f64;
-namespace ovt = xs::test::ov;
+namespace dev = xs::test::device;
 
 namespace {
 
-const ovt::Tolerance kAttention = ovt::tolerance({1e-5, 1e-4}, {4e-3, 4e-3});
+const dev::Tolerance kAttention = dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3});
 
 struct AttentionCase {
     int64_t heads = 4;
@@ -59,12 +58,12 @@ void append_rows(Tensor64& all, const HostTensor& rows) {
 
 // Runs every step of `c` through one session. Returns false at the first step whose output is not within `tol` of
 // the reference computed with `reference_spec`.
-bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& reference_spec, ovt::Tolerance tol,
+bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& reference_spec, dev::Tolerance tol,
                        uint32_t seed) {
     test::TensorRng rng(seed);
-    SessionOptions options = ovt::options();
+    SessionOptions options = dev::options();
     options.extra["attention"] = c.impl;
-    const auto session = ovt::backend().compile(attention_graph(c), test::MemoryWeights{}, options);
+    const auto session = dev::backend().compile(attention_graph(c), test::MemoryWeights{}, options);
     Tensor64 k_all, v_all;
     bool ok = true;
     for (const int64_t t : c.steps) {
@@ -76,7 +75,7 @@ bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& r
         TensorMap out;
         session->run({{"q", q}, {"k", k}, {"v", v}}, out);
         const Tensor64 expected = test::ref::attention(to_f64(q), k_all, v_all, reference_spec);
-        ok = ovt::close(str_cat("attention ", describe(c)), out.at("out"), expected, tol) && ok;
+        ok = dev::close(str_cat("attention ", describe(c)), out.at("out"), expected, tol) && ok;
     }
     return ok;
 }
@@ -87,11 +86,11 @@ bool attention_matches(const AttentionCase& c, uint32_t seed) {
 
 }  // namespace
 
-TEST_SUITE("openvino attention") {
+TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
     TEST_CASE("causal attention with GQA for head dims 64, 256 and 512, both lowerings") {
         for (const int64_t head_dim : {64, 256, 512}) {
             for (const auto& [heads, kv_heads] : {std::pair<int64_t, int64_t>{4, 4}, {8, 2}, {8, 1}}) {
-                for (const std::string& impl : ovt::attention_impls()) {
+                for (const std::string& impl : dev::attention_impls()) {
                     AttentionCase c;
                     c.head_dim = head_dim;
                     c.heads = heads;
@@ -106,7 +105,7 @@ TEST_SUITE("openvino attention") {
 
     TEST_CASE("sliding window over a prefill longer than the window, then decode steps") {
         for (const int64_t head_dim : {64, 256, 512}) {
-            for (const std::string& impl : ovt::attention_impls()) {
+            for (const std::string& impl : dev::attention_impls()) {
                 AttentionCase c;
                 c.head_dim = head_dim;
                 c.heads = 8;
@@ -122,7 +121,7 @@ TEST_SUITE("openvino attention") {
 
     TEST_CASE("decode over a long cache, whole and windowed (split across work-groups on SYCL)") {
         for (const int64_t window : {0, 1100}) {
-            for (const std::string& impl : ovt::attention_impls()) {
+            for (const std::string& impl : dev::attention_impls()) {
                 AttentionCase c;
                 c.head_dim = 128;
                 c.heads = 8;
@@ -156,7 +155,7 @@ TEST_SUITE("openvino attention") {
     }
 
     TEST_CASE("planted bug: a reference whose window is one key wider must not match") {
-        for (const std::string& impl : ovt::attention_impls()) {
+        for (const std::string& impl : dev::attention_impls()) {
             AttentionCase c;
             c.window = 3;
             c.impl = impl;
@@ -165,15 +164,5 @@ TEST_SUITE("openvino attention") {
             CHECK(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, kAttention, 300));
             CHECK_FALSE(attention_matches(c, {scale_of(c), c.window, 0.0, 1}, kAttention, 300));
         }
-    }
-
-    TEST_CASE("sdpa cannot express a softcap and says so") {
-        if (ovt::backend_name() != "openvino") return;
-        AttentionCase c;
-        c.softcap = 30.0f;
-        SessionOptions options = ovt::options();
-        options.extra["attention"] = "sdpa";
-        CHECK_THROWS_WITH_AS(ovt::backend().compile(attention_graph(c), test::MemoryWeights{}, options),
-                             doctest::Contains("softcap"), Error);
     }
 }

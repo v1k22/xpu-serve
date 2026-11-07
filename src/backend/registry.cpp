@@ -2,32 +2,23 @@
 
 #include "backend/cpu_ref/cpu_backend.h"
 #include "util/error.h"
-#ifdef XS_HAVE_OPENVINO
-#include "backend/openvino/ov_backend.h"
-#endif
 #ifdef XS_HAVE_SYCL
 #include "backend/sycl/sycl_backend.h"
 #endif
 
 namespace xs {
 
-// In order of preference: the first is the CLI's default. SYCL is the main GPU backend (docs/decisions/0007).
+// In order of preference: the first is the CLI's default.
 std::vector<std::string> available_backends() {
     std::vector<std::string> out;
 #ifdef XS_HAVE_SYCL
     out.emplace_back("sycl");
-#endif
-#ifdef XS_HAVE_OPENVINO
-    out.emplace_back("openvino");
 #endif
     out.emplace_back("cpu-ref");
     return out;
 }
 
 std::unique_ptr<Backend> make_backend(std::string_view name) {
-#ifdef XS_HAVE_OPENVINO
-    if (name == "openvino") return make_openvino_backend();
-#endif
 #ifdef XS_HAVE_SYCL
     if (name == "sycl") return make_sycl_backend();
 #endif

@@ -27,7 +27,6 @@ struct SessionOptions {
     std::string device;                // empty = backend default
     DType precision = DType::F16;      // compute precision for activations and weights (F16 or F32)
     int64_t max_context = 8192;        // upper bound on tokens per sequence (sizes caches)
-    std::string cache_dir;             // compiled-model cache, empty = none
     std::map<std::string, std::string> extra;  // backend-specific options, refused by name when unknown
 };
 
@@ -59,7 +58,7 @@ public:
                                              const SessionOptions& options) = 0;
 };
 
-// Backends compiled into this binary, e.g. {"openvino", "cpu-ref"}.
+// Backends compiled into this binary, in order of preference, e.g. {"sycl", "cpu-ref"}.
 std::vector<std::string> available_backends();
 // Throws xs::Error listing the available backends when `name` is unknown.
 std::unique_ptr<Backend> make_backend(std::string_view name);
