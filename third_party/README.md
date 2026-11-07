@@ -8,7 +8,7 @@ Pinned copies. Update one dependency per commit and note the new version here.
 | `httplib/` | [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) | v0.57.1 | MIT |
 | `doctest/` | [doctest/doctest](https://github.com/doctest/doctest) (tests only) | v2.5.3 | MIT |
 | `stb/` | [nothings/stb](https://github.com/nothings/stb) `stb_image.h` (image decoding; JPEG, PNG, BMP, GIF enabled in `stb_image.cpp`) | v2.30, identical to upstream master (sha256 `594c2fe3...4200b3`) | public domain or MIT |
-| `openvino_dev/` | [openvinotoolkit/openvino](https://github.com/openvinotoolkit/openvino) dev-API header for the `GatedDeltaNet` op (see `openvino_dev/PROVENANCE.md`) | 2026.2.1, unchanged | Apache-2.0 |
+| `openvino_dev/` | [openvinotoolkit/openvino](https://github.com/openvinotoolkit/openvino) dev-API header for the `GatedDeltaNet` op (see `openvino_dev/PROVENANCE.md`) | 2026.4.1, unchanged | Apache-2.0 |
 | `jinja_cpp/` | [wangzhaode/jinja.cpp](https://github.com/wangzhaode/jinja.cpp) as vendored and fixed in [mlx-serve](https://github.com/ddalcu/mlx-serve) `lib/jinja_cpp` | mlx-serve `1f1332d7` + 4 fixes (see `jinja_cpp/PROVENANCE.md`) | Apache-2.0 |
 
 Fixes we make to vendored code are kept small, and each one is listed in that directory's notes.

@@ -11,10 +11,10 @@ the code.
 
 ## Build
 
-Needs a C++20 compiler (g++ 11 or newer), CMake 3.22+, Ninja, and the OpenVINO 2026.2 runtime archive.
+Needs a C++20 compiler (g++ 11 or newer), CMake 3.22+, Ninja, and the OpenVINO 2026.4 runtime archive.
 
 ```bash
-source /opt/intel/openvino_2026.2.1/setupvars.sh        # or wherever OpenVINO is unpacked
+source /opt/intel/openvino_2026.4.1/setupvars.sh        # or wherever OpenVINO is unpacked
 cmake -S . -B build -G Ninja -DOpenVINO_DIR=$INTEL_OPENVINO_DIR/runtime/cmake
 cmake --build build
 build/tests/xs_tests                                     # unit tests

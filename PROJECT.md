@@ -28,7 +28,7 @@ Face fp32 logits and greedy output. One sequence at a time, no quantization yet.
 ## 2. Build, run, test
 
 ```bash
-source /opt/intel/openvino_2026.2.1/setupvars.sh          # OpenVINO 2026.2 runtime
+source /opt/intel/openvino_2026.4.1/setupvars.sh          # OpenVINO 2026.4 runtime
 cmake -S . -B build -G Ninja -DOpenVINO_DIR=$INTEL_OPENVINO_DIR/runtime/cmake
 cmake --build build
 build/tests/xs_tests                                      # every unit test (doctest); model tests skip without a model
