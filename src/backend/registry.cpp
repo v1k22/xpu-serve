@@ -11,13 +11,14 @@
 
 namespace xs {
 
+// In order of preference: the first is the CLI's default. SYCL is the main GPU backend (docs/decisions/0007).
 std::vector<std::string> available_backends() {
     std::vector<std::string> out;
-#ifdef XS_HAVE_OPENVINO
-    out.emplace_back("openvino");
-#endif
 #ifdef XS_HAVE_SYCL
     out.emplace_back("sycl");
+#endif
+#ifdef XS_HAVE_OPENVINO
+    out.emplace_back("openvino");
 #endif
     out.emplace_back("cpu-ref");
     return out;

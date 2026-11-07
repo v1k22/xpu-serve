@@ -2,41 +2,37 @@
 Experimental engine to run LLMs on Intel platforms.
 
 One repo, one binary: the model code, the engine, the tokenizer, chat templates and an OpenAI-compatible server all
-live here, and the math runs on an Intel GPU through a backend (OpenVINO, or the experimental SYCL backend). Read
+live here, and the math runs on an Intel GPU through a backend: SYCL with our own kernels (the main one), or OpenVINO.
+Read
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
 **Status: v0.3.** Gemma 4 E2B / E4B (text and images) and Qwen3.5 (dense, text), weights loaded straight from the
-Hugging Face checkpoint (no convert step yet), one request at a time, OpenVINO backend and an experimental SYCL backend
-(own kernels). [PROJECT.md](PROJECT.md) maps the code.
+Hugging Face checkpoint (no convert step yet), one request at a time, on the SYCL backend (Intel GPUs) or OpenVINO
+(Intel GPUs and CPUs). [PROJECT.md](PROJECT.md) maps the code.
 
 ## Build
 
-Needs a C++20 compiler (g++ 11 or newer), CMake 3.22+, Ninja, and the OpenVINO 2026.4 runtime archive.
+Needs CMake 3.22+, Ninja and the oneAPI toolkit 2026.2 (DPC++ compiler `icpx` and oneMKL) for the SYCL backend, plus,
+optionally, the OpenVINO 2026.4 runtime archive for the OpenVINO backend (CPU, or a second opinion on the GPU).
 
 ```bash
-source /opt/intel/openvino_2026.4.1/setupvars.sh        # or wherever OpenVINO is unpacked
-cmake -S . -B build -G Ninja -DOpenVINO_DIR=$INTEL_OPENVINO_DIR/runtime/cmake
+source /opt/intel/oneapi/setvars.sh                      # oneAPI 2026.2
+source /opt/intel/openvino_2026.4.1/setupvars.sh         # optional: OpenVINO 2026.4
+cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx -DOpenVINO_DIR=$INTEL_OPENVINO_DIR/runtime/cmake
 cmake --build build
 build/tests/xs_tests                                     # unit tests
 ```
 
-The SYCL backend (experimental, Intel GPUs through Level Zero) needs the oneAPI toolkit 2026.2 (DPC++ compiler and
-oneMKL):
-
-```bash
-source /opt/intel/oneapi/setvars.sh
-cmake -S . -B build-sycl -G Ninja -DCMAKE_CXX_COMPILER=icpx -DXS_WITH_SYCL=ON \
-      -DOpenVINO_DIR=$INTEL_OPENVINO_DIR/runtime/cmake      # OpenVINO is optional here
-cmake --build build-sycl
-build-sycl/src/xpu-serve run ~/models/gemma-4-E2B-it --backend sycl --device GPU.0
-```
+Add `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` to compile the SYCL kernels ahead of time for the Arc Pro B60 (otherwise
+they compile at first use). Without oneAPI, any C++20 compiler (g++ 11 or newer) builds the OpenVINO and CPU
+reference backends only.
 
 ## Run
 
 Any Hugging Face directory of a supported model works, e.g. `google/gemma-4-E2B-it` or `Qwen/Qwen3.5-4B`:
 
 ```bash
-build/src/xpu-serve info                                           # backends and devices
+build/src/xpu-serve info                                           # backends and devices (the first is the default)
 build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU     # chat in the terminal
 build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --image photo.jpg --prompt "What is in this picture?"
 build/src/xpu-serve serve ~/models/gemma-4-E2B-it --device GPU     # http://127.0.0.1:8080/v1

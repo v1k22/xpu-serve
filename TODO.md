@@ -1,8 +1,8 @@
 # TODO
 
 The working plan for [DESIGN.md](DESIGN.md). Phases match DESIGN.md section 17.
-**Backend order: OpenVINO first (Phases 1 to 3), then SYCL (Phase 4). The main backend is chosen in Phase 5,
-after experiments.**
+**Backend order: OpenVINO first (Phases 1 to 3), then SYCL (Phase 4). Decided 2026-11-07 after the first
+comparison: SYCL is the main GPU backend (`docs/decisions/0007`); OpenVINO stays for CPUs and as a second opinion.**
 
 **v0.1 (2026-11-06):** Gemma 4 E2B text, served end to end on OpenVINO, weights loaded from the HF checkpoint (convert
 skipped for now, by decision), KV as OpenVINO state rather than engine-owned pages (`docs/decisions/0002`). Ticked items

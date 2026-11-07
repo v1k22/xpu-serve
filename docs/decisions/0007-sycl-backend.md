@@ -1,6 +1,7 @@
-# 0007: SYCL backend (experimental) and the first comparison with OpenVINO
+# 0007: SYCL is the main GPU backend
 
-Date: 2026-11-07 · Status: proposed (SYCL as the main GPU backend; OpenVINO kept for CPU, NPU and as a second opinion)
+Date: 2026-11-07 · Status: accepted. SYCL is the main GPU backend and the default when built; OpenVINO stays for CPU,
+NPU and as a second opinion on the GPU.
 
 **What it is.** `src/backend/sycl/` runs the step graph op by op on an in-order Level Zero queue (oneAPI 2026.2:
 DPC++ and oneMKL). Our own kernels cover every op: elementwise, norms, RoPE, gather, copies, causal conv, the gated
