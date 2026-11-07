@@ -191,6 +191,83 @@ inline Tensor64 axial_rope(const Tensor64& x, const std::vector<std::vector<int6
     return out;
 }
 
+// Partial rotary (Qwen): rotate-half rope over the first `rotary_dim` channels, the rest unchanged.
+inline Tensor64 partial_rope(const Tensor64& x, const std::vector<int64_t>& positions,
+                             const std::vector<double>& inv_freq, int64_t rotary_dim) {
+    const int64_t tokens = x.shape[0], heads = x.shape[1], dim = x.shape[2];
+    const Tensor64 rotated = rope(slice(x, 2, 0, rotary_dim), positions, inv_freq);
+    Tensor64 out = x;
+    for (int64_t t = 0; t < tokens; ++t) {
+        for (int64_t h = 0; h < heads; ++h) {
+            for (int64_t c = 0; c < rotary_dim; ++c)
+                out[(t * heads + h) * dim + c] = rotated[(t * heads + h) * rotary_dim + c];
+        }
+    }
+    return out;
+}
+
+// Depthwise causal conv over a whole sequence x [N, C] with w [C, K] (zeros before the first input), as
+// torch.nn.functional.conv1d(padding=K-1)[..., :N].
+inline Tensor64 causal_conv(const Tensor64& x, const Tensor64& w) {
+    const int64_t n = x.shape[0], c = x.shape[1], k = w.shape[1];
+    Tensor64 out(x.shape);
+    for (int64_t t = 0; t < n; ++t) {
+        for (int64_t ch = 0; ch < c; ++ch) {
+            double acc = 0;
+            for (int64_t j = 0; j < k; ++j) {
+                const int64_t src = t - (k - 1) + j;
+                if (src >= 0) acc += w[ch * k + j] * x[src * c + ch];
+            }
+            out[t * c + ch] = acc;
+        }
+    }
+    return out;
+}
+
+// transformers' torch_recurrent_gated_delta_rule over a whole sequence: q, k [N, Hk, Dk], v [N, Hv, Dv],
+// g, beta [N, Hv]; key heads repeat_interleave'd to the value heads. `group_of` maps a value head to its key head
+// (planted-bug controls pass a wrong one).
+inline Tensor64 gated_delta(const Tensor64& q, const Tensor64& k, const Tensor64& v, const Tensor64& g,
+                            const Tensor64& beta, double l2norm_eps, int64_t (*group_of)(int64_t h, int64_t hk, int64_t hv) = nullptr) {
+    const int64_t n = q.shape[0], hk = q.shape[1], dk = q.shape[2], hv = v.shape[1], dv = v.shape[2];
+    Tensor64 out(v.shape);
+    for (int64_t h = 0; h < hv; ++h) {
+        const int64_t kh = group_of ? group_of(h, hk, hv) : h / (hv / hk);
+        std::vector<double> S(static_cast<size_t>(dk * dv), 0.0);
+        for (int64_t t = 0; t < n; ++t) {
+            std::vector<double> qt(static_cast<size_t>(dk)), kt(static_cast<size_t>(dk));
+            double sq = 0, sk = 0;
+            for (int64_t i = 0; i < dk; ++i) {
+                qt[static_cast<size_t>(i)] = q[(t * hk + kh) * dk + i];
+                kt[static_cast<size_t>(i)] = k[(t * hk + kh) * dk + i];
+                sq += qt[static_cast<size_t>(i)] * qt[static_cast<size_t>(i)];
+                sk += kt[static_cast<size_t>(i)] * kt[static_cast<size_t>(i)];
+            }
+            for (int64_t i = 0; i < dk; ++i) {
+                if (l2norm_eps > 0) {
+                    qt[static_cast<size_t>(i)] /= std::sqrt(sq + l2norm_eps);
+                    kt[static_cast<size_t>(i)] /= std::sqrt(sk + l2norm_eps);
+                }
+                qt[static_cast<size_t>(i)] /= std::sqrt(static_cast<double>(dk));
+            }
+            const double decay = std::exp(g[t * hv + h]);
+            for (double& s : S) s *= decay;
+            for (int64_t j = 0; j < dv; ++j) {
+                double mem = 0;
+                for (int64_t i = 0; i < dk; ++i) mem += S[static_cast<size_t>(i * dv + j)] * kt[static_cast<size_t>(i)];
+                const double delta = (v[(t * hv + h) * dv + j] - mem) * beta[t * hv + h];
+                for (int64_t i = 0; i < dk; ++i) S[static_cast<size_t>(i * dv + j)] += kt[static_cast<size_t>(i)] * delta;
+            }
+            for (int64_t j = 0; j < dv; ++j) {
+                double o = 0;
+                for (int64_t i = 0; i < dk; ++i) o += S[static_cast<size_t>(i * dv + j)] * qt[static_cast<size_t>(i)];
+                out[(t * hv + h) * dv + j] = o;
+            }
+        }
+    }
+    return out;
+}
+
 struct AttentionSpec {
     double scale = 1.0;
     int64_t sliding_window = 0;

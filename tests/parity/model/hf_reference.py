@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Reference outputs for Gemma 4 text models from Hugging Face transformers (test-only).
+"""Reference outputs for text models from Hugging Face transformers (test-only).
 
-    python -I tests/parity/model/hf_reference.py --model-dir <hf dir> [--out tests/fixtures/generated/gemma4] [--gen 32]
+    python -I tests/parity/model/hf_reference.py --model-dir <hf dir> [--out tests/fixtures/generated/<model_type>]
+        [--gen 32]
 
 Runs the checkpoint in float32 on the CPU with eager attention and writes, per prompt:
   * the prompt token ids,
@@ -9,9 +10,9 @@ Runs the checkpoint in float32 on the CPU with eager attention and writes, per p
   * the top-5 token ids at every prompt position,
   * the greedy continuation (--gen tokens, stop tokens included if hit).
 
-One deliberate deviation from a plain float32 load: the main embedding scale sqrt(hidden_size) is rounded to bfloat16,
-as the checkpoint's own dtype does in transformers (and in the original JAX code). Without it a float32 load would
-use 39.19 instead of 39.25 for E2B and every comparison would carry that 0.15% error.
+One deliberate deviation from a plain float32 load, for Gemma 4 only: the main embedding scale sqrt(hidden_size) is
+rounded to bfloat16, as the checkpoint's own dtype does in transformers (and in the original JAX code). Without it a
+float32 load would use 39.19 instead of 39.25 for E2B and every comparison would carry that 0.15% error.
 """
 
 import argparse
@@ -48,7 +49,7 @@ def build_prompts(tok):
     long_messages = [{"role": "user", "content": LONG_TEXT + "\n\nSummarize the text above in one sentence."}]
     text = tok.apply_chat_template(long_messages, tokenize=False, add_generation_prompt=True)
     prompts["chat_long"] = tok(text, add_special_tokens=False)["input_ids"]
-    prompts["raw_text"] = tok("<bos>The theory of relativity", add_special_tokens=False)["input_ids"]
+    prompts["raw_text"] = tok((tok.bos_token or "") + "The theory of relativity", add_special_tokens=False)["input_ids"]
     return prompts
 
 
@@ -59,23 +60,26 @@ def bf16(x):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
-    ap.add_argument("--out", default=os.path.join("tests", "fixtures", "generated", "gemma4"))
+    ap.add_argument("--out", help="default: tests/fixtures/generated/<model_type>")
     ap.add_argument("--gen", type=int, default=32)
     ap.add_argument("--threads", type=int, default=min(32, os.cpu_count() or 1))
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
+    with open(os.path.join(args.model_dir, "config.json")) as f:
+        model_type = json.load(f)["model_type"]
+    args.out = args.out or os.path.join("tests", "fixtures", "generated", model_type)
     os.makedirs(args.out, exist_ok=True)
 
     tok = AutoTokenizer.from_pretrained(args.model_dir)
     model = AutoModelForImageTextToText.from_pretrained(args.model_dir, dtype=torch.float32, attn_implementation="eager")
     model.eval()
-    lm = model.model.language_model
-    hidden = model.config.text_config.hidden_size
-    lm.embed_tokens.embed_scale.fill_(bf16(math.sqrt(hidden)))
+    if model_type.startswith("gemma4"):
+        hidden = model.config.text_config.hidden_size
+        model.model.language_model.embed_tokens.embed_scale.fill_(bf16(math.sqrt(hidden)))
     eos = model.generation_config.eos_token_id
     eos = eos if isinstance(eos, list) else [eos]
 
-    manifest = {"model_dir": os.path.abspath(args.model_dir), "dtype": "float32", "cases": []}
+    manifest = {"model_dir": os.path.abspath(args.model_dir), "model_type": model_type, "dtype": "float32", "cases": []}
     for name, ids in build_prompts(tok).items():
         input_ids = torch.tensor([ids])
         with torch.no_grad():

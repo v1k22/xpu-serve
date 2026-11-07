@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <map>
 
+#include <openvino/op/gated_delta_net.hpp>
+#include <openvino/op/paged_gated_delta_net.hpp>
 #include <openvino/op/ops.hpp>
 #include <openvino/op/util/variable.hpp>
 
@@ -66,6 +68,14 @@ private:
     OvOutput lower_rope(const Node& n, const std::string& label);
     void lower_kv_cache(const Node& n, size_t index, const std::string& label);
     OvOutput lower_attention(const Node& n, const std::string& label);
+    OvOutput lower_causal_conv(const Node& n, const std::string& label);
+    OvOutput lower_gated_delta(const Node& n, const std::string& label);
+    // A ReadValue of a new variable, and its Assign of `next` registered as a sink.
+    OvOutput read_state(const ov::PartialShape& shape, const std::string& id, const std::string& label);
+    void write_state(const OvOutput& next, const std::string& label);
+    OvOutput internal_input(const std::string& name, DType dtype, const Dims& shape, InputRole role);
+    // The per-step index inputs PagedGatedDeltaNet shares across layers, created on first use.
+    const std::vector<OvOutput>& paged_indices();
 
     OvOutput value(Value v);
     OvOutput float_value(Value v) { return as_f32(value(v)); }
@@ -84,6 +94,8 @@ private:
     OvOutput tokens_;  // scalar i64: T
     OvOutput cached_;  // scalar i64: L
     std::map<int64_t, OvOutput> masks_;
+    std::shared_ptr<ov::op::util::Variable> last_variable_;
+    std::vector<OvOutput> paged_indices_;
 };
 
 Translation Translator::run() {
@@ -106,7 +118,8 @@ Translation Translator::run() {
         output_names.push_back(out.name);
     }
     Translation t;
-    t.stateful = !graph_.kv_slots().empty();
+    t.stateful = graph_.stateful();
+    t.fixed_state = graph_.has_fixed_state();
     t.model = std::make_shared<ov::Model>(results, sinks_, parameters_, "xs_step");
     t.inputs = std::move(input_specs_);
     t.outputs = std::move(output_names);
@@ -164,6 +177,15 @@ void Translator::lower(size_t index) {
             set(named(std::make_shared<ops::v1::Multiply>(tanh, f32_scalar(cap)), label));
             break;
         }
+        case OpKind::Sigmoid:
+            set(named(std::make_shared<ops::v0::Sigmoid>(float_value(n.inputs[0])), label));
+            break;
+        case OpKind::Silu:
+            set(named(std::make_shared<ops::v4::Swish>(float_value(n.inputs[0])), label));
+            break;
+        case OpKind::Softplus:
+            set(named(std::make_shared<ops::v4::SoftPlus>(float_value(n.inputs[0])), label));
+            break;
         case OpKind::Clamp: {
             const auto& a = std::get<graph::ClampAttrs>(n.attrs);
             set(named(std::make_shared<ops::v0::Clamp>(float_value(n.inputs[0]), static_cast<double>(a.lo),
@@ -195,6 +217,12 @@ void Translator::lower(size_t index) {
             break;
         case OpKind::Attention:
             set(lower_attention(n, label));
+            break;
+        case OpKind::CausalConv:
+            set(lower_causal_conv(n, label));
+            break;
+        case OpKind::GatedDelta:
+            set(lower_gated_delta(n, label));
             break;
     }
 }
@@ -274,33 +302,42 @@ OvOutput Translator::lower_slice(const Node& n) {
 OvOutput Translator::lower_rope(const Node& n, const std::string& label) {
     const OvOutput x = float_value(n.inputs[0]);
     const int64_t dim = n.outputs[0].shape[2];
+    const int64_t rotary_dim = std::get<graph::RopeAttrs>(n.attrs).rotary_dim;
+    const int64_t rotated = rotary_dim == 0 ? dim : rotary_dim;
     const Dims& pos_shape = graph_.type(n.inputs[1]).shape;
     const int64_t sections = pos_shape.size() == 2 ? pos_shape[1] : 1;
-    const int64_t width = dim / sections;
+    const int64_t width = rotated / sections;
     const int64_t half = width / 2;
 
-    // angles[t, s, j] = positions[t, s] * freq[j] with freq = [inv_freq, inv_freq], then [T, 1, D] section-major.
+    // angles[t, s, j] = positions[t, s] * freq[j] with freq = [inv_freq, inv_freq], then [T, 1, R] section-major,
+    // zero-padded to [T, 1, D] so pass-through channels get cos 1 and sin 0.
     const OvOutput inv_freq = float_value(n.inputs[2]);
     const auto freq = std::make_shared<ops::v0::Concat>(ov::OutputVector{inv_freq, inv_freq}, 0);  // [W]
     const auto positions = std::make_shared<ops::v0::Convert>(value(n.inputs[1]), ov::element::f32);
     const auto positions_3d =
         std::make_shared<ops::v1::Reshape>(positions, i64_constant({-1, sections, 1}), false);  // [T, S, 1]
     const auto angles_3d = std::make_shared<ops::v1::Multiply>(positions_3d, freq);              // [T, S, W]
-    const auto angles = std::make_shared<ops::v1::Reshape>(angles_3d, i64_constant({-1, 1, dim}), false);
+    std::shared_ptr<ov::Node> angles = std::make_shared<ops::v1::Reshape>(angles_3d, i64_constant({-1, 1, rotated}), false);
+    std::vector<std::shared_ptr<ov::Node>> angle_path{inv_freq.get_node_shared_ptr(), freq, positions, positions_3d,
+                                                      angles_3d, angles};
+    if (rotated < dim) {
+        angles = std::make_shared<ops::v1::Pad>(angles, i64_constant({0, 0, 0}), i64_constant({0, 0, dim - rotated}),
+                                                f32_scalar(0.0f), ov::op::PadMode::CONSTANT);
+        angle_path.push_back(angles);
+    }
     const auto cos = std::make_shared<ops::v0::Cos>(angles);
     const auto sin = std::make_shared<ops::v0::Sin>(angles);
-    for (const std::shared_ptr<ov::Node>& node :
-         {inv_freq.get_node_shared_ptr(), std::shared_ptr<ov::Node>(freq), std::shared_ptr<ov::Node>(positions),
-          std::shared_ptr<ov::Node>(positions_3d), std::shared_ptr<ov::Node>(angles_3d),
-          std::shared_ptr<ov::Node>(angles), std::shared_ptr<ov::Node>(cos), std::shared_ptr<ov::Node>(sin)}) {
-        keep_in_f32(node);
-    }
+    angle_path.push_back(cos);
+    angle_path.push_back(sin);
+    for (const auto& node : angle_path) keep_in_f32(node);
     named(cos, label, "cos");
     named(sin, label, "sin");
 
     std::vector<int64_t> swap_halves(static_cast<size_t>(dim));
-    std::vector<float> sign(static_cast<size_t>(dim));
+    std::vector<float> sign(static_cast<size_t>(dim), 0.0f);
     for (int64_t c = 0; c < dim; ++c) {
+        swap_halves[static_cast<size_t>(c)] = c;
+        if (c >= rotated) continue;
         const int64_t base = c / width * width;
         const int64_t i = c - base;
         swap_halves[static_cast<size_t>(c)] = base + (i + half) % width;
@@ -309,10 +346,94 @@ OvOutput Translator::lower_rope(const Node& n, const std::string& label) {
     const auto swapped = std::make_shared<ops::v8::Gather>(x, i64_constant(swap_halves), i64_scalar(-1));
     const auto sign_const =
         std::make_shared<ops::v0::Constant>(ov::element::f32, ov::Shape{static_cast<size_t>(dim)}, sign);
-    const auto rotated = std::make_shared<ops::v1::Multiply>(swapped, sign_const);
+    const auto rotated_x = std::make_shared<ops::v1::Multiply>(swapped, sign_const);
     const auto x_cos = std::make_shared<ops::v1::Multiply>(x, cos);
-    const auto rotated_sin = std::make_shared<ops::v1::Multiply>(rotated, sin);
+    const auto rotated_sin = std::make_shared<ops::v1::Multiply>(rotated_x, sin);
     return named(std::make_shared<ops::v1::Add>(x_cos, rotated_sin), label);
+}
+
+OvOutput Translator::read_state(const ov::PartialShape& shape, const std::string& id, const std::string& label) {
+    last_variable_ = std::make_shared<ov::op::util::Variable>(ov::op::util::VariableInfo{shape, ov::element::f32, id});
+    return named(std::make_shared<ops::v6::ReadValue>(last_variable_), label, "past");
+}
+
+void Translator::write_state(const OvOutput& next, const std::string& label) {
+    const auto assign = std::make_shared<ops::v6::Assign>(next, last_variable_);
+    named(assign, label, "assign");
+    sinks_.push_back(assign);
+}
+
+// x' = [state; x] along T, then one depthwise convolution without padding; the state keeps the last K-1 rows of x'.
+OvOutput Translator::lower_causal_conv(const Node& n, const std::string& label) {
+    const int slot = std::get<graph::StateAttrs>(n.attrs).slot;
+    const graph::ConvSlot& spec = graph_.conv_slots().at(static_cast<size_t>(slot));
+    const int64_t past = spec.kernel - 1;
+    const OvOutput state = read_state({1, past, spec.channels}, str_cat("conv", slot), label);
+    const OvOutput x = std::make_shared<ops::v0::Unsqueeze>(float_value(n.inputs[0]), i64_scalar(0));  // [1, T, C]
+    const OvOutput all = std::make_shared<ops::v0::Concat>(ov::OutputVector{state, x}, 1);            // [1, K-1+T, C]
+    write_state(std::make_shared<ops::v8::Slice>(all, i64_constant({-past}), i64_constant({graph::kSliceEnd}),
+                                                 i64_constant({1}), i64_constant({1})),
+                label);
+    const OvOutput channels_first = std::make_shared<ops::v1::Transpose>(all, i64_constant({0, 2, 1}));  // [1, C, K-1+T]
+    const OvOutput kernel = std::make_shared<ops::v1::Reshape>(float_value(n.inputs[1]),
+                                                               i64_constant({spec.channels, 1, 1, spec.kernel}), false);
+    const auto conv = std::make_shared<ops::v1::GroupConvolution>(channels_first, kernel, ov::Strides{1},
+                                                                  ov::CoordinateDiff{0}, ov::CoordinateDiff{0},
+                                                                  ov::Strides{1});  // [1, C, T]
+    const OvOutput out = std::make_shared<ops::v1::Transpose>(conv, i64_constant({0, 2, 1}));
+    return named(std::make_shared<ops::v0::Squeeze>(out, i64_constant({0})), label);
+}
+
+OvOutput Translator::internal_input(const std::string& name, DType dtype, const Dims& shape, InputRole role) {
+    ov::PartialShape ps;
+    for (int64_t d : shape) ps.push_back(ov::Dimension(d));
+    const auto param = std::make_shared<ops::v0::Parameter>(to_ov_type(dtype), ps);
+    param->set_friendly_name(name);
+    param->output(0).set_names({name});
+    parameters_.push_back(param);
+    input_specs_.push_back(InputSpec{name, dtype, shape, role});
+    return param;
+}
+
+const std::vector<OvOutput>& Translator::paged_indices() {
+    if (paged_indices_.empty()) {
+        paged_indices_ = {internal_input("xs.gdn.subsequence_begins", DType::I32, {2}, InputRole::SubsequenceBegins),
+                          internal_input("xs.gdn.block_indices", DType::I32, {2}, InputRole::BlockIndices),
+                          internal_input("xs.gdn.block_indices_begins", DType::I32, {2}, InputRole::BlockIndicesBegins),
+                          internal_input("xs.gdn.processed_tokens", DType::I32, {1}, InputRole::ProcessedTokens),
+                          internal_input("xs.gdn.cache_interval", DType::I32, {1}, InputRole::CacheInterval)};
+    }
+    return paged_indices_;
+}
+
+OvOutput Translator::lower_gated_delta(const Node& n, const std::string& label) {
+    const auto& a = std::get<graph::StateAttrs>(n.attrs);
+    const graph::RecurrentSlot& spec = graph_.recurrent_slots().at(static_cast<size_t>(a.slot));
+    const bool l2norm = a.qk_l2norm_eps > 0.0f;
+    const float eps = l2norm ? a.qk_l2norm_eps : 1e-6f;
+    if (options_.gated_delta == GatedDeltaImpl::Paged) {
+        // [T, heads, dim] operands; the state table is [1, heads, value_dim, key_dim] and updated in place. The op
+        // runs in f32 so the plugin puts no conversion between the table and the kernel (writes would land in a copy).
+        const OvOutput table = internal_input(str_cat("xs.gdn_state.", a.slot), DType::F32,
+                                              {1, spec.heads, spec.value_dim, spec.key_dim}, InputRole::StateTable);
+        const std::vector<OvOutput>& idx = paged_indices();
+        const auto gdn = std::make_shared<ov::op::internal::PagedGatedDeltaNet>(
+            float_value(n.inputs[0]), float_value(n.inputs[1]), float_value(n.inputs[2]), table,
+            float_value(n.inputs[3]), float_value(n.inputs[4]), idx[0], idx[1], idx[2], idx[3], idx[4], l2norm, eps, eps);
+        keep_in_f32(gdn);
+        return named(gdn, label);
+    }
+    // GatedDeltaNet takes [batch, T, heads, dim] operands and returns the output and the new state.
+    const auto batched = [&](size_t i) -> OvOutput {
+        return std::make_shared<ops::v0::Unsqueeze>(float_value(n.inputs[i]), i64_scalar(0));
+    };
+    const OvOutput state =
+        read_state({1, spec.heads, spec.key_dim, spec.value_dim}, str_cat("rec", a.slot), label);
+    const auto gdn = std::make_shared<ov::op::internal::GatedDeltaNet>(batched(0), batched(1), batched(2), state,
+                                                                       batched(3), batched(4), l2norm, eps, eps);
+    named(gdn, label, "gdn");
+    write_state(gdn->output(1), label);
+    return named(std::make_shared<ops::v0::Squeeze>(gdn->output(0), i64_constant({0})), label);
 }
 
 void Translator::lower_kv_cache(const Node& n, size_t index, const std::string& label) {

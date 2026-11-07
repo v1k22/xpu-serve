@@ -39,6 +39,9 @@ std::string_view op_name(OpKind kind) {
         case OpKind::Tanh: return "Tanh";
         case OpKind::GeluTanh: return "GeluTanh";
         case OpKind::Softcap: return "Softcap";
+        case OpKind::Sigmoid: return "Sigmoid";
+        case OpKind::Silu: return "Silu";
+        case OpKind::Softplus: return "Softplus";
         case OpKind::Clamp: return "Clamp";
         case OpKind::RmsNorm: return "RmsNorm";
         case OpKind::Reshape: return "Reshape";
@@ -47,6 +50,8 @@ std::string_view op_name(OpKind kind) {
         case OpKind::Rope: return "Rope";
         case OpKind::KvCache: return "KvCache";
         case OpKind::Attention: return "Attention";
+        case OpKind::CausalConv: return "CausalConv";
+        case OpKind::GatedDelta: return "GatedDelta";
     }
     return "?";
 }
@@ -204,6 +209,10 @@ Value Graph::softcap(Value x, float cap) {
     return elementwise_unary(OpKind::Softcap, x, SoftcapAttrs{cap});
 }
 
+Value Graph::sigmoid(Value x) { return elementwise_unary(OpKind::Sigmoid, x, {}); }
+Value Graph::silu(Value x) { return elementwise_unary(OpKind::Silu, x, {}); }
+Value Graph::softplus(Value x) { return elementwise_unary(OpKind::Softplus, x, {}); }
+
 Value Graph::clamp(Value x, float lo, float hi) {
     XS_CHECK(!std::isnan(lo) && !std::isnan(hi) && lo <= hi, "clamp bounds [", lo, ", ", hi, "] are invalid at ",
              where(x));
@@ -273,21 +282,24 @@ Value Graph::transpose(Value x, std::vector<int> perm) {
                     "transpose");
 }
 
-Value Graph::rope(Value x, Value positions, Value inv_freq) {
+Value Graph::rope(Value x, Value positions, Value inv_freq, int64_t rotary_dim) {
     const Dims& xs = type(x).shape;
     const TensorType& pt = type(positions);
     const TensorType& ft = type(inv_freq);
     XS_CHECK(xs.size() == 3 && xs[0] == kT, "rope input must be [T, heads, head_dim], got ", shape_to_string(xs));
+    const int64_t rotated = rotary_dim == 0 ? xs[2] : rotary_dim;
+    XS_CHECK(rotated > 0 && rotated <= xs[2], "rope rotary_dim ", rotary_dim, " out of range for head_dim ", xs[2]);
     const bool axial = pt.shape.size() == 2;
-    XS_CHECK(is_int(pt.dtype) && pt.shape[0] == kT && (pt.shape.size() == 1 || (axial && pt.shape[1] > 0)),
+    XS_CHECK(is_int(pt.dtype) && !pt.shape.empty() && pt.shape[0] == kT && (pt.shape.size() == 1 || (axial && pt.shape[1] > 0)),
              "rope positions must be [T] or [T, sections] int, got ", dtype_name(pt.dtype), shape_to_string(pt.shape));
     const int64_t sections = axial ? pt.shape[1] : 1;
-    XS_CHECK(xs[2] % (2 * sections) == 0, "rope head_dim ", xs[2], " does not split into ", sections,
+    XS_CHECK(rotated % (2 * sections) == 0, "rope rotary dim ", rotated, " does not split into ", sections,
              " sections of even width");
-    const int64_t pairs = xs[2] / (2 * sections);
+    const int64_t pairs = rotated / (2 * sections);
     XS_CHECK(ft.shape == Dims{pairs} && ft.dtype == DType::F32, "rope inv_freq must be [", pairs, "] f32, got ",
              dtype_name(ft.dtype), shape_to_string(ft.shape));
-    return add_node(OpKind::Rope, {x, positions, inv_freq}, {}, {TensorType{DType::F32, xs}}, "rope");
+    return add_node(OpKind::Rope, {x, positions, inv_freq}, RopeAttrs{rotary_dim == xs[2] ? 0 : rotary_dim},
+                    {TensorType{DType::F32, xs}}, "rope");
 }
 
 int Graph::add_kv_slot(int64_t num_kv_heads, int64_t head_dim, int64_t sliding_window, std::string label) {
@@ -328,6 +340,46 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     return add_node(OpKind::Attention, {q, k_all, v_all}, attrs, {TensorType{DType::F32, qs}}, "attention");
 }
 
+int Graph::add_conv_slot(int64_t channels, int64_t kernel, std::string label) {
+    XS_CHECK(channels > 0 && kernel > 1, "invalid conv slot ", label);
+    conv_slots_.push_back(ConvSlot{channels, kernel, std::move(label)});
+    return static_cast<int>(conv_slots_.size() - 1);
+}
+
+Value Graph::causal_conv(int slot, Value x, Value w) {
+    XS_CHECK(slot >= 0 && static_cast<size_t>(slot) < conv_slots_.size(), "unknown conv slot ", slot);
+    const ConvSlot& s = conv_slots_[static_cast<size_t>(slot)];
+    XS_CHECK(type(x).shape == (Dims{kT, s.channels}), "causal_conv slot ", slot, " (", s.label, ") expects x [T, ",
+             s.channels, "], got ", shape_to_string(type(x).shape));
+    XS_CHECK(type(w).shape == (Dims{s.channels, s.kernel}), "causal_conv slot ", slot, " expects w [", s.channels, ", ",
+             s.kernel, "], got ", shape_to_string(type(w).shape));
+    return add_node(OpKind::CausalConv, {x, w}, StateAttrs{slot, 0.0f}, {TensorType{DType::F32, {kT, s.channels}}},
+                    "causal_conv");
+}
+
+int Graph::add_recurrent_slot(int64_t heads, int64_t key_dim, int64_t value_dim, std::string label) {
+    XS_CHECK(heads > 0 && key_dim > 0 && value_dim > 0, "invalid recurrent slot ", label);
+    recurrent_slots_.push_back(RecurrentSlot{heads, key_dim, value_dim, std::move(label)});
+    return static_cast<int>(recurrent_slots_.size() - 1);
+}
+
+Value Graph::gated_delta(int slot, Value q, Value k, Value v, Value g, Value beta, float qk_l2norm_eps) {
+    XS_CHECK(slot >= 0 && static_cast<size_t>(slot) < recurrent_slots_.size(), "unknown recurrent slot ", slot);
+    const RecurrentSlot& s = recurrent_slots_[static_cast<size_t>(slot)];
+    const Dims& qs = type(q).shape;
+    XS_CHECK(qs.size() == 3 && qs[0] == kT && qs[2] == s.key_dim && type(k).shape == qs, "gated_delta slot ", slot, " (",
+             s.label, ") expects q, k [T, Hk, ", s.key_dim, "], got ", shape_to_string(qs), " and ",
+             shape_to_string(type(k).shape));
+    XS_CHECK(type(v).shape == (Dims{kT, s.heads, s.value_dim}), "gated_delta expects v [T, ", s.heads, ", ",
+             s.value_dim, "], got ", shape_to_string(type(v).shape));
+    XS_CHECK(type(g).shape == (Dims{kT, s.heads}) && type(beta).shape == (Dims{kT, s.heads}),
+             "gated_delta expects g and beta [T, ", s.heads, "]");
+    XS_CHECK(s.heads % qs[1] == 0, "gated_delta: ", s.heads, " value heads are not a multiple of ", qs[1], " key heads");
+    XS_CHECK(qk_l2norm_eps >= 0.0f, "gated_delta: negative l2norm epsilon");
+    return add_node(OpKind::GatedDelta, {q, k, v, g, beta}, StateAttrs{slot, qk_l2norm_eps},
+                    {TensorType{DType::F32, type(v).shape}}, "gated_delta");
+}
+
 void Graph::output(const std::string& name, Value v) {
     (void)type(v);
     for (const auto& o : outputs_) XS_CHECK(o.name != name, "duplicate graph output '", name, "'");
@@ -345,12 +397,23 @@ std::vector<Value> Graph::inputs() const {
 void Graph::validate() const {
     XS_CHECK(!outputs_.empty(), "graph has no outputs");
     std::vector<int> appended(kv_slots_.size(), 0);
+    std::vector<int> convs(conv_slots_.size(), 0);
+    std::vector<int> recurrents(recurrent_slots_.size(), 0);
     for (const Node& n : nodes_) {
         if (n.kind == OpKind::KvCache) ++appended[static_cast<size_t>(std::get<KvCacheAttrs>(n.attrs).slot)];
+        if (n.kind == OpKind::CausalConv) ++convs[static_cast<size_t>(std::get<StateAttrs>(n.attrs).slot)];
+        if (n.kind == OpKind::GatedDelta) ++recurrents[static_cast<size_t>(std::get<StateAttrs>(n.attrs).slot)];
     }
     for (size_t s = 0; s < appended.size(); ++s) {
         XS_CHECK(appended[s] == 1, "kv slot ", s, " (", kv_slots_[s].label, ") is appended ", appended[s],
                  " times; expected exactly once per graph");
+    }
+    for (size_t s = 0; s < convs.size(); ++s) {
+        XS_CHECK(convs[s] == 1, "conv slot ", s, " (", conv_slots_[s].label, ") is used ", convs[s], " times");
+    }
+    for (size_t s = 0; s < recurrents.size(); ++s) {
+        XS_CHECK(recurrents[s] == 1, "recurrent slot ", s, " (", recurrent_slots_[s].label, ") is used ", recurrents[s],
+                 " times");
     }
 }
 

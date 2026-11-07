@@ -90,6 +90,7 @@ class CpuSession final : public Session {
           pool_(std::move(pool)),
           max_context_(max_context),
           kv_(graph_.kv_slots().size()) {
+        reset_fixed_state();
         const auto& nodes = graph_.nodes();
         for (size_t i = 0; i < nodes.size(); ++i) {
             for (const Value& in : nodes[i].inputs)
@@ -104,6 +105,9 @@ class CpuSession final : public Session {
         XS_CHECK(step.kv_len <= max_context_, "cpu-ref: ", step.kv_len, " tokens exceed max_context ", max_context_);
         const auto& nodes = graph_.nodes();
         std::vector<std::vector<HostTensor>> values(nodes.size());
+        // Conv and recurrent ops update copies, committed only when the whole step succeeds.
+        pending_conv_ = conv_;
+        pending_recurrent_ = recurrent_;
         try {
             for (size_t i = 0; i < nodes.size(); ++i) {
                 values[i] = eval_node(i, values, inputs, step);
@@ -116,7 +120,9 @@ class CpuSession final : public Session {
             resize_kv(cached_);  // a failed step leaves the KV state as it was
             throw;
         }
-        if (!graph_.kv_slots().empty()) cached_ = step.kv_len;  // a graph without KV slots is stateless
+        if (graph_.stateful()) cached_ = step.kv_len;  // a graph without slots is stateless
+        conv_.swap(pending_conv_);
+        recurrent_.swap(pending_recurrent_);
         for (const auto& out : graph_.outputs()) {
             const HostTensor& t = values[static_cast<size_t>(out.value.node)][static_cast<size_t>(out.value.index)];
             outputs[out.name] = is_leaf(nodes[static_cast<size_t>(out.value.node)].kind) ? t.clone() : t;
@@ -129,7 +135,11 @@ class CpuSession final : public Session {
 
     void truncate(int64_t n) override {
         XS_CHECK(n >= 0 && n <= cached_, "cannot truncate to ", n, " tokens; ", cached_, " are cached");
+        if (n == cached_) return;
+        XS_CHECK(n == 0 || !graph_.has_fixed_state(), "cannot truncate to ", n,
+                 " tokens: conv and recurrent state summarize the whole sequence");
         resize_kv(n);
+        if (n == 0) reset_fixed_state();
         cached_ = n;
     }
 
@@ -226,6 +236,12 @@ class CpuSession final : public Session {
                 return {cpu_ref::gelu_tanh(f32(0))};
             case OpKind::Softcap:
                 return {cpu_ref::softcap(f32(0), std::get<graph::SoftcapAttrs>(n.attrs).cap)};
+            case OpKind::Sigmoid:
+                return {cpu_ref::sigmoid(f32(0))};
+            case OpKind::Silu:
+                return {cpu_ref::silu(f32(0))};
+            case OpKind::Softplus:
+                return {cpu_ref::softplus(f32(0))};
             case OpKind::Clamp: {
                 const auto& a = std::get<graph::ClampAttrs>(n.attrs);
                 return {cpu_ref::clamp(f32(0), a.lo, a.hi)};
@@ -245,7 +261,16 @@ class CpuSession final : public Session {
             case OpKind::Transpose:
                 return {cpu_ref::transpose(in(0), std::get<graph::TransposeAttrs>(n.attrs).perm)};
             case OpKind::Rope:
-                return {cpu_ref::rope(f32(0), in(1), f32(2))};
+                return {cpu_ref::rope(f32(0), in(1), f32(2), std::get<graph::RopeAttrs>(n.attrs).rotary_dim)};
+            case OpKind::CausalConv: {
+                const auto& a = std::get<graph::StateAttrs>(n.attrs);
+                return {cpu_ref::causal_conv(f32(0), f32(1), pending_conv_[static_cast<size_t>(a.slot)])};
+            }
+            case OpKind::GatedDelta: {
+                const auto& a = std::get<graph::StateAttrs>(n.attrs);
+                return {cpu_ref::gated_delta(*pool_, f32(0), f32(1), f32(2), f32(3), f32(4), a.qk_l2norm_eps,
+                                             pending_recurrent_[static_cast<size_t>(a.slot)])};
+            }
             case OpKind::KvCache: {
                 auto [k_all, v_all] = append_kv(std::get<graph::KvCacheAttrs>(n.attrs).slot, f32(0), f32(1), step);
                 return {std::move(k_all), std::move(v_all)};
@@ -271,6 +296,15 @@ class CpuSession final : public Session {
                 HostTensor::from_vector(DType::F32, shape, state.v)};
     }
 
+    void reset_fixed_state() {
+        conv_.clear();
+        for (const graph::ConvSlot& c : graph_.conv_slots())
+            conv_.emplace_back(static_cast<size_t>((c.kernel - 1) * c.channels), 0.0f);
+        recurrent_.clear();
+        for (const graph::RecurrentSlot& r : graph_.recurrent_slots())
+            recurrent_.emplace_back(static_cast<size_t>(r.heads * r.key_dim * r.value_dim), 0.0f);
+    }
+
     void resize_kv(int64_t tokens) {
         for (size_t slot = 0; slot < kv_.size(); ++slot) {
             const graph::KvSlot& s = graph_.kv_slots()[slot];
@@ -286,6 +320,8 @@ class CpuSession final : public Session {
     const std::shared_ptr<cpu_ref::ThreadPool> pool_;
     const int64_t max_context_;
     std::vector<KvState> kv_;
+    std::vector<std::vector<float>> conv_, recurrent_;                  // per slot, committed state
+    std::vector<std::vector<float>> pending_conv_, pending_recurrent_;  // per slot, the running step's state
     int64_t cached_ = 0;
 };
 

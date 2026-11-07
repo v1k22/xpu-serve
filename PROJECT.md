@@ -21,9 +21,9 @@ How that works:
   conversion step yet; a `convert` command for quantized packs is planned (DESIGN.md section 6).
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
-Status (see TODO.md): Gemma 4 E2B/E4B, text and image input, served end to end on OpenVINO (CPU, Arc B390, Arc Pro
-B60), matching Hugging Face fp32 logits (text: cosine >= 0.999999 in f16 on GPU). One sequence at a time, no
-quantization yet.
+Status (see TODO.md): Gemma 4 E2B/E4B (text and images) and Qwen3.5 (dense, text; a hybrid of Gated DeltaNet
+linear attention and full attention), served end to end on OpenVINO (CPU, Arc B390, Arc Pro B60), matching Hugging
+Face fp32 logits and greedy output. One sequence at a time, no quantization yet.
 
 ## 2. Build, run, test
 
@@ -44,9 +44,11 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
   `--prefill-chunk N`, `--backend-opt key=value` (OpenVINO: `attention=auto|sdpa|matmul`,
   `activations_scale_factor=F`), `--no-vision`, `--log-level debug`. `xpu-serve <command> --help` lists all of them;
   `src/cli/main.cpp` is the source of truth.
-- Run one test case: `build/tests/xs_tests -tc='gemma4 matches*'`. Environment for the tests that need files:
+- Run one test case: `build/tests/xs_tests -tc='model matches*'`. Environment for the tests that need files:
   `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref` or `openvino`),
-  `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`.
+  `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`; `XS_QWEN35_DIR` (Qwen3.5 tokenizer parity,
+  default /root/workspace/models/Qwen3.5-4B). `XS_OV_PROFILE=1` logs the OpenVINO plugin's costliest op types per
+  decode step when a session ends.
 - Remote GPU machines: `scripts/dev/remote_build.sh <system> <tag>` copies this tree to `~/xpu-serve/src-<tag>` on a
   machine reachable through the `remote` CLI and builds it there; `scripts/dev/remote_env.sh` sets up OpenVINO and
   `XS_TEST_MODEL_DIR` on that machine.
@@ -83,8 +85,8 @@ area).
 | `models/` | xs_core | `model.h` (the `Model` interface), `registry.cpp` (model_type -> code), `config_util` (checked JSON readers), one folder per architecture |
 | `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop), `Sampler`, request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses) |
 | `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `openvino/` |
-| `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively (normalizer, pre-tokenizer, added tokens, byte fallback, streaming decoder) |
-| `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp), output parsers per dialect (thinking, tool calls) |
+| `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
+| `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls), `plain` |
 | `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming |
 | `service/` | xs_service | `EngineService`: loads tokenizer + template + model, compiles on a backend, owns the engine thread |
 | `cli/` | (exe) | `main.cpp` (commands serve, run, bench, info), `args` (flag parser) |
@@ -99,6 +101,7 @@ area).
 | `src/models/gemma4/gemma4_model.cpp` | Gemma 4 text model: graph builder + per-step host inputs |
 | `src/models/gemma4/gemma4_config.cpp` | Gemma 4 `config.json` parsing; refuses unsupported variants by name |
 | `src/models/gemma4/gemma4_vision.cpp` | Gemma 4 vision: image processor (resize, patches, pooling map) and vision tower graph |
+| `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention |
 | `src/backend/backend.h` | `Backend::compile(graph, weights, options) -> Session`; `Session::run/reset/truncate` |
 | `src/backend/cpu_ref/ops.cpp` | f32/f64 reference kernels, one per op: the accuracy oracle |
 | `src/backend/openvino/ov_translate.cpp` | Step graph -> `ov::Model` (one lowering per op), KV as stateful variables |
@@ -143,14 +146,18 @@ sequence. Model code builds it once at load time; a backend compiles it once.
   are static. No batch dim.
 - Values are logically f32; weights keep their stored dtype and backends choose the compute precision.
 - MatMul weights use the Hugging Face layout `[out, in]`: `matmul(x, w) = x @ w^T`.
-- Ops: Input, Weight, Constant, Gather, MatMul, Add, Mul, Scale, Tanh, GeluTanh, Softcap, Clamp, RmsNorm, Reshape,
-  Slice, Transpose, Rope (1-D or axial), KvCache, Attention (causal with optional window, or non-causal). The exact
-  semantics are the comments in `graph.h`.
+- Ops: Input, Weight, Constant, Gather, MatMul, Add, Mul, Scale, Tanh, GeluTanh, Softcap, Sigmoid, Silu, Softplus,
+  Clamp, RmsNorm, Reshape, Slice, Transpose, Rope (1-D or axial, optionally partial), KvCache, Attention (causal with
+  optional window, or non-causal), CausalConv and GatedDelta (stateful, for linear attention). The exact semantics
+  are the comments in `graph.h`.
 - KV: `add_kv_slot(...)` declares per-sequence state; `kv_cache(slot, k, v)` appends this step's K/V and returns the
   whole cache. A slot can be read by later layers (Gemma 4's KV-shared layers reuse an earlier layer's outputs).
 - Graph inputs are filled per step by `Model::prepare_inputs` (token ids, positions, and model-specific host inputs
   such as Gemma 4's per-layer embedding rows, and the image rows that replace soft-token embeddings).
-- A graph without KV slots is stateless (every run stands alone): that is how vision encoders run, one image per run,
+- Conv and recurrent slots (`add_conv_slot`, `add_recurrent_slot`) hold fixed-size per-sequence state for
+  `causal_conv` and `gated_delta`. They summarize the whole sequence, so a session cannot cut them back to a prefix:
+  the engine reuses a cached prefix for such models only when the new prompt extends it, else it starts over.
+- A graph without slots is stateless (every run stands alone): that is how vision encoders run, one image per run,
   compiled as a second session next to the text one.
 
 **Backends** (`src/backend/`):
@@ -158,7 +165,7 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 | Backend | Status | Notes |
 |---|---|---|
 | `cpu-ref` | test oracle | f32 values, f64 accumulation, threaded matmul. Slow by design; correctness only |
-| `openvino` | main backend today | Translates the graph to an `ov::Model` with the OpenVINO C++ opset API; KV as ReadValue/Assign state; bf16 weights converted to f16 (or f32) at compile; runs on CPU and Intel GPUs |
+| `openvino` | main backend today | Translates the graph to an `ov::Model` with the OpenVINO C++ opset API; KV and conv state as ReadValue/Assign variables; GatedDelta as OpenVINO's `PagedGatedDeltaNet` (internal op, header vendored in `third_party/openvino_dev`) with session-owned state tables updated in place; bf16 weights converted to f16 (or f32) at compile; runs on CPU and Intel GPUs. Options: `attention=auto|sdpa|matmul`, `gdn=paged|ref`, `activations_scale_factor` |
 | `sycl` | planned (DESIGN.md 8.7) | |
 
 ## 7. Tests (`tests/`)
@@ -171,11 +178,12 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/image/` | decoding, resize, hashing | Pillow-written images; torchvision resize outputs in `tests/fixtures/image/` (bit-exact) |
 | `tests/unit/backend/cpu_*.cpp` | each op on cpu-ref (`cpu_encoder_ops.cpp`: the encoder ops and stateless sessions), KV sessions, attention masks | fp64 references in `reference_ops.h`, with planted-bug controls |
 | `tests/unit/backend/ov_*.cpp` | each op on OpenVINO (`ov_encoder_ops.cpp` likewise), sessions, cross-backend agreement, decode timing | the same references; skip without OpenVINO |
-| `tests/unit/tokenizer/` | encode/decode, streaming | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` |
-| `tests/unit/chat/` | template rendering, Gemma 4 output parsing | `apply_chat_template` outputs in `tests/fixtures/chat/` |
+| `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on both backends | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |
+| `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`; tables from `gen_unicode_tables.py`) |
+| `tests/unit/chat/` | template rendering, Gemma 4 and Qwen3.5 output parsing | `apply_chat_template` outputs in `tests/fixtures/chat/` |
 | `tests/unit/server/` | request parsing, response format, stop strings, HTTP end to end | a fake `InferenceService` (`fake_service.h`) |
 | `tests/unit/model/gemma4_config.cpp` | config parsing and refusals | |
-| `tests/unit/model/gemma4_parity.cpp` | whole model: last-token logits and greedy continuations | Hugging Face fp32, from `tests/parity/model/hf_reference.py` |
+| `tests/unit/model/model_parity.cpp` | whole model: last-token logits and greedy continuations | Hugging Face fp32, from `tests/parity/model/hf_reference.py` |
 | `tests/unit/model/gemma4_vision_parity.cpp` | image input: pixels, vision features, expanded prompt, logits, greedy (whole and chunked prefill), prefix reuse by image | Hugging Face fp32, from `tests/parity/model/hf_vision_reference.py` |
 
 - `tests/parity/**/*.py` generate fixtures from Hugging Face (run with a Python venv that has `transformers`,
@@ -198,7 +206,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 3. Register the `model_type` in `src/models/registry.cpp` (`load_model` and `supported_model_types`).
 4. If the model needs an op the IR does not have, add the op first (8.2).
 5. Tests: a config test (`tests/unit/model/<arch>_config.cpp`) and a parity test against Hugging Face fp32 modeled
-   on `gemma4_parity.cpp` + `tests/parity/model/hf_reference.py`.
+   on `model_parity.cpp` + `tests/parity/model/hf_reference.py` (both are model-agnostic).
 6. Images (optional): implement `VisionEncoder` (see `gemma4_vision.cpp`): `prepare` reproduces the Hugging Face image
    processor on an `image::Image`, `graph()` is the tower ending in an `embeddings` output, and `token_run` lays out
    one image in the prompt. Return it from `Model::vision()` and add the `media` / `media_keep` inputs to the text
@@ -245,7 +253,9 @@ Parse and validate it in `src/server/openai_request.cpp` (a bad value is a 400 n
 
 ## 10. Known limitations
 
-- One model family (Gemma 4 E2B/E4B); text and images, no audio or video yet. Images only as base64 data: URLs.
+- Two model families: Gemma 4 E2B/E4B (text and images) and Qwen3.5 dense (text; its vision tower and MTP head
+  are not loaded). No audio or video. Images only as base64 data: URLs.
+- Linear-attention models re-prefill when a new prompt does not extend the cached sequence (no state snapshots).
 - No `convert`/quantization: weights are converted from bf16 to f16 at load.
 - One sequence at a time; no batching. KV lives in OpenVINO state; truncation copies through the host.
 - Sliding-window layers keep every key (memory grows with context).

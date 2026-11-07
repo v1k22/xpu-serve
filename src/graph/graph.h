@@ -50,20 +50,34 @@ enum class OpKind : uint8_t {
     Tanh,       // tanh(x)
     GeluTanh,   // 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
     Softcap,    // cap * tanh(x / cap)
+    Sigmoid,    // 1 / (1 + exp(-x))
+    Silu,       // x * sigmoid(x)
+    Softplus,   // log(1 + exp(x))
     Clamp,      // min(max(x, lo), hi); either bound may be infinite
     RmsNorm,    // (x [..., D] [, w [D]]) -> x * (mean(x^2) + eps)^-1/2 [* w], computed in f32. No "+1" offset.
     Reshape,    // same element count; target may use kT / kL
     Slice,      // python-style [begin, end) on one axis; a symbolic axis only supports "last n" (begin < 0, end = kSliceEnd)
     Transpose,  // out.shape[i] = x.shape[perm[i]]; any dtype
-    Rope,       // (x [T, H, D], positions [T] or [T, S] int, inv_freq [D/(2S)] f32) -> [T, H, D]; see note below
+    Rope,       // (x [T, H, D], positions [T] or [T, S] int, inv_freq [R/(2S)] f32) -> [T, H, D]; see note below
     KvCache,    // (k [T, Hkv, D], v [T, Hkv, D]) -> (k_all [L, Hkv, D], v_all [L, Hkv, D]); appends to the slot's state
     Attention,  // (q [T, Hq, D], k [N, Hkv, D], v [N, Hkv, D]) -> [T, Hq, D]; see AttentionAttrs; GQA
+    CausalConv, // (x [T, C], w [C, K]) -> [T, C]; depthwise causal conv over the slot's last K-1 inputs, see below
+    GatedDelta, // (q [T, Hk, Dk], k [T, Hk, Dk], v [T, Hv, Dv], g [T, Hv], beta [T, Hv]) -> [T, Hv, Dv]; see below
 };
 
-// Rope: rotate-half (NeoX) rotary embedding in the Hugging Face form, out = x * cos + rotate_half(x) * sin.
-// With positions [T] the whole head dim is one section. With positions [T, S] (axial RoPE, e.g. 2-D image patches)
-// the head dim splits into S contiguous sections of D/S channels; section s rotates by positions[:, s]. Within a
-// section of width W, channel c < W/2 pairs with c + W/2 and both rotate by the angle position * inv_freq[c].
+// CausalConv: with x' = [the slot's K-1 previous inputs (zeros at the start), x], out[t, c] = sum_j w[c, j] x'[t + j, c];
+// the slot then keeps the last K-1 rows of x'.
+//
+// GatedDelta (gated delta rule, the recurrence of Gated DeltaNet linear attention): v head h reads key head
+// h / (Hv / Hk) and owns a state S_h [Dk, Dv] (zeros at the start), kept in the slot across runs. Per token t:
+//   q, k = l2norm(q_t), l2norm(k_t) (when qk_l2norm_eps > 0: x / sqrt(sum x^2 + eps)), then q *= 1 / sqrt(Dk);
+//   S = S * exp(g_t); S = S + k (beta_t (v_t - S^T k))^T; out_t = S^T q. Computed in f32.
+
+// Rope: rotate-half (NeoX) rotary embedding in the Hugging Face form, out = x * cos + rotate_half(x) * sin, over the
+// first R = rotary_dim channels of each head (all D when 0); channels R.. pass through (partial rotary).
+// With positions [T] the rotated channels are one section. With positions [T, S] (axial RoPE, e.g. 2-D image patches)
+// they split into S contiguous sections of R/S channels; section s rotates by positions[:, s]. Within a section of
+// width W, channel c < W/2 pairs with c + W/2 and both rotate by the angle position * inv_freq[c].
 
 std::string_view op_name(OpKind kind);
 
@@ -103,6 +117,13 @@ struct TransposeAttrs {
 struct KvCacheAttrs {
     int slot = -1;
 };
+struct RopeAttrs {
+    int64_t rotary_dim = 0;  // 0 = the whole head dim
+};
+struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op's state across runs
+    int slot = -1;
+    float qk_l2norm_eps = 0.0f;  // GatedDelta only; 0 = no l2norm of q and k
+};
 // Causal (the default): k and v are KvCache outputs [L, Hkv, D]. Query i of the step sits at absolute position
 // p_i = L - T + i; key j sits at position j. Key j is visible to query i iff j <= p_i and (sliding_window == 0 or
 // p_i - j < sliding_window).
@@ -118,7 +139,7 @@ struct AttentionAttrs {
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
                            ClampAttrs, RmsNormAttrs, ReshapeAttrs, SliceAttrs, TransposeAttrs, KvCacheAttrs,
-                           AttentionAttrs>;
+                           RopeAttrs, StateAttrs, AttentionAttrs>;
 
 struct TensorType {
     DType dtype = DType::F32;
@@ -133,12 +154,24 @@ struct Node {
     std::string label;  // scope path for debugging and backend node names, e.g. "layers.3.attn.q_proj"
 };
 
-// Per-sequence KV state owned by the backend session. A slot is appended by exactly one KvCache node per graph. A graph
-// without slots is stateless: every run stands alone (encoders).
+// Per-sequence state owned by the backend session. Each slot is used by exactly one node per graph. A graph without
+// slots is stateless: every run stands alone (encoders). KV slots grow with the sequence and can be cut back to a
+// prefix; conv and recurrent slots have a fixed size and summarize the whole sequence, so they cannot.
 struct KvSlot {
     int64_t num_kv_heads = 0;
     int64_t head_dim = 0;
     int64_t sliding_window = 0;  // hint: keys older than this are never read (0 = all are)
+    std::string label;
+};
+struct ConvSlot {  // the last kernel - 1 inputs of a CausalConv: [kernel - 1, channels]
+    int64_t channels = 0;
+    int64_t kernel = 0;
+    std::string label;
+};
+struct RecurrentSlot {  // a GatedDelta state: [heads, key_dim, value_dim], f32
+    int64_t heads = 0;
+    int64_t key_dim = 0;
+    int64_t value_dim = 0;
     std::string label;
 };
 
@@ -163,16 +196,23 @@ public:
     Value tanh(Value x);
     Value gelu_tanh(Value x);
     Value softcap(Value x, float cap);
+    Value sigmoid(Value x);
+    Value silu(Value x);
+    Value softplus(Value x);
     Value clamp(Value x, float lo, float hi);
     Value rms_norm(Value x, float eps);
     Value rms_norm(Value x, Value weight, float eps);
     Value reshape(Value x, Dims shape);
     Value slice(Value x, int axis, int64_t begin, int64_t end = kSliceEnd);
     Value transpose(Value x, std::vector<int> perm);
-    Value rope(Value x, Value positions, Value inv_freq);
+    Value rope(Value x, Value positions, Value inv_freq, int64_t rotary_dim = 0);
     int add_kv_slot(int64_t num_kv_heads, int64_t head_dim, int64_t sliding_window, std::string label);
     std::pair<Value, Value> kv_cache(int slot, Value k, Value v);
     Value attention(Value q, Value k_all, Value v_all, const AttentionAttrs& attrs);
+    int add_conv_slot(int64_t channels, int64_t kernel, std::string label);
+    Value causal_conv(int slot, Value x, Value w);
+    int add_recurrent_slot(int64_t heads, int64_t key_dim, int64_t value_dim, std::string label);
+    Value gated_delta(int slot, Value q, Value k, Value v, Value g, Value beta, float qk_l2norm_eps);
 
     void output(const std::string& name, Value v);
 
@@ -195,6 +235,11 @@ public:
     const TensorType& type(Value v) const;
     const std::vector<GraphOutput>& outputs() const { return outputs_; }
     const std::vector<KvSlot>& kv_slots() const { return kv_slots_; }
+    const std::vector<ConvSlot>& conv_slots() const { return conv_slots_; }
+    const std::vector<RecurrentSlot>& recurrent_slots() const { return recurrent_slots_; }
+    bool stateful() const { return !kv_slots_.empty() || !conv_slots_.empty() || !recurrent_slots_.empty(); }
+    // True when some state cannot be cut back to a prefix (conv or recurrent slots).
+    bool has_fixed_state() const { return !conv_slots_.empty() || !recurrent_slots_.empty(); }
     std::vector<Value> inputs() const;  // Input nodes in creation order
 
     // Checks graph-level invariants (outputs exist, every slot appended exactly once, unique names). Throws.
@@ -212,6 +257,8 @@ private:
     std::vector<Node> nodes_;
     std::vector<GraphOutput> outputs_;
     std::vector<KvSlot> kv_slots_;
+    std::vector<ConvSlot> conv_slots_;
+    std::vector<RecurrentSlot> recurrent_slots_;
     std::string scope_;
 };
 

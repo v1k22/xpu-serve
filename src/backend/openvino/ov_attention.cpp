@@ -41,26 +41,37 @@ OvOutput attention_mask(const OvOutput& tokens, const OvOutput& cached, int64_t 
 
 namespace {
 
-// Grouped-query attention without materializing repeated kv heads: queries are viewed as [1, Hkv, G, T, D] against
-// kv [1, Hkv, 1, L, D], so the size-1 group axis broadcasts. With one kv head (or no grouping) plain rank 4 already
-// broadcasts. Repeating kv heads with Broadcast instead costs the GPU plugin a kernel build per new L on every step.
+// Grouped-query attention. One kv head (or no grouping) broadcasts in plain rank 4. For the SDPA path with several kv
+// heads, kv is repeated in the form the GPU plugin's UnsqueezeBroadcastReshapeSDPAFusion recognizes (Unsqueeze ->
+// bidirectional Broadcast with a constant target -> Reshape -> SDPA): the plugin then drops the repeat and its fused
+// SDPA kernel reads the grouped heads directly, for any L. Other spellings make it build kernels per new L. The
+// matmul path views queries as [1, Hkv, G, T, D] against kv [1, Hkv, 1, L, D] instead.
 struct Grouped {
     OvOutput q, k, v, mask;
     bool rank5 = false;
 };
 
-Grouped group_heads(const AttentionOperands& in) {
+OvOutput repeat_kv_heads(const OvOutput& kv, const AttentionOperands& in) {
+    const int64_t group = in.num_heads / in.num_kv_heads;
+    const OvOutput unsqueezed = std::make_shared<ops::v0::Unsqueeze>(kv, i64_constant({2}));  // [1, Hkv, 1, L, D]
+    const OvOutput repeated = std::make_shared<ops::v3::Broadcast>(unsqueezed, i64_constant({1, 1, group, 1, 1}),
+                                                                   ov::op::BroadcastType::BIDIRECTIONAL);
+    return std::make_shared<ops::v1::Reshape>(repeated, i64_constant({0, in.num_heads, -1, in.head_dim}), true);
+}
+
+Grouped group_heads(const AttentionOperands& in, bool for_sdpa) {
     Grouped g;
     const int64_t group = in.num_heads / in.num_kv_heads;
-    g.rank5 = group > 1 && in.num_kv_heads > 1;
     const bool masked = in.mask.get_node() != nullptr;
-    if (!g.rank5) {
+    const bool grouped = group > 1 && in.num_kv_heads > 1;
+    if (!grouped || for_sdpa) {
         g.q = in.q;
-        g.k = in.k;
-        g.v = in.v;
+        g.k = grouped ? repeat_kv_heads(in.k, in) : in.k;
+        g.v = grouped ? repeat_kv_heads(in.v, in) : in.v;
         if (masked) g.mask = std::make_shared<ops::v0::Unsqueeze>(in.mask, i64_constant({0, 1}));  // [1, 1, T, L]
         return g;
     }
+    g.rank5 = true;
     g.q = std::make_shared<ops::v1::Reshape>(in.q, i64_constant({1, in.num_kv_heads, group, -1, in.head_dim}), false);
     g.k = std::make_shared<ops::v0::Unsqueeze>(in.k, i64_scalar(2));
     g.v = std::make_shared<ops::v0::Unsqueeze>(in.v, i64_scalar(2));
@@ -68,7 +79,6 @@ Grouped group_heads(const AttentionOperands& in) {
     return g;
 }
 
-// Without a mask, a zero [1, 1] mask stands in: the op takes the scale only after a mask operand.
 OvOutput sdpa(const Grouped& g, float scale) {
     const OvOutput mask = g.mask.get_node()
                               ? g.mask
@@ -109,8 +119,8 @@ OvOutput attention(const AttentionOperands& in, const graph::AttentionAttrs& att
         fail("attention ", label, " has softcap ", attrs.softcap,
              ", which ScaledDotProductAttention cannot express; use attention=auto or matmul");
     }
-    const Grouped g = group_heads(in);
     const bool use_matmul = impl == AttentionImpl::MatMul || attrs.softcap > 0.0f;
+    const Grouped g = group_heads(in, !use_matmul);
     OvOutput out = use_matmul ? matmul_attention(g, attrs, label) : sdpa(g, attrs.scale);
     if (g.rank5) out = std::make_shared<ops::v1::Reshape>(out, i64_constant({1, in.num_heads, -1, in.head_dim}), false);
     return named(out.get_node_shared_ptr(), label, use_matmul ? "matmul_attention" : "sdpa");

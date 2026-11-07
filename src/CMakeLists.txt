@@ -34,6 +34,12 @@ xs_add_library(xs_backend_cpu DIRS backend/cpu_ref DEPS xs_core)
 
 if(XS_WITH_OPENVINO)
   xs_add_library(xs_backend_openvino DIRS backend/openvino DEPS xs_core openvino::runtime)
+  # ov::op::internal::GatedDeltaNet comes from a vendored dev-API header that must match the runtime version.
+  if(NOT OpenVINO_VERSION VERSION_EQUAL 2026.2.1)
+    message(FATAL_ERROR "the OpenVINO backend needs OpenVINO 2026.2.1 (found ${OpenVINO_VERSION}): "
+                        "third_party/openvino_dev holds headers of that version")
+  endif()
+  target_include_directories(xs_backend_openvino SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openvino_dev)
 endif()
 
 # Backend registry: the one place that knows which backends were compiled in.

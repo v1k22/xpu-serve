@@ -1,10 +1,11 @@
-// End-to-end parity of the Gemma 4 step graph against Hugging Face reference outputs
-// (tests/parity/model/hf_reference.py). Opt-in: needs XS_TEST_MODEL_DIR and the generated fixtures.
+// End-to-end parity of a model's step graph against Hugging Face reference outputs
+// (tests/parity/model/hf_reference.py), for whichever model XS_TEST_MODEL_DIR holds. Opt-in: needs XS_TEST_MODEL_DIR
+// and the generated fixtures.
 //
 //   XS_PARITY_BACKEND   cpu-ref (default) | openvino
 //   XS_PARITY_DEVICE    backend device, e.g. GPU
 //   XS_PARITY_PRECISION f32 (default) | f16
-//   XS_PARITY_FIXTURES  default: <source>/tests/fixtures/generated/gemma4
+//   XS_PARITY_FIXTURES  default: <source>/tests/fixtures/generated/<model_type of the model>
 
 #include <doctest/doctest.h>
 
@@ -27,14 +28,19 @@ using xs::test::env_or;
 using xs::test::read_f32;
 
 std::filesystem::path fixtures() {
-    return env_or("XS_PARITY_FIXTURES", std::string(XS_SOURCE_DIR) + "/tests/fixtures/generated/gemma4");
+    std::string model_type = "unknown";
+    if (const auto dir = xs::test::model_dir()) {
+        std::ifstream in(*dir / "config.json");
+        if (in.good()) model_type = nlohmann::json::parse(in).value("model_type", model_type);
+    }
+    return env_or("XS_PARITY_FIXTURES", std::string(XS_SOURCE_DIR) + "/tests/fixtures/generated/" + model_type);
 }
 
 bool enabled() { return xs::test::model_dir().has_value() && std::filesystem::exists(fixtures() / "manifest.json"); }
 
 }  // namespace
 
-TEST_CASE("gemma4 matches Hugging Face logits and greedy output" * doctest::skip(!enabled())) {
+TEST_CASE("model matches Hugging Face logits and greedy output" * doctest::skip(!enabled())) {
     std::ifstream mf(fixtures() / "manifest.json");
     const auto manifest = nlohmann::json::parse(mf);
     const std::string backend_name = env_or("XS_PARITY_BACKEND", "cpu-ref");

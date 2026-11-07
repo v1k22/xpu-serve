@@ -6,7 +6,10 @@ after experiments.**
 
 **v0.1 (2026-11-06):** Gemma 4 E2B text, served end to end on OpenVINO, weights loaded from the HF checkpoint (convert
 skipped for now, by decision), KV as OpenVINO state rather than engine-owned pages (`docs/decisions/0002`). Ticked items
-below are done and tested; the parity numbers are in `tests/unit/model/gemma4_parity.cpp`.
+below are done and tested; the parity numbers are in `tests/unit/model/model_parity.cpp`.
+
+**v0.3 (2026-11-07):** Qwen3.5 dense text (Gated DeltaNet + gated full attention, `docs/decisions/0006`), byte-level BPE
+tokenizer with NFC, Qwen3.5 chat template parity and output parser.
 
 **v0.2 (2026-11-07):** image input for Gemma 4 E2B/E4B (OpenAI `image_url` data URLs), checked against Hugging Face
 end to end (`docs/decisions/0005`, `tests/unit/model/gemma4_vision_parity.cpp`). `PROJECT.md` maps the code.
@@ -195,6 +198,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Audio input (Gemma 4 E-series audio tower, mel features) and video input
 - [ ] Remote image URLs behind an explicit opt-in (size and host limits)
 - [ ] Gemma 4 dense (12B, 31B) and E-series (E2B, E4B: PLE, KV-shared tail)
+- [x] Qwen3.5 dense (text): Gated DeltaNet via CausalConv + GatedDelta graph ops, OpenVINO PagedGatedDeltaNet,
+      byte-level BPE + NFC tokenizer, chat template parity, `qwen3_5` output parser; HF parity on CPU and B60
+- [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; MoE variant; vision tower; MTP head
 - [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
 - [ ] Llama 3
 - [ ] Import MLX-affine packs; import GGUF (Q4_0 / Q8_0 / K-quants)

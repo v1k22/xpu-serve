@@ -36,14 +36,16 @@ public:
     virtual ~Session() = default;
 
     // Runs one step. `inputs` holds every graph input by name (shapes resolve kT). Fills `outputs` with every graph
-    // output by name as freshly allocated host tensors (f32 for float outputs). Appends T tokens to the KV state.
+    // output by name as freshly allocated host tensors (f32 for float outputs). Advances the state by T tokens; a
+    // failed step leaves it as it was. A graph without state slots is stateless (num_cached() stays 0).
     virtual void run(const TensorMap& inputs, TensorMap& outputs) = 0;
 
     // Tokens currently in the KV state (L of the last run, 0 after reset).
     virtual int64_t num_cached() const = 0;
     // Drops all KV state.
     virtual void reset() = 0;
-    // Keeps the first `n` cached tokens (n <= num_cached()).
+    // Keeps the first `n` cached tokens (n <= num_cached()). A graph with conv or recurrent state
+    // (Graph::has_fixed_state) can only keep 0 or num_cached() tokens; anything else throws.
     virtual void truncate(int64_t n) = 0;
 };
 

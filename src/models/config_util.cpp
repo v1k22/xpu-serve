@@ -86,4 +86,22 @@ SamplingParams read_generation_defaults(const std::filesystem::path& model_dir, 
     return p;
 }
 
+std::optional<int32_t> tokenizer_eos_id(const std::filesystem::path& model_dir) {
+    const auto path = model_dir / "tokenizer_config.json";
+    if (!std::filesystem::exists(path)) return std::nullopt;
+    const auto j = read_json(path);
+    if (!j.contains("eos_token")) return std::nullopt;
+    const nlohmann::json& eos = j.at("eos_token");
+    const std::string text = eos.is_string() ? eos.get<std::string>()
+                             : eos.is_object() && eos.contains("content") ? eos.at("content").get<std::string>()
+                                                                          : std::string();
+    if (text.empty() || !j.contains("added_tokens_decoder") || !j.at("added_tokens_decoder").is_object()) {
+        return std::nullopt;
+    }
+    for (const auto& [id, token] : j.at("added_tokens_decoder").items()) {
+        if (token.is_object() && token.value("content", "") == text) return static_cast<int32_t>(std::stol(id));
+    }
+    return std::nullopt;
+}
+
 }  // namespace xs::cfg

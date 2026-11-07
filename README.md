@@ -5,8 +5,9 @@ One repo, one binary: the model code, the engine, the tokenizer, chat templates 
 live here, and the math runs on an Intel GPU through a backend (OpenVINO first, SYCL next). Read
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
-**Status: v0.2.** One model family (Gemma 4 E2B / E4B, text and images), weights loaded straight from the Hugging Face
-checkpoint (no convert step yet), one request at a time, OpenVINO backend. [PROJECT.md](PROJECT.md) maps the code.
+**Status: v0.3.** Gemma 4 E2B / E4B (text and images) and Qwen3.5 (dense, text), weights loaded straight from the
+Hugging Face checkpoint (no convert step yet), one request at a time, OpenVINO backend. [PROJECT.md](PROJECT.md) maps
+the code.
 
 ## Build
 
@@ -21,7 +22,7 @@ build/tests/xs_tests                                     # unit tests
 
 ## Run
 
-Any Hugging Face directory of a supported model works, e.g. `google/gemma-4-E2B-it`:
+Any Hugging Face directory of a supported model works, e.g. `google/gemma-4-E2B-it` or `Qwen/Qwen3.5-4B`:
 
 ```bash
 build/src/xpu-serve info                                           # backends and devices
@@ -41,11 +42,11 @@ Every layer is tested against a reference:
 
 | What | Reference | Where |
 |---|---|---|
-| Tokenizer | Hugging Face `tokenizers`, exact ids and text | `tests/unit/tokenizer/` |
+| Tokenizer (Gemma BPE, byte-level BPE with NFC) | Hugging Face `tokenizers`, exact ids and text | `tests/unit/tokenizer/` |
 | Chat template | `apply_chat_template`, byte-exact | `tests/unit/chat/` |
 | Image resize | torchvision's antialiased bicubic, bit-exact | `tests/unit/image/` |
 | Every graph op, both backends | fp64 references, with planted-bug controls | `tests/unit/backend/` |
-| Whole model | Hugging Face fp32 logits and greedy output | `tests/unit/model/gemma4_parity.cpp` |
+| Whole model (Gemma 4, Qwen3.5) | Hugging Face fp32 logits and greedy output | `tests/unit/model/model_parity.cpp` |
 | Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/gemma4_vision_parity.cpp` |
 
 The model parity test needs the model and generated fixtures:

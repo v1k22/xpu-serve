@@ -209,6 +209,24 @@ HostTensor softcap(const HostTensor& x, float cap) {
     });
 }
 
+HostTensor sigmoid(const HostTensor& x) {
+    return map_unary(x, [](float v) { return static_cast<float>(1.0 / (1.0 + std::exp(-static_cast<double>(v)))); });
+}
+
+HostTensor silu(const HostTensor& x) {
+    return map_unary(x, [](float v) {
+        const double d = v;
+        return static_cast<float>(d / (1.0 + std::exp(-d)));
+    });
+}
+
+HostTensor softplus(const HostTensor& x) {
+    return map_unary(x, [](float v) {
+        const double d = v;
+        return static_cast<float>(d > 20.0 ? d : std::log1p(std::exp(d)));  // torch's threshold: identity above 20
+    });
+}
+
 HostTensor clamp(const HostTensor& x, float lo, float hi) {
     return map_unary(x, [lo, hi](float v) { return std::min(std::max(v, lo), hi); });
 }
@@ -296,19 +314,20 @@ HostTensor transpose(const HostTensor& x, const std::vector<int>& perm) {
     return out;
 }
 
-HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTensor& inv_freq) {
+HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTensor& inv_freq, int64_t rotary_dim) {
     check_f32(x, "rope x");
     check_f32(inv_freq, "rope inv_freq");
     const int64_t tokens = x.dim(0);
     const int64_t heads = x.dim(1);
     const int64_t dim = x.dim(2);
+    const int64_t rotated = rotary_dim == 0 ? dim : rotary_dim;
     const int64_t sections = positions.rank() == 2 ? positions.dim(1) : 1;
-    const int64_t width = dim / sections;
+    const int64_t width = rotated / sections;
     const int64_t half = width / 2;
     XS_CHECK(positions.numel() == tokens * sections, "rope has ", positions.numel(), " positions for ", tokens,
              " tokens of ", sections, " sections");
     XS_CHECK(inv_freq.numel() == half, "rope inv_freq has ", inv_freq.numel(), " entries, expected ", half);
-    HostTensor out(DType::F32, x.shape());
+    HostTensor out = x.clone();  // channels past rotary_dim pass through
     for (int64_t t = 0; t < tokens; ++t) {
         for (int64_t s = 0; s < sections; ++s) {
             const double pos = static_cast<double>(int_at(positions, t * sections + s));
@@ -326,6 +345,94 @@ HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTens
             }
         }
     }
+    return out;
+}
+
+HostTensor causal_conv(const HostTensor& x, const HostTensor& w, std::vector<float>& state) {
+    check_f32(x, "causal_conv x");
+    check_f32(w, "causal_conv w");
+    const int64_t tokens = x.dim(0);
+    const int64_t channels = x.dim(1);
+    const int64_t kernel = w.dim(1);
+    const int64_t past = kernel - 1;
+    XS_CHECK(w.dim(0) == channels && static_cast<int64_t>(state.size()) == past * channels,
+             "causal_conv shapes do not fit");
+    // x' = [state; x], [past + T, C]
+    std::vector<float> ext(static_cast<size_t>((past + tokens) * channels));
+    std::copy(state.begin(), state.end(), ext.begin());
+    std::copy(x.data<float>(), x.data<float>() + x.numel(), ext.begin() + past * channels);
+    HostTensor out(DType::F32, {tokens, channels});
+    for (int64_t t = 0; t < tokens; ++t) {
+        for (int64_t c = 0; c < channels; ++c) {
+            double acc = 0;
+            for (int64_t j = 0; j < kernel; ++j)
+                acc += static_cast<double>(w.data<float>()[c * kernel + j]) * ext[static_cast<size_t>((t + j) * channels + c)];
+            out.data<float>()[t * channels + c] = static_cast<float>(acc);
+        }
+    }
+    std::copy(ext.end() - past * channels, ext.end(), state.begin());
+    return out;
+}
+
+HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& k, const HostTensor& v,
+                       const HostTensor& g, const HostTensor& beta, float qk_l2norm_eps, std::vector<float>& state) {
+    for (const HostTensor* t : {&q, &k, &v, &g, &beta}) check_f32(*t, "gated_delta operand");
+    const int64_t tokens = q.dim(0);
+    const int64_t k_heads = q.dim(1);
+    const int64_t dk = q.dim(2);
+    const int64_t v_heads = v.dim(1);
+    const int64_t dv = v.dim(2);
+    const int64_t group = v_heads / k_heads;
+    XS_CHECK(static_cast<int64_t>(state.size()) == v_heads * dk * dv, "gated_delta state does not fit");
+    HostTensor out(DType::F32, {tokens, v_heads, dv});
+    const double q_scale = 1.0 / std::sqrt(static_cast<double>(dk));
+    pool.parallel_for(v_heads, [&](int64_t h) {
+        const int64_t kh = h / group;
+        float* S = state.data() + h * dk * dv;  // [dk, dv]
+        std::vector<double> qn(static_cast<size_t>(dk)), kn(static_cast<size_t>(dk)), kv(static_cast<size_t>(dv));
+        for (int64_t t = 0; t < tokens; ++t) {
+            const float* qt = q.data<float>() + (t * k_heads + kh) * dk;
+            const float* kt = k.data<float>() + (t * k_heads + kh) * dk;
+            double q_norm = 1.0, k_norm = 1.0;
+            if (qk_l2norm_eps > 0.0f) {
+                double sq = 0, sk = 0;
+                for (int64_t i = 0; i < dk; ++i) {
+                    sq += static_cast<double>(qt[i]) * qt[i];
+                    sk += static_cast<double>(kt[i]) * kt[i];
+                }
+                q_norm = 1.0 / std::sqrt(sq + qk_l2norm_eps);
+                k_norm = 1.0 / std::sqrt(sk + qk_l2norm_eps);
+            }
+            for (int64_t i = 0; i < dk; ++i) {
+                qn[static_cast<size_t>(i)] = qt[i] * q_norm * q_scale;
+                kn[static_cast<size_t>(i)] = kt[i] * k_norm;
+            }
+            const double decay = std::exp(static_cast<double>(g.data<float>()[t * v_heads + h]));
+            const double b = beta.data<float>()[t * v_heads + h];
+            const float* vt = v.data<float>() + (t * v_heads + h) * dv;
+            // S *= decay; kv = S^T k
+            std::fill(kv.begin(), kv.end(), 0.0);
+            for (int64_t i = 0; i < dk; ++i) {
+                float* row = S + i * dv;
+                for (int64_t j = 0; j < dv; ++j) {
+                    row[j] = static_cast<float>(row[j] * decay);
+                    kv[static_cast<size_t>(j)] += kn[static_cast<size_t>(i)] * row[j];
+                }
+            }
+            // S += k (beta (v - kv))^T; out = S^T q
+            float* o = out.data<float>() + (t * v_heads + h) * dv;
+            std::vector<double> acc(static_cast<size_t>(dv), 0.0);
+            for (int64_t i = 0; i < dk; ++i) {
+                float* row = S + i * dv;
+                for (int64_t j = 0; j < dv; ++j) {
+                    row[j] = static_cast<float>(row[j] + kn[static_cast<size_t>(i)] * b * (vt[j] - kv[static_cast<size_t>(j)]));
+                    acc[static_cast<size_t>(j)] += row[j] * qn[static_cast<size_t>(i)];
+                }
+            }
+            for (int64_t j = 0; j < dv; ++j)
+                o[j] = static_cast<float>(acc[static_cast<size_t>(j)]);
+        }
+    });
     return out;
 }
 

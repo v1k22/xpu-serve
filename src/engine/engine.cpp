@@ -71,6 +71,12 @@ int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
         return 0;
     }
     if (keep < static_cast<int64_t>(cached_.size())) {
+        if (model_->graph().has_fixed_state()) {
+            // Conv and recurrent state cannot be cut back into the sequence; start over.
+            session_->reset();
+            cached_.clear();
+            return 0;
+        }
         session_->truncate(keep);
         cached_.resize(static_cast<size_t>(keep));
     }

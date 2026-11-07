@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -30,6 +31,7 @@ constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 struct ExtraOptions {
     std::optional<float> activations_scale_factor;  // ov::hint::activations_scale_factor (f16 overflow guard)
     AttentionImpl attention = AttentionImpl::Auto;  // "auto", "sdpa" or "matmul"
+    ov_backend::GatedDeltaImpl gated_delta = ov_backend::GatedDeltaImpl::Paged;  // "paged" or "ref"
 };
 
 ExtraOptions parse_extra(const std::map<std::string, std::string>& extra) {
@@ -45,8 +47,16 @@ ExtraOptions parse_extra(const std::map<std::string, std::string>& extra) {
             }
         } else if (key == "attention") {
             out.attention = ov_backend::parse_attention_impl(text);
+        } else if (key == "gdn") {
+            if (text == "paged") {
+                out.gated_delta = ov_backend::GatedDeltaImpl::Paged;
+            } else if (text == "ref") {
+                out.gated_delta = ov_backend::GatedDeltaImpl::Ref;
+            } else {
+                fail("openvino option gdn='", text, "' is unknown (expected paged or ref)");
+            }
         } else {
-            fail("openvino option '", key, "' is unknown (supported: activations_scale_factor, attention)");
+            fail("openvino option '", key, "' is unknown (supported: activations_scale_factor, attention, gdn)");
         }
     }
     return out;
@@ -73,9 +83,15 @@ uint64_t system_memory() {
     return pages > 0 && page_size > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size) : 0;
 }
 
+bool profiling_requested() {
+    const char* v = std::getenv("XS_OV_PROFILE");
+    return v != nullptr && *v != '\0' && std::string(v) != "0";
+}
+
 ov::AnyMap compile_config(const SessionOptions& options, const ExtraOptions& extra) {
     const ov::element::Type precision = ov_backend::to_ov_type(options.precision);
     ov::AnyMap config{ov::hint::inference_precision(precision), ov::hint::kv_cache_precision(precision)};
+    if (profiling_requested()) config.emplace(ov::enable_profiling(true));
     if (!options.cache_dir.empty()) config.emplace(ov::cache_dir(options.cache_dir));
     if (extra.activations_scale_factor) {
         config.emplace(ov::hint::activations_scale_factor(*extra.activations_scale_factor));
@@ -128,7 +144,7 @@ public:
         if (extra.activations_scale_factor) require_property(device, ov::hint::activations_scale_factor.name());
 
         Timer timer;
-        ov_backend::Translation t = ov_backend::translate(graph, weights, {options.precision, extra.attention});
+        ov_backend::Translation t = ov_backend::translate(graph, weights, {options.precision, extra.attention, extra.gated_delta});
         const double translate_ms = timer.elapsed_ms();
         ov::CompiledModel compiled;
         try {
@@ -143,8 +159,11 @@ public:
                   " GiB converted; host RSS ", process_memory("VmRSS") / kGiB, " GiB, peak ",
                   process_memory("VmHWM") / kGiB, " GiB");
         log::debug("openvino: runtime ops: ", runtime_op_summary(compiled));
-        return std::make_unique<ov_backend::OvSession>(std::move(compiled), std::move(t.inputs), std::move(t.outputs),
-                                                       options.max_context, t.stateful);
+        auto session = std::make_unique<ov_backend::OvSession>(std::move(compiled), std::move(t.inputs),
+                                                               std::move(t.outputs), options.max_context, t.stateful,
+                                                               t.fixed_state);
+        if (profiling_requested()) session->enable_profile_report();
+        return session;
     }
 
 private:

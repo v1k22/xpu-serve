@@ -2,11 +2,15 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 #include <openvino/core/except.hpp>
+#include <openvino/runtime/remote_tensor.hpp>
 
 #include "util/error.h"
 #include "util/half.h"
+#include "util/log.h"
+#include "util/timer.h"
 
 namespace xs::ov_backend {
 
@@ -56,24 +60,57 @@ HostTensor to_host(const ov::Tensor& t) {
 }  // namespace
 
 OvSession::OvSession(ov::CompiledModel compiled, std::vector<InputSpec> inputs, std::vector<std::string> outputs,
-                     int64_t max_context, bool stateful)
+                     int64_t max_context, bool stateful, bool fixed_state)
     : compiled_(std::move(compiled)),
       inputs_(std::move(inputs)),
       outputs_(std::move(outputs)),
       max_context_(max_context),
-      stateful_(stateful) {
+      stateful_(stateful),
+      fixed_state_(fixed_state) {
     rethrow_openvino("create_infer_request", [&] { request_ = compiled_.create_infer_request(); });
+    // Recurrent state tables live for the whole session and are bound once; kernels update them in place.
+    rethrow_openvino("state table allocation", [&] {
+        for (size_t i = 0; i < inputs_.size(); ++i) {
+            if (inputs_[i].role != InputRole::StateTable) continue;
+            const ov::Shape shape(inputs_[i].shape.begin(), inputs_[i].shape.end());
+            // The plugin may have lowered the table's precision (GPU: f16); the tensor must match its port.
+            const ov::element::Type type = compiled_.input(i).get_element_type();
+            ov::Tensor table;
+            try {
+                table = compiled_.get_context().create_tensor(type, shape);
+            } catch (const ov::Exception&) {
+                table = ov::Tensor(type, shape);  // plugins without a device context (CPU) use host memory
+            }
+            request_.set_input_tensor(i, table);
+            state_tables_.push_back(table);
+        }
+        zero_state_tables();
+    });
+}
+
+void OvSession::zero_state_tables() {
+    for (ov::Tensor& table : state_tables_) {
+        if (table.is<ov::RemoteTensor>()) {
+            ov::Tensor zeros(table.get_element_type(), table.get_shape());
+            std::memset(zeros.data(), 0, zeros.get_byte_size());
+            ov::RemoteTensor remote = table.as<ov::RemoteTensor>();
+            remote.copy_from(zeros);
+        } else {
+            std::memset(table.data(), 0, table.get_byte_size());
+        }
+    }
 }
 
 int64_t OvSession::validate_inputs(const TensorMap& inputs) const {
     for (const auto& [name, tensor] : inputs) {
-        const bool known =
-            std::any_of(inputs_.begin(), inputs_.end(), [&](const InputSpec& s) { return s.name == name; });
+        const bool known = std::any_of(inputs_.begin(), inputs_.end(),
+                                       [&](const InputSpec& s) { return s.role == InputRole::Graph && s.name == name; });
         XS_CHECK(known, "input '", name, "' is not an input of this graph");
     }
     int64_t tokens = -1;
     std::string tokens_source;
     for (const InputSpec& spec : inputs_) {
+        if (spec.role != InputRole::Graph) continue;
         const auto it = inputs.find(spec.name);
         XS_CHECK(it != inputs.end(), "graph input '", spec.name, "' is missing");
         const HostTensor& t = it->second;
@@ -99,12 +136,31 @@ int64_t OvSession::validate_inputs(const TensorMap& inputs) const {
     return std::max<int64_t>(tokens, 0);
 }
 
-void OvSession::bind_inputs(const TensorMap& inputs) {
+void OvSession::bind_inputs(const TensorMap& inputs, int64_t tokens) {
+    // One sequence whose state sits in block 0 of every table: read it there, write it back there.
+    index_values_.assign(16, 0);
+    int32_t* next = index_values_.data();
+    const auto bind_ints = [&](size_t i, std::initializer_list<int64_t> values) {
+        int32_t* begin = next;
+        for (const int64_t v : values) *next++ = static_cast<int32_t>(v);
+        request_.set_input_tensor(i, ov::Tensor(ov::element::i32, ov::Shape{values.size()}, begin));
+    };
     for (size_t i = 0; i < inputs_.size(); ++i) {
-        const HostTensor& t = inputs.at(inputs_[i].name);
-        const ov::Shape shape(t.shape().begin(), t.shape().end());
-        // The host tensor is only read, and only during this synchronous infer.
-        request_.set_input_tensor(i, ov::Tensor(to_ov_type(t.dtype()), shape, const_cast<void*>(t.raw())));
+        switch (inputs_[i].role) {
+            case InputRole::Graph: {
+                const HostTensor& t = inputs.at(inputs_[i].name);
+                const ov::Shape shape(t.shape().begin(), t.shape().end());
+                // The host tensor is only read, and only during this synchronous infer.
+                request_.set_input_tensor(i, ov::Tensor(to_ov_type(t.dtype()), shape, const_cast<void*>(t.raw())));
+                break;
+            }
+            case InputRole::StateTable: break;  // bound once at construction
+            case InputRole::SubsequenceBegins: bind_ints(i, {0, tokens}); break;
+            case InputRole::BlockIndices: bind_ints(i, {0, 0}); break;
+            case InputRole::BlockIndicesBegins: bind_ints(i, {0, 2}); break;
+            case InputRole::ProcessedTokens: bind_ints(i, {num_cached_}); break;
+            case InputRole::CacheInterval: bind_ints(i, {0}); break;
+        }
     }
 }
 
@@ -114,20 +170,59 @@ void OvSession::read_outputs(TensorMap& outputs) {
         outputs[outputs_[i]] = to_host(request_.get_output_tensor(i));
 }
 
+OvSession::~OvSession() {
+    if (!profile_ || profiled_steps_ == 0) return;
+    std::vector<std::pair<double, std::string>> rows;
+    double total = 0;
+    for (const auto& [type, e] : profile_by_type_) {
+        rows.emplace_back(e.us, type);
+        total += e.us;
+    }
+    std::sort(rows.rbegin(), rows.rend());
+    std::string report;
+    for (size_t i = 0; i < rows.size() && i < 15; ++i) {
+        const auto& e = profile_by_type_.at(rows[i].second);
+        report += str_cat("\n  ", rows[i].second, ": ", rows[i].first / static_cast<double>(profiled_steps_) / 1000.0,
+                          " ms/step (", e.count / profiled_steps_, " nodes)");
+    }
+    const double steps = static_cast<double>(profiled_steps_);
+    log::info("openvino profile over ", profiled_steps_, " single-token steps: ", total / steps / 1000.0,
+              " ms/step in nodes; host wall ms/step: bind ", bind_ms_ / steps, ", infer ", infer_ms_ / steps, ", read ",
+              read_ms_ / steps, report);
+}
+
 void OvSession::run(const TensorMap& inputs, TensorMap& outputs) {
     const int64_t tokens = validate_inputs(inputs);
     XS_CHECK(num_cached_ + tokens <= max_context_, "step of ", tokens, " tokens on top of ", num_cached_,
              " cached exceeds max_context ", max_context_);
     rethrow_openvino("infer", [&] {
-        bind_inputs(inputs);
+        Timer timer;
+        bind_inputs(inputs, tokens);
+        const double bound = timer.elapsed_ms();
         request_.infer();
+        const double inferred = timer.elapsed_ms();
         read_outputs(outputs);
+        if (profile_ && tokens == 1) {
+            bind_ms_ += bound;
+            infer_ms_ += inferred - bound;
+            read_ms_ += timer.elapsed_ms() - inferred;
+            ++profiled_steps_;
+            for (const ov::ProfilingInfo& p : request_.get_profiling_info()) {
+                if (p.status != ov::ProfilingInfo::Status::EXECUTED) continue;
+                ProfileEntry& e = profile_by_type_[p.node_type + " [" + p.exec_type + "]"];
+                e.us += static_cast<double>(p.real_time.count());
+                ++e.count;
+            }
+        }
     });
     if (stateful_) num_cached_ += tokens;
 }
 
 void OvSession::reset() {
-    rethrow_openvino("reset_state", [&] { request_.reset_state(); });
+    rethrow_openvino("reset_state", [&] {
+        request_.reset_state();
+        zero_state_tables();
+    });
     num_cached_ = 0;
 }
 
@@ -138,6 +233,7 @@ void OvSession::truncate(int64_t n) {
         reset();
         return;
     }
+    XS_CHECK(!fixed_state_, "cannot truncate to ", n, " tokens: conv and recurrent state summarize the whole sequence");
     rethrow_openvino("truncate", [&] {
         for (ov::VariableState& state : request_.query_state())
             state.set_state(slice_state(state.get_state(), n));

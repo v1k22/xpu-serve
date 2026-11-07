@@ -1,6 +1,6 @@
 // End-to-end parity of Gemma 4 image input against Hugging Face (tests/parity/model/hf_vision_reference.py):
 // preprocessing, the vision tower, the expanded prompt, prompt logits and greedy continuations. Opt-in: needs
-// XS_TEST_MODEL_DIR and the generated fixtures. Same XS_PARITY_* variables as gemma4_parity.cpp; fixtures default to
+// XS_TEST_MODEL_DIR and the generated fixtures. Same XS_PARITY_* variables as model_parity.cpp; fixtures default to
 // <source>/tests/fixtures/generated/gemma4_vision.
 
 #include <doctest/doctest.h>
