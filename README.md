@@ -1,5 +1,5 @@
 # xpu-serve
-AI written experimental engine to run LLMs on Intel platforms.
+Experimental engine to run LLMs on Intel platforms.
 
 One repo, one binary: the model code, the engine, the tokenizer, chat templates and an OpenAI-compatible server all
 live here, and the math runs on an Intel GPU through a backend (OpenVINO first, SYCL next). Read
