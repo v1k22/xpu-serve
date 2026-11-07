@@ -162,15 +162,19 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ## Phase 4: SYCL backend (same model, own kernels)
 
-- [ ] Toolchain: oneAPI DPC++ build in CMake; device selection; USM allocation; in-order queues
+- [x] Toolchain: oneAPI DPC++ build in CMake; device selection; USM allocation; in-order queues (2026-11-07, oneAPI 2026.2)
 - [ ] Bandwidth probe in SYCL (matches 0.2)
 - [ ] int4 / int8 GEMV for decode (target ≥ 85% of measured bandwidth), contracts for every format and group size
 - [ ] MoE grouped GEMV (top-8 of 128) incl. the expert union at verify width k+1
 - [ ] Paged decode attention: head dims 256 / 512, GQA, sliding window, chain and **tree** masks
-- [ ] Prefill: oneDNN GEMM through SYCL interop; prefill attention
-- [ ] Norms, RoPE, activations, embedding gather, sampling helpers
+- [x] Prefill: oneMKL GEMM (f16 x f16 -> f32); prefill attention through two batched GEMMs per query chunk
+- [ ] Prefill attention on XMX without the score matrix (flash attention, e.g. SYCL*TLA)
+- [ ] Gated delta prefill in chunks (WY form, GEMMs) instead of the per-token loop
+- [x] Norms, RoPE, activations, embedding gather; f16 GEMV for decode; split-K decode attention (sampling stays on host)
 - [ ] SYCL command-graph capture/replay per shape bucket; eager fallback; measure per-step overhead
-- [ ] Tiny + real parity on SYCL
+- [x] Tiny + real parity on SYCL: op suites at f32 and f16; Gemma 4 E2B and Qwen3.5-4B match HF (f32 cosine 1.0, greedy exact)
+- [ ] Multi-GPU: layer split and tensor split across two Arc Pro B60s in one process
+- [x] End-to-end comparison with OpenVINO 2026.4.1 (docs/decisions/0007); per-op profile with `XS_SYCL_PROFILE=1`
 - [ ] Per-op comparison with OpenVINO (same graph, same inputs) → `bench/`
 - [ ] Tree drafts end to end (capability only SYCL has at first)
 - **Done when:** every contract and parity test passes on SYCL, and the per-op comparison is published.

@@ -42,6 +42,18 @@ if(XS_WITH_OPENVINO)
   target_include_directories(xs_backend_openvino SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openvino_dev)
 endif()
 
+if(XS_WITH_SYCL)
+  xs_add_library(xs_backend_sycl DIRS backend/sycl DEPS xs_core)
+  set(xs_sycl_flags -fsycl)
+  if(XS_SYCL_TARGETS)
+    list(APPEND xs_sycl_flags -fsycl-targets=${XS_SYCL_TARGETS})
+  endif()
+  target_compile_options(xs_backend_sycl PRIVATE ${xs_sycl_flags})
+  # Executables that link the backend need the SYCL device link step.
+  target_link_options(xs_backend_sycl INTERFACE ${xs_sycl_flags})
+  target_link_libraries(xs_backend_sycl PRIVATE MKL::MKL_SYCL::BLAS)
+endif()
+
 # Backend registry: the one place that knows which backends were compiled in.
 add_library(xs_backends STATIC backend/registry.cpp)
 target_include_directories(xs_backends PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -49,6 +61,10 @@ target_link_libraries(xs_backends PUBLIC xs_core xs_backend_cpu PRIVATE xs_warni
 if(XS_WITH_OPENVINO)
   target_link_libraries(xs_backends PUBLIC xs_backend_openvino)
   target_compile_definitions(xs_backends PRIVATE XS_HAVE_OPENVINO=1)
+endif()
+if(XS_WITH_SYCL)
+  target_link_libraries(xs_backends PUBLIC xs_backend_sycl)
+  target_compile_definitions(xs_backends PRIVATE XS_HAVE_SYCL=1)
 endif()
 
 xs_add_library(xs_server DIRS server DEPS xs_core xs_tokenizer xs_chat xs_httplib)

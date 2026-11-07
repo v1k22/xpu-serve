@@ -2,12 +2,12 @@
 Experimental engine to run LLMs on Intel platforms.
 
 One repo, one binary: the model code, the engine, the tokenizer, chat templates and an OpenAI-compatible server all
-live here, and the math runs on an Intel GPU through a backend (OpenVINO first, SYCL next). Read
+live here, and the math runs on an Intel GPU through a backend (OpenVINO, or the experimental SYCL backend). Read
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
 **Status: v0.3.** Gemma 4 E2B / E4B (text and images) and Qwen3.5 (dense, text), weights loaded straight from the
-Hugging Face checkpoint (no convert step yet), one request at a time, OpenVINO backend. [PROJECT.md](PROJECT.md) maps
-the code.
+Hugging Face checkpoint (no convert step yet), one request at a time, OpenVINO backend and an experimental SYCL backend
+(own kernels). [PROJECT.md](PROJECT.md) maps the code.
 
 ## Build
 
@@ -18,6 +18,17 @@ source /opt/intel/openvino_2026.4.1/setupvars.sh        # or wherever OpenVINO i
 cmake -S . -B build -G Ninja -DOpenVINO_DIR=$INTEL_OPENVINO_DIR/runtime/cmake
 cmake --build build
 build/tests/xs_tests                                     # unit tests
+```
+
+The SYCL backend (experimental, Intel GPUs through Level Zero) needs the oneAPI toolkit 2026.2 (DPC++ compiler and
+oneMKL):
+
+```bash
+source /opt/intel/oneapi/setvars.sh
+cmake -S . -B build-sycl -G Ninja -DCMAKE_CXX_COMPILER=icpx -DXS_WITH_SYCL=ON \
+      -DOpenVINO_DIR=$INTEL_OPENVINO_DIR/runtime/cmake      # OpenVINO is optional here
+cmake --build build-sycl
+build-sycl/src/xpu-serve run ~/models/gemma-4-E2B-it --backend sycl --device GPU.0
 ```
 
 ## Run

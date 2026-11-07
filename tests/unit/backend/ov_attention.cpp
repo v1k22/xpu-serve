@@ -1,5 +1,6 @@
 // Attention through the stateful KV cache against the fp64 reference: head dims 64/256/512, GQA, sliding window,
-// softcap, both lowerings (ScaledDotProductAttention and MatMul/Softmax), over several steps of different T.
+// softcap, both lowerings (OpenVINO: ScaledDotProductAttention and MatMul/Softmax; SYCL: per-row kernel and GEMMs),
+// over several steps of different T.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -90,7 +91,7 @@ TEST_SUITE("openvino attention") {
     TEST_CASE("causal attention with GQA for head dims 64, 256 and 512, both lowerings") {
         for (const int64_t head_dim : {64, 256, 512}) {
             for (const auto& [heads, kv_heads] : {std::pair<int64_t, int64_t>{4, 4}, {8, 2}, {8, 1}}) {
-                for (const char* impl : {"sdpa", "matmul"}) {
+                for (const std::string& impl : ovt::attention_impls()) {
                     AttentionCase c;
                     c.head_dim = head_dim;
                     c.heads = heads;
@@ -105,7 +106,7 @@ TEST_SUITE("openvino attention") {
 
     TEST_CASE("sliding window over a prefill longer than the window, then decode steps") {
         for (const int64_t head_dim : {64, 256, 512}) {
-            for (const char* impl : {"sdpa", "matmul"}) {
+            for (const std::string& impl : ovt::attention_impls()) {
                 AttentionCase c;
                 c.head_dim = head_dim;
                 c.heads = 8;
@@ -115,6 +116,22 @@ TEST_SUITE("openvino attention") {
                 c.steps = {37, 1, 1, 4};
                 CAPTURE(describe(c));
                 CHECK(attention_matches(c, static_cast<uint32_t>(100 + head_dim)));
+            }
+        }
+    }
+
+    TEST_CASE("decode over a long cache, whole and windowed (split across work-groups on SYCL)") {
+        for (const int64_t window : {0, 1100}) {
+            for (const std::string& impl : ovt::attention_impls()) {
+                AttentionCase c;
+                c.head_dim = 128;
+                c.heads = 8;
+                c.kv_heads = 2;
+                c.window = window;
+                c.impl = impl;
+                c.steps = {2100, 1, 2};
+                CAPTURE(describe(c));
+                CHECK(attention_matches(c, static_cast<uint32_t>(400 + window)));
             }
         }
     }
@@ -139,7 +156,7 @@ TEST_SUITE("openvino attention") {
     }
 
     TEST_CASE("planted bug: a reference whose window is one key wider must not match") {
-        for (const char* impl : {"sdpa", "matmul"}) {
+        for (const std::string& impl : ovt::attention_impls()) {
             AttentionCase c;
             c.window = 3;
             c.impl = impl;
@@ -151,6 +168,7 @@ TEST_SUITE("openvino attention") {
     }
 
     TEST_CASE("sdpa cannot express a softcap and says so") {
+        if (ovt::backend_name() != "openvino") return;
         AttentionCase c;
         c.softcap = 30.0f;
         SessionOptions options = ovt::options();

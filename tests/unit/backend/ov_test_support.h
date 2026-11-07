@@ -1,8 +1,10 @@
 #pragma once
 
 // Shared setup for the OpenVINO backend tests: the device under test (XS_OV_TEST_DEVICE, default CPU), its
-// precision (f32 on CPU, f16 elsewhere), per-precision tolerances and an optional per-op error report
-// (XS_OV_TEST_REPORT=1 prints "ov-error <op> max_abs=... max_rel=..." lines).
+// precision (f32 on CPU, f16 elsewhere; XS_DEVICE_TEST_PRECISION=f32|f16 overrides), per-precision tolerances and an
+// optional per-op error report (XS_OV_TEST_REPORT=1 prints "ov-error <op> max_abs=... max_rel=..." lines).
+// XS_DEVICE_TEST_BACKEND=sycl runs the backend-neutral suites (ops, attention, encoder ops, recurrent ops) against
+// another backend of this build.
 
 #include <doctest/doctest.h>
 
@@ -11,12 +13,24 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <vector>
 
-#include "backend/openvino/ov_backend.h"
+#include "backend/backend.h"
 #include "backend_test_util.h"
 #include "util/log.h"
 
 namespace xs::test::ov {
+
+inline std::string backend_name() {
+    const char* name = std::getenv("XS_DEVICE_TEST_BACKEND");
+    return name != nullptr && *name != '\0' ? name : "openvino";
+}
+
+// The two attention implementations to cover, as values of the backend's "attention" option.
+inline std::vector<std::string> attention_impls() {
+    if (backend_name() == "sycl") return {"rows", "gemm"};
+    return {"sdpa", "matmul"};
+}
 
 inline std::string device() {
     const char* d = std::getenv("XS_OV_TEST_DEVICE");
@@ -24,6 +38,8 @@ inline std::string device() {
 }
 
 inline DType precision() {
+    const char* p = std::getenv("XS_DEVICE_TEST_PRECISION");
+    if (p != nullptr && *p != '\0') return std::string(p) == "f32" ? DType::F32 : DType::F16;
     return device() == "CPU" ? DType::F32 : DType::F16;
 }
 inline bool is_f16() {
@@ -43,7 +59,7 @@ inline SessionOptions options(int64_t max_context = 4096) {
 inline Backend& backend() {
     static const std::unique_ptr<Backend> instance = [] {
         if (const char* level = std::getenv("XS_OV_TEST_LOG")) log::set_level(log::parse_level(level));
-        return make_openvino_backend();
+        return make_backend(backend_name());
     }();
     return *instance;
 }

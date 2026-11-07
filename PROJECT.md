@@ -8,7 +8,7 @@ that moves, adds or renames a file updates the map below in the same commit.
 
 A C++20 LLM inference engine and OpenAI-compatible server for Intel GPUs. One repo, one binary (`xpu-serve`):
 model code, engine, tokenizer, chat templates and HTTP server all live here, and the math runs through a backend
-(OpenVINO today, SYCL planned, plus a CPU reference used as the test oracle).
+(OpenVINO and an experimental SYCL backend with our own kernels, plus a CPU reference used as the test oracle).
 
 The rule that shapes everything: **one feature = one PR in this repo.** Supporting a model or a feature must never
 need changes in an exporter, a separate pipeline library and a separate server.
@@ -49,6 +49,13 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
   `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`; `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for
   tokenizer parity). `XS_OV_PROFILE=1` logs the OpenVINO plugin's costliest op types per decode step when a session
   ends.
+- SYCL backend: needs the oneAPI toolkit (DPC++ compiler and oneMKL, 2026.2):
+  `source <oneapi>/setvars.sh`, then configure with `-DXS_WITH_SYCL=ON -DCMAKE_CXX_COMPILER=icpx` (add
+  `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` to compile the kernels ahead of time for the Arc Pro B60). Run with
+  `--backend sycl --device GPU.0`; backend option `attention=auto|rows|gemm`. `XS_SYCL_PROFILE=1` logs per-op time
+  per step (each op runs alone), `XS_SYCL_SYNC=1` waits after every op and names the op a device error comes from.
+- The backend op suites ("openvino ops", "openvino attention", ...) run against SYCL too:
+  `XS_DEVICE_TEST_BACKEND=sycl XS_OV_TEST_DEVICE=GPU.0 [XS_DEVICE_TEST_PRECISION=f32]`.
 
 ## 3. Repository map
 
@@ -80,7 +87,7 @@ area).
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
 | `models/` | xs_core | `model.h` (the `Model` interface), `registry.cpp` (model_type -> code), `config_util` (checked JSON readers), one folder per architecture |
 | `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop), `Sampler`, request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses) |
-| `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `openvino/` |
+| `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `openvino/`, `sycl/` |
 | `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
 | `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls), `plain` |
 | `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming |
@@ -102,6 +109,9 @@ area).
 | `src/backend/cpu_ref/ops.cpp` | f32/f64 reference kernels, one per op: the accuracy oracle |
 | `src/backend/openvino/ov_translate.cpp` | Step graph -> `ov::Model` (one lowering per op), KV as stateful variables |
 | `src/backend/openvino/ov_attention.cpp` | Attention lowering: mask, GQA by broadcast, SDPA or matmul path |
+| `src/backend/sycl/sycl_backend.cpp` | SYCL session: device dtypes, fusions, per-T memory plan (one arena), op dispatch, KV and state buffers |
+| `src/backend/sycl/sycl_kernels.cpp` | SYCL kernels: elementwise, norms, RoPE, gather, copies, causal conv, gated delta, decode attention, GEMV |
+| `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond) and Attention (per-row kernel with split-K, or GEMMs) |
 | `src/engine/engine.cpp` | Generation loop for one sequence; encodes images and splices their rows into prefill chunks |
 | `src/service/engine_service.cpp` | Wiring from a model directory to a ready service |
 | `src/server/completion_handlers.cpp` | `/v1/chat/completions` and `/v1/completions` |
@@ -162,7 +172,7 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 |---|---|---|
 | `cpu-ref` | test oracle | f32 values, f64 accumulation, threaded matmul. Slow by design; correctness only |
 | `openvino` | main backend today | Translates the graph to an `ov::Model` with the OpenVINO C++ opset API; KV and conv state as ReadValue/Assign variables; GatedDelta as OpenVINO's `PagedGatedDeltaNet` (internal op, header vendored in `third_party/openvino_dev`) with session-owned state tables updated in place; bf16 weights converted to f16 (or f32) at compile; runs on CPU and Intel GPUs. Options: `attention=auto|sdpa|matmul`, `gdn=paged|ref`, `activations_scale_factor` |
-| `sycl` | planned (DESIGN.md 8.7) | |
+| `sycl` | experimental (`-DXS_WITH_SYCL=ON`, icpx) | Runs the graph op by op on an in-order Level Zero queue with its own kernels; oneMKL for prefill GEMMs. Weights and KV f16 (f32 at f32 precision), activations f32. Memory: one arena per step, planned per T from value lifetimes; KV slots grow by doubling; conv/recurrent state double-buffered so a failed step changes nothing. Fuses act(x)*gate and conv+SiLU. Decode attention reads only the sliding window and splits long caches across work-groups. Option `attention=auto|rows|gemm`. See docs/decisions/0007 |
 
 ## 7. Tests (`tests/`)
 
@@ -221,6 +231,8 @@ Touch, in this order:
 4. `src/backend/cpu_ref/ops.{h,cpp}` + the switch in `cpu_backend.cpp`; test in `tests/unit/backend/cpu_ops.cpp`.
 5. `src/backend/openvino/ov_translate.cpp` (and `ov_attention.cpp` for attention); test in
    `tests/unit/backend/ov_ops.cpp` on CPU, then run the same test on both GPUs.
+6. `src/backend/sycl/`: a kernel in `sycl_kernels.cpp` and a case in `SyclSession::launch` (operand dtypes in
+   `check_ops`); run the same suites with `XS_DEVICE_TEST_BACKEND=sycl`.
 
 ### 8.3 Add a backend option
 

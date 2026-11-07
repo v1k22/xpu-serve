@@ -5,6 +5,9 @@
 #ifdef XS_HAVE_OPENVINO
 #include "backend/openvino/ov_backend.h"
 #endif
+#ifdef XS_HAVE_SYCL
+#include "backend/sycl/sycl_backend.h"
+#endif
 
 namespace xs {
 
@@ -13,6 +16,9 @@ std::vector<std::string> available_backends() {
 #ifdef XS_HAVE_OPENVINO
     out.emplace_back("openvino");
 #endif
+#ifdef XS_HAVE_SYCL
+    out.emplace_back("sycl");
+#endif
     out.emplace_back("cpu-ref");
     return out;
 }
@@ -20,6 +26,9 @@ std::vector<std::string> available_backends() {
 std::unique_ptr<Backend> make_backend(std::string_view name) {
 #ifdef XS_HAVE_OPENVINO
     if (name == "openvino") return make_openvino_backend();
+#endif
+#ifdef XS_HAVE_SYCL
+    if (name == "sycl") return make_sycl_backend();
 #endif
     if (name == "cpu-ref") return make_cpu_ref_backend();
     std::string list;

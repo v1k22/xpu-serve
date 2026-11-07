@@ -11,10 +11,25 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(XS_WITH_OPENVINO "Build the OpenVINO backend" ON)
+option(XS_WITH_SYCL "Build the SYCL backend (needs the oneAPI DPC++ compiler, icpx, and oneMKL)" OFF)
+set(XS_SYCL_TARGETS "" CACHE STRING "-fsycl-targets for the SYCL backend, e.g. intel_gpu_bmg_g21 (empty: JIT)")
 option(XS_BUILD_TESTS "Build unit tests" ON)
 option(XS_WERROR "Treat warnings as errors" OFF)
 
 find_package(Threads REQUIRED)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+  add_compile_options(-fp-model=precise)  # icpx defaults to fast math
+endif()
+
+if(XS_WITH_SYCL)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    message(FATAL_ERROR "XS_WITH_SYCL needs the oneAPI DPC++ compiler: configure with -DCMAKE_CXX_COMPILER=icpx")
+  endif()
+  set(MKL_INTERFACE lp64)
+  set(MKL_THREADING sequential)
+  find_package(MKL CONFIG REQUIRED)
+endif()
 
 if(XS_WITH_OPENVINO)
   # Point OpenVINO_DIR at <openvino>/runtime/cmake, or source <openvino>/setupvars.sh first.
@@ -41,4 +56,5 @@ if(XS_BUILD_TESTS)
   add_subdirectory(tests)
 endif()
 
-message(STATUS "xpu-serve ${PROJECT_VERSION}: OpenVINO backend = ${XS_WITH_OPENVINO}, tests = ${XS_BUILD_TESTS}")
+message(STATUS "xpu-serve ${PROJECT_VERSION}: OpenVINO backend = ${XS_WITH_OPENVINO}, SYCL backend = ${XS_WITH_SYCL}, "
+               "tests = ${XS_BUILD_TESTS}")

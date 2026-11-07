@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <functional>
+#include <vector>
 
 #include "backend_test_util.h"
 #include "reference_ops.h"
@@ -118,8 +119,15 @@ inline void causal_conv_steps(const Env& env) {
 
 inline void gated_delta_steps(const Env& env) {
     TensorRng rng(24);
-    const int64_t hk = 2, hv = 4, dk = 32, dv = 16;
+    struct Dims {
+        int64_t dk, dv;
+        std::vector<int64_t> steps;
+    };
+    // Small heads, and Qwen3.5's 128 x 128 heads over a step longer than a backend's staging block.
+    for (const Dims& dims : {Dims{32, 16, {7, 1, 4}}, Dims{128, 128, {70, 1, 4}}})
     for (const float eps : {0.0f, 1e-6f}) {
+        const int64_t hk = 2, hv = 4, dk = dims.dk, dv = dims.dv;
+        CAPTURE(dk);
         CAPTURE(eps);
         Graph g;
         const int slot = g.add_recurrent_slot(hv, dk, dv, "gdn");
@@ -129,8 +137,8 @@ inline void gated_delta_steps(const Env& env) {
         const auto session = env.compile(g, MemoryWeights{});
         std::vector<HostTensor> qs, ks, vs, gs, betas, outs;
         // Without l2norm, k must stay small so the recurrence stays bounded (as l2norm guarantees in the model).
-        const float k_range = eps > 0 ? 1.0f : 0.2f;
-        for (const int64_t t : {7, 1, 4}) {
+        const float k_range = eps > 0 ? 1.0f : 0.2f * std::sqrt(32.0f / static_cast<float>(dk));
+        for (const int64_t t : dims.steps) {
             qs.push_back(rng.uniform(DType::F32, {t, hk, dk}));
             ks.push_back(rng.uniform(DType::F32, {t, hk, dk}, k_range));
             vs.push_back(rng.uniform(DType::F32, {t, hv, dv}));

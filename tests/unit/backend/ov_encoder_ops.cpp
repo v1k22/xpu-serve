@@ -106,7 +106,7 @@ TEST_SUITE("openvino encoder ops") {
                                             g.input("k", DType::F32, {kT, kv_heads, dim}),
                                             g.input("v", DType::F32, {kT, kv_heads, dim}), attrs));
                 SessionOptions options = ovt::options();
-                if (matmul) options.extra["attention"] = "matmul";
+                options.extra["attention"] = ovt::attention_impls()[matmul ? 1 : 0];
                 const HostTensor out = ovt::run(g, test::MemoryWeights{}, {{"q", q}, {"k", k}, {"v", v}}, options)
                                            .at("out");
                 test::ref::AttentionSpec spec;
