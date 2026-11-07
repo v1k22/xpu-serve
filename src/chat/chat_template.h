@@ -21,6 +21,15 @@ public:
     // {"enable_thinking": true}). Throws xs::Error with the template engine's message on failure.
     virtual std::string render(const nlohmann::json& messages, const nlohmann::json& tools, bool add_generation_prompt,
                                const nlohmann::json& extra = nlohmann::json::object()) const = 0;
+
+    // The same with object keys in the caller's order. Templates that print tool schemas with tojson or iterate
+    // arguments with items (Qwen) put key order into the prompt, and Hugging Face keeps the request's order; a
+    // nlohmann::json has already sorted its keys. The default drops the order and calls the overload above.
+    virtual std::string render(const nlohmann::ordered_json& messages, const nlohmann::ordered_json& tools,
+                               bool add_generation_prompt,
+                               const nlohmann::ordered_json& extra = nlohmann::ordered_json::object()) const {
+        return render(nlohmann::json(messages), nlohmann::json(tools), add_generation_prompt, nlohmann::json(extra));
+    }
 };
 
 }  // namespace xs::chat

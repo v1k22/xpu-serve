@@ -1,8 +1,9 @@
 """Renders chat-template parity cases with Hugging Face for the C++ ChatTemplate test.
 
-Usage: /root/workspace/xs-ref/venv/bin/python tests/parity/chat/gen_cases.py [model_dir]
-Writes tests/fixtures/chat/gemma4_cases.json. The model dir needs only chat_template.jinja and tokenizer_config.json
-(plus tokenizer.json for AutoTokenizer); it defaults to the vendored fixture copy's source model.
+Usage: /root/workspace/xs-ref/venv/bin/python -I tests/parity/chat/gen_cases.py [gemma4|qwen3_5[=model_dir]] ...
+Writes tests/fixtures/chat/<set>_cases.json for each set named (default: all). A model dir needs only
+chat_template.jinja and tokenizer_config.json (plus tokenizer.json for AutoTokenizer); it defaults to the vendored
+fixture copy's source model (see tests/fixtures/chat/<set>/SOURCE).
 """
 
 import copy
@@ -14,8 +15,7 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 REPO = Path(__file__).resolve().parents[3]
-OUT = REPO / "tests/fixtures/chat/gemma4_cases.json"
-DEFAULT_MODEL = Path("/root/workspace/models/gemma-4-E2B-it")
+FIXTURES = REPO / "tests/fixtures/chat"
 
 
 def tool(name, description, properties, required=None, **extra):
@@ -229,17 +229,238 @@ def openai_cases():
     ], [WEATHER], True, {}
 
 
-def main():
-    model = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_MODEL
+TRANSLATE = tool(
+    "traduire_texte",
+    "Traduit un texte — 翻訳します 🌐. Use “smart quotes” and a \\ backslash.",
+    {
+        "texte": {"type": "string", "description": "Texte à traduire"},
+        "langue": {"type": "string", "enum": ["fr", "日本語", "español"]},
+        "options": {
+            "type": "object",
+            "properties": {
+                "formel": {"type": "boolean", "default": False},
+                "glossaire": {
+                    "type": "array",
+                    "items": {"type": "object", "properties": {"de": {"type": "string"}, "vers": {"type": "string"}}},
+                },
+                "température": {"type": "number", "minimum": 0.0, "maximum": 1.5, "default": 0.7531246},
+            },
+        },
+    },
+    ["texte", "langue"],
+)
+
+QWEN_ARGS = {
+    "s": "two\nlines <b>&</b> ünï 日本 🎉",
+    "i": -12,
+    "f": 2.5,
+    "whole": 3.0,
+    "precise": 0.123456789012,
+    "large": 1234567.125,
+    "tiny": 1e-05,
+    "big": 1e20,
+    "t": True,
+    "no": False,
+    "none": None,
+    "obj": {"nested": {"deep": [1, "two", {"x": False}]}, "é": "ü"},
+    "list": [[1, 2], {"k": None}],
+    "empty_s": "",
+    "empty_o": {},
+    "empty_l": [],
+}
+
+
+def qwen3_5_cases():
+    u = {"role": "user", "content": "What is the weather in Paris?"}
+    sys_msg = {"role": "system", "content": "  You are a helpful assistant.\n"}
+    weather_call = call("call_1", "get_weather", {"city": "Paris", "unit": "celsius"})
+    weather_text_call = call("call_1", "get_weather", "{\"city\": \"Paris\", \"unit\": \"celsius\"}")
+    think_off = {"enable_thinking": False}
+    think_on = {"enable_thinking": True}
+
+    yield "user_only", [u], None, True, {}
+    yield "user_only_no_generation_prompt", [u], None, False, {}
+    yield "system_and_user", [sys_msg, u], None, True, {}
+    yield "system_and_user_no_generation_prompt", [sys_msg, u], None, False, {}
+    yield "thinking_on", [sys_msg, u], None, True, think_on
+    yield "thinking_off", [sys_msg, u], None, True, think_off
+    yield "multi_turn", [
+        sys_msg,
+        {"role": "user", "content": "Hi!"},
+        {"role": "assistant", "content": "Hello! How can I help?"},
+        {"role": "user", "content": "Tell me a joke."},
+    ], None, True, {}
+    yield "multi_turn_thinking_off", [
+        {"role": "user", "content": "Hi!"},
+        {"role": "assistant", "content": "Hello!"},
+        {"role": "user", "content": "Again"},
+    ], None, True, think_off
+    yield "assistant_prefill", [u, {"role": "assistant", "content": "Let me check"}], None, False, {}
+    yield "reasoning_content_after_last_user", [
+        u, {"role": "assistant", "reasoning_content": "\nThe user wants weather.\n\n", "content": "Sunny."},
+    ], None, False, {}
+    yield "reasoning_content_before_last_user_dropped", [
+        u,
+        {"role": "assistant", "reasoning_content": "Old thoughts.", "content": "Sunny."},
+        {"role": "user", "content": "And tomorrow?"},
+    ], None, True, {}
+    yield "think_in_content_after_last_user", [
+        u, {"role": "assistant", "content": "<think>\nhmm, Paris\n\n</think>\n\nIt is sunny."},
+    ], None, False, {}
+    yield "think_in_content_before_last_user_stripped", [
+        u,
+        {"role": "assistant", "content": "<think>\nhmm\n</think>\n\nIt is sunny."},
+        {"role": "user", "content": "Thanks"},
+    ], None, True, {}
+    yield "think_close_only_in_content", [
+        u,
+        {"role": "assistant", "content": "thinking without opener</think>\n\nanswer"},
+        {"role": "user", "content": "ok"},
+        {"role": "assistant", "content": "  leading spaces then</think>tail  "},
+    ], None, False, {}
+    yield "reasoning_content_wins_over_think_in_content", [
+        u, {"role": "assistant", "reasoning_content": "Real reasoning.", "content": "<think>x</think>Visible."},
+    ], None, False, {}
+    yield "reasoning_content_null_with_think_in_content", [
+        u, {"role": "assistant", "reasoning_content": None, "content": "<think>r</think>c"},
+    ], None, False, {}
+    yield "content_parts", [
+        {"role": "system", "content": [{"type": "text", "text": "Part one."}, {"type": "text", "text": " Part two. "}]},
+        {"role": "user", "content": [{"type": "text", "text": "  Look: "}, {"type": "text", "text": "two parts"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Seen."}]},
+        {"role": "user", "content": [{"type": "text", "text": "Again"}]},
+    ], None, True, {}
+    yield "image_parts", [
+        {"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": "What is in this image?"}]},
+    ], None, True, {}
+    yield "image_parts_multi_turn", [
+        {"role": "user", "content": [
+            {"type": "text", "text": "Compare "}, {"type": "image"}, {"type": "text", "text": " and "},
+            {"type": "image"}]},
+        {"role": "assistant", "content": "They differ."},
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "And this one?"}]},
+    ], None, True, think_off
+    yield "image_parts_with_vision_ids", [
+        {"role": "user", "content": [{"type": "image"}, {"type": "image"}, {"type": "text", "text": "Both?"}]},
+    ], None, True, {"add_vision_id": True}
+    yield "video_part", [
+        {"role": "user", "content": [{"type": "video"}, {"type": "text", "text": "Summarize."}]},
+    ], None, True, {}
+    yield "unicode", [
+        {"role": "system", "content": "Réponds en français. 日本語も可。"},
+        {"role": "user", "content": "Ça va? 👋🏽 Привет — “quotes” \\ back\\slash \t tab"},
+        {"role": "assistant", "content": "Très bien 😀"},
+        {"role": "user", "content": "中文 العربية עברית"},
+    ], None, True, {}
+    yield "tools_simple", [u], [WEATHER], True, {}
+    yield "tools_several_with_system", [sys_msg, u], [WEATHER, SEARCH, EDIT, TRANSLATE, NO_ARGS], True, {}
+    yield "tools_empty_system", [{"role": "system", "content": "   "}, u], [WEATHER], True, {}
+    yield "tools_thinking_off", [u], [WEATHER, TRANSLATE], True, think_off
+    yield "tool_call_object_arguments", [
+        u,
+        {"role": "assistant", "tool_calls": [weather_call]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 21}"},
+    ], [WEATHER], True, {}
+    yield "tool_call_string_arguments", [
+        u,
+        {"role": "assistant", "content": None, "tool_calls": [weather_text_call]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 21}"},
+    ], [WEATHER], True, {}
+    yield "tool_call_argument_types_object", [
+        u, {"role": "assistant", "tool_calls": [call("c", "kitchen_sink", QWEN_ARGS)]},
+        {"role": "tool", "tool_call_id": "c", "content": "ok"},
+    ], None, True, {}
+    yield "tool_call_argument_types_string", [
+        u, {"role": "assistant", "tool_calls": [call("c", "kitchen_sink", json.dumps(QWEN_ARGS))]},
+        {"role": "tool", "tool_call_id": "c", "content": "ok"},
+    ], None, True, {}
+    yield "tool_call_argument_floats", [
+        u, {"role": "assistant", "tool_calls": [call("c", "nums", FLOATS)]},
+        {"role": "tool", "tool_call_id": "c", "content": "ok"},
+    ], None, True, {}
+    yield "tool_call_flat_without_function_key", [
+        u, {"role": "assistant", "tool_calls": [{"name": "get_weather", "arguments": {"city": "Oslo"}}]},
+        {"role": "tool", "content": "-3 C"},
+    ], [WEATHER], True, {}
+    yield "tool_call_without_arguments", [
+        u, {"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "list_files"}}]},
+        {"role": "tool", "tool_call_id": "c", "content": "a.txt"},
+    ], [NO_ARGS], True, {}
+    yield "tool_call_with_preamble_and_reasoning", [
+        u,
+        {"role": "assistant", "reasoning_content": "Need the tool.", "content": "Let me check.\n",
+         "tool_calls": [weather_call]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "21 C"},
+    ], [WEATHER], True, {}
+    yield "tool_call_whitespace_only_content", [
+        u, {"role": "assistant", "content": " \n ", "tool_calls": [weather_call]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "21 C"},
+    ], [WEATHER], True, {}
+    yield "multiple_tool_calls_consecutive_responses", [
+        sys_msg,
+        {"role": "user", "content": "Weather in Paris, docs on rain, and translate it?"},
+        {"role": "assistant", "content": "I will use three tools.", "tool_calls": [
+            weather_call,
+            call("call_2", "search_docs", json.dumps({
+                "query": "rain \"gear\"", "Limit": 5, "exact": False,
+                "filters": {"tags": ["a", "b"], "since": None, "score": 0.75}, "URL": "x.org"})),
+            call("call_3", "traduire_texte", {"texte": "il pleut", "langue": "日本語"}),
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "21 C"},
+        {"role": "tool", "tool_call_id": "call_2", "content": [{"type": "text", "text": "Doc A"},
+                                                               {"type": "text", "text": "; Doc B"}]},
+        {"role": "tool", "tool_call_id": "call_3", "content": "雨が降っています"},
+    ], [WEATHER, SEARCH, TRANSLATE], True, {}
+    yield "multi_step_tools_keep_reasoning_after_last_user", [
+        u,
+        {"role": "assistant", "reasoning_content": "First the weather.", "tool_calls": [weather_call]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "21 C"},
+        {"role": "assistant", "content": "<think>\nNow the docs.\n</think>\n\n",
+         "tool_calls": [call("call_2", "search_docs", {"query": "umbrella"})]},
+        {"role": "tool", "tool_call_id": "call_2", "content": "Doc C"},
+    ], [WEATHER, SEARCH], True, think_on
+    yield "tool_round_trip_answered_then_new_user", [
+        u,
+        {"role": "assistant", "reasoning_content": "Calling.", "content": "", "tool_calls": [weather_text_call]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "21 C"},
+        {"role": "assistant", "reasoning_content": "Answer now.", "content": "It is 21 C in Paris."},
+        {"role": "user", "content": "Thanks!"},
+    ], [WEATHER], True, think_off
+    yield "user_message_wrapped_in_tool_response", [
+        u,
+        {"role": "assistant", "tool_calls": [weather_call]},
+        {"role": "user", "content": "<tool_response>\n21 C\n</tool_response>"},
+    ], [WEATHER], True, {}
+
+
+SETS = {
+    "gemma4": (Path("/root/workspace/models/gemma-4-E2B-it"), lambda: itertools.chain(cases(), openai_cases())),
+    "qwen3_5": (Path("/root/workspace/models/Qwen3.5-4B"), qwen3_5_cases),
+}
+
+
+def write_set(name, model):
     tok = AutoTokenizer.from_pretrained(model)
     out = []
-    for name, messages, tools, add_gen, extra in itertools.chain(cases(), openai_cases()):
+    for case_name, messages, tools, add_gen, extra in SETS[name][1]():
         expected = tok.apply_chat_template(
             openai_to_hf(messages), tools=tools, add_generation_prompt=add_gen, tokenize=False, **extra)
-        out.append({"name": name, "messages": messages, "tools": tools, "add_generation_prompt": add_gen,
+        out.append({"name": case_name, "messages": messages, "tools": tools, "add_generation_prompt": add_gen,
                     "extra": extra, "expected": expected})
-    OUT.write_text(json.dumps(out, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
-    print(f"wrote {len(out)} cases to {OUT}")
+    names = [c["name"] for c in out]
+    assert len(names) == len(set(names)), "duplicate case names"
+    path = FIXTURES / f"{name}_cases.json"
+    path.write_text(json.dumps(out, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    print(f"wrote {len(out)} cases to {path}")
+
+
+def main():
+    for arg in sys.argv[1:] or list(SETS):
+        name, _, model = arg.partition("=")
+        if name not in SETS:
+            sys.exit(f"unknown set {name!r} (known: {', '.join(SETS)})")
+        write_set(name, Path(model) if model else SETS[name][0])
 
 
 if __name__ == "__main__":

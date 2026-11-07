@@ -1429,7 +1429,7 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
     } else if (is_val<value_int>(val)) {
         oss << val->as_int();
     } else if (is_val<value_float>(val)) {
-        oss << val->as_float();
+        oss << python_float_repr(val->as_float());  // xpu-serve: json.dumps writes floats as repr
     } else if (is_val<value_string>(val)) {
         oss << "\"";
         for (char c : val->as_string().str()) {

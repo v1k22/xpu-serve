@@ -13,6 +13,7 @@
 
 namespace fs = std::filesystem;
 using nlohmann::json;
+using nlohmann::ordered_json;
 
 namespace {
 
@@ -22,6 +23,13 @@ json read_json(const fs::path& path) {
     std::ifstream in(path);
     REQUIRE_MESSAGE(in.good(), "missing fixture ", path.string());
     return json::parse(in);
+}
+
+// Keeps key order, as Hugging Face does for tool schemas and tool-call arguments.
+ordered_json read_ordered_json(const fs::path& path) {
+    std::ifstream in(path);
+    REQUIRE_MESSAGE(in.good(), "missing fixture ", path.string());
+    return ordered_json::parse(in);
 }
 
 // A scratch model dir holding only the given files; removed on scope exit.
@@ -67,6 +75,20 @@ TEST_SUITE("chat template") {
         }
     }
 
+    TEST_CASE("qwen3_5 renders byte-identical to Hugging Face") {
+        const auto tmpl = xs::chat::ChatTemplate::load(kChatFixtures / "qwen3_5");
+        const ordered_json cases = read_ordered_json(kChatFixtures / "qwen3_5_cases.json");
+        REQUIRE(cases.size() >= 35);
+        for (const ordered_json& c : cases) {
+            const std::string name = c["name"].get<std::string>();
+            CAPTURE(name);
+            std::string rendered;
+            CHECK_NOTHROW(
+                rendered = tmpl->render(c["messages"], c["tools"], c["add_generation_prompt"].get<bool>(), c["extra"]));
+            CHECK(rendered == c["expected"].get<std::string>());
+        }
+    }
+
     TEST_CASE("special tokens come from tokenizer_config, as strings or AddedToken objects") {
         CHECK(render_one("{{ bos_token }}|{{ eos_token }}", json::array()) == "<s>|</s>");
     }
@@ -91,6 +113,42 @@ TEST_SUITE("chat template") {
         const json values = json::array({0.1 + 0.2, 1e16, 1e-5, 123456.5, -0.0, 2.0, 1e-4});
         CHECK(render_one("{% for v in messages %}{{ v }} {% endfor %}", values) ==
               "0.30000000000000004 1e+16 1e-05 123456.5 -0.0 2.0 0.0001 ");
+    }
+
+    TEST_CASE("tojson and |string write floats like Python json.dumps and str") {
+        const json values = json::array({3.0, 0.123456789012, 1234567.125, 1e-5, 7});
+        CHECK(render_one("{{ messages | tojson }}", values) == "[3.0, 0.123456789012, 1234567.125, 1e-05, 7]");
+        CHECK(render_one("{% for v in messages %}{{ v | string }} {% endfor %}", values) ==
+              "3.0 0.123456789012 1234567.125 1e-05 7 ");
+    }
+
+    TEST_CASE("the ordered overload keeps key order; the plain one sorts") {
+        ScratchModelDir dir("order");
+        dir.write("chat_template.jinja", "{{ messages[0] | tojson }}");
+        const auto tmpl = xs::chat::ChatTemplate::load(dir.path());
+        const std::string text = R"([{"role": "user", "content": "x", "b": 1, "a": 2}])";
+        CHECK(tmpl->render(ordered_json::parse(text), nullptr, false) ==
+              R"({"role": "user", "content": "x", "b": 1, "a": 2})");
+        CHECK(tmpl->render(json::parse(text), nullptr, false) == R"({"a": 2, "b": 1, "content": "x", "role": "user"})");
+    }
+
+    TEST_CASE("qwen3_5: JSON-text tool arguments keep their key order") {
+        const auto tmpl = xs::chat::ChatTemplate::load(kChatFixtures / "qwen3_5");
+        auto conversation = [](const ordered_json& arguments) {
+            ordered_json call = {{"id", "c1"}, {"type", "function"}};
+            call["function"] = {{"name", "f"}, {"arguments", arguments}};
+            return ordered_json::array({
+                {{"role", "user"}, {"content", "go"}},
+                {{"role", "assistant"}, {"tool_calls", ordered_json::array({call})}},
+                {{"role", "tool"}, {"tool_call_id", "c1"}, {"content", "ok"}},
+            });
+        };
+        const std::string from_text = tmpl->render(conversation(R"({"zeta": 1, "alpha": true})"), nullptr, true);
+        CHECK(from_text ==
+              tmpl->render(conversation(ordered_json::parse(R"({"zeta": 1, "alpha": true})")), nullptr, true));
+        CHECK(from_text.find("<function=f>\n<parameter=zeta>\n1\n</parameter>\n<parameter=alpha>\nTrue\n</parameter>\n"
+                             "</function>") != std::string::npos);
+        CHECK_THROWS_AS(tmpl->render(conversation("[1, 2]"), nullptr, true), xs::Error);
     }
 
     TEST_CASE("map applies a named filter to every item") {

@@ -1,0 +1,1860 @@
+[
+ {
+  "name": "user_only",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "user_only_no_generation_prompt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n"
+ },
+ {
+  "name": "system_and_user",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are a helpful assistant.\n"
+   },
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "system_and_user_no_generation_prompt",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are a helpful assistant.\n"
+   },
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n"
+ },
+ {
+  "name": "thinking_on",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are a helpful assistant.\n"
+   },
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": true
+  },
+  "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "thinking_off",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are a helpful assistant.\n"
+   },
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "multi_turn",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are a helpful assistant.\n"
+   },
+   {
+    "role": "user",
+    "content": "Hi!"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello! How can I help?"
+   },
+   {
+    "role": "user",
+    "content": "Tell me a joke."
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me a joke.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "multi_turn_thinking_off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi!"
+   },
+   {
+    "role": "assistant",
+    "content": "Hello!"
+   },
+   {
+    "role": "user",
+    "content": "Again"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "assistant_prefill",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "Let me check"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nLet me check<|im_end|>\n"
+ },
+ {
+  "name": "reasoning_content_after_last_user",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "\nThe user wants weather.\n\n",
+    "content": "Sunny."
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nThe user wants weather.\n</think>\n\nSunny.<|im_end|>\n"
+ },
+ {
+  "name": "reasoning_content_before_last_user_dropped",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Old thoughts.",
+    "content": "Sunny."
+   },
+   {
+    "role": "user",
+    "content": "And tomorrow?"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\nSunny.<|im_end|>\n<|im_start|>user\nAnd tomorrow?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "think_in_content_after_last_user",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nhmm, Paris\n\n</think>\n\nIt is sunny."
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nhmm, Paris\n</think>\n\nIt is sunny.<|im_end|>\n"
+ },
+ {
+  "name": "think_in_content_before_last_user_stripped",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nhmm\n</think>\n\nIt is sunny."
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\nIt is sunny.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "think_close_only_in_content",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "thinking without opener</think>\n\nanswer"
+   },
+   {
+    "role": "user",
+    "content": "ok"
+   },
+   {
+    "role": "assistant",
+    "content": "  leading spaces then</think>tail  "
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>user\nok<|im_end|>\n<|im_start|>assistant\n<think>\nleading spaces then\n</think>\n\ntail<|im_end|>\n"
+ },
+ {
+  "name": "reasoning_content_wins_over_think_in_content",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Real reasoning.",
+    "content": "<think>x</think>Visible."
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nReal reasoning.\n</think>\n\n<think>x</think>Visible.<|im_end|>\n"
+ },
+ {
+  "name": "reasoning_content_null_with_think_in_content",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": null,
+    "content": "<think>r</think>c"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\nc<|im_end|>\n"
+ },
+ {
+  "name": "content_parts",
+  "messages": [
+   {
+    "role": "system",
+    "content": [
+     {
+      "type": "text",
+      "text": "Part one."
+     },
+     {
+      "type": "text",
+      "text": " Part two. "
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "  Look: "
+     },
+     {
+      "type": "text",
+      "text": "two parts"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": [
+     {
+      "type": "text",
+      "text": "Seen."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Again"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\nPart one. Part two.<|im_end|>\n<|im_start|>user\nLook: two parts<|im_end|>\n<|im_start|>assistant\nSeen.<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "image_parts",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "What is in this image?"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>What is in this image?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "image_parts_multi_turn",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "Compare "
+     },
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": " and "
+     },
+     {
+      "type": "image"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "They differ."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "And this one?"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>user\nCompare <|vision_start|><|image_pad|><|vision_end|> and <|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\nThey differ.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>And this one?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "image_parts_with_vision_ids",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image"
+     },
+     {
+      "type": "image"
+     },
+     {
+      "type": "text",
+      "text": "Both?"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "add_vision_id": true
+  },
+  "expected": "<|im_start|>user\nPicture 1: <|vision_start|><|image_pad|><|vision_end|>Picture 2: <|vision_start|><|image_pad|><|vision_end|>Both?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "video_part",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "video"
+     },
+     {
+      "type": "text",
+      "text": "Summarize."
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>user\n<|vision_start|><|video_pad|><|vision_end|>Summarize.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "unicode",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Réponds en français. 日本語も可。"
+   },
+   {
+    "role": "user",
+    "content": "Ça va? 👋🏽 Привет — “quotes” \\ back\\slash \t tab"
+   },
+   {
+    "role": "assistant",
+    "content": "Très bien 😀"
+   },
+   {
+    "role": "user",
+    "content": "中文 العربية עברית"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\nRéponds en français. 日本語も可。<|im_end|>\n<|im_start|>user\nÇa va? 👋🏽 Привет — “quotes” \\ back\\slash \t tab<|im_end|>\n<|im_start|>assistant\nTrès bien 😀<|im_end|>\n<|im_start|>user\n中文 العربية עברית<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools_simple",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools_several_with_system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are a helpful assistant.\n"
+   },
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_docs",
+     "description": "Search the documentation.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "Limit": {
+        "type": "integer",
+        "description": "Max results"
+       },
+       "filters": {
+        "type": "object",
+        "description": "Optional filters",
+        "properties": {
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "since": {
+          "type": "string",
+          "nullable": true
+         },
+         "score": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "tags"
+        ]
+       },
+       "URL": {
+        "type": "string",
+        "description": "Restrict to this site"
+       },
+       "exact": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "apply_edits",
+     "description": "Apply a list of edits to a file.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "edits": {
+        "type": "array",
+        "description": "Edits in order",
+        "items": {
+         "type": "object",
+         "properties": {
+          "old": {
+           "type": "string"
+          },
+          "new": {
+           "type": "string"
+          },
+          "count": {
+           "type": "integer"
+          }
+         },
+         "required": [
+          "old",
+          "new"
+         ]
+        }
+       },
+       "mode": {
+        "type": "array",
+        "items": {
+         "type": [
+          "string",
+          "null"
+         ],
+         "enum": [
+          "fast",
+          "safe"
+         ]
+        }
+       }
+      },
+      "required": [
+       "path",
+       "edits"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "traduire_texte",
+     "description": "Traduit un texte — 翻訳します 🌐. Use “smart quotes” and a \\ backslash.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "texte": {
+        "type": "string",
+        "description": "Texte à traduire"
+       },
+       "langue": {
+        "type": "string",
+        "enum": [
+         "fr",
+         "日本語",
+         "español"
+        ]
+       },
+       "options": {
+        "type": "object",
+        "properties": {
+         "formel": {
+          "type": "boolean",
+          "default": false
+         },
+         "glossaire": {
+          "type": "array",
+          "items": {
+           "type": "object",
+           "properties": {
+            "de": {
+             "type": "string"
+            },
+            "vers": {
+             "type": "string"
+            }
+           }
+          }
+         },
+         "température": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.5,
+          "default": 0.7531246
+         }
+        }
+       }
+      },
+      "required": [
+       "texte",
+       "langue"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "list_files",
+     "description": "List the files."
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search_docs\", \"description\": \"Search the documentation.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"Limit\": {\"type\": \"integer\", \"description\": \"Max results\"}, \"filters\": {\"type\": \"object\", \"description\": \"Optional filters\", \"properties\": {\"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"since\": {\"type\": \"string\", \"nullable\": true}, \"score\": {\"type\": \"number\"}}, \"required\": [\"tags\"]}, \"URL\": {\"type\": \"string\", \"description\": \"Restrict to this site\"}, \"exact\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"apply_edits\", \"description\": \"Apply a list of edits to a file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"edits\": {\"type\": \"array\", \"description\": \"Edits in order\", \"items\": {\"type\": \"object\", \"properties\": {\"old\": {\"type\": \"string\"}, \"new\": {\"type\": \"string\"}, \"count\": {\"type\": \"integer\"}}, \"required\": [\"old\", \"new\"]}}, \"mode\": {\"type\": \"array\", \"items\": {\"type\": [\"string\", \"null\"], \"enum\": [\"fast\", \"safe\"]}}}, \"required\": [\"path\", \"edits\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"traduire_texte\", \"description\": \"Traduit un texte — 翻訳します 🌐. Use “smart quotes” and a \\\\ backslash.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"texte\": {\"type\": \"string\", \"description\": \"Texte à traduire\"}, \"langue\": {\"type\": \"string\", \"enum\": [\"fr\", \"日本語\", \"español\"]}, \"options\": {\"type\": \"object\", \"properties\": {\"formel\": {\"type\": \"boolean\", \"default\": false}, \"glossaire\": {\"type\": \"array\", \"items\": {\"type\": \"object\", \"properties\": {\"de\": {\"type\": \"string\"}, \"vers\": {\"type\": \"string\"}}}}, \"température\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.5, \"default\": 0.7531246}}}}, \"required\": [\"texte\", \"langue\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files.\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools_empty_system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "   "
+   },
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools_thinking_off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "traduire_texte",
+     "description": "Traduit un texte — 翻訳します 🌐. Use “smart quotes” and a \\ backslash.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "texte": {
+        "type": "string",
+        "description": "Texte à traduire"
+       },
+       "langue": {
+        "type": "string",
+        "enum": [
+         "fr",
+         "日本語",
+         "español"
+        ]
+       },
+       "options": {
+        "type": "object",
+        "properties": {
+         "formel": {
+          "type": "boolean",
+          "default": false
+         },
+         "glossaire": {
+          "type": "array",
+          "items": {
+           "type": "object",
+           "properties": {
+            "de": {
+             "type": "string"
+            },
+            "vers": {
+             "type": "string"
+            }
+           }
+          }
+         },
+         "température": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.5,
+          "default": 0.7531246
+         }
+        }
+       }
+      },
+      "required": [
+       "texte",
+       "langue"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"traduire_texte\", \"description\": \"Traduit un texte — 翻訳します 🌐. Use “smart quotes” and a \\\\ backslash.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"texte\": {\"type\": \"string\", \"description\": \"Texte à traduire\"}, \"langue\": {\"type\": \"string\", \"enum\": [\"fr\", \"日本語\", \"español\"]}, \"options\": {\"type\": \"object\", \"properties\": {\"formel\": {\"type\": \"boolean\", \"default\": false}, \"glossaire\": {\"type\": \"array\", \"items\": {\"type\": \"object\", \"properties\": {\"de\": {\"type\": \"string\"}, \"vers\": {\"type\": \"string\"}}}}, \"température\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.5, \"default\": 0.7531246}}}}, \"required\": [\"texte\", \"langue\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "tool_call_object_arguments",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp\": 21}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_string_arguments",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": null,
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp\": 21}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_argument_types_object",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "c",
+      "type": "function",
+      "function": {
+       "name": "kitchen_sink",
+       "arguments": {
+        "s": "two\nlines <b>&</b> ünï 日本 🎉",
+        "i": -12,
+        "f": 2.5,
+        "whole": 3.0,
+        "precise": 0.123456789012,
+        "large": 1234567.125,
+        "tiny": 1e-05,
+        "big": 1e+20,
+        "t": true,
+        "no": false,
+        "none": null,
+        "obj": {
+         "nested": {
+          "deep": [
+           1,
+           "two",
+           {
+            "x": false
+           }
+          ]
+         },
+         "é": "ü"
+        },
+        "list": [
+         [
+          1,
+          2
+         ],
+         {
+          "k": null
+         }
+        ],
+        "empty_s": "",
+        "empty_o": {},
+        "empty_l": []
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c",
+    "content": "ok"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=kitchen_sink>\n<parameter=s>\ntwo\nlines <b>&</b> ünï 日本 🎉\n</parameter>\n<parameter=i>\n-12\n</parameter>\n<parameter=f>\n2.5\n</parameter>\n<parameter=whole>\n3.0\n</parameter>\n<parameter=precise>\n0.123456789012\n</parameter>\n<parameter=large>\n1234567.125\n</parameter>\n<parameter=tiny>\n1e-05\n</parameter>\n<parameter=big>\n1e+20\n</parameter>\n<parameter=t>\nTrue\n</parameter>\n<parameter=no>\nFalse\n</parameter>\n<parameter=none>\nNone\n</parameter>\n<parameter=obj>\n{\"nested\": {\"deep\": [1, \"two\", {\"x\": false}]}, \"é\": \"ü\"}\n</parameter>\n<parameter=list>\n[[1, 2], {\"k\": null}]\n</parameter>\n<parameter=empty_s>\n\n</parameter>\n<parameter=empty_o>\n{}\n</parameter>\n<parameter=empty_l>\n[]\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_argument_types_string",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "c",
+      "type": "function",
+      "function": {
+       "name": "kitchen_sink",
+       "arguments": "{\"s\": \"two\\nlines <b>&</b> \\u00fcn\\u00ef \\u65e5\\u672c \\ud83c\\udf89\", \"i\": -12, \"f\": 2.5, \"whole\": 3.0, \"precise\": 0.123456789012, \"large\": 1234567.125, \"tiny\": 1e-05, \"big\": 1e+20, \"t\": true, \"no\": false, \"none\": null, \"obj\": {\"nested\": {\"deep\": [1, \"two\", {\"x\": false}]}, \"\\u00e9\": \"\\u00fc\"}, \"list\": [[1, 2], {\"k\": null}], \"empty_s\": \"\", \"empty_o\": {}, \"empty_l\": []}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c",
+    "content": "ok"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=kitchen_sink>\n<parameter=s>\ntwo\nlines <b>&</b> ünï 日本 🎉\n</parameter>\n<parameter=i>\n-12\n</parameter>\n<parameter=f>\n2.5\n</parameter>\n<parameter=whole>\n3.0\n</parameter>\n<parameter=precise>\n0.123456789012\n</parameter>\n<parameter=large>\n1234567.125\n</parameter>\n<parameter=tiny>\n1e-05\n</parameter>\n<parameter=big>\n1e+20\n</parameter>\n<parameter=t>\nTrue\n</parameter>\n<parameter=no>\nFalse\n</parameter>\n<parameter=none>\nNone\n</parameter>\n<parameter=obj>\n{\"nested\": {\"deep\": [1, \"two\", {\"x\": false}]}, \"é\": \"ü\"}\n</parameter>\n<parameter=list>\n[[1, 2], {\"k\": null}]\n</parameter>\n<parameter=empty_s>\n\n</parameter>\n<parameter=empty_o>\n{}\n</parameter>\n<parameter=empty_l>\n[]\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_argument_floats",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "c",
+      "type": "function",
+      "function": {
+       "name": "nums",
+       "arguments": {
+        "a": 3.0,
+        "b": 0.1,
+        "c": 1e-05,
+        "d": 1e+20,
+        "e": -2.5,
+        "f": 12345678901234,
+        "g": 0,
+        "h": 2.5e-07
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c",
+    "content": "ok"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=nums>\n<parameter=a>\n3.0\n</parameter>\n<parameter=b>\n0.1\n</parameter>\n<parameter=c>\n1e-05\n</parameter>\n<parameter=d>\n1e+20\n</parameter>\n<parameter=e>\n-2.5\n</parameter>\n<parameter=f>\n12345678901234\n</parameter>\n<parameter=g>\n0\n</parameter>\n<parameter=h>\n2.5e-07\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_flat_without_function_key",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "Oslo"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "-3 C"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n-3 C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_without_arguments",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "c",
+      "type": "function",
+      "function": {
+       "name": "list_files"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "c",
+    "content": "a.txt"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "list_files",
+     "description": "List the files."
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"list_files\", \"description\": \"List the files.\"}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=list_files>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\na.txt\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_with_preamble_and_reasoning",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Need the tool.",
+    "content": "Let me check.\n",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "21 C"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nNeed the tool.\n</think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n21 C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_call_whitespace_only_content",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": " \n ",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "21 C"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n21 C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "multiple_tool_calls_consecutive_responses",
+  "messages": [
+   {
+    "role": "system",
+    "content": "  You are a helpful assistant.\n"
+   },
+   {
+    "role": "user",
+    "content": "Weather in Paris, docs on rain, and translate it?"
+   },
+   {
+    "role": "assistant",
+    "content": "I will use three tools.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "celsius"
+       }
+      }
+     },
+     {
+      "id": "call_2",
+      "type": "function",
+      "function": {
+       "name": "search_docs",
+       "arguments": "{\"query\": \"rain \\\"gear\\\"\", \"Limit\": 5, \"exact\": false, \"filters\": {\"tags\": [\"a\", \"b\"], \"since\": null, \"score\": 0.75}, \"URL\": \"x.org\"}"
+      }
+     },
+     {
+      "id": "call_3",
+      "type": "function",
+      "function": {
+       "name": "traduire_texte",
+       "arguments": {
+        "texte": "il pleut",
+        "langue": "日本語"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "21 C"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_2",
+    "content": [
+     {
+      "type": "text",
+      "text": "Doc A"
+     },
+     {
+      "type": "text",
+      "text": "; Doc B"
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_3",
+    "content": "雨が降っています"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_docs",
+     "description": "Search the documentation.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "Limit": {
+        "type": "integer",
+        "description": "Max results"
+       },
+       "filters": {
+        "type": "object",
+        "description": "Optional filters",
+        "properties": {
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "since": {
+          "type": "string",
+          "nullable": true
+         },
+         "score": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "tags"
+        ]
+       },
+       "URL": {
+        "type": "string",
+        "description": "Restrict to this site"
+       },
+       "exact": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "traduire_texte",
+     "description": "Traduit un texte — 翻訳します 🌐. Use “smart quotes” and a \\ backslash.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "texte": {
+        "type": "string",
+        "description": "Texte à traduire"
+       },
+       "langue": {
+        "type": "string",
+        "enum": [
+         "fr",
+         "日本語",
+         "español"
+        ]
+       },
+       "options": {
+        "type": "object",
+        "properties": {
+         "formel": {
+          "type": "boolean",
+          "default": false
+         },
+         "glossaire": {
+          "type": "array",
+          "items": {
+           "type": "object",
+           "properties": {
+            "de": {
+             "type": "string"
+            },
+            "vers": {
+             "type": "string"
+            }
+           }
+          }
+         },
+         "température": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.5,
+          "default": 0.7531246
+         }
+        }
+       }
+      },
+      "required": [
+       "texte",
+       "langue"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search_docs\", \"description\": \"Search the documentation.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"Limit\": {\"type\": \"integer\", \"description\": \"Max results\"}, \"filters\": {\"type\": \"object\", \"description\": \"Optional filters\", \"properties\": {\"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"since\": {\"type\": \"string\", \"nullable\": true}, \"score\": {\"type\": \"number\"}}, \"required\": [\"tags\"]}, \"URL\": {\"type\": \"string\", \"description\": \"Restrict to this site\"}, \"exact\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"traduire_texte\", \"description\": \"Traduit un texte — 翻訳します 🌐. Use “smart quotes” and a \\\\ backslash.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"texte\": {\"type\": \"string\", \"description\": \"Texte à traduire\"}, \"langue\": {\"type\": \"string\", \"enum\": [\"fr\", \"日本語\", \"español\"]}, \"options\": {\"type\": \"object\", \"properties\": {\"formel\": {\"type\": \"boolean\", \"default\": false}, \"glossaire\": {\"type\": \"array\", \"items\": {\"type\": \"object\", \"properties\": {\"de\": {\"type\": \"string\"}, \"vers\": {\"type\": \"string\"}}}}, \"température\": {\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.5, \"default\": 0.7531246}}}}, \"required\": [\"texte\", \"langue\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWeather in Paris, docs on rain, and translate it?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nI will use three tools.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=search_docs>\n<parameter=query>\nrain \"gear\"\n</parameter>\n<parameter=Limit>\n5\n</parameter>\n<parameter=exact>\nFalse\n</parameter>\n<parameter=filters>\n{\"tags\": [\"a\", \"b\"], \"since\": null, \"score\": 0.75}\n</parameter>\n<parameter=URL>\nx.org\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=traduire_texte>\n<parameter=texte>\nil pleut\n</parameter>\n<parameter=langue>\n日本語\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n21 C\n</tool_response>\n<tool_response>\nDoc A; Doc B\n</tool_response>\n<tool_response>\n雨が降っています\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "multi_step_tools_keep_reasoning_after_last_user",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "First the weather.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "21 C"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nNow the docs.\n</think>\n\n",
+    "tool_calls": [
+     {
+      "id": "call_2",
+      "type": "function",
+      "function": {
+       "name": "search_docs",
+       "arguments": {
+        "query": "umbrella"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_2",
+    "content": "Doc C"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_docs",
+     "description": "Search the documentation.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "Limit": {
+        "type": "integer",
+        "description": "Max results"
+       },
+       "filters": {
+        "type": "object",
+        "description": "Optional filters",
+        "properties": {
+         "tags": {
+          "type": "array",
+          "items": {
+           "type": "string"
+          }
+         },
+         "since": {
+          "type": "string",
+          "nullable": true
+         },
+         "score": {
+          "type": "number"
+         }
+        },
+        "required": [
+         "tags"
+        ]
+       },
+       "URL": {
+        "type": "string",
+        "description": "Restrict to this site"
+       },
+       "exact": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": true
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"search_docs\", \"description\": \"Search the documentation.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}, \"Limit\": {\"type\": \"integer\", \"description\": \"Max results\"}, \"filters\": {\"type\": \"object\", \"description\": \"Optional filters\", \"properties\": {\"tags\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"since\": {\"type\": \"string\", \"nullable\": true}, \"score\": {\"type\": \"number\"}}, \"required\": [\"tags\"]}, \"URL\": {\"type\": \"string\", \"description\": \"Restrict to this site\"}, \"exact\": {\"type\": \"boolean\"}}, \"required\": [\"query\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\nFirst the weather.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n21 C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nNow the docs.\n</think>\n\n<tool_call>\n<function=search_docs>\n<parameter=query>\numbrella\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nDoc C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_round_trip_answered_then_new_user",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Calling.",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\", \"unit\": \"celsius\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "21 C"
+   },
+   {
+    "role": "assistant",
+    "reasoning_content": "Answer now.",
+    "content": "It is 21 C in Paris."
+   },
+   {
+    "role": "user",
+    "content": "Thanks!"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n21 C\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt is 21 C in Paris.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "user_message_wrapped_in_tool_response",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "unit": "celsius"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "<tool_response>\n21 C\n</tool_response>"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name, e.g. Paris"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Current weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name, e.g. Paris\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"], \"description\": \"Temperature unit\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n21 C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]

@@ -61,15 +61,16 @@ ordered_json special_tokens_of(const nlohmann::json& tokenizer_config) {
 }
 
 // OpenAI clients send tool_calls[].function.arguments as JSON text, while Hugging Face templates expect a mapping;
-// like vLLM and llama.cpp, text that parses to a JSON object is replaced by that object. Anything else is left as is.
-nlohmann::json with_parsed_tool_arguments(nlohmann::json messages) {
+// like vLLM and llama.cpp, text that parses to a JSON object is replaced by that object (keys in their written order,
+// as Python's json.loads keeps them). Anything else is left as is.
+ordered_json with_parsed_tool_arguments(ordered_json messages) {
     for (auto& message : messages) {
         if (!message.is_object() || !message.contains("tool_calls") || !message["tool_calls"].is_array()) continue;
         for (auto& call : message["tool_calls"]) {
             if (!call.is_object() || !call.contains("function") || !call["function"].is_object()) continue;
-            nlohmann::json& function = call["function"];
+            ordered_json& function = call["function"];
             if (!function.contains("arguments") || !function["arguments"].is_string()) continue;
-            nlohmann::json parsed = nlohmann::json::parse(function["arguments"].get<std::string>(), nullptr, false);
+            ordered_json parsed = ordered_json::parse(function["arguments"].get<std::string>(), nullptr, false);
             if (parsed.is_object()) function["arguments"] = std::move(parsed);
         }
     }
@@ -83,6 +84,11 @@ public:
 
     std::string render(const nlohmann::json& messages, const nlohmann::json& tools, bool add_generation_prompt,
                        const nlohmann::json& extra) const override {
+        return render(ordered_json(messages), ordered_json(tools), add_generation_prompt, ordered_json(extra));
+    }
+
+    std::string render(const ordered_json& messages, const ordered_json& tools, bool add_generation_prompt,
+                       const ordered_json& extra) const override {
         XS_CHECK(messages.is_array(), "chat messages must be a JSON array, got ", messages.type_name());
         XS_CHECK(tools.is_null() || tools.is_array(), "chat tools must be a JSON array or null, got ",
                  tools.type_name());
@@ -103,15 +109,15 @@ public:
 private:
     // Same variables, in the same precedence, as transformers' apply_chat_template: special tokens, then the
     // conversation, then caller kwargs (which override special tokens).
-    ordered_json variables(const nlohmann::json& messages, const nlohmann::json& tools, bool add_generation_prompt,
-                           const nlohmann::json& extra) const {
+    ordered_json variables(const ordered_json& messages, const ordered_json& tools, bool add_generation_prompt,
+                           const ordered_json& extra) const {
         ordered_json vars = special_tokens_;
-        vars["messages"] = ordered_json(with_parsed_tool_arguments(messages));
-        vars["tools"] = ordered_json(tools);
+        vars["messages"] = with_parsed_tool_arguments(messages);
+        vars["tools"] = tools;
         vars["documents"] = nullptr;
         vars["add_generation_prompt"] = add_generation_prompt;
         for (const auto& [key, value] : extra.items())
-            vars[key] = ordered_json(value);
+            vars[key] = value;
         return vars;
     }
 

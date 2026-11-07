@@ -9,7 +9,7 @@
 namespace xs::server {
 namespace {
 
-using nlohmann::json;
+using json = RequestJson;
 
 [[noreturn]] void reject(const std::string& param, const std::string& message) { throw InvalidRequest(message, param); }
 

@@ -41,11 +41,14 @@ struct ImagePart {
     std::vector<uint8_t> bytes;
 };
 
+// Request JSON keeps the client's key order: chat templates can print it (tool schemas, tool-call arguments).
+using RequestJson = nlohmann::ordered_json;
+
 struct ChatRequest {
-    nlohmann::json messages;         // validated: non-empty array of objects with a string "role"; image parts are
-                                     // reduced to {"type": "image"}, their bytes are in `images`
-    nlohmann::json tools;            // array, or null when absent, empty or tool_choice is "none"
-    nlohmann::json template_kwargs;  // chat_template_kwargs, always an object
+    RequestJson messages;         // validated: non-empty array of objects with a string "role"; image parts are
+                                  // reduced to {"type": "image"}, their bytes are in `images`
+    RequestJson tools;            // array, or null when absent, empty or tool_choice is "none"
+    RequestJson template_kwargs;  // chat_template_kwargs, always an object
     std::vector<ImagePart> images;   // in message order, then part order
     GenerationOptions options;
 };
@@ -56,10 +59,10 @@ struct CompletionRequest {
 };
 
 // Parses a request body that must be a JSON object.
-nlohmann::json parse_json_body(std::string_view body);
+RequestJson parse_json_body(std::string_view body);
 
 // Absent sampling fields take their value from `defaults` (the model's generation_config).
-ChatRequest parse_chat_request(const nlohmann::json& body, const SamplingParams& defaults);
-CompletionRequest parse_completion_request(const nlohmann::json& body, const SamplingParams& defaults);
+ChatRequest parse_chat_request(const RequestJson& body, const SamplingParams& defaults);
+CompletionRequest parse_completion_request(const RequestJson& body, const SamplingParams& defaults);
 
 }  // namespace xs::server

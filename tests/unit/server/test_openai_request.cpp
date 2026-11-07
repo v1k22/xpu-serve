@@ -162,4 +162,14 @@ TEST_SUITE("server.request") {
         CHECK(param_of({{"type", "image"}, {"image", "cat.png"}}) == where);
         CHECK(param_of({{"type", "input_audio"}, {"input_audio", {{"data", "AAAA"}, {"format", "wav"}}}}) == where);
     }
+
+    TEST_CASE("request JSON keeps the client's key order, which templates can print") {
+        const auto body = parse_json_body(
+            R"({"messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function":
+               {"name": "f", "parameters": {"type": "object", "properties": {"zeta": {}, "alpha": {}, "mid": {}}}}}]})");
+        const auto r = parse_chat_request(body, {});
+        std::string order;
+        for (const auto& [key, value] : r.tools[0]["function"]["parameters"]["properties"].items()) order += key + " ";
+        CHECK(order == "zeta alpha mid ");
+    }
 }

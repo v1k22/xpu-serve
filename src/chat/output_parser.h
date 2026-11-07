@@ -31,9 +31,9 @@ public:
     virtual ParsedDelta finish() = 0;
 };
 
-// Dialects: "gemma4", "plain" (everything is content). Throws xs::Error naming the known dialects otherwise.
+// Dialects: "gemma4", "qwen3_5", "plain" (everything is content). Throws xs::Error naming the known dialects otherwise.
 // prompt_tail: the end of the rendered prompt (see prompt_tail()); the parser starts in the state it leaves open, e.g.
-// in reasoning when the prompt ends inside an opened thought channel.
+// in reasoning when the prompt ends inside an opened thought channel (Gemma 4) or an open <think> (Qwen 3.5).
 std::unique_ptr<OutputParser> make_output_parser(std::string_view dialect, std::string_view prompt_tail = {});
 
 // The end of a rendered prompt that make_output_parser needs; keeping only this avoids copying whole prompts.
