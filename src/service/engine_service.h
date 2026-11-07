@@ -19,6 +19,7 @@ struct ServiceOptions {
     SessionOptions session;
     EngineOptions engine;
     std::string model_id;  // empty = the model directory name
+    bool vision = true;    // load the vision encoder when the checkpoint has one
 };
 
 // The real InferenceService: loads model, tokenizer and chat template from a model directory, compiles the step
@@ -35,6 +36,9 @@ public:
     const tok::Tokenizer& tokenizer() const override { return *tokenizer_; }
     const chat::ChatTemplate& chat_template() const override { return *template_; }
     GenerateResult generate(const GenerateRequest& request, const TokenCallback& on_token) override;
+    bool accepts_images() const override { return engine_->accepts_images(); }
+    MediaInput prepare_image(std::span<const uint8_t> encoded) const override;
+    std::vector<int32_t> expand_media(std::vector<int32_t> prompt, const std::vector<MediaInput>& media) const override;
 
 private:
     struct Job;

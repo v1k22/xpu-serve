@@ -14,6 +14,7 @@
 
 #include "chat/chat_template.h"
 #include "engine/service.h"
+#include "image/image.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
 
@@ -43,15 +44,26 @@ public:
     static std::vector<int32_t> tokens(std::string_view text) { return {text.begin(), text.end()}; }
 };
 
+// The byte LineTemplate renders for an image part, and FakeService's image placeholder token.
+inline constexpr char kImageByte = '\x7f';
+
 // "<role>: <content>\n" per message, then "[tools:N]" and "[think]" markers so tests can see what reached it.
-// A message whose content is "BOOM" makes rendering fail.
+// List content renders its text parts and kImageByte per image part. A message whose content is "BOOM" makes
+// rendering fail.
 class LineTemplate final : public chat::ChatTemplate {
 public:
     std::string render(const nlohmann::json& messages, const nlohmann::json& tools, bool add_generation_prompt,
                        const nlohmann::json& extra) const override {
         std::string out;
         for (const auto& m : messages) {
-            const std::string content = m.value("content", "");
+            std::string content;
+            if (m.contains("content") && m["content"].is_array()) {
+                for (const auto& part : m["content"]) {
+                    content += part["type"] == "image" ? std::string(1, kImageByte) : part.value("text", "");
+                }
+            } else {
+                content = m.value("content", "");
+            }
             if (content == "BOOM") fail("template exploded");
             out += m["role"].get<std::string>() + ": " + content + "\n";
         }
@@ -107,6 +119,31 @@ public:
         return result;
     }
 
+    bool accepts_images() const override { return images; }
+    // Decodes for real (so bad images fail as they would), then stands in two soft tokens per image.
+    MediaInput prepare_image(std::span<const uint8_t> encoded) const override {
+        if (!images) return InferenceService::prepare_image(encoded);
+        const image::Image img = image::decode(encoded);
+        MediaInput m;
+        m.key = image::content_hash(img);
+        m.num_tokens = 2;
+        return m;
+    }
+    std::vector<int32_t> expand_media(std::vector<int32_t> prompt, const std::vector<MediaInput>& media) const override {
+        std::vector<int32_t> out;
+        size_t k = 0;
+        for (int32_t t : prompt) {
+            if (t != kImageByte) {
+                out.push_back(t);
+                continue;
+            }
+            if (k == media.size()) fail("more image placeholders than images");
+            out.insert(out.end(), static_cast<size_t>(media[k++].num_tokens), t);
+        }
+        if (k != media.size()) fail("fewer image placeholders than images");
+        return out;
+    }
+
     GenerateRequest last_request() const {
         std::lock_guard lock(serial_);
         return last_request_;
@@ -120,6 +157,7 @@ public:
     // Set before requests are sent.
     std::string reply = "Hello!";
     std::string error;  // non-empty: every generation fails with this message
+    bool images = false;  // accept image parts
     std::chrono::milliseconds token_delay{0};
     std::atomic<bool> cancelled = false;
 

@@ -16,7 +16,7 @@ namespace xs::ov_backend {
 class OvSession final : public Session {
 public:
     OvSession(ov::CompiledModel compiled, std::vector<InputSpec> inputs, std::vector<std::string> outputs,
-              int64_t max_context);
+              int64_t max_context, bool stateful);
 
     void run(const TensorMap& inputs, TensorMap& outputs) override;
     int64_t num_cached() const override { return num_cached_; }
@@ -34,6 +34,7 @@ private:
     std::vector<InputSpec> inputs_;
     std::vector<std::string> outputs_;
     int64_t max_context_ = 0;
+    bool stateful_ = true;
     int64_t num_cached_ = 0;
 };
 

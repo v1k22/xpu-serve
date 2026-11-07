@@ -13,3 +13,9 @@ target_include_directories(xs_doctest SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DI
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/jinja_cpp/CMakeLists.txt)
   add_subdirectory(jinja_cpp)
 endif()
+
+# Image decoding (stb_image, public domain / MIT): one compiled translation unit, its warnings silenced.
+add_library(xs_stb_image STATIC stb/stb_image.cpp)
+target_include_directories(xs_stb_image SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/stb)
+target_compile_options(xs_stb_image PRIVATE -w)
+set_target_properties(xs_stb_image PROPERTIES POSITION_INDEPENDENT_CODE ON)

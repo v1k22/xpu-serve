@@ -144,7 +144,7 @@ public:
                   process_memory("VmHWM") / kGiB, " GiB");
         log::debug("openvino: runtime ops: ", runtime_op_summary(compiled));
         return std::make_unique<ov_backend::OvSession>(std::move(compiled), std::move(t.inputs), std::move(t.outputs),
-                                                       options.max_context);
+                                                       options.max_context, t.stateful);
     }
 
 private:

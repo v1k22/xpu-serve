@@ -16,52 +16,21 @@
 #include "backend/backend.h"
 #include "engine/engine.h"
 #include "models/model.h"
+#include "parity_util.h"
 #include "test_support.h"
 
 namespace {
 
-std::string env_or(const char* name, const std::string& fallback) {
-    const char* v = std::getenv(name);
-    return v != nullptr && *v != '\0' ? std::string(v) : fallback;
-}
+using xs::test::compare;
+using xs::test::Compare;
+using xs::test::env_or;
+using xs::test::read_f32;
 
 std::filesystem::path fixtures() {
     return env_or("XS_PARITY_FIXTURES", std::string(XS_SOURCE_DIR) + "/tests/fixtures/generated/gemma4");
 }
 
 bool enabled() { return xs::test::model_dir().has_value() && std::filesystem::exists(fixtures() / "manifest.json"); }
-
-std::vector<float> read_f32(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    REQUIRE_MESSAGE(in.good(), "cannot read ", path.string());
-    in.seekg(0, std::ios::end);
-    std::vector<float> v(static_cast<size_t>(in.tellg()) / sizeof(float));
-    in.seekg(0);
-    in.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(v.size() * sizeof(float)));
-    return v;
-}
-
-struct Compare {
-    double cosine = 0;
-    double max_abs = 0;
-    int argmax_ours = -1;
-    int argmax_ref = -1;
-};
-
-Compare compare(const std::vector<float>& ours, const std::vector<float>& ref) {
-    Compare c;
-    double dot = 0, a2 = 0, b2 = 0;
-    for (size_t i = 0; i < ref.size(); ++i) {
-        dot += static_cast<double>(ours[i]) * ref[i];
-        a2 += static_cast<double>(ours[i]) * ours[i];
-        b2 += static_cast<double>(ref[i]) * ref[i];
-        c.max_abs = std::max(c.max_abs, static_cast<double>(std::fabs(ours[i] - ref[i])));
-    }
-    c.cosine = dot / std::sqrt(a2 * b2);
-    c.argmax_ours = static_cast<int>(std::max_element(ours.begin(), ours.end()) - ours.begin());
-    c.argmax_ref = static_cast<int>(std::max_element(ref.begin(), ref.end()) - ref.begin());
-    return c;
-}
 
 }  // namespace
 
@@ -85,7 +54,7 @@ TEST_CASE("gemma4 matches Hugging Face logits and greedy output" * doctest::skip
         const auto ids = c["input_ids"].get<std::vector<int32_t>>();
         session->reset();
         xs::TensorMap inputs, outputs;
-        model->prepare_inputs(ids, 0, inputs);
+        model->prepare_inputs(ids, 0, {}, inputs);
         session->run(inputs, outputs);
         const auto& logits = outputs.at("logits");
         const std::vector<float> ours(logits.data<float>(), logits.data<float>() + logits.numel());
@@ -100,7 +69,7 @@ TEST_CASE("gemma4 matches Hugging Face logits and greedy output" * doctest::skip
     // continuation includes the stop token when one was produced, so it is compared like any other token.
     xs::EngineOptions eo;
     eo.max_context = 4096;
-    xs::Engine engine(std::move(model), std::move(session), eo);
+    xs::Engine engine(std::move(model), std::move(session), nullptr, eo);
     for (const auto& c : manifest["cases"]) {
         const auto ref = c["greedy"].get<std::vector<int32_t>>();
         xs::GenerateRequest req;

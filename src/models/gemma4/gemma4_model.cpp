@@ -51,41 +51,81 @@ std::string probe_prefix(const WeightStore& weights) {
 
 class Gemma4Model final : public Model {
 public:
-    Gemma4Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> weights)
-        : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)), prefix_(probe_prefix(*weights_)) {
+    // `vision`: the vision config when the encoder should be loaded (the checkpoint has one and it was asked for).
+    Gemma4Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> weights, int32_t pad_token_id,
+                const std::optional<VisionConfig>& vision)
+        : cfg_(std::move(cfg)),
+          info_(std::move(info)),
+          weights_(std::move(weights)),
+          prefix_(probe_prefix(*weights_)),
+          pad_token_id_(pad_token_id) {
         if (cfg_.ple_dim > 0) {
             ple_table_ = &weights_->get(w("embed_tokens_per_layer.weight"));
             XS_CHECK(ple_table_->shape == (Dims{cfg_.ple_vocab_size, cfg_.num_layers * cfg_.ple_dim}),
                      "gemma4: embed_tokens_per_layer has shape ", dims_to_string(ple_table_->shape));
             ple_scale_ = round_to_dtype(std::sqrt(static_cast<float>(cfg_.ple_dim)), ple_table_->dtype);
         }
+        if (vision) load_vision(*vision);
         build_graph();
     }
 
     const ModelInfo& info() const override { return info_; }
     const graph::Graph& graph() const override { return graph_; }
     const WeightStore& weights() const override { return *weights_; }
+    const VisionEncoder* vision() const override { return vision_.get(); }
 
-    void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, TensorMap& inputs) const override {
+    void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
+                        TensorMap& inputs) const override {
         const auto n = static_cast<int64_t>(tokens.size());
         XS_CHECK(n > 0, "gemma4: a step needs at least one token");
+        XS_CHECK(embeddings.empty() || static_cast<int64_t>(embeddings.size()) == n, "gemma4: ", embeddings.size(),
+                 " embedding entries for ", n, " tokens");
+        XS_CHECK(embeddings.empty() || vision_ != nullptr, "gemma4: embedding rows given, but vision is not loaded");
         HostTensor ids(DType::I32, {n});
         HostTensor pos(DType::I32, {n});
+        std::vector<int32_t> ple_ids(tokens.begin(), tokens.end());
         for (int64_t i = 0; i < n; ++i) {
             const int32_t t = tokens[static_cast<size_t>(i)];
             if (t < 0 || t >= cfg_.vocab_size) fail("gemma4: token id ", t, " outside the vocabulary (", cfg_.vocab_size, ")");
             ids.data<int32_t>()[i] = t;
             pos.data<int32_t>()[i] = static_cast<int32_t>(start_pos + i);
         }
+        if (vision_ != nullptr) {
+            // Rows replace the scaled token embedding; their per-layer embedding reads the pad token, as the
+            // reference does for every multimodal position.
+            const int64_t width = cfg_.hidden_size;
+            HostTensor media(DType::F32, {n, width});
+            HostTensor keep(DType::F32, {n, 1});
+            for (int64_t i = 0; i < n; ++i) {
+                const float* row = embeddings.empty() ? nullptr : embeddings[static_cast<size_t>(i)];
+                keep.data<float>()[i] = row == nullptr ? 1.0f : 0.0f;
+                if (row == nullptr) continue;
+                std::copy(row, row + width, media.data<float>() + i * width);
+                ple_ids[static_cast<size_t>(i)] = pad_token_id_;
+            }
+            inputs["media"] = std::move(media);
+            inputs["media_keep"] = std::move(keep);
+        }
         inputs["token_ids"] = std::move(ids);
         inputs["positions"] = std::move(pos);
-        if (ple_table_ != nullptr) inputs["ple"] = gather_ple_rows(tokens);
+        if (ple_table_ != nullptr) inputs["ple"] = gather_ple_rows(ple_ids);
     }
 
 private:
     std::string w(const std::string& suffix) const { return prefix_ + suffix; }
     Value weight(const std::string& suffix) { return graph_.weight(*weights_, w(suffix)); }
     float eps() const { return static_cast<float>(cfg_.rms_norm_eps); }
+
+    // Checkpoints of Gemma4ForConditionalGeneration keep the towers next to the decoder: model.vision_tower.* and
+    // model.embed_vision.* beside model.language_model.*.
+    void load_vision(const VisionConfig& vc) {
+        const std::string vision_prefix = prefix_ == "model.language_model." ? "model." : prefix_;
+        if (!weights_->contains(vision_prefix + "vision_tower.patch_embedder.input_proj.weight")) {
+            log::warn("gemma4: config.json has a vision_config but the checkpoint has no vision weights; text only");
+            return;
+        }
+        vision_ = make_vision_encoder(vc, *weights_, vision_prefix);
+    }
 
     // The token-identity half of the per-layer embeddings is a 262144 x (layers * 256) table (4.7 GB in bf16). Rows
     // are gathered on the host so the table never has to live in device memory.
@@ -131,6 +171,12 @@ private:
         const Value embed = weight("embed_tokens.weight");
         const float embed_scale = round_to_dtype(std::sqrt(static_cast<float>(cfg_.hidden_size)), g.type(embed).dtype);
         Value h = g.scale(g.gather(embed, ids), embed_scale);
+        if (vision_ != nullptr) {
+            // Image soft tokens: keep is 0 and media holds the encoder's row; elsewhere keep is 1 and media 0.
+            const Value media = g.input("media", DType::F32, {kT, cfg_.hidden_size});
+            const Value keep = g.input("media_keep", DType::F32, {kT, 1});
+            h = g.add(g.mul(h, keep), media);
+        }
 
         const Value per_layer = cfg_.ple_dim > 0 ? per_layer_inputs(h) : Value{};
         inv_freq_sliding_ = g.constant(rope_inv_freq(cfg_.rope_sliding, cfg_.head_dim));
@@ -223,6 +269,8 @@ private:
     ModelInfo info_;
     std::unique_ptr<SafetensorsWeights> weights_;
     std::string prefix_;
+    int32_t pad_token_id_ = 0;
+    std::unique_ptr<VisionEncoder> vision_;
     graph::Graph graph_;
     const TensorView* ple_table_ = nullptr;
     float ple_scale_ = 1.0f;
@@ -233,14 +281,26 @@ private:
 
 }  // namespace
 
-std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json) {
+std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
+                            const LoadOptions& options) {
     Config cfg = parse_config(config_json);
+    const nlohmann::json& text = config_json.contains("text_config") ? config_json.at("text_config") : config_json;
+    const auto pad_token_id = static_cast<int32_t>(cfg::get_int_or(text, "pad_token_id", 0, "config.json"));
+    std::optional<VisionConfig> vision;
+    if (options.vision) {
+        try {
+            vision = parse_vision_config(config_json, dir, cfg.hidden_size);
+        } catch (const Error& e) {
+            log::warn("gemma4: vision disabled, text only: ", e.what());
+        }
+    }
 
     ModelInfo info;
     info.arch = "gemma4";
     info.id = std::filesystem::absolute(dir).lexically_normal().filename().string();
     if (info.id.empty()) info.id = std::filesystem::absolute(dir).lexically_normal().parent_path().filename().string();
     info.vocab_size = cfg.vocab_size;
+    info.hidden_size = cfg.hidden_size;
     info.max_position = cfg.max_position;
     info.dialect = "gemma4";
     std::vector<int32_t> gen_eos;
@@ -256,7 +316,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     info.stop_token_ids = std::move(stops);
 
     auto weights = SafetensorsWeights::open_dir(dir);
-    return std::make_unique<Gemma4Model>(std::move(cfg), std::move(info), std::move(weights));
+    return std::make_unique<Gemma4Model>(std::move(cfg), std::move(info), std::move(weights), pad_token_id, vision);
 }
 
 }  // namespace xs::gemma4

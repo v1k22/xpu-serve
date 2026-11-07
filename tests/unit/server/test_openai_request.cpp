@@ -134,4 +134,32 @@ TEST_SUITE("server.request") {
         CHECK_THROWS_AS(parse_completion_request(json::object(), {}), InvalidRequest);
         CHECK_THROWS_AS(parse_completion_request({{"prompt", "a"}, {"n", 3}}, {}), InvalidRequest);
     }
+
+    TEST_CASE("image_url parts: data URLs are decoded, the part is reduced for the template, the rest refused") {
+        const json image = {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,iVBORw0K"}}}};
+        const json text = {{"type", "text"}, {"text", "what is this?"}};
+        const json messages = json::array(
+            {{{"role", "system"}, {"content", "be brief"}},
+             {{"role", "user"}, {"content", json::array({image, text, {{"type", "image_url"}, {"image_url", "data:image/jpeg;base64,/9j/"}}})}}});
+        const auto r = parse_chat_request(chat_body({{"messages", messages}}), {});
+        REQUIRE(r.images.size() == 2);
+        CHECK(r.images[0].param == "messages[1].content[0]");
+        CHECK(r.images[0].bytes == std::vector<uint8_t>{0x89, 'P', 'N', 'G', '\r', '\n'});
+        CHECK(r.images[1].param == "messages[1].content[2]");
+        CHECK(r.messages[1]["content"][0] == json{{"type", "image"}});
+        CHECK(r.messages[1]["content"][1] == text);
+
+        const auto param_of = [&text](const json& part) {
+            return rejected_param(chat_body(
+                {{"messages", json::array({{{"role", "user"}, {"content", json::array({text, part})}}})}}));
+        };
+        const std::string where = "messages[0].content[1]";
+        CHECK(param_of({{"type", "image_url"}, {"image_url", {{"url", "https://example.com/cat.png"}}}}) == where);
+        CHECK(param_of({{"type", "image_url"}, {"image_url", {{"url", "data:image/png,rawbytes"}}}}) == where);
+        CHECK(param_of({{"type", "image_url"}, {"image_url", {{"url", "data:text/plain;base64,aGk="}}}}) == where);
+        CHECK(param_of({{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,!!"}}}}) == where);
+        CHECK(param_of({{"type", "image_url"}, {"image_url", 42}}) == where);
+        CHECK(param_of({{"type", "image"}, {"image", "cat.png"}}) == where);
+        CHECK(param_of({{"type", "input_audio"}, {"input_audio", {{"data", "AAAA"}, {"format", "wav"}}}}) == where);
+    }
 }

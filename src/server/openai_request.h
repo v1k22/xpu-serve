@@ -2,6 +2,7 @@
 
 // Parsing and validation of OpenAI request bodies. Unknown fields are ignored; a field set to null counts as absent.
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -34,10 +35,18 @@ struct GenerationOptions {
     bool include_usage = false;  // stream_options.include_usage
 };
 
+// An image part of a chat message, decoded from its data: URL (not yet decoded as an image).
+struct ImagePart {
+    std::string param;  // where it came from, e.g. "messages[1].content[0]", for error messages
+    std::vector<uint8_t> bytes;
+};
+
 struct ChatRequest {
-    nlohmann::json messages;         // validated: non-empty array of objects with a string "role"
+    nlohmann::json messages;         // validated: non-empty array of objects with a string "role"; image parts are
+                                     // reduced to {"type": "image"}, their bytes are in `images`
     nlohmann::json tools;            // array, or null when absent, empty or tool_choice is "none"
     nlohmann::json template_kwargs;  // chat_template_kwargs, always an object
+    std::vector<ImagePart> images;   // in message order, then part order
     GenerationOptions options;
 };
 

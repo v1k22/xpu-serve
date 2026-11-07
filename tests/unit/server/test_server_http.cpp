@@ -264,6 +264,39 @@ TEST_SUITE("server.http") {
         CHECK(service.calls() == 0);
     }
 
+    TEST_CASE("image parts reach the engine as media with their placeholders expanded") {
+        // A 2x1 grayscale PNG.
+        const std::string png =
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAAAAADRSSBWAAAAC0lEQVR4nGNg/wUAAQsBAsdd+yMAAAAASUVORK5CYII=";
+        const auto user_with = [](const json& image_part) {
+            return json::array({{{"role", "user"},
+                                 {"content", json::array({{{"type", "text"}, {"text", "see"}}, image_part})}}});
+        };
+        const json image = {{"type", "image_url"}, {"image_url", {{"url", png}}}};
+        xs::test::FakeService service;
+        RunningServer running(service);
+        auto client = running.client();
+
+        // A model without vision refuses images, naming the part.
+        json err = post_json(client, "/v1/chat/completions", chat_body({{"messages", user_with(image)}}), 400);
+        CHECK(err["error"]["param"] == "messages[0].content[1]");
+
+        service.images = true;
+        post_json(client, "/v1/chat/completions", chat_body({{"messages", user_with(image)}}));
+        const xs::GenerateRequest req = service.last_request();
+        REQUIRE(req.media.size() == 1);
+        CHECK(std::count(req.prompt.begin(), req.prompt.end(), xs::test::kImageByte) == 2);
+
+        // Undecodable image bytes and a stray placeholder in the text are 400s too.
+        const json broken = {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,iVBORw0KGgo="}}}};
+        err = post_json(client, "/v1/chat/completions", chat_body({{"messages", user_with(broken)}}), 400);
+        CHECK(err["error"]["param"] == "messages[0].content[1]");
+        CHECK(err["error"]["message"].get<std::string>().find("could not be decoded") != std::string::npos);
+        const json stray = json::array({{{"role", "user"}, {"content", std::string("look ") + xs::test::kImageByte}}});
+        err = post_json(client, "/v1/chat/completions", chat_body({{"messages", stray}}), 400);
+        CHECK(err["error"]["param"] == "messages");
+    }
+
     TEST_CASE("prompt longer than the context is refused") {
         xs::test::FakeService service;
         service.card().context_length = 8;

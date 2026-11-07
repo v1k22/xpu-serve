@@ -1,7 +1,9 @@
 // xpu-serve command line: serve | run | bench | info.
 
 #include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -53,6 +55,7 @@ void add_engine_options(Args& a) {
         .value("cache-dir", "backend compile cache directory")
         .value("backend-opt", "backend options as key=value[,key=value]")
         .value("log-level", "debug | info | warn | error", "info")
+        .flag("no-vision", "do not load the model's vision encoder (text only)")
         .flag("help", "show this help");
 }
 
@@ -68,6 +71,7 @@ ServiceOptions service_options(const Args& a) {
     } else {
         fail("--precision must be f16 or f32, got '", p, "'");
     }
+    o.vision = !a.has("no-vision");
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");
     o.session.cache_dir = a.get("cache-dir");
@@ -144,12 +148,14 @@ SamplingParams sampling_from(const Args& a, SamplingParams p) {
     return p;
 }
 
-// Streams one assistant turn to stdout and returns the raw generated text (for the conversation history).
-std::string run_turn(EngineService& service, std::string_view prompt_text, const SamplingParams& sampling,
-                     int max_tokens) {
-    const std::vector<int32_t> prompt = service.tokenizer().encode(prompt_text);
+// Streams one assistant turn to stdout and returns the raw generated text (for the conversation history). `media`
+// holds every image of the conversation so far, in order.
+std::string run_turn(EngineService& service, std::string_view prompt_text, const std::vector<MediaInput>& media,
+                     const SamplingParams& sampling, int max_tokens) {
+    const std::vector<int32_t> prompt = service.expand_media(service.tokenizer().encode(prompt_text), media);
     GenerateRequest req;
     req.prompt = prompt;
+    req.media = media;
     req.sampling = sampling;
     req.max_new_tokens = max_tokens;
     req.stop_token_ids = service.model().stop_token_ids;
@@ -186,10 +192,21 @@ std::string run_turn(EngineService& service, std::string_view prompt_text, const
     std::fflush(stdout);  // the stats line goes to stderr and must come after the reply
     if (r.finish == FinishReason::Error) fail("generation failed: ", r.error);
     const GenerateStats& s = r.stats;
-    std::fprintf(stderr, "[%d prompt tokens (%d cached), prefill %.1f tok/s | %d tokens, decode %.1f tok/s | %s]\n",
-                 s.prompt_tokens, s.cached_tokens, s.prefill_tok_per_s(), s.generated_tokens, s.decode_tok_per_s(),
-                 finish_reason_name(r.finish));
+    std::string images;
+    if (s.images_encoded > 0) {
+        images = str_cat(s.images_encoded, s.images_encoded == 1 ? " image" : " images", " encoded in ",
+                         static_cast<int>(s.encode_ms), " ms | ");
+    }
+    std::fprintf(stderr, "[%s%d prompt tokens (%d cached), prefill %.1f tok/s | %d tokens, decode %.1f tok/s | %s]\n",
+                 images.c_str(), s.prompt_tokens, s.cached_tokens, s.prefill_tok_per_s(), s.generated_tokens,
+                 s.decode_tok_per_s(), finish_reason_name(r.finish));
     return raw;
+}
+
+std::vector<uint8_t> read_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    XS_CHECK(in.good(), "cannot read '", path, "'");
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
 int cmd_run(const std::vector<std::string>& argv) {
@@ -202,6 +219,7 @@ int cmd_run(const std::vector<std::string>& argv) {
         .value("top-k", "top-k (default: the model's)")
         .value("top-p", "top-p (default: the model's)")
         .value("seed", "sampling seed")
+        .value("image", "image file(s) for the first message, comma-separated (PNG, JPEG, BMP, GIF)")
         .flag("think", "enable the model's thinking mode")
         .flag("raw", "feed --prompt to the model as is, without the chat template");
     a.parse(argv);
@@ -214,15 +232,32 @@ int cmd_run(const std::vector<std::string>& argv) {
 
     if (a.has("raw")) {
         XS_CHECK(a.has("prompt"), "--raw needs --prompt");
-        run_turn(*service, a.get("prompt"), sampling, max_tokens);
+        XS_CHECK(!a.has("image"), "--image needs the chat template; drop --raw");
+        run_turn(*service, a.get("prompt"), {}, sampling, max_tokens);
         return 0;
     }
     nlohmann::json messages = nlohmann::json::array();
     if (a.has("system")) messages.push_back({{"role", "system"}, {"content", a.get("system")}});
+    std::vector<MediaInput> media;
+    std::string pending_images = a.get("image");
     auto turn = [&](const std::string& user_text) {
-        messages.push_back({{"role", "user"}, {"content", user_text}});
+        nlohmann::json content = user_text;
+        if (!pending_images.empty()) {
+            content = nlohmann::json::array();
+            for (size_t pos = 0; pos <= pending_images.size();) {
+                const size_t comma = std::min(pending_images.find(',', pos), pending_images.size());
+                const std::string path = pending_images.substr(pos, comma - pos);
+                pos = comma + 1;
+                if (path.empty()) continue;
+                media.push_back(service->prepare_image(read_file(path)));
+                content.push_back({{"type", "image"}});
+            }
+            content.push_back({{"type", "text"}, {"text", user_text}});
+            pending_images.clear();
+        }
+        messages.push_back({{"role", "user"}, {"content", content}});
         const std::string text = service->chat_template().render(messages, nullptr, true, extra);
-        const std::string reply = run_turn(*service, text, sampling, max_tokens);
+        const std::string reply = run_turn(*service, text, media, sampling, max_tokens);
         auto parser = chat::make_output_parser(service->model().dialect, chat::prompt_tail(text));
         chat::ParsedDelta d = parser->feed(reply);
         const chat::ParsedDelta end = parser->finish();

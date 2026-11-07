@@ -144,7 +144,9 @@ void log_summary(std::string_view id, const GenerationOutcome& outcome, bool has
     } else {
         finish = outcome_finish_reason(outcome, has_tool_calls);
     }
-    log::info(id, ": prompt=", s.prompt_tokens, " cached=", s.cached_tokens, " generated=", s.generated_tokens,
+    const std::string images =
+        s.images_encoded > 0 ? str_cat(" images_encoded=", s.images_encoded, " (", fixed1(s.encode_ms), " ms)") : "";
+    log::info(id, ": prompt=", s.prompt_tokens, " cached=", s.cached_tokens, images, " generated=", s.generated_tokens,
               " prefill=", fixed1(s.prefill_tok_per_s()), " tok/s decode=", fixed1(s.decode_tok_per_s()),
               " tok/s finish=", finish);
 }
@@ -154,6 +156,17 @@ void log_summary(std::string_view id, const GenerationOutcome& outcome, bool has
 void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& res) const {
     const ModelCard& card = service_.model();
     ChatRequest chat = parse_chat_request(parse_json_body(req.body), card.default_sampling);
+    std::vector<MediaInput> media;
+    if (!chat.images.empty() && !service_.accepts_images()) {
+        throw InvalidRequest(str_cat("model '", card.id, "' does not take images"), chat.images.front().param);
+    }
+    for (const ImagePart& image : chat.images) {
+        try {
+            media.push_back(service_.prepare_image(image.bytes));
+        } catch (const Error& e) {
+            throw InvalidRequest(str_cat(image.param, ": ", e.what()), image.param);
+        }
+    }
     std::vector<int32_t> prompt;
     std::string text;
     try {
@@ -163,9 +176,16 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
     } catch (const std::exception& e) {
         throw InvalidRequest(str_cat("could not render the chat template: ", e.what()), "messages");
     }
+    try {
+        prompt = service_.expand_media(std::move(prompt), media);
+    } catch (const Error& e) {
+        throw InvalidRequest(e.what(), "messages");
+    }
+    GenerateRequest request = make_generate_request(std::move(prompt), chat.options, card, "messages");
+    request.media = std::move(media);
     Job job{.chat = true,
             .meta = {random_id("chatcmpl-"), card.id, unix_seconds_now()},
-            .request = make_generate_request(std::move(prompt), chat.options, card, "messages"),
+            .request = std::move(request),
             .options = std::move(chat.options),
             .dialect = card.dialect,
             .prompt_tail = std::string(chat::prompt_tail(text))};

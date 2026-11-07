@@ -209,6 +209,10 @@ HostTensor softcap(const HostTensor& x, float cap) {
     });
 }
 
+HostTensor clamp(const HostTensor& x, float lo, float hi) {
+    return map_unary(x, [lo, hi](float v) { return std::min(std::max(v, lo), hi); });
+}
+
 HostTensor rms_norm(const HostTensor& x, const HostTensor* weight, float eps) {
     check_f32(x, "rms_norm x");
     const int64_t width = x.shape().back();
@@ -261,26 +265,64 @@ HostTensor slice(const HostTensor& x, int axis, int64_t begin, int64_t end) {
     return out;
 }
 
+HostTensor transpose(const HostTensor& x, const std::vector<int>& perm) {
+    const size_t rank = x.rank();
+    XS_CHECK(perm.size() == rank, "transpose of ", dims_to_string(x.shape()), " with ", perm.size(), " axes");
+    Dims out_shape(rank);
+    for (size_t i = 0; i < rank; ++i)
+        out_shape[i] = x.dim(static_cast<size_t>(perm[i]));
+    // Element stride in x of each output axis.
+    std::vector<int64_t> in_strides(rank, 1);
+    for (size_t d = rank; d-- > 1;)
+        in_strides[d - 1] = in_strides[d] * x.dim(d);
+    std::vector<int64_t> strides(rank);
+    for (size_t i = 0; i < rank; ++i)
+        strides[i] = in_strides[static_cast<size_t>(perm[i])];
+    HostTensor out(x.dtype(), out_shape);
+    const size_t elem = dtype_size(x.dtype());
+    const auto* src = static_cast<const unsigned char*>(x.raw());
+    auto* dst = static_cast<unsigned char*>(out.raw());
+    std::vector<int64_t> index(rank, 0);
+    int64_t offset = 0;
+    for (int64_t i = 0; i < out.numel(); ++i) {
+        std::memcpy(dst + static_cast<size_t>(i) * elem, src + static_cast<size_t>(offset) * elem, elem);
+        for (size_t d = rank; d-- > 0;) {  // odometer increment of the output index
+            offset += strides[d];
+            if (++index[d] < out_shape[d]) break;
+            offset -= strides[d] * out_shape[d];
+            index[d] = 0;
+        }
+    }
+    return out;
+}
+
 HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTensor& inv_freq) {
     check_f32(x, "rope x");
     check_f32(inv_freq, "rope inv_freq");
     const int64_t tokens = x.dim(0);
     const int64_t heads = x.dim(1);
-    const int64_t half = x.dim(2) / 2;
-    XS_CHECK(positions.numel() == tokens, "rope has ", positions.numel(), " positions for ", tokens, " tokens");
+    const int64_t dim = x.dim(2);
+    const int64_t sections = positions.rank() == 2 ? positions.dim(1) : 1;
+    const int64_t width = dim / sections;
+    const int64_t half = width / 2;
+    XS_CHECK(positions.numel() == tokens * sections, "rope has ", positions.numel(), " positions for ", tokens,
+             " tokens of ", sections, " sections");
+    XS_CHECK(inv_freq.numel() == half, "rope inv_freq has ", inv_freq.numel(), " entries, expected ", half);
     HostTensor out(DType::F32, x.shape());
     for (int64_t t = 0; t < tokens; ++t) {
-        const double pos = static_cast<double>(int_at(positions, t));
-        for (int64_t i = 0; i < half; ++i) {
-            const double angle = pos * inv_freq.data<float>()[i];
-            const double c = std::cos(angle);
-            const double s = std::sin(angle);
-            for (int64_t h = 0; h < heads; ++h) {
-                const int64_t base = (t * heads + h) * 2 * half;
-                const double x1 = x.data<float>()[base + i];
-                const double x2 = x.data<float>()[base + half + i];
-                out.data<float>()[base + i] = static_cast<float>(x1 * c - x2 * s);
-                out.data<float>()[base + half + i] = static_cast<float>(x2 * c + x1 * s);
+        for (int64_t s = 0; s < sections; ++s) {
+            const double pos = static_cast<double>(int_at(positions, t * sections + s));
+            for (int64_t i = 0; i < half; ++i) {
+                const double angle = pos * inv_freq.data<float>()[i];
+                const double c = std::cos(angle);
+                const double sn = std::sin(angle);
+                for (int64_t h = 0; h < heads; ++h) {
+                    const int64_t base = (t * heads + h) * dim + s * width;
+                    const double x1 = x.data<float>()[base + i];
+                    const double x2 = x.data<float>()[base + half + i];
+                    out.data<float>()[base + i] = static_cast<float>(x1 * c - x2 * sn);
+                    out.data<float>()[base + half + i] = static_cast<float>(x2 * c + x1 * sn);
+                }
             }
         }
     }
@@ -297,7 +339,7 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
     const int64_t head_dim = q.dim(2);
     const int64_t kv_len = k_all.dim(0);
     const int64_t kv_heads = k_all.dim(1);
-    XS_CHECK(kv_len >= tokens, "attention has ", kv_len, " keys for ", tokens, " queries");
+    XS_CHECK(!attrs.causal || kv_len >= tokens, "attention has ", kv_len, " keys for ", tokens, " queries");
     XS_CHECK(k_all.shape() == v_all.shape() && k_all.dim(2) == head_dim && q_heads % kv_heads == 0,
              "attention shapes q ", dims_to_string(q.shape()), ", k ", dims_to_string(k_all.shape()), ", v ",
              dims_to_string(v_all.shape()), " do not fit");
@@ -308,8 +350,9 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
         const int64_t h = item % q_heads;
         const int64_t pos = kv_len - tokens + t;
         const int64_t first = attrs.sliding_window > 0 ? std::max<int64_t>(0, pos - attrs.sliding_window + 1) : 0;
+        const int64_t last = attrs.causal ? pos : kv_len - 1;
         const int64_t offset = (t * q_heads + h) * head_dim;
-        attend_one(q.data<float>() + offset, k_all, v_all, h / group, first, pos, attrs, out.data<float>() + offset);
+        attend_one(q.data<float>() + offset, k_all, v_all, h / group, first, last, attrs, out.data<float>() + offset);
     });
     return out;
 }

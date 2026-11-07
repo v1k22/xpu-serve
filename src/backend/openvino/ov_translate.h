@@ -33,6 +33,7 @@ struct Translation {
     std::vector<InputSpec> inputs;     // in model parameter order
     std::vector<std::string> outputs;  // in model result order
     WeightBytes weight_bytes;
+    bool stateful = true;  // false for a graph without KV slots: runs do not accumulate tokens
 };
 
 Translation translate(const graph::Graph& graph, const WeightStore& weights, const TranslateOptions& options);

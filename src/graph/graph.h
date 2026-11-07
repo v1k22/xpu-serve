@@ -50,13 +50,20 @@ enum class OpKind : uint8_t {
     Tanh,       // tanh(x)
     GeluTanh,   // 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
     Softcap,    // cap * tanh(x / cap)
+    Clamp,      // min(max(x, lo), hi); either bound may be infinite
     RmsNorm,    // (x [..., D] [, w [D]]) -> x * (mean(x^2) + eps)^-1/2 [* w], computed in f32. No "+1" offset.
     Reshape,    // same element count; target may use kT / kL
     Slice,      // python-style [begin, end) on one axis; a symbolic axis only supports "last n" (begin < 0, end = kSliceEnd)
-    Rope,       // (x [T, H, D], positions [T] int, inv_freq [D/2] f32) -> [T, H, D]; rotate-half (NeoX) layout
+    Transpose,  // out.shape[i] = x.shape[perm[i]]; any dtype
+    Rope,       // (x [T, H, D], positions [T] or [T, S] int, inv_freq [D/(2S)] f32) -> [T, H, D]; see note below
     KvCache,    // (k [T, Hkv, D], v [T, Hkv, D]) -> (k_all [L, Hkv, D], v_all [L, Hkv, D]); appends to the slot's state
-    Attention,  // (q [T, Hq, D], k_all [L, Hkv, D], v_all [L, Hkv, D]) -> [T, Hq, D]; causal, optional window, GQA
+    Attention,  // (q [T, Hq, D], k [N, Hkv, D], v [N, Hkv, D]) -> [T, Hq, D]; see AttentionAttrs; GQA
 };
+
+// Rope: rotate-half (NeoX) rotary embedding in the Hugging Face form, out = x * cos + rotate_half(x) * sin.
+// With positions [T] the whole head dim is one section. With positions [T, S] (axial RoPE, e.g. 2-D image patches)
+// the head dim splits into S contiguous sections of D/S channels; section s rotates by positions[:, s]. Within a
+// section of width W, channel c < W/2 pairs with c + W/2 and both rotate by the angle position * inv_freq[c].
 
 std::string_view op_name(OpKind kind);
 
@@ -86,20 +93,32 @@ struct SliceAttrs {
     int64_t begin = 0;
     int64_t end = kSliceEnd;
 };
+struct ClampAttrs {
+    float lo = 0.0f;
+    float hi = 0.0f;
+};
+struct TransposeAttrs {
+    std::vector<int> perm;
+};
 struct KvCacheAttrs {
     int slot = -1;
 };
-// Query i of the step sits at absolute position p_i = L - T + i; key j sits at position j.
-// Key j is visible to query i iff j <= p_i and (sliding_window == 0 or p_i - j < sliding_window).
+// Causal (the default): k and v are KvCache outputs [L, Hkv, D]. Query i of the step sits at absolute position
+// p_i = L - T + i; key j sits at position j. Key j is visible to query i iff j <= p_i and (sliding_window == 0 or
+// p_i - j < sliding_window).
+// Not causal (encoders): every key is visible to every query; k and v may have any length N (e.g. kT for
+// self-attention over the step's own tokens); sliding_window must be 0.
 // scores = scale * q.k (f32); if softcap > 0: scores = softcap * tanh(scores / softcap); softmax in f32.
 struct AttentionAttrs {
     float scale = 1.0f;
     int64_t sliding_window = 0;
     float softcap = 0.0f;
+    bool causal = true;
 };
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
-                           RmsNormAttrs, ReshapeAttrs, SliceAttrs, KvCacheAttrs, AttentionAttrs>;
+                           ClampAttrs, RmsNormAttrs, ReshapeAttrs, SliceAttrs, TransposeAttrs, KvCacheAttrs,
+                           AttentionAttrs>;
 
 struct TensorType {
     DType dtype = DType::F32;
@@ -114,7 +133,8 @@ struct Node {
     std::string label;  // scope path for debugging and backend node names, e.g. "layers.3.attn.q_proj"
 };
 
-// Per-sequence KV state owned by the backend session. A slot is appended by exactly one KvCache node per graph.
+// Per-sequence KV state owned by the backend session. A slot is appended by exactly one KvCache node per graph. A graph
+// without slots is stateless: every run stands alone (encoders).
 struct KvSlot {
     int64_t num_kv_heads = 0;
     int64_t head_dim = 0;
@@ -143,10 +163,12 @@ public:
     Value tanh(Value x);
     Value gelu_tanh(Value x);
     Value softcap(Value x, float cap);
+    Value clamp(Value x, float lo, float hi);
     Value rms_norm(Value x, float eps);
     Value rms_norm(Value x, Value weight, float eps);
     Value reshape(Value x, Dims shape);
     Value slice(Value x, int axis, int64_t begin, int64_t end = kSliceEnd);
+    Value transpose(Value x, std::vector<int> perm);
     Value rope(Value x, Value positions, Value inv_freq);
     int add_kv_slot(int64_t num_kv_heads, int64_t head_dim, int64_t sliding_window, std::string label);
     std::pair<Value, Value> kv_cache(int slot, Value k, Value v);

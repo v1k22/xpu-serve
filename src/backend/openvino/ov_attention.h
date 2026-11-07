@@ -23,7 +23,7 @@ struct AttentionOperands {
     OvOutput q;     // [1, Hq, T, D]
     OvOutput k;     // [1, Hkv, L, D]
     OvOutput v;     // [1, Hkv, L, D]
-    OvOutput mask;  // [T, L]
+    OvOutput mask;  // [T, L]; absent (no node) when every key is visible
     int64_t num_heads = 0;
     int64_t num_kv_heads = 0;
     int64_t head_dim = 0;

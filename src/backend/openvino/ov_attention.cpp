@@ -53,22 +53,27 @@ Grouped group_heads(const AttentionOperands& in) {
     Grouped g;
     const int64_t group = in.num_heads / in.num_kv_heads;
     g.rank5 = group > 1 && in.num_kv_heads > 1;
+    const bool masked = in.mask.get_node() != nullptr;
     if (!g.rank5) {
         g.q = in.q;
         g.k = in.k;
         g.v = in.v;
-        g.mask = std::make_shared<ops::v0::Unsqueeze>(in.mask, i64_constant({0, 1}));  // [1, 1, T, L]
+        if (masked) g.mask = std::make_shared<ops::v0::Unsqueeze>(in.mask, i64_constant({0, 1}));  // [1, 1, T, L]
         return g;
     }
     g.q = std::make_shared<ops::v1::Reshape>(in.q, i64_constant({1, in.num_kv_heads, group, -1, in.head_dim}), false);
     g.k = std::make_shared<ops::v0::Unsqueeze>(in.k, i64_scalar(2));
     g.v = std::make_shared<ops::v0::Unsqueeze>(in.v, i64_scalar(2));
-    g.mask = std::make_shared<ops::v0::Unsqueeze>(in.mask, i64_constant({0, 1, 2}));  // [1, 1, 1, T, L]
+    if (masked) g.mask = std::make_shared<ops::v0::Unsqueeze>(in.mask, i64_constant({0, 1, 2}));  // [1, 1, 1, T, L]
     return g;
 }
 
+// Without a mask, a zero [1, 1] mask stands in: the op takes the scale only after a mask operand.
 OvOutput sdpa(const Grouped& g, float scale) {
-    return std::make_shared<ops::v13::ScaledDotProductAttention>(g.q, g.k, g.v, g.mask, f32_scalar(scale), false);
+    const OvOutput mask = g.mask.get_node()
+                              ? g.mask
+                              : std::make_shared<ops::v0::Constant>(ov::element::f32, ov::Shape{1, 1}, 0.0f)->output(0);
+    return std::make_shared<ops::v13::ScaledDotProductAttention>(g.q, g.k, g.v, mask, f32_scalar(scale), false);
 }
 
 // scores -> scale -> softcap -> mask -> softmax -> probs @ v, with everything after the score matmul kept in f32.
@@ -84,9 +89,11 @@ OvOutput matmul_attention(const Grouped& g, const graph::AttentionAttrs& attrs, 
         keep_in_f32(tanh);
         keep_in_f32(x);
     }
-    const auto masked = std::make_shared<ops::v1::Add>(x, g.mask);
-    const auto probs = std::make_shared<ops::v8::Softmax>(masked, -1);
-    keep_in_f32(masked);
+    if (g.mask.get_node()) {
+        x = std::make_shared<ops::v1::Add>(x, g.mask);
+        keep_in_f32(x);
+    }
+    const auto probs = std::make_shared<ops::v8::Softmax>(x, -1);
     keep_in_f32(probs);
     named(probs, label, "probs");
     return std::make_shared<ops::v0::MatMul>(probs, g.v);

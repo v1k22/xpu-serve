@@ -116,7 +116,7 @@ class CpuSession final : public Session {
             resize_kv(cached_);  // a failed step leaves the KV state as it was
             throw;
         }
-        cached_ = step.kv_len;
+        if (!graph_.kv_slots().empty()) cached_ = step.kv_len;  // a graph without KV slots is stateless
         for (const auto& out : graph_.outputs()) {
             const HostTensor& t = values[static_cast<size_t>(out.value.node)][static_cast<size_t>(out.value.index)];
             outputs[out.name] = is_leaf(nodes[static_cast<size_t>(out.value.node)].kind) ? t.clone() : t;
@@ -226,6 +226,10 @@ class CpuSession final : public Session {
                 return {cpu_ref::gelu_tanh(f32(0))};
             case OpKind::Softcap:
                 return {cpu_ref::softcap(f32(0), std::get<graph::SoftcapAttrs>(n.attrs).cap)};
+            case OpKind::Clamp: {
+                const auto& a = std::get<graph::ClampAttrs>(n.attrs);
+                return {cpu_ref::clamp(f32(0), a.lo, a.hi)};
+            }
             case OpKind::RmsNorm: {
                 const float eps = std::get<graph::RmsNormAttrs>(n.attrs).eps;
                 if (n.inputs.size() == 1) return {cpu_ref::rms_norm(f32(0), nullptr, eps)};
@@ -238,6 +242,8 @@ class CpuSession final : public Session {
                 const auto& a = std::get<graph::SliceAttrs>(n.attrs);
                 return {cpu_ref::slice(in(0), a.axis, a.begin, a.end)};
             }
+            case OpKind::Transpose:
+                return {cpu_ref::transpose(in(0), std::get<graph::TransposeAttrs>(n.attrs).perm)};
             case OpKind::Rope:
                 return {cpu_ref::rope(f32(0), in(1), f32(2))};
             case OpKind::KvCache: {

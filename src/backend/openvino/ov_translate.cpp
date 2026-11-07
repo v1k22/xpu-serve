@@ -106,6 +106,7 @@ Translation Translator::run() {
         output_names.push_back(out.name);
     }
     Translation t;
+    t.stateful = !graph_.kv_slots().empty();
     t.model = std::make_shared<ov::Model>(results, sinks_, parameters_, "xs_step");
     t.inputs = std::move(input_specs_);
     t.outputs = std::move(output_names);
@@ -163,6 +164,13 @@ void Translator::lower(size_t index) {
             set(named(std::make_shared<ops::v1::Multiply>(tanh, f32_scalar(cap)), label));
             break;
         }
+        case OpKind::Clamp: {
+            const auto& a = std::get<graph::ClampAttrs>(n.attrs);
+            set(named(std::make_shared<ops::v0::Clamp>(float_value(n.inputs[0]), static_cast<double>(a.lo),
+                                                       static_cast<double>(a.hi)),
+                      label));
+            break;
+        }
         case OpKind::RmsNorm:
             set(lower_rms_norm(n, label));
             break;
@@ -172,6 +180,13 @@ void Translator::lower(size_t index) {
         case OpKind::Slice:
             set(named(lower_slice(n).get_node_shared_ptr(), label));
             break;
+        case OpKind::Transpose: {
+            const auto& perm = std::get<graph::TransposeAttrs>(n.attrs).perm;
+            set(named(std::make_shared<ops::v1::Transpose>(value(n.inputs[0]),
+                                                           i64_constant(std::vector<int64_t>(perm.begin(), perm.end()))),
+                      label));
+            break;
+        }
         case OpKind::Rope:
             set(lower_rope(n, label));
             break;
@@ -251,26 +266,33 @@ OvOutput Translator::lower_slice(const Node& n) {
                                             i64_constant({1}), i64_constant({a.axis}));
 }
 
-// NeoX rotate-half in the Hugging Face form: x * cos + rotate_half(x) * sin with rotate_half(x) = [-x2, x1] and
-// the D/2 frequencies repeated twice. The angle path stays in f32: positions times inverse frequencies reach tens of
-// thousands of radians, where f16 has no fractional bits left. rotate_half is a Gather times a sign rather than a
-// Concat, because the GPU plugin's activation scaling mishandles a Concat fed by f32-kept and f16 branches.
+// NeoX rotate-half in the Hugging Face form: x * cos + rotate_half(x) * sin, per section (one section unless the
+// positions are [T, S]). Within a section of width W, rotate_half(x) = [-x2, x1] and the W/2 frequencies repeat
+// twice. The angle path stays in f32: positions times inverse frequencies reach tens of thousands of radians, where
+// f16 has no fractional bits left. rotate_half is a Gather times a sign rather than a Concat, because the GPU plugin's
+// activation scaling mishandles a Concat fed by f32-kept and f16 branches.
 OvOutput Translator::lower_rope(const Node& n, const std::string& label) {
     const OvOutput x = float_value(n.inputs[0]);
     const int64_t dim = n.outputs[0].shape[2];
-    const int64_t half = dim / 2;
+    const Dims& pos_shape = graph_.type(n.inputs[1]).shape;
+    const int64_t sections = pos_shape.size() == 2 ? pos_shape[1] : 1;
+    const int64_t width = dim / sections;
+    const int64_t half = width / 2;
 
+    // angles[t, s, j] = positions[t, s] * freq[j] with freq = [inv_freq, inv_freq], then [T, 1, D] section-major.
     const OvOutput inv_freq = float_value(n.inputs[2]);
-    const auto freq_full = std::make_shared<ops::v0::Concat>(ov::OutputVector{inv_freq, inv_freq}, 0);  // [D]
+    const auto freq = std::make_shared<ops::v0::Concat>(ov::OutputVector{inv_freq, inv_freq}, 0);  // [W]
     const auto positions = std::make_shared<ops::v0::Convert>(value(n.inputs[1]), ov::element::f32);
-    const auto positions_col = std::make_shared<ops::v0::Unsqueeze>(positions, i64_constant({1, 2}));  // [T, 1, 1]
-    const auto angles = std::make_shared<ops::v1::Multiply>(positions_col, freq_full);                 // [T, 1, D]
+    const auto positions_3d =
+        std::make_shared<ops::v1::Reshape>(positions, i64_constant({-1, sections, 1}), false);  // [T, S, 1]
+    const auto angles_3d = std::make_shared<ops::v1::Multiply>(positions_3d, freq);              // [T, S, W]
+    const auto angles = std::make_shared<ops::v1::Reshape>(angles_3d, i64_constant({-1, 1, dim}), false);
     const auto cos = std::make_shared<ops::v0::Cos>(angles);
     const auto sin = std::make_shared<ops::v0::Sin>(angles);
     for (const std::shared_ptr<ov::Node>& node :
-         {inv_freq.get_node_shared_ptr(), std::shared_ptr<ov::Node>(freq_full), std::shared_ptr<ov::Node>(positions),
-          std::shared_ptr<ov::Node>(positions_col), std::shared_ptr<ov::Node>(angles), std::shared_ptr<ov::Node>(cos),
-          std::shared_ptr<ov::Node>(sin)}) {
+         {inv_freq.get_node_shared_ptr(), std::shared_ptr<ov::Node>(freq), std::shared_ptr<ov::Node>(positions),
+          std::shared_ptr<ov::Node>(positions_3d), std::shared_ptr<ov::Node>(angles_3d),
+          std::shared_ptr<ov::Node>(angles), std::shared_ptr<ov::Node>(cos), std::shared_ptr<ov::Node>(sin)}) {
         keep_in_f32(node);
     }
     named(cos, label, "cos");
@@ -278,9 +300,11 @@ OvOutput Translator::lower_rope(const Node& n, const std::string& label) {
 
     std::vector<int64_t> swap_halves(static_cast<size_t>(dim));
     std::vector<float> sign(static_cast<size_t>(dim));
-    for (int64_t i = 0; i < dim; ++i) {
-        swap_halves[static_cast<size_t>(i)] = (i + half) % dim;
-        sign[static_cast<size_t>(i)] = i < half ? -1.0f : 1.0f;
+    for (int64_t c = 0; c < dim; ++c) {
+        const int64_t base = c / width * width;
+        const int64_t i = c - base;
+        swap_halves[static_cast<size_t>(c)] = base + (i + half) % width;
+        sign[static_cast<size_t>(c)] = i < half ? -1.0f : 1.0f;
     }
     const auto swapped = std::make_shared<ops::v8::Gather>(x, i64_constant(swap_halves), i64_scalar(-1));
     const auto sign_const =
@@ -321,7 +345,7 @@ OvOutput Translator::lower_attention(const Node& n, const std::string& label) {
     in.q = to_heads(float_value(n.inputs[0]), label + "/q");
     in.k = heads_value(n.inputs[1], label + "/k");
     in.v = heads_value(n.inputs[2], label + "/v");
-    in.mask = mask(attrs.sliding_window);
+    if (attrs.causal) in.mask = mask(attrs.sliding_window);
     in.num_heads = q_shape[1];
     in.num_kv_heads = graph_.type(n.inputs[1]).shape[1];
     in.head_dim = q_shape[2];

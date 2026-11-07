@@ -19,8 +19,8 @@ function(xs_add_library name)
   endif()
 endfunction()
 
-# Core: utilities, host tensors, safetensors I/O, the step graph, model code and the engine.
-xs_add_library(xs_core DIRS util tensor io graph models engine DEPS xs_json Threads::Threads)
+# Core: utilities, host tensors, safetensors I/O, images, the step graph, model code and the engine.
+xs_add_library(xs_core DIRS util tensor io image graph models engine DEPS xs_json xs_stb_image Threads::Threads)
 
 xs_add_library(xs_tokenizer DIRS tokenizer DEPS xs_core)
 

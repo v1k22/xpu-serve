@@ -3,10 +3,14 @@
 // What the HTTP server needs from the inference side. The server is written against this interface only, so it can
 // be tested with a fake.
 
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "engine/types.h"
+#include "util/error.h"
 
 namespace xs {
 namespace tok {
@@ -35,6 +39,20 @@ public:
     // Runs one generation and blocks until it ends. Requests are served one at a time in arrival order;
     // `on_token` runs on the engine thread. Thread-safe.
     virtual GenerateResult generate(const GenerateRequest& request, const TokenCallback& on_token) = 0;
+
+    // Images. Only a model with a loaded vision encoder takes them.
+    virtual bool accepts_images() const { return false; }
+    // Decodes one encoded image (PNG, JPEG, BMP, GIF) and preprocesses it for the vision encoder. Throws xs::Error
+    // with a message meant for the client. Thread-safe.
+    virtual MediaInput prepare_image(std::span<const uint8_t> /*encoded*/) const {
+        fail("model '", model().id, "' does not take images");
+    }
+    // `prompt` with each image placeholder the chat template rendered replaced by its image's token run. Throws
+    // xs::Error when placeholders and images do not pair up.
+    virtual std::vector<int32_t> expand_media(std::vector<int32_t> prompt, const std::vector<MediaInput>& media) const {
+        XS_CHECK(media.empty(), "model '", model().id, "' does not take images");
+        return prompt;
+    }
 };
 
 }  // namespace xs

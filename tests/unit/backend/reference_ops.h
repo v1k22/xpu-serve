@@ -117,6 +117,28 @@ inline Tensor64 slice(const Tensor64& x, size_t axis, int64_t b, int64_t e) {
     return out;
 }
 
+// out.shape[i] = x.shape[perm[i]].
+inline Tensor64 transpose(const Tensor64& x, const std::vector<int>& perm) {
+    const size_t rank = x.shape.size();
+    Dims shape(rank);
+    for (size_t i = 0; i < rank; ++i)
+        shape[i] = x.shape[static_cast<size_t>(perm[i])];
+    Tensor64 out(shape);
+    std::vector<int64_t> in_index(rank);
+    for (int64_t flat = 0; flat < out.numel(); ++flat) {
+        int64_t rem = flat;
+        for (size_t i = rank; i-- > 0;) {
+            in_index[static_cast<size_t>(perm[i])] = rem % shape[i];
+            rem /= shape[i];
+        }
+        int64_t src = 0;
+        for (size_t d = 0; d < rank; ++d)
+            src = src * x.shape[d] + in_index[d];
+        out[flat] = x[src];
+    }
+    return out;
+}
+
 enum class RopeLayout { RotateHalf, Interleaved /* planted-bug control: GPT-J pairs (2i, 2i+1) */ };
 
 // HF formulation: out = x * cat(cos, cos) + rotate_half(x) * cat(sin, sin), rotate_half(x) = cat(-x2, x1).
@@ -145,11 +167,36 @@ inline Tensor64 rope(const Tensor64& x, const std::vector<int64_t>& positions, c
     return out;
 }
 
+// Axial RoPE as transformers' apply_multidimensional_rope: split the head dim into S equal parts, apply the
+// rotate-half rope to part s with positions[t][s], concatenate.
+inline Tensor64 axial_rope(const Tensor64& x, const std::vector<std::vector<int64_t>>& positions,
+                           const std::vector<double>& inv_freq) {
+    const int64_t tokens = x.shape[0], heads = x.shape[1], dim = x.shape[2];
+    const int64_t sections = static_cast<int64_t>(positions[0].size());
+    const int64_t width = dim / sections;
+    Tensor64 out(x.shape);
+    for (int64_t s = 0; s < sections; ++s) {
+        const Tensor64 part = slice(x, 2, s * width, (s + 1) * width);
+        std::vector<int64_t> pos;
+        for (const auto& p : positions)
+            pos.push_back(p[static_cast<size_t>(s)]);
+        const Tensor64 rotated = rope(part, pos, inv_freq);
+        for (int64_t t = 0; t < tokens; ++t) {
+            for (int64_t h = 0; h < heads; ++h) {
+                for (int64_t c = 0; c < width; ++c)
+                    out[(t * heads + h) * dim + s * width + c] = rotated[(t * heads + h) * width + c];
+            }
+        }
+    }
+    return out;
+}
+
 struct AttentionSpec {
     double scale = 1.0;
     int64_t sliding_window = 0;
     double softcap = 0.0;
     int64_t window_slack = 0;  // planted-bug control: > 0 lets queries see that many keys beyond the window
+    bool causal = true;        // false: every key is visible to every query
 };
 
 // Builds the full [T, L] mask and score matrix per head, then a max-subtracted softmax.
@@ -163,8 +210,8 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
             const int64_t p = l_len - t_len + i;
             std::vector<double> scores(static_cast<size_t>(l_len), -std::numeric_limits<double>::infinity());
             for (int64_t j = 0; j < l_len; ++j) {
-                const bool visible =
-                    j <= p && (spec.sliding_window == 0 || p - j < spec.sliding_window + spec.window_slack);
+                const bool visible = !spec.causal || (j <= p && (spec.sliding_window == 0 ||
+                                                                 p - j < spec.sliding_window + spec.window_slack));
                 if (!visible) continue;
                 double s = 0;
                 for (int64_t d = 0; d < dim; ++d)

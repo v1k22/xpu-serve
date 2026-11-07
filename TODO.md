@@ -8,6 +8,9 @@ after experiments.**
 skipped for now, by decision), KV as OpenVINO state rather than engine-owned pages (`docs/decisions/0002`). Ticked items
 below are done and tested; the parity numbers are in `tests/unit/model/gemma4_parity.cpp`.
 
+**v0.2 (2026-11-07):** image input for Gemma 4 E2B/E4B (OpenAI `image_url` data URLs), checked against Hugging Face
+end to end (`docs/decisions/0005`, `tests/unit/model/gemma4_vision_parity.cpp`). `PROJECT.md` maps the code.
+
 Legend: `[x]` done · `[ ]` to do · **Done when** = the check that closes the item.
 
 ---
@@ -185,6 +188,12 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ## Phase 6: More models and formats
 
+- [x] Image input for Gemma 4 E-series: `image_url` data URLs, Hugging Face-exact preprocessing (torchvision-exact
+      resize), the vision tower as a stateless graph (Clamp, Transpose, axial Rope, non-causal Attention), image rows
+      spliced into prefill chunks, prefix cache keyed by image content
+- [ ] Vision towers with `standardize` (Gemma 4 26B / 31B); Qwen-VL style towers
+- [ ] Audio input (Gemma 4 E-series audio tower, mel features) and video input
+- [ ] Remote image URLs behind an explicit opt-in (size and host limits)
 - [ ] Gemma 4 dense (12B, 31B) and E-series (E2B, E4B: PLE, KV-shared tail)
 - [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
 - [ ] Llama 3

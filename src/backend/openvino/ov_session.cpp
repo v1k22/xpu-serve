@@ -56,11 +56,12 @@ HostTensor to_host(const ov::Tensor& t) {
 }  // namespace
 
 OvSession::OvSession(ov::CompiledModel compiled, std::vector<InputSpec> inputs, std::vector<std::string> outputs,
-                     int64_t max_context)
+                     int64_t max_context, bool stateful)
     : compiled_(std::move(compiled)),
       inputs_(std::move(inputs)),
       outputs_(std::move(outputs)),
-      max_context_(max_context) {
+      max_context_(max_context),
+      stateful_(stateful) {
     rethrow_openvino("create_infer_request", [&] { request_ = compiled_.create_infer_request(); });
 }
 
@@ -122,7 +123,7 @@ void OvSession::run(const TensorMap& inputs, TensorMap& outputs) {
         request_.infer();
         read_outputs(outputs);
     });
-    num_cached_ += tokens;
+    if (stateful_) num_cached_ += tokens;
 }
 
 void OvSession::reset() {

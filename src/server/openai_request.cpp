@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 
+#include "util/base64.h"
 #include "util/error.h"
 
 namespace xs::server {
@@ -110,20 +111,63 @@ GenerationOptions parse_generation_options(const json& body, const SamplingParam
     return o;
 }
 
-json parse_messages(const json& body) {
+// The bytes of an OpenAI image_url part: "data:image/<type>;base64,<payload>". Remote URLs are never fetched.
+std::vector<uint8_t> image_url_bytes(const json& part, const std::string& param) {
+    const json* image_url = find_field(part, "image_url");
+    const json* url = image_url != nullptr && image_url->is_object() ? find_field(*image_url, "url") : image_url;
+    if (url == nullptr || !url->is_string()) {
+        reject(param, str_cat("'", param, ".image_url' must be a string or an object with a string 'url'"));
+    }
+    const std::string& text = url->get_ref<const std::string&>();
+    if (text.rfind("data:", 0) != 0) {
+        reject(param, str_cat("'", param, "' must be a data: URL (data:image/png;base64,...); the server does not ",
+                              "fetch remote images"));
+    }
+    const size_t comma = text.find(',');
+    const std::string_view header = std::string_view(text).substr(5, comma == std::string::npos ? 0 : comma - 5);
+    const bool base64 = header.size() >= 7 && header.substr(header.size() - 7) == ";base64";
+    if (comma == std::string::npos || !base64 || header.rfind("image/", 0) != 0) {
+        reject(param, str_cat("'", param, "' must be a base64 image data: URL (data:image/<type>;base64,...)"));
+    }
+    auto bytes = base64_decode(std::string_view(text).substr(comma + 1));
+    if (!bytes.has_value()) reject(param, str_cat("'", param, "' holds invalid base64"));
+    return std::move(*bytes);
+}
+
+// Validates messages and takes the images out of their content parts.
+json parse_messages(const json& body, std::vector<ImagePart>& images) {
     const json* v = find_field(body, "messages");
     if (v == nullptr) reject("messages", "'messages' is a required field");
     if (!v->is_array() || v->empty()) reject("messages", "'messages' must be a non-empty array");
-    for (size_t i = 0; i < v->size(); ++i) {
-        const json& m = (*v)[i];
+    json messages = *v;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        json& m = messages[i];
         const std::string param = str_cat("messages[", i, "]");
         if (!m.is_object()) reject(param, str_cat("'", param, "' must be an object"));
         const json* role = find_field(m, "role");
         if (role == nullptr || !role->is_string()) {
             reject(param + ".role", str_cat("'", param, ".role' must be a string"));
         }
+        auto content = m.find("content");
+        if (content == m.end() || !content->is_array()) continue;
+        for (size_t j = 0; j < content->size(); ++j) {
+            json& part = (*content)[j];
+            const std::string part_param = str_cat(param, ".content[", j, "]");
+            const json* type = part.is_object() ? find_field(part, "type") : nullptr;
+            if (type == nullptr || !type->is_string()) continue;
+            const std::string& t = type->get_ref<const std::string&>();
+            if (t == "image_url") {
+                images.push_back(ImagePart{part_param, image_url_bytes(part, part_param)});
+                part = json{{"type", "image"}};  // what templates need, without megabytes of base64
+            } else if (t == "image") {
+                reject(part_param, str_cat("'", part_param, "': send images as {\"type\": \"image_url\", ",
+                                           "\"image_url\": {\"url\": \"data:image/...;base64,...\"}}"));
+            } else if (t == "input_audio" || t == "audio" || t == "video" || t == "video_url" || t == "file") {
+                reject(part_param, str_cat("'", part_param, "': content of type '", t, "' is not supported yet"));
+            }
+        }
     }
-    return *v;
+    return messages;
 }
 
 bool tools_disabled(const json& body) {
@@ -181,7 +225,7 @@ json parse_json_body(std::string_view body) {
 
 ChatRequest parse_chat_request(const json& body, const SamplingParams& defaults) {
     ChatRequest r;
-    r.messages = parse_messages(body);
+    r.messages = parse_messages(body, r.images);
     r.tools = parse_tools(body);
     check_response_format(body);
     const json* kwargs = object_field(body, "chat_template_kwargs");

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <map>
 #include <set>
 #include <sstream>
@@ -38,9 +39,11 @@ std::string_view op_name(OpKind kind) {
         case OpKind::Tanh: return "Tanh";
         case OpKind::GeluTanh: return "GeluTanh";
         case OpKind::Softcap: return "Softcap";
+        case OpKind::Clamp: return "Clamp";
         case OpKind::RmsNorm: return "RmsNorm";
         case OpKind::Reshape: return "Reshape";
         case OpKind::Slice: return "Slice";
+        case OpKind::Transpose: return "Transpose";
         case OpKind::Rope: return "Rope";
         case OpKind::KvCache: return "KvCache";
         case OpKind::Attention: return "Attention";
@@ -201,6 +204,12 @@ Value Graph::softcap(Value x, float cap) {
     return elementwise_unary(OpKind::Softcap, x, SoftcapAttrs{cap});
 }
 
+Value Graph::clamp(Value x, float lo, float hi) {
+    XS_CHECK(!std::isnan(lo) && !std::isnan(hi) && lo <= hi, "clamp bounds [", lo, ", ", hi, "] are invalid at ",
+             where(x));
+    return elementwise_unary(OpKind::Clamp, x, ClampAttrs{lo, hi});
+}
+
 Value Graph::rms_norm(Value x, float eps) {
     XS_CHECK(!type(x).shape.empty(), "rms_norm of a scalar at ", where(x));
     return add_node(OpKind::RmsNorm, {x}, RmsNormAttrs{eps}, {TensorType{DType::F32, type(x).shape}}, "rms_norm");
@@ -247,16 +256,37 @@ Value Graph::slice(Value x, int axis, int64_t begin, int64_t end) {
                     "slice");
 }
 
+Value Graph::transpose(Value x, std::vector<int> perm) {
+    const TensorType& xt = type(x);
+    XS_CHECK(perm.size() == xt.shape.size(), "transpose of ", shape_to_string(xt.shape), " needs ", xt.shape.size(),
+             " axes, got ", perm.size(), " at ", where(x));
+    std::vector<bool> seen(perm.size(), false);
+    Dims out(perm.size());
+    for (size_t i = 0; i < perm.size(); ++i) {
+        const int axis = perm[i];
+        XS_CHECK(axis >= 0 && static_cast<size_t>(axis) < perm.size() && !seen[static_cast<size_t>(axis)],
+                 "transpose permutation is not a permutation of 0..", perm.size() - 1, " at ", where(x));
+        seen[static_cast<size_t>(axis)] = true;
+        out[i] = xt.shape[static_cast<size_t>(axis)];
+    }
+    return add_node(OpKind::Transpose, {x}, TransposeAttrs{std::move(perm)}, {TensorType{xt.dtype, std::move(out)}},
+                    "transpose");
+}
+
 Value Graph::rope(Value x, Value positions, Value inv_freq) {
     const Dims& xs = type(x).shape;
     const TensorType& pt = type(positions);
     const TensorType& ft = type(inv_freq);
     XS_CHECK(xs.size() == 3 && xs[0] == kT, "rope input must be [T, heads, head_dim], got ", shape_to_string(xs));
-    XS_CHECK(xs[2] % 2 == 0, "rope head_dim must be even, got ", xs[2]);
-    XS_CHECK(pt.shape == Dims{kT} && is_int(pt.dtype), "rope positions must be [T] int, got ", dtype_name(pt.dtype),
-             shape_to_string(pt.shape));
-    XS_CHECK(ft.shape == Dims{xs[2] / 2} && ft.dtype == DType::F32, "rope inv_freq must be [", xs[2] / 2,
-             "] f32, got ", dtype_name(ft.dtype), shape_to_string(ft.shape));
+    const bool axial = pt.shape.size() == 2;
+    XS_CHECK(is_int(pt.dtype) && pt.shape[0] == kT && (pt.shape.size() == 1 || (axial && pt.shape[1] > 0)),
+             "rope positions must be [T] or [T, sections] int, got ", dtype_name(pt.dtype), shape_to_string(pt.shape));
+    const int64_t sections = axial ? pt.shape[1] : 1;
+    XS_CHECK(xs[2] % (2 * sections) == 0, "rope head_dim ", xs[2], " does not split into ", sections,
+             " sections of even width");
+    const int64_t pairs = xs[2] / (2 * sections);
+    XS_CHECK(ft.shape == Dims{pairs} && ft.dtype == DType::F32, "rope inv_freq must be [", pairs, "] f32, got ",
+             dtype_name(ft.dtype), shape_to_string(ft.shape));
     return add_node(OpKind::Rope, {x, positions, inv_freq}, {}, {TensorType{DType::F32, xs}}, "rope");
 }
 
@@ -283,8 +313,15 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     const Dims& ks = type(k_all).shape;
     const Dims& vs = type(v_all).shape;
     XS_CHECK(qs.size() == 3 && qs[0] == kT, "attention q must be [T, heads, head_dim], got ", shape_to_string(qs));
-    XS_CHECK(ks.size() == 3 && ks[0] == kL && ks == vs, "attention k/v must be [L, kv_heads, head_dim] and equal, got ",
-             shape_to_string(ks), " and ", shape_to_string(vs));
+    if (attrs.causal) {
+        XS_CHECK(ks.size() == 3 && ks[0] == kL && ks == vs,
+                 "causal attention k/v must be [L, kv_heads, head_dim] and equal, got ", shape_to_string(ks), " and ",
+                 shape_to_string(vs));
+    } else {
+        XS_CHECK(ks.size() == 3 && ks == vs, "attention k/v must be [N, kv_heads, head_dim] and equal, got ",
+                 shape_to_string(ks), " and ", shape_to_string(vs));
+        XS_CHECK(attrs.sliding_window == 0, "non-causal attention takes no sliding window");
+    }
     XS_CHECK(ks[2] == qs[2], "attention head_dim differs: q ", qs[2], ", k ", ks[2]);
     XS_CHECK(qs[1] % ks[1] == 0, "attention heads ", qs[1], " not a multiple of kv heads ", ks[1]);
     XS_CHECK(attrs.sliding_window >= 0 && attrs.softcap >= 0.0f, "invalid attention attributes");
