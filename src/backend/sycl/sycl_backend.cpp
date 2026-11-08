@@ -259,6 +259,7 @@ public:
                 }
             }
             const auto& nodes = graph_.nodes();
+            const auto submit_start = std::chrono::steady_clock::now();
             // The first run of a step shape compiles kernels (JIT, oneMKL): not part of the profile.
             const bool profile_step = profiling_ && !profiled_shapes_.insert(step.tokens).second;
             for (size_t i = 0; i < nodes.size(); ++i) {
@@ -277,6 +278,14 @@ public:
                 } else {
                     launch(i, plan, step);
                 }
+            }
+            if (log::level() <= log::Level::Debug) {  // host-bound when submitting takes about as long as the run
+                const auto submitted = std::chrono::steady_clock::now();
+                q_.wait();
+                log::debug("sycl: T=", step.tokens, " ops submitted in ",
+                           std::chrono::duration<double, std::milli>(submitted - submit_start).count(), " ms, done after ",
+                           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_start).count(),
+                           " ms");
             }
             std::vector<std::pair<std::string, HostTensor>> results;
             for (const auto& out : graph_.outputs()) {
