@@ -147,8 +147,8 @@ TEST_SUITE("device session" * doctest::skip(!dev::enabled())) {
         unknown.extra["num_streams"] = "2";
         CHECK_THROWS_WITH_AS(f.session(unknown), doctest::Contains("'num_streams'"), Error);
         SessionOptions bad_impl = dev::options();
-        bad_impl.extra["attention"] = "flash";
-        CHECK_THROWS_WITH_AS(f.session(bad_impl), doctest::Contains("attention=flash"), Error);
+        bad_impl.extra["attention"] = "xmx";
+        CHECK_THROWS_WITH_AS(f.session(bad_impl), doctest::Contains("attention=xmx"), Error);
         SessionOptions bf16 = dev::options();
         bf16.precision = DType::BF16;
         CHECK_THROWS_WITH_AS(f.session(bf16), doctest::Contains("precision must be f16 or f32"), Error);

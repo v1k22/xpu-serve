@@ -82,6 +82,8 @@ inline void concat_axes(const Env& env) {
 
 // Non-causal attention over a static number of queries with keys masked by a -inf bias: SigLIP's shape (head dim 72,
 // 16 heads, only the GEMM path covers it) and the action expert's (50 queries over a padded prefix, MQA, head dim 256).
+// Operands as graph inputs, and through a reshape (an f16 session stores those in f16, which the fused matrix-engine
+// kernel needs). 300 keys against 50 queries of an MQA head split the keys between work-groups there.
 inline void attention_key_bias(const Env& env) {
     TensorRng rng(43);
     struct Case {
@@ -100,11 +102,6 @@ inline void attention_key_bias(const Env& env) {
         AttentionAttrs attrs;
         attrs.causal = false;
         attrs.scale = 1.0f / std::sqrt(static_cast<float>(c.dim));
-        Graph g;
-        g.output("out", g.attention(g.input("q", DType::F32, {c.queries, c.heads, c.dim}),
-                                    g.input("k", DType::F32, {c.keys, c.kv_heads, c.dim}),
-                                    g.input("v", DType::F32, {c.keys, c.kv_heads, c.dim}),
-                                    g.input("bias", DType::F32, {c.keys}), attrs));
         ref::AttentionSpec spec;
         spec.scale = attrs.scale;
         spec.causal = false;
@@ -112,13 +109,28 @@ inline void attention_key_bias(const Env& env) {
         const Tensor64 expected = ref::attention(to_f64(q), to_f64(k), to_f64(v), spec);
         spec.key_bias.clear();
         const Tensor64 unmasked = ref::attention(to_f64(q), to_f64(k), to_f64(v), spec);
-        for (const std::string& impl : env.attention_impls) {
-            CAPTURE(impl);
-            SessionOptions o = env.options();
-            if (impl != "auto") o.extra["attention"] = impl;
-            const HostTensor out = run(env, g, {{"q", q}, {"k", k}, {"v", v}, {"bias", key_bias}}, o).at("out");
-            CHECK(all_close(out, expected, env.attn_atol, env.attn_rtol));
-            CHECK_FALSE(all_close(out, unmasked, env.attn_atol, env.attn_rtol));  // planted: the mask matters
+        for (const bool reshaped : {false, true}) {
+            CAPTURE(reshaped);
+            Graph g;
+            const auto operand = [&](const char* name, const Dims& shape) {
+                if (!reshaped) return g.input(name, DType::F32, shape);
+                return g.reshape(g.input(name, DType::F32, {shape[0], shape[1] * shape[2]}), shape);
+            };
+            g.output("out", g.attention(operand("q", {c.queries, c.heads, c.dim}), operand("k", {c.keys, c.kv_heads, c.dim}),
+                                        operand("v", {c.keys, c.kv_heads, c.dim}),
+                                        g.input("bias", DType::F32, {c.keys}), attrs));
+            const auto flat = [&](const HostTensor& t) {
+                return reshaped ? t.reshaped({t.shape()[0], t.shape()[1] * t.shape()[2]}) : t.clone();
+            };
+            for (const std::string& impl : env.attention_impls) {
+                CAPTURE(impl);
+                SessionOptions o = env.options();
+                if (impl != "auto") o.extra["attention"] = impl;
+                const HostTensor out =
+                    run(env, g, {{"q", flat(q)}, {"k", flat(k)}, {"v", flat(v)}, {"bias", key_bias}}, o).at("out");
+                CHECK(all_close(out, expected, env.attn_atol, env.attn_rtol));
+                CHECK_FALSE(all_close(out, unmasked, env.attn_atol, env.attn_rtol));  // planted: the mask matters
+            }
         }
     }
 }

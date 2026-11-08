@@ -133,18 +133,32 @@ void attention_by_rows(sycl::queue& q, Scratch& scratch, float* out, const Atten
 
 }  // namespace
 
-bool attention_gemm_path(const AttentionShape& s, AttentionPath path) { return !rows_path(s, path); }
+bool attention_matrix_path(const AttentionShape& s, AttentionPath path) { return !rows_path(s, path); }
 
 template <typename KV, typename QT>
 void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, const KV* v, float* out,
-               const AttentionShape& s, AttentionPath path) {
-    if (rows_path(s, path)) {
+               const AttentionShape& s, const AttentionPlan& plan) {
+    if (rows_path(s, plan.path)) {
         if constexpr (std::is_same_v<QT, float>) {
             attention_by_rows(q, scratch, out, s,
                               [&](int64_t split, float* part) { attention_rows(q, qp, k, v, out, s, split, part); });
             return;
         } else {
-            fail("sycl attention: an f16 query takes the GEMM path only");
+            fail("sycl attention: an f16 query takes a matrix path only");
+        }
+    }
+    if constexpr (std::is_same_v<KV, half>) {
+        const bool want = plan.path == AttentionPath::Auto || plan.path == AttentionPath::Flash;
+        if (want && plan.flash_device && flash_attention_fits(s, qp, std::is_same_v<QT, half>, k, v)) {
+            const int64_t split = flash_attention_split(s, plan.compute_units);
+            float* part = nullptr;
+            if (split > 1) {
+                part = static_cast<float*>(
+                    scratch.get(static_cast<size_t>(s.tokens * s.q_heads * split * (s.head_dim + 2)) * sizeof(float)));
+            }
+            flash_attention(q, qp, k, v, out, s, split, part);
+            if (split > 1) attention_combine(q, part, out, s.tokens * s.q_heads, split, s.head_dim);
+            return;
         }
     }
     const int64_t group = s.q_heads / s.kv_heads;
@@ -194,8 +208,8 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
 
 template <typename CT>
 void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvI8& kv, float* out,
-                  const AttentionShape& s, AttentionPath path) {
-    if (rows_path(s, path)) {
+                  const AttentionShape& s, const AttentionPlan& plan) {
+    if (rows_path(s, plan.path)) {
         attention_by_rows(q, scratch, out, s,
                           [&](int64_t split, float* part) { attention_rows_i8(q, qp, kv, out, s, split, part); });
         return;
@@ -212,7 +226,7 @@ void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const f
     dequantize_kv_i8(q, kv.v + skip * s.head_dim, kv.v_scale + skip, v, rows, s.head_dim);
     AttentionShape visible = s;
     visible.kv_len = s.kv_len - first;
-    attention(q, scratch, qp, k, v, out, visible, AttentionPath::Gemm);
+    attention(q, scratch, qp, k, v, out, visible, plan);
 }
 
 namespace {
@@ -326,16 +340,16 @@ template void expert_matmul_quant_gemm<int64_t>(sycl::queue&, Scratch&, const fl
 template void matmul<half>(sycl::queue&, Scratch&, const float*, const half*, float*, int64_t, int64_t, int64_t);
 template void matmul<float>(sycl::queue&, Scratch&, const float*, const float*, float*, int64_t, int64_t, int64_t);
 template void attention<half, float>(sycl::queue&, Scratch&, const float*, const half*, const half*, float*,
-                                     const AttentionShape&, AttentionPath);
+                                     const AttentionShape&, const AttentionPlan&);
 template void attention<float, float>(sycl::queue&, Scratch&, const float*, const float*, const float*, float*,
-                                      const AttentionShape&, AttentionPath);
+                                      const AttentionShape&, const AttentionPlan&);
 template void attention<half, half>(sycl::queue&, Scratch&, const half*, const half*, const half*, float*,
-                                    const AttentionShape&, AttentionPath);
+                                    const AttentionShape&, const AttentionPlan&);
 template void attention<float, half>(sycl::queue&, Scratch&, const half*, const float*, const float*, float*,
-                                     const AttentionShape&, AttentionPath);
+                                     const AttentionShape&, const AttentionPlan&);
 template void attention_i8<half>(sycl::queue&, Scratch&, Scratch&, const float*, const KvI8&, float*,
-                                 const AttentionShape&, AttentionPath);
+                                 const AttentionShape&, const AttentionPlan&);
 template void attention_i8<float>(sycl::queue&, Scratch&, Scratch&, const float*, const KvI8&, float*,
-                                  const AttentionShape&, AttentionPath);
+                                  const AttentionShape&, const AttentionPlan&);
 
 }  // namespace xs::sycl_be

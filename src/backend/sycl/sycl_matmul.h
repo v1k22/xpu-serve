@@ -44,21 +44,28 @@ void expert_matmul_quant_gemm(sycl::queue& q, Scratch& scratch, const float* x, 
                               const I* idx, float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n,
                               int64_t k, bool f32);
 
-// Auto: attention_rows up to kAttentionRowsMax queries, GEMMs beyond. Rows and Gemm force one (tests).
-enum class AttentionPath : uint8_t { Auto, Rows, Gemm };
+// Auto: attention_rows up to kAttentionRowsMax queries; beyond, flash_attention where the device and shape allow
+// it, GEMMs otherwise. Rows, Gemm and Flash force one (tests); Flash takes GEMMs where it does not fit.
+enum class AttentionPath : uint8_t { Auto, Rows, Gemm, Flash };
 inline constexpr int64_t kAttentionRowsMax = 8;
 
-// out [T, Hq, D] from q [T, Hq, D] and k, v [N, Hkv, D] (graph.h Attention). An f16 q takes the GEMM path.
+struct AttentionPlan {
+    AttentionPath path = AttentionPath::Auto;
+    bool flash_device = false;  // flash_attention_device()
+    int64_t compute_units = 0;
+};
+
+// out [T, Hq, D] from q [T, Hq, D] and k, v [N, Hkv, D] (graph.h Attention). An f16 q takes a matrix path.
 template <typename KV, typename QT = float>
 void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, const KV* v, float* out,
-               const AttentionShape& s, AttentionPath path);
-// True when attention() takes the GEMM path for this shape.
-bool attention_gemm_path(const AttentionShape& s, AttentionPath path);
+               const AttentionShape& s, const AttentionPlan& plan);
+// True when attention() runs on the matrix engines (flash or GEMMs) for this shape: f16 operands welcome.
+bool attention_matrix_path(const AttentionShape& s, AttentionPath path);
 
 // attention() over an int8 KV cache. The rows path reads the codes; the GEMM path first dequantizes the keys the
 // queries can see to CT in `kv_scratch` (a second scratch: the GEMM path uses `scratch` for its own buffers).
 template <typename CT>
 void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvI8& kv, float* out,
-                  const AttentionShape& s, AttentionPath path);
+                  const AttentionShape& s, const AttentionPlan& plan);
 
 }  // namespace xs::sycl_be

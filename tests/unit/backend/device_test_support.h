@@ -32,7 +32,7 @@ inline bool enabled() {
 
 // The two attention implementations to cover, as values of the backend's "attention" option.
 inline std::vector<std::string> attention_impls() {
-    return {"rows", "gemm"};
+    return {"rows", "gemm", "flash"};
 }
 
 inline DType precision() {

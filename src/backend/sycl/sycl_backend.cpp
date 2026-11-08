@@ -176,10 +176,10 @@ bool is_suffix_broadcast(const Dims& b, const Dims& out) {
 class SyclSession final : public Session, private sycl_be::Scratch {
 public:
     SyclSession(const graph::Graph& graph, const WeightStore& weights, const SessionOptions& options, sycl::queue q,
-                sycl_be::AttentionPath attention_path)
+                const sycl_be::AttentionPlan& attention)
         : graph_(graph),
           q_(std::move(q)),
-          attention_path_(attention_path),
+          attention_(attention),
           precision_(options.precision),
           kv_i8_(options.kv_dtype == DType::I8),
           max_context_(options.max_context),
@@ -694,14 +694,14 @@ private:
         };
         const auto gemm_attention = [&](size_t a) {
             const Node& n = nodes[a];
-            if (n.kind != OpKind::Attention || attention_path_ == sycl_be::AttentionPath::Rows) return false;
+            if (n.kind != OpKind::Attention || attention_.path == sycl_be::AttentionPath::Rows) return false;
             const Dims& q = graph_.type(n.inputs[0]).shape;
             const Dims& k = graph_.type(n.inputs[1]).shape;
             if (!static_shape(q) || !static_shape(k) || dt(n.inputs[1]) == DType::I8) return false;
             sycl_be::AttentionShape sh;
             sh.tokens = q[0];
             sh.head_dim = q[2];
-            return sycl_be::attention_gemm_path(sh, attention_path_);
+            return sycl_be::attention_matrix_path(sh, attention_.path);
         };
         std::vector<uint8_t> half(count, 0);
         for (size_t i = 0; i < count; ++i) {
@@ -1421,17 +1421,17 @@ private:
                     kv.k_scale = reinterpret_cast<const float*>(b.k_scale.get());
                     kv.v_scale = reinterpret_cast<const float*>(b.v_scale.get());
                     if (precision_ == DType::F16) {
-                        sycl_be::attention_i8<half>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_path_);
+                        sycl_be::attention_i8<half>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_);
                     } else {
-                        sycl_be::attention_i8<float>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_path_);
+                        sycl_be::attention_i8<float>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_);
                     }
                 } else {
                     const auto run = [&](const auto* qp) {
                         if (in_dt(1) == DType::F16) {
                             sycl_be::attention(q_, *this, qp, reinterpret_cast<const half*>(in_ptr(1)),
-                                               reinterpret_cast<const half*>(in_ptr(2)), out, s, attention_path_);
+                                               reinterpret_cast<const half*>(in_ptr(2)), out, s, attention_);
                         } else {
-                            sycl_be::attention(q_, *this, qp, in_f32(1), in_f32(2), out, s, attention_path_);
+                            sycl_be::attention(q_, *this, qp, in_f32(1), in_f32(2), out, s, attention_);
                         }
                     };
                     if (in_dt(0) == DType::F16) {
@@ -1605,7 +1605,7 @@ private:
 
     const graph::Graph graph_;
     sycl::queue q_;
-    const sycl_be::AttentionPath attention_path_;
+    const sycl_be::AttentionPlan attention_;
     const DType precision_;
     const bool kv_i8_;  // KV slots that only attention reads are int8 (SessionOptions::kv_dtype)
     const int64_t max_context_;
@@ -1670,15 +1670,17 @@ public:
         XS_CHECK(options.max_context > 0, "sycl max_context must be positive, got ", options.max_context);
         XS_CHECK(!options.kv_dtype || *options.kv_dtype == DType::I8, "sycl KV cache dtype must be i8 when set, got ",
                  dtype_name(*options.kv_dtype));
-        auto attention_path = sycl_be::AttentionPath::Auto;
+        sycl_be::AttentionPlan attention;
         for (const auto& [key, value] : options.extra) {
             if (key != "attention") fail("sycl does not know backend option '", key, "' (known: attention)");
             if (value == "rows") {
-                attention_path = sycl_be::AttentionPath::Rows;
+                attention.path = sycl_be::AttentionPath::Rows;
             } else if (value == "gemm") {
-                attention_path = sycl_be::AttentionPath::Gemm;
+                attention.path = sycl_be::AttentionPath::Gemm;
+            } else if (value == "flash") {
+                attention.path = sycl_be::AttentionPath::Flash;
             } else if (value != "auto") {
-                fail("sycl backend option attention=", value, " is not one of auto, rows, gemm");
+                fail("sycl backend option attention=", value, " is not one of auto, rows, gemm, flash");
             }
         }
         XS_CHECK(!devices_.empty(), "sycl: no Level Zero GPU found");
@@ -1696,7 +1698,9 @@ public:
                           sycl::property_list{sycl::property::queue::in_order()});
             it = queues_.emplace(index, std::move(q)).first;
         }
-        return std::make_unique<SyclSession>(graph, weights, options, it->second, attention_path);
+        attention.flash_device = sycl_be::flash_attention_device(devices_[index]);
+        attention.compute_units = devices_[index].get_info<sycl::info::device::max_compute_units>();
+        return std::make_unique<SyclSession>(graph, weights, options, it->second, attention);
     }
 
 private:
