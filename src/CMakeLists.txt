@@ -58,6 +58,9 @@ xs_add_library(xs_server DIRS server DEPS xs_core xs_tokenizer xs_chat xs_httpli
 # `convert`: checkpoint -> pack; AWQ calibration runs the model on a backend and needs the tokenizer.
 xs_add_library(xs_convert DIRS convert DEPS xs_core xs_backends xs_tokenizer)
 
+# The policy runtime: a robot policy, its tokenizer and its compiled programs on one device.
+xs_add_library(xs_policy DIRS policy DEPS xs_core xs_backends xs_tokenizer)
+
 # The InferenceService that ties model, backend, tokenizer and chat template together.
 xs_add_library(xs_service DIRS service DEPS xs_core xs_backends xs_tokenizer xs_chat)
 
@@ -65,5 +68,5 @@ add_executable(xpu-serve cli/main.cpp)
 file(GLOB xs_cli_extra CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cli/*.cpp)
 list(REMOVE_ITEM xs_cli_extra ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.cpp)
 target_sources(xpu-serve PRIVATE ${xs_cli_extra})
-target_link_libraries(xpu-serve PRIVATE xs_service xs_server xs_convert xs_warnings)
+target_link_libraries(xpu-serve PRIVATE xs_service xs_server xs_convert xs_policy xs_warnings)
 target_compile_definitions(xpu-serve PRIVATE XS_VERSION="${PROJECT_VERSION}")

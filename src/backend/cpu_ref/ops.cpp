@@ -108,7 +108,7 @@ double dot(const float* a, const float* b, int64_t n) {
 
 // Softmax-weighted sum of v rows for one query head; keys [first, last] are the visible ones.
 void attend_one(const float* q, const HostTensor& k_all, const HostTensor& v_all, int64_t kv_head, int64_t first,
-                int64_t last, const graph::AttentionAttrs& attrs, float* out) {
+                int64_t last, const graph::AttentionAttrs& attrs, const float* key_bias, float* out) {
     const int64_t kv_heads = k_all.dim(1);
     const int64_t head_dim = k_all.dim(2);
     const float* k = k_all.data<float>();
@@ -118,6 +118,7 @@ void attend_one(const float* q, const HostTensor& k_all, const HostTensor& v_all
     for (int64_t j = first; j <= last; ++j) {
         double s = attrs.scale * dot(q, k + (j * kv_heads + kv_head) * head_dim, head_dim);
         if (attrs.softcap > 0.0f) s = attrs.softcap * std::tanh(s / attrs.softcap);
+        if (key_bias != nullptr) s += key_bias[j];
         scores[static_cast<size_t>(j - first)] = s;
         max_score = std::max(max_score, s);
     }
@@ -437,7 +438,7 @@ HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& 
 }
 
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
-                     const graph::AttentionAttrs& attrs) {
+                     const graph::AttentionAttrs& attrs, const HostTensor* key_bias) {
     check_f32(q, "attention q");
     check_f32(k_all, "attention k");
     check_f32(v_all, "attention v");
@@ -451,6 +452,9 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
              "attention shapes q ", dims_to_string(q.shape()), ", k ", dims_to_string(k_all.shape()), ", v ",
              dims_to_string(v_all.shape()), " do not fit");
     const int64_t group = q_heads / kv_heads;
+    XS_CHECK(key_bias == nullptr || (!attrs.causal && key_bias->numel() == kv_len), "attention key bias of ",
+             key_bias == nullptr ? 0 : key_bias->numel(), " for ", kv_len, " keys");
+    const float* bias = key_bias != nullptr ? key_bias->data<float>() : nullptr;
     HostTensor out(DType::F32, q.shape());
     pool.parallel_for(tokens * q_heads, [&](int64_t item) {
         const int64_t t = item / q_heads;
@@ -459,8 +463,54 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
         const int64_t first = attrs.sliding_window > 0 ? std::max<int64_t>(0, pos - attrs.sliding_window + 1) : 0;
         const int64_t last = attrs.causal ? pos : kv_len - 1;
         const int64_t offset = (t * q_heads + h) * head_dim;
-        attend_one(q.data<float>() + offset, k_all, v_all, h / group, first, last, attrs, out.data<float>() + offset);
+        attend_one(q.data<float>() + offset, k_all, v_all, h / group, first, last, attrs, bias,
+                   out.data<float>() + offset);
     });
+    return out;
+}
+
+HostTensor layer_norm(const HostTensor& x, const HostTensor& weight, const HostTensor& bias, float eps) {
+    check_f32(x, "layer_norm x");
+    const int64_t width = x.shape().back();
+    HostTensor out(DType::F32, x.shape());
+    for (int64_t r = 0; r < x.numel() / width; ++r) {
+        const float* in = x.data<float>() + r * width;
+        float* o = out.data<float>() + r * width;
+        double mean = 0;
+        for (int64_t i = 0; i < width; ++i)
+            mean += in[i];
+        mean /= static_cast<double>(width);
+        double var = 0;
+        for (int64_t i = 0; i < width; ++i)
+            var += (in[i] - mean) * (in[i] - mean);
+        const double inv = 1.0 / std::sqrt(var / static_cast<double>(width) + eps);
+        for (int64_t i = 0; i < width; ++i)
+            o[i] = static_cast<float>((in[i] - mean) * inv * weight.data<float>()[i] + bias.data<float>()[i]);
+    }
+    return out;
+}
+
+HostTensor concat(const std::vector<HostTensor>& parts, int axis) {
+    Dims shape = parts[0].shape();
+    shape[static_cast<size_t>(axis)] = 0;
+    for (const HostTensor& p : parts)
+        shape[static_cast<size_t>(axis)] += p.dim(static_cast<size_t>(axis));
+    HostTensor out(parts[0].dtype(), shape);
+    int64_t outer = 1;
+    for (int d = 0; d < axis; ++d)
+        outer *= shape[static_cast<size_t>(d)];
+    const size_t esize = dtype_size(out.dtype());
+    const int64_t out_row = out.numel() / outer;  // elements per outer index
+    int64_t offset = 0;
+    for (const HostTensor& p : parts) {
+        const int64_t row = p.numel() / outer;
+        for (int64_t o = 0; o < outer; ++o) {
+            std::memcpy(static_cast<char*>(out.raw()) + static_cast<size_t>(o * out_row + offset) * esize,
+                        static_cast<const char*>(p.raw()) + static_cast<size_t>(o * row) * esize,
+                        static_cast<size_t>(row) * esize);
+        }
+        offset += row;
+    }
     return out;
 }
 

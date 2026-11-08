@@ -238,6 +238,7 @@ void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v,
     const float softcap = s.softcap;
     const int64_t window = s.window;
     const bool causal = s.causal;
+    const float* key_bias = s.key_bias;
     constexpr int kWg = kAttnSubGroups * kSubGroup;
     syclex::submit(q, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>(kAttnSubGroups * (D + 2)), h);
@@ -300,6 +301,8 @@ void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v,
                 float sc = sycl::reduce_over_group(sg, dot, sycl::plus<float>()) * scale;
                 if constexpr (kI8) sc *= k_scale[j * hkv_n + kh];
                 if (softcap > 0.0f) sc = softcap * sycl::tanh(sc / softcap);
+                if (key_bias != nullptr) sc += key_bias[j];
+                if (sc == -std::numeric_limits<float>::infinity()) continue;  // a masked key
                 const float m_new = sycl::fmax(m, sc);
                 const float corr = sycl::exp(m - m_new);
                 const float p = sycl::exp(sc - m_new);
@@ -898,6 +901,28 @@ void rms_norm(sycl::queue& q, const float* x, const float* w, float* y, int64_t 
     });
 }
 
+void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t width,
+                float eps) {
+    const size_t wg = width >= 1024 ? 512 : (width >= 256 ? 256 : 128);
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * wg, wg), [=](sycl::nd_item<1> it) {
+        const int64_t r = static_cast<int64_t>(it.get_group(0));
+        const float* xr = x + r * width;
+        float* yr = y + r * width;
+        const auto lid = static_cast<int64_t>(it.get_local_id(0));
+        float sum = 0.0f;
+        for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
+            sum += xr[i];
+        const float mean = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>()) / static_cast<float>(width);
+        float sq = 0.0f;
+        for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
+            sq += (xr[i] - mean) * (xr[i] - mean);
+        const float var = sycl::reduce_over_group(it.get_group(), sq, sycl::plus<float>()) / static_cast<float>(width);
+        const float inv = 1.0f / sycl::sqrt(var + eps);
+        for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
+            yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+    });
+}
+
 template <typename T, typename I>
 void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n, int64_t width) {
     syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(n), static_cast<size_t>(width)), [=](sycl::item<2> it) {
@@ -1139,6 +1164,7 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
     const float softcap = s.softcap;
     const int64_t window = s.window;
     const bool causal = s.causal;
+    const float* key_bias = s.key_bias;
     constexpr size_t kWg = 256;
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * kWg, kWg), [=](sycl::nd_item<1> it) {
         const int64_t r = static_cast<int64_t>(it.get_group(0));
@@ -1156,7 +1182,8 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
         const int64_t lid = static_cast<int64_t>(it.get_local_id(0));
         auto score = [&](int64_t j) {
             const float v = sr[j];
-            return softcap > 0.0f ? softcap * sycl::tanh(v / softcap) : v;
+            const float c = softcap > 0.0f ? softcap * sycl::tanh(v / softcap) : v;
+            return key_bias != nullptr ? c + key_bias[k_lo + j] : c;
         };
         float mx = -std::numeric_limits<float>::infinity();
         for (int64_t j = lo + lid; j <= hi; j += static_cast<int64_t>(kWg))

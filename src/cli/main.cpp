@@ -1,5 +1,6 @@
 // xpu-serve command line: serve | run | bench | convert | info.
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -13,6 +14,8 @@
 #include "chat/output_parser.h"
 #include "cli/args.h"
 #include "convert/convert.h"
+#include "models/policy.h"
+#include "policy/runner.h"
 #include "server/server.h"
 #include "service/engine_service.h"
 #include "tokenizer/tokenizer.h"
@@ -339,14 +342,73 @@ int cmd_run(const std::vector<std::string>& argv) {
     return 0;
 }
 
+double percentile(std::vector<double> v, double p) {
+    std::sort(v.begin(), v.end());
+    const double at = p * static_cast<double>(v.size() - 1);
+    const auto lo = static_cast<size_t>(at);
+    const size_t hi = std::min(lo + 1, v.size() - 1);
+    return v[lo] + (v[hi] - v[lo]) * (at - static_cast<double>(lo));
+}
+
+// Latency of a robot policy: warm-up (compile, then untimed runs), then timed calls on a synthetic observation.
+int bench_policy(const Args& a, const std::string& dir) {
+    const ServiceOptions so = service_options(a);
+    PolicyRunnerOptions ro;
+    ro.backend = so.backend;
+    ro.session = so.session;
+    auto runner = PolicyRunner::create(dir, ro);
+    const PolicySpec& spec = runner->spec();
+    const int n_cam = a.get_int("cameras") > 0 ? a.get_int("cameras") : static_cast<int>(spec.cameras.size());
+    XS_CHECK(n_cam >= 1 && n_cam <= static_cast<int>(spec.cameras.size()), "--cameras must be 1 to ", spec.cameras.size());
+    std::vector<int> cameras;
+    for (int c = 0; c < n_cam; ++c) cameras.push_back(c);
+    const int steps = a.get_int("steps") > 0 ? a.get_int("steps") : spec.denoise_steps;
+    const double compile_ms = runner->warm_up(cameras, steps, a.get_int("warmup"));
+    const Observation obs = synthetic_observation(spec, cameras, "pick up the red cup and place it on the plate");
+    std::vector<double> total, prepare, device;
+    size_t prompt_tokens = 0;
+    for (int run = 0; run < a.get_int("runs"); ++run) {
+        ActOptions o;
+        o.steps = steps;
+        o.seed = static_cast<uint64_t>(run);
+        const ActResult r = runner->act(obs, o);
+        prompt_tokens = r.prompt_ids.size();
+        total.push_back(r.timing.total_ms);
+        prepare.push_back(r.timing.prepare_ms);
+        device.push_back(r.timing.device_ms);
+        if (a.has("verbose")) {
+            std::printf("run %d: %.2f ms (prepare %.2f, device %.2f, finish %.2f)\n", run, r.timing.total_ms,
+                        r.timing.prepare_ms, r.timing.device_ms, r.timing.finish_ms);
+        }
+    }
+    std::printf("%s: %d camera(s) %lldx%lld, %d flow steps, prompt %zu tokens, %s %s %s, compile %.0f ms\n",
+                spec.id.c_str(), n_cam, static_cast<long long>(spec.cameras[0].height),
+                static_cast<long long>(spec.cameras[0].width), steps, prompt_tokens, so.backend.c_str(),
+                so.session.device.empty() ? "default" : so.session.device.c_str(),
+                std::string(dtype_name(so.session.precision)).c_str(), compile_ms);
+    std::printf("latency over %zu runs: p50 %.2f ms, p90 %.2f, min %.2f, max %.2f | device p50 %.2f, host prepare p50 "
+                "%.2f\n",
+                total.size(), percentile(total, 0.5), percentile(total, 0.9), percentile(total, 0.0),
+                percentile(total, 1.0), percentile(device, 0.5), percentile(prepare, 0.5));
+    return 0;
+}
+
 int cmd_bench(const std::vector<std::string>& argv) {
     Args a;
     add_engine_options(a);
-    a.value("prompt-tokens", "prompt length", "512").value("gen-tokens", "tokens to generate", "128").value("runs", "runs", "3");
+    a.value("prompt-tokens", "prompt length (language models)", "512")
+        .value("gen-tokens", "tokens to generate (language models)", "128")
+        .value("runs", "timed runs", "3")
+        .value("cameras", "policies: cameras present, the first N (default: all)", "0")
+        .value("steps", "policies: flow steps (default: the checkpoint's)", "0")
+        .value("warmup", "policies: untimed runs after compiling", "3")
+        .flag("verbose", "policies: print every run");
     a.parse(argv);
     if (wants_help(a, "bench", "<model-dir> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
-    auto service = EngineService::create(model_dir_arg(a, "bench"), service_options(a));
+    const std::string dir = model_dir_arg(a, "bench");
+    if (model_kind(dir) == ModelKind::Policy) return bench_policy(a, dir);
+    auto service = EngineService::create(dir, service_options(a));
     const int n_prompt = a.get_int("prompt-tokens");
     const int n_gen = a.get_int("gen-tokens");
     std::string text;

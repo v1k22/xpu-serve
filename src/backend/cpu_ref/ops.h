@@ -41,12 +41,15 @@ HostTensor causal_conv(const HostTensor& x, const HostTensor& w, std::vector<flo
 HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& k, const HostTensor& v,
                        const HostTensor& g, const HostTensor& beta, float qk_l2norm_eps, std::vector<float>& state);
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
-                     const graph::AttentionAttrs& attrs);
+                     const graph::AttentionAttrs& attrs, const HostTensor* key_bias = nullptr);
 HostTensor div(const HostTensor& a, const HostTensor& b);
 HostTensor softmax(const HostTensor& x);
 // (values f32, indices i32) of the k largest along the last axis, largest first; ties keep the lower index first.
 std::pair<HostTensor, HostTensor> topk(const HostTensor& x, int64_t k);
 HostTensor reduce_sum(const HostTensor& x, int axis);
+HostTensor layer_norm(const HostTensor& x, const HostTensor& weight, const HostTensor& bias, float eps);
+// Any dtype; the parts agree off the axis.
+HostTensor concat(const std::vector<HostTensor>& parts, int axis);
 // x [T, K] or [T, S, K], w [E, N, K], idx [T, S] int -> [T, S, N].
 HostTensor expert_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& w, const HostTensor& idx);
 

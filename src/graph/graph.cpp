@@ -57,6 +57,8 @@ std::string_view op_name(OpKind kind) {
         case OpKind::TopK: return "TopK";
         case OpKind::ReduceSum: return "ReduceSum";
         case OpKind::ExpertMatMul: return "ExpertMatMul";
+        case OpKind::LayerNorm: return "LayerNorm";
+        case OpKind::Concat: return "Concat";
     }
     return "?";
 }
@@ -221,7 +223,7 @@ Value Graph::reduce_sum(Value x, int axis) {
              shape_to_string(s), " at ", where(x));
     Dims out = s;
     out.erase(out.begin() + axis);
-    return add_node(OpKind::ReduceSum, {x}, ReduceAttrs{axis}, {TensorType{DType::F32, out}}, "reduce_sum");
+    return add_node(OpKind::ReduceSum, {x}, AxisAttrs{axis}, {TensorType{DType::F32, out}}, "reduce_sum");
 }
 
 Value Graph::expert_matmul(Value x, Value w, Value idx) {
@@ -266,7 +268,7 @@ Value Graph::clamp(Value x, float lo, float hi) {
 
 Value Graph::rms_norm(Value x, float eps) {
     XS_CHECK(!type(x).shape.empty(), "rms_norm of a scalar at ", where(x));
-    return add_node(OpKind::RmsNorm, {x}, RmsNormAttrs{eps}, {TensorType{DType::F32, type(x).shape}}, "rms_norm");
+    return add_node(OpKind::RmsNorm, {x}, NormAttrs{eps}, {TensorType{DType::F32, type(x).shape}}, "rms_norm");
 }
 
 Value Graph::rms_norm(Value x, Value weight, float eps) {
@@ -274,7 +276,43 @@ Value Graph::rms_norm(Value x, Value weight, float eps) {
     const Dims& ws = type(weight).shape;
     XS_CHECK(!xs.empty() && ws.size() == 1 && ws[0] == xs.back(), "rms_norm weight ", shape_to_string(ws),
              " does not match the last dim of ", shape_to_string(xs), " (", where(weight), ")");
-    return add_node(OpKind::RmsNorm, {x, weight}, RmsNormAttrs{eps}, {TensorType{DType::F32, xs}}, "rms_norm");
+    return add_node(OpKind::RmsNorm, {x, weight}, NormAttrs{eps}, {TensorType{DType::F32, xs}}, "rms_norm");
+}
+
+Value Graph::layer_norm(Value x, Value weight, Value bias, float eps) {
+    const Dims& xs = type(x).shape;
+    for (const Value p : {weight, bias}) {
+        const Dims& ps = type(p).shape;
+        XS_CHECK(!xs.empty() && ps.size() == 1 && ps[0] == xs.back(), "layer_norm parameter ", shape_to_string(ps),
+                 " does not match the last dim of ", shape_to_string(xs), " (", where(p), ")");
+    }
+    return add_node(OpKind::LayerNorm, {x, weight, bias}, NormAttrs{eps}, {TensorType{DType::F32, xs}}, "layer_norm");
+}
+
+Value Graph::concat(const std::vector<Value>& parts, int axis) {
+    XS_CHECK(parts.size() >= 2, "concat needs at least two parts");
+    const TensorType& first = type(parts[0]);
+    XS_CHECK(axis >= 0 && static_cast<size_t>(axis) < first.shape.size(), "concat axis ", axis, " of ",
+             shape_to_string(first.shape), " (", where(parts[0]), ")");
+    Dims out = first.shape;
+    out[static_cast<size_t>(axis)] = 0;
+    for (const Value p : parts) {
+        const TensorType& t = type(p);
+        XS_CHECK(t.dtype == first.dtype && t.shape.size() == first.shape.size(), "concat parts differ: ",
+                 shape_to_string(first.shape), " ", dtype_name(first.dtype), " and ", shape_to_string(t.shape), " ",
+                 dtype_name(t.dtype), " (", where(p), ")");
+        for (size_t d = 0; d < t.shape.size(); ++d) {
+            if (d == static_cast<size_t>(axis)) {
+                XS_CHECK(!is_symbol(t.shape[d]), "concat axis ", axis, " must be static, got ", shape_to_string(t.shape),
+                         " (", where(p), ")");
+                out[d] += t.shape[d];
+            } else {
+                XS_CHECK(t.shape[d] == first.shape[d], "concat parts differ off the axis: ", shape_to_string(first.shape),
+                         " and ", shape_to_string(t.shape), " (", where(p), ")");
+            }
+        }
+    }
+    return add_node(OpKind::Concat, parts, AxisAttrs{axis}, {TensorType{first.dtype, out}}, "concat");
 }
 
 Value Graph::reshape(Value x, Dims shape) {
@@ -331,12 +369,15 @@ Value Graph::rope(Value x, Value positions, Value inv_freq, int64_t rotary_dim) 
     const Dims& xs = type(x).shape;
     const TensorType& pt = type(positions);
     const TensorType& ft = type(inv_freq);
-    XS_CHECK(xs.size() == 3 && xs[0] == kT, "rope input must be [T, heads, head_dim], got ", shape_to_string(xs));
+    XS_CHECK(xs.size() == 3 && (xs[0] == kT || xs[0] > 0), "rope input must be [T, heads, head_dim], got ",
+             shape_to_string(xs));
     const int64_t rotated = rotary_dim == 0 ? xs[2] : rotary_dim;
     XS_CHECK(rotated > 0 && rotated <= xs[2], "rope rotary_dim ", rotary_dim, " out of range for head_dim ", xs[2]);
     const bool axial = pt.shape.size() == 2;
-    XS_CHECK(is_int(pt.dtype) && !pt.shape.empty() && pt.shape[0] == kT && (pt.shape.size() == 1 || (axial && pt.shape[1] > 0)),
-             "rope positions must be [T] or [T, sections] int, got ", dtype_name(pt.dtype), shape_to_string(pt.shape));
+    XS_CHECK(is_int(pt.dtype) && !pt.shape.empty() && pt.shape[0] == xs[0] &&
+                 (pt.shape.size() == 1 || (axial && pt.shape[1] > 0)),
+             "rope positions must be [T] or [T, sections] int with the input's T, got ", dtype_name(pt.dtype),
+             shape_to_string(pt.shape), " for ", shape_to_string(xs));
     const int64_t sections = axial ? pt.shape[1] : 1;
     XS_CHECK(rotated % (2 * sections) == 0, "rope rotary dim ", rotated, " does not split into ", sections,
              " sections of even width");
@@ -369,7 +410,8 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     const Dims& qs = type(q).shape;
     const Dims& ks = type(k_all).shape;
     const Dims& vs = type(v_all).shape;
-    XS_CHECK(qs.size() == 3 && qs[0] == kT, "attention q must be [T, heads, head_dim], got ", shape_to_string(qs));
+    XS_CHECK(qs.size() == 3 && (qs[0] == kT || (!attrs.causal && qs[0] > 0)),
+             "attention q must be [T, heads, head_dim] (a static T only when not causal), got ", shape_to_string(qs));
     if (attrs.causal) {
         XS_CHECK(ks.size() == 3 && ks[0] == kL && ks == vs,
                  "causal attention k/v must be [L, kv_heads, head_dim] and equal, got ", shape_to_string(ks), " and ",
@@ -383,6 +425,16 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     XS_CHECK(qs[1] % ks[1] == 0, "attention heads ", qs[1], " not a multiple of kv heads ", ks[1]);
     XS_CHECK(attrs.sliding_window >= 0 && attrs.softcap >= 0.0f, "invalid attention attributes");
     return add_node(OpKind::Attention, {q, k_all, v_all}, attrs, {TensorType{DType::F32, qs}}, "attention");
+}
+
+Value Graph::attention(Value q, Value k, Value v, Value key_bias, const AttentionAttrs& attrs) {
+    XS_CHECK(!attrs.causal, "attention with a key bias must not be causal");
+    const Value out = attention(q, k, v, attrs);
+    const TensorType& bt = type(key_bias);
+    XS_CHECK(bt.dtype == DType::F32 && bt.shape == (Dims{type(k).shape[0]}), "attention key_bias must be f32 [",
+             dim_to_string(type(k).shape[0]), "], got ", shape_to_string(bt.shape), " (", where(key_bias), ")");
+    nodes_[static_cast<size_t>(out.node)].inputs.push_back(key_bias);
+    return out;
 }
 
 int Graph::add_conv_slot(int64_t channels, int64_t kernel, std::string label) {
@@ -483,7 +535,7 @@ std::string attrs_to_string(const Attrs& a) {
                 os << "cap=" << v.cap;
             } else if constexpr (std::is_same_v<T, ClampAttrs>) {
                 os << "lo=" << v.lo << " hi=" << v.hi;
-            } else if constexpr (std::is_same_v<T, RmsNormAttrs>) {
+            } else if constexpr (std::is_same_v<T, NormAttrs>) {
                 os << "eps=" << v.eps;
             } else if constexpr (std::is_same_v<T, ReshapeAttrs>) {
                 os << "shape=" << shape_to_string(v.shape);
@@ -500,7 +552,7 @@ std::string attrs_to_string(const Attrs& a) {
                 os << "slot=" << v.slot << " l2norm_eps=" << v.qk_l2norm_eps;
             } else if constexpr (std::is_same_v<T, TopKAttrs>) {
                 os << "k=" << v.k;
-            } else if constexpr (std::is_same_v<T, ReduceAttrs>) {
+            } else if constexpr (std::is_same_v<T, AxisAttrs>) {
                 os << "axis=" << v.axis;
             } else if constexpr (std::is_same_v<T, AttentionAttrs>) {
                 os << "scale=" << v.scale << " window=" << v.sliding_window << " softcap=" << v.softcap

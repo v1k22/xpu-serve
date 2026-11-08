@@ -55,21 +55,23 @@ enum class OpKind : uint8_t {
     Softplus,   // log(1 + exp(x))
     Clamp,      // min(max(x, lo), hi); either bound may be infinite
     RmsNorm,    // (x [..., D] [, w [D]]) -> x * (mean(x^2) + eps)^-1/2 [* w], computed in f32. No "+1" offset.
+    LayerNorm,  // (x [..., D], w [D], b [D]) -> (x - mean(x)) * (var(x) + eps)^-1/2 * w + b, over the last dim, f32
     Reshape,    // same element count; target may use kT / kL
     Slice,      // python-style [begin, end) on one axis; a symbolic axis only supports "last n" (begin < 0, end = kSliceEnd)
     Transpose,  // out.shape[i] = x.shape[perm[i]]; any dtype
-    Rope,       // (x [T, H, D], positions [T] or [T, S] int, inv_freq [R/(2S)] f32) -> [T, H, D]; see note below
+    Rope,       // (x [T, H, D], positions [T] or [T, S] int, inv_freq [R/(2S)] f32) -> [T, H, D]; T may be static; see below
     KvCache,    // (k [T, Hkv, D], v [T, Hkv, D]) -> (k_all [L, Hkv, D], v_all [L, Hkv, D]); appends to the slot's state
-    Attention,  // (q [T, Hq, D], k [N, Hkv, D], v [N, Hkv, D]) -> [T, Hq, D]; see AttentionAttrs; GQA
+    Attention,  // (q [T, Hq, D], k [N, Hkv, D], v [N, Hkv, D] [, key_bias [N] f32]) -> [T, Hq, D]; see AttentionAttrs; GQA
     CausalConv, // (x [T, C], w [C, K]) -> [T, C]; depthwise causal conv over the slot's last K-1 inputs, see below
     GatedDelta, // (q [T, Hk, Dk], k [T, Hk, Dk], v [T, Hv, Dv], g [T, Hv], beta [T, Hv]) -> [T, Hv, Dv]; see below
     Div,        // (a, b) numpy broadcasting: a / b
     Softmax,    // softmax over the last axis, computed in f32
     TopK,       // (x [..., N]) -> (values [..., k] f32, indices [..., k] i32): the k largest along the last axis,
                 // largest first; equal values keep the lower index first
-    ReduceSum,  // sum over one axis (ReduceAttrs::axis), which is removed; f32
+    ReduceSum,  // sum over one axis (AxisAttrs::axis), which is removed; f32
     ExpertMatMul, // (x [T, K] or [T, S, K], w [E, N, K], idx [T, S] int) -> [T, S, N]: out[t, s] = x[t] (or
                   // x[t, s]) @ w[idx[t, s]]^T; every idx in [0, E). The expert matmuls of a mixture of experts
+    Concat,     // (x0, x1, ...) joined along AxisAttrs::axis (static there); the other dims and the dtype agree
 };
 
 // CausalConv: with x' = [the slot's K-1 previous inputs (zeros at the start), x], out[t, c] = sum_j w[c, j] x'[t + j, c];
@@ -103,7 +105,7 @@ struct ScaleAttrs {
 struct SoftcapAttrs {
     float cap = 0.0f;
 };
-struct RmsNormAttrs {
+struct NormAttrs {  // RmsNorm, LayerNorm
     float eps = 1e-6f;
 };
 struct ReshapeAttrs {
@@ -130,7 +132,7 @@ struct RopeAttrs {
 struct TopKAttrs {
     int64_t k = 1;
 };
-struct ReduceAttrs {
+struct AxisAttrs {  // ReduceSum, Concat
     int axis = 0;
 };
 struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op's state across runs
@@ -140,8 +142,9 @@ struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op'
 // Causal (the default): k and v are KvCache outputs [L, Hkv, D]. Query i of the step sits at absolute position
 // p_i = L - T + i; key j sits at position j. Key j is visible to query i iff j <= p_i and (sliding_window == 0 or
 // p_i - j < sliding_window).
-// Not causal (encoders): every key is visible to every query; k and v may have any length N (e.g. kT for
-// self-attention over the step's own tokens); sliding_window must be 0.
+// Not causal (encoders, policy prefixes): every key is visible to every query; q may have a static length and k, v
+// any length N (e.g. kT for self-attention over the step's own tokens); sliding_window must be 0. The optional
+// key_bias [N] is added to every query's score of key j (0 keeps it, -inf masks it: prompt padding).
 // scores = scale * q.k (f32); if softcap > 0: scores = softcap * tanh(scores / softcap); softmax in f32.
 struct AttentionAttrs {
     float scale = 1.0f;
@@ -151,8 +154,8 @@ struct AttentionAttrs {
 };
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
-                           ClampAttrs, RmsNormAttrs, ReshapeAttrs, SliceAttrs, TransposeAttrs, KvCacheAttrs,
-                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, ReduceAttrs>;
+                           ClampAttrs, NormAttrs, ReshapeAttrs, SliceAttrs, TransposeAttrs, KvCacheAttrs,
+                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, AxisAttrs>;
 
 struct TensorType {
     DType dtype = DType::F32;
@@ -215,6 +218,7 @@ public:
     Value clamp(Value x, float lo, float hi);
     Value rms_norm(Value x, float eps);
     Value rms_norm(Value x, Value weight, float eps);
+    Value layer_norm(Value x, Value weight, Value bias, float eps);
     Value reshape(Value x, Dims shape);
     Value slice(Value x, int axis, int64_t begin, int64_t end = kSliceEnd);
     Value transpose(Value x, std::vector<int> perm);
@@ -222,6 +226,8 @@ public:
     int add_kv_slot(int64_t num_kv_heads, int64_t head_dim, int64_t sliding_window, std::string label);
     std::pair<Value, Value> kv_cache(int slot, Value k, Value v);
     Value attention(Value q, Value k_all, Value v_all, const AttentionAttrs& attrs);
+    // Non-causal attention whose key j's scores get key_bias[j] added (AttentionAttrs::causal must be false).
+    Value attention(Value q, Value k, Value v, Value key_bias, const AttentionAttrs& attrs);
     int add_conv_slot(int64_t channels, int64_t kernel, std::string label);
     Value causal_conv(int slot, Value x, Value w);
     int add_recurrent_slot(int64_t heads, int64_t key_dim, int64_t value_dim, std::string label);
@@ -231,6 +237,7 @@ public:
     std::pair<Value, Value> topk(Value x, int64_t k);  // (values, indices)
     Value reduce_sum(Value x, int axis);
     Value expert_matmul(Value x, Value w, Value idx);
+    Value concat(const std::vector<Value>& parts, int axis);
 
     void output(const std::string& name, Value v);
 

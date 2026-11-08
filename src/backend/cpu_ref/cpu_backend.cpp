@@ -255,7 +255,7 @@ class CpuSession final : public Session {
                 return {cpu_ref::clamp(f32(0), a.lo, a.hi)};
             }
             case OpKind::RmsNorm: {
-                const float eps = std::get<graph::RmsNormAttrs>(n.attrs).eps;
+                const float eps = std::get<graph::NormAttrs>(n.attrs).eps;
                 if (n.inputs.size() == 1) return {cpu_ref::rms_norm(f32(0), nullptr, eps)};
                 const HostTensor weight = f32(1);
                 return {cpu_ref::rms_norm(f32(0), &weight, eps)};
@@ -283,8 +283,22 @@ class CpuSession final : public Session {
                 auto [k_all, v_all] = append_kv(std::get<graph::KvCacheAttrs>(n.attrs).slot, f32(0), f32(1), step);
                 return {std::move(k_all), std::move(v_all)};
             }
-            case OpKind::Attention:
-                return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), std::get<graph::AttentionAttrs>(n.attrs))};
+            case OpKind::Attention: {
+                const auto& a = std::get<graph::AttentionAttrs>(n.attrs);
+                if (n.inputs.size() == 4) {
+                    const HostTensor bias = f32(3);
+                    return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, &bias)};
+                }
+                return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a)};
+            }
+            case OpKind::LayerNorm:
+                return {cpu_ref::layer_norm(f32(0), f32(1), f32(2), std::get<graph::NormAttrs>(n.attrs).eps)};
+            case OpKind::Concat: {
+                std::vector<HostTensor> parts;
+                for (size_t k = 0; k < n.inputs.size(); ++k)
+                    parts.push_back(in(k).dtype() == DType::I32 || in(k).dtype() == DType::I64 ? in(k) : f32(k));
+                return {cpu_ref::concat(parts, std::get<graph::AxisAttrs>(n.attrs).axis)};
+            }
             case OpKind::Div:
                 return {cpu_ref::div(f32(0), f32(1))};
             case OpKind::Softmax:
@@ -294,7 +308,7 @@ class CpuSession final : public Session {
                 return {std::move(top_values), std::move(top_indices)};
             }
             case OpKind::ReduceSum:
-                return {cpu_ref::reduce_sum(f32(0), std::get<graph::ReduceAttrs>(n.attrs).axis)};
+                return {cpu_ref::reduce_sum(f32(0), std::get<graph::AxisAttrs>(n.attrs).axis)};
             case OpKind::ExpertMatMul:
                 return {cpu_ref::expert_matmul(*pool_, f32(0), f32(1), in(2))};
         }

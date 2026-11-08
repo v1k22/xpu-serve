@@ -84,6 +84,7 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantW
 namespace {
 
 bool rows_path(const AttentionShape& s, AttentionPath path) {
+    if (!attention_rows_head_dim(s.head_dim)) return false;
     return path == AttentionPath::Rows || (path == AttentionPath::Auto && s.tokens <= kAttentionRowsMax);
 }
 

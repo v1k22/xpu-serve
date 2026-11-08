@@ -49,6 +49,9 @@ void expert_matmul(sycl::queue& q, const float* x, bool per_slot, const W* w, co
 
 // Rows of `width`; w may be null.
 void rms_norm(sycl::queue& q, const float* x, const float* w, float* y, int64_t rows, int64_t width, float eps);
+// Rows of `width`: (x - mean) / sqrt(var + eps) * w + b.
+void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t width,
+                float eps);
 
 template <typename T, typename I>
 void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n, int64_t width);
@@ -92,7 +95,12 @@ struct AttentionShape {
     float softcap = 0.0f;
     int64_t window = 0;
     bool causal = true;
+    const float* key_bias = nullptr;  // [N], added to key j's scores (non-causal only); null: none
 };
+// The per-row kernels cover these head dims; others take the GEMM path.
+inline bool attention_rows_head_dim(int64_t d) {
+    return d == 16 || d == 32 || d == 64 || d == 128 || d == 192 || d == 256 || d == 512;
+}
 
 // An int8 KV cache: codes [N, Hkv, D] and one f32 scale per (key, head); the value is code * scale.
 struct KvI8 {

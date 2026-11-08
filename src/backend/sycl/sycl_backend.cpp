@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -256,9 +257,11 @@ public:
                 }
             }
             const auto& nodes = graph_.nodes();
+            // The first run of a step shape compiles kernels (JIT, oneMKL): not part of the profile.
+            const bool profile_step = profiling_ && !profiled_shapes_.insert(step.tokens).second;
             for (size_t i = 0; i < nodes.size(); ++i) {
                 if (plan.alias[i] != 0 || nodes[i].kind == OpKind::Input) continue;
-                if (profiling_) {
+                if (profile_step) {
                     timed_launch(i, plan, step);
                 } else if (sync_) {
                     try {
@@ -294,7 +297,9 @@ public:
         if (graph_.stateful()) cached_ = step.kv_len;  // a graph without slots is stateless
         for (StateBuffers& s : fixed_state_)
             s.cur = 1 - s.cur;
-        if (profiling_) ++(step.tokens == 1 ? decode_steps_ : prefill_steps_);
+        if (profiling_ && profiled_shapes_.count(step.tokens) != 0 && profiled_runs_[step.tokens]++ > 0) {
+            ++(step.tokens == 1 ? decode_steps_ : prefill_steps_);
+        }
     }
 
     int64_t num_cached() const override { return cached_; }
@@ -424,6 +429,9 @@ private:
                 case OpKind::TopK:
                     dtype_[i][1] = DType::I32;
                     break;
+                case OpKind::Concat:
+                    dtype_[i][0] = dt(n.inputs[0]);
+                    break;
                 default:
                     break;
             }
@@ -467,6 +475,11 @@ private:
                              "columns, got ", k);
                     break;
                 }
+                case OpKind::Concat:
+                    for (size_t k = 1; k < n.inputs.size(); ++k)
+                        need(k, dt(n.inputs[k]) == dt(n.inputs[0]), "the dtype of input 0");
+                    need(0, !is_quantized(dt(n.inputs[0])), "an unquantized tensor");
+                    break;
                 case OpKind::ExpertMatMul: {
                     need(0, is_f32(0), "f32");
                     need(1, is_fp(1) || is_packed(1), "f16, f32, q8 or q4");
@@ -486,8 +499,9 @@ private:
                     need(1, is_fp(1) || dt(n.inputs[1]) == DType::I8, "f16, f32 or i8");
                     need(2, dt(n.inputs[2]) == dt(n.inputs[1]), "the dtype of k");
                     const int64_t d = graph_.type(n.inputs[0]).shape.back();
-                    XS_CHECK(d == 16 || d == 32 || d == 64 || d == 128 || d == 192 || d == 256 || d == 512, where(i),
-                             ": head_dim ", d, " is not supported (16, 32, 64, 128, 192, 256, 512)");
+                    XS_CHECK(d % 8 == 0 && d <= 512, where(i), ": head_dim ", d,
+                             " is not supported (a multiple of 8, at most 512)");
+                    if (n.inputs.size() == 4) need(3, is_f32(3), "f32");
                     break;
                 }
                 case OpKind::GatedDelta: {
@@ -1069,7 +1083,7 @@ private:
                 const int64_t width = out_shape.back();
                 const float* w = n.inputs.size() == 2 ? in_f32(1) : nullptr;
                 sycl_be::rms_norm(q_, in_f32(0), w, out, out_n / width, width,
-                                  std::get<graph::RmsNormAttrs>(n.attrs).eps);
+                                  std::get<graph::NormAttrs>(n.attrs).eps);
                 return;
             }
             case OpKind::Slice: {  // the aliasing case returned earlier: a copy
@@ -1155,6 +1169,7 @@ private:
                 s.softcap = a.softcap;
                 s.window = a.sliding_window;
                 s.causal = a.causal;
+                if (n.inputs.size() == 4) s.key_bias = in_f32(3);
                 if (in_dt(1) == DType::I8) {
                     const int slot = std::get<graph::KvCacheAttrs>(graph_.node(n.inputs[1]).attrs).slot;
                     const KvBuffers& b = kv_[static_cast<size_t>(slot)];
@@ -1176,6 +1191,32 @@ private:
                 }
                 return;
             }
+            case OpKind::LayerNorm: {
+                const int64_t width = out_shape.back();
+                sycl_be::layer_norm(q_, in_f32(0), in_f32(1), in_f32(2), out, out_n / width, width,
+                                    std::get<graph::NormAttrs>(n.attrs).eps);
+                return;
+            }
+            case OpKind::Concat: {
+                const int axis = std::get<graph::AxisAttrs>(n.attrs).axis;
+                const size_t esize = dtype_size(dt(Value{static_cast<int32_t>(i), 0}));
+                int64_t outer = 1;
+                for (int d = 0; d < axis; ++d)
+                    outer *= out_shape[static_cast<size_t>(d)];
+                const size_t out_row = static_cast<size_t>(out_n / outer) * esize;
+                size_t offset = 0;
+                for (size_t k = 0; k < n.inputs.size(); ++k) {
+                    const size_t row = static_cast<size_t>(numel(in_shape(k)) / outer) * esize;
+                    if (outer == 1) {
+                        q_.memcpy(out_raw + offset, in_ptr(k), row);
+                    } else {
+                        q_.ext_oneapi_memcpy2d(out_raw + offset, out_row, in_ptr(k), row, row,
+                                               static_cast<size_t>(outer));
+                    }
+                    offset += row;
+                }
+                return;
+            }
             case OpKind::Softmax: {
                 const int64_t width = out_shape.back();
                 sycl_be::softmax(q_, in_f32(0), out, out_n / width, width);
@@ -1189,7 +1230,7 @@ private:
                 return;
             }
             case OpKind::ReduceSum: {
-                const int axis = std::get<graph::ReduceAttrs>(n.attrs).axis;
+                const int axis = std::get<graph::AxisAttrs>(n.attrs).axis;
                 const Dims& in = in_shape(0);
                 int64_t outer = 1;
                 for (int d = 0; d < axis; ++d)
@@ -1279,9 +1320,14 @@ private:
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         const Node& n = graph_.nodes()[i];
         std::string key(graph::op_name(n.kind));
+        const auto shape = [&](size_t k) -> const Dims& {
+            return p.shapes[static_cast<size_t>(n.inputs[k].node)][static_cast<size_t>(n.inputs[k].index)];
+        };
         if (n.kind == OpKind::MatMul) {
-            const Dims& w = p.shapes[static_cast<size_t>(n.inputs[1].node)][static_cast<size_t>(n.inputs[1].index)];
-            key += str_cat(" ", w[0], "x", w[1]);
+            key += str_cat(" ", shape(1)[0], "x", shape(1)[1]);
+        } else if (n.kind == OpKind::Attention) {
+            key += str_cat(" T=", shape(0)[0] == kT ? step.tokens : shape(0)[0], " N=",
+                           shape(1)[0] == kL ? step.kv_len : shape(1)[0], " D=", shape(0)[2]);
         }
         (step.tokens == 1 ? decode_ms_ : prefill_ms_)[key] += ms;
     }
@@ -1335,6 +1381,8 @@ private:
     GrowingScratch kv_scratch_{q_};  // the int8 KV cache dequantized for prefill attention
     int64_t cached_ = 0;
     std::map<std::string, double> decode_ms_, prefill_ms_;
+    std::set<int64_t> profiled_shapes_;      // step token counts seen (their first run is not profiled)
+    std::map<int64_t, int64_t> profiled_runs_;
     int64_t decode_steps_ = 0;
     int64_t prefill_steps_ = 0;
 };

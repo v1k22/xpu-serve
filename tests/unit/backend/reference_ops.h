@@ -275,6 +275,7 @@ struct AttentionSpec {
     double softcap = 0.0;
     int64_t window_slack = 0;  // planted-bug control: > 0 lets queries see that many keys beyond the window
     bool causal = true;        // false: every key is visible to every query
+    std::vector<double> key_bias;  // empty, or one per key: added to every query's score of that key
 };
 
 // Builds the full [T, L] mask and score matrix per head, then a max-subtracted softmax.
@@ -296,6 +297,7 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
                     s += q[(i * hq + h) * dim + d] * k[(j * hkv + kvh) * dim + d];
                 s *= spec.scale;
                 if (spec.softcap > 0) s = spec.softcap * std::tanh(s / spec.softcap);
+                if (!spec.key_bias.empty()) s += spec.key_bias[static_cast<size_t>(j)];
                 scores[static_cast<size_t>(j)] = s;
             }
             const double mx = *std::max_element(scores.begin(), scores.end());
@@ -309,6 +311,23 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
                 out[(i * hq + h) * dim + d] = acc;
             }
         }
+    }
+    return out;
+}
+
+inline Tensor64 layer_norm(const Tensor64& x, const Tensor64& w, const Tensor64& b, double eps) {
+    const int64_t width = x.shape.back();
+    Tensor64 out(x.shape);
+    for (int64_t r = 0; r < x.numel() / width; ++r) {
+        double mean = 0, var = 0;
+        for (int64_t i = 0; i < width; ++i)
+            mean += x[r * width + i];
+        mean /= static_cast<double>(width);
+        for (int64_t i = 0; i < width; ++i)
+            var += (x[r * width + i] - mean) * (x[r * width + i] - mean);
+        var /= static_cast<double>(width);
+        for (int64_t i = 0; i < width; ++i)
+            out[r * width + i] = (x[r * width + i] - mean) / std::sqrt(var + eps) * w[i] + b[i];
     }
     return out;
 }
