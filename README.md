@@ -5,8 +5,10 @@ One repo, one binary: the model code, the engine, the tokenizer, chat templates 
 live here, and the math runs on Intel GPUs through our SYCL backend (our own kernels, oneMKL for large matmuls). Read
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
-**Status: v0.4.** Gemma 4 E2B / E4B (text and images) and Qwen3.5 (dense, text), from the Hugging Face checkpoint or
-a q8 / q4 pack written by `xpu-serve convert`, one request at a time, on Intel GPUs through the SYCL backend.
+**Status: v0.4.** Gemma 4 E2B / E4B (text and images) and Qwen3.5 / Qwen3.6 (text, dense and mixture of experts),
+from the Hugging Face checkpoint or a q8 / q4 pack written by `xpu-serve convert`, one request at a time, on Intel
+GPUs through the SYCL backend. Qwen3.6-35B-A3B as a q4 pack runs on one Arc Pro B60 (24 GB): about 48 tok/s decode,
+1,250 tok/s prefill, 84 % on our 25-question MMLU-Pro set.
 [PROJECT.md](PROJECT.md) maps the code.
 
 ## Build
