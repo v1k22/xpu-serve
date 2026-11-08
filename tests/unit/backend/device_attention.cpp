@@ -1,5 +1,6 @@
-// Attention through the stateful KV cache against the fp64 reference: head dims 64/256/512, GQA, sliding window,
-// softcap, both attention paths (the per-row kernel and GEMMs), over several steps of different T.
+// Attention through the stateful KV cache against the fp64 reference: head dims 64/128/256/512, GQA, sliding window,
+// softcap, every attention path (the per-row kernel, GEMMs, the fused matrix-engine kernel), over several steps of
+// different T.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -100,8 +101,8 @@ bool attention_matches(const AttentionCase& c, uint32_t seed) {
 }  // namespace
 
 TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
-    TEST_CASE("causal attention with GQA for head dims 64, 256 and 512, both lowerings") {
-        for (const int64_t head_dim : {64, 256, 512}) {
+    TEST_CASE("causal attention with GQA for head dims 64, 128, 256 and 512, every lowering") {
+        for (const int64_t head_dim : {64, 128, 256, 512}) {
             for (const auto& [heads, kv_heads] : {std::pair<int64_t, int64_t>{4, 4}, {8, 2}, {8, 1}}) {
                 for (const std::string& impl : dev::attention_impls()) {
                     AttentionCase c;

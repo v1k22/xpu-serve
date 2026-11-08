@@ -145,13 +145,13 @@ void attention_rows_i8(sycl::queue& q, const float* qp, const KvI8& kv, float* o
 void attention_combine(sycl::queue& q, const float* part, float* out, int64_t rows, int64_t split, int64_t head_dim);
 
 // Fused attention on the matrix engines (sycl_flash_attention.cpp): an online softmax over blocks of keys, the
-// scores never leaving registers. k and v f16; q f32 or f16 up to head_dim 128, f16 at 256. split > 1 shares each
+// scores never leaving registers. head_dim up to 128, k and v f16, q f32 or f16. split > 1 shares each
 // row's keys between work-groups, which write [D partial sums, max, denominator] rows to `part` (attention_combine's
 // layout) instead of `out`.
 // The device runs it: f16 joint_matrix tiles 8x16x16 accumulating f32 on 16-lane sub-groups (Xe2 and later).
 bool flash_attention_device(const sycl::device& d);
 // The shape and the operands' addresses suit it (head_dim, the 2D block loads' alignment and extents).
-bool flash_attention_fits(const AttentionShape& s, const void* q, bool q_f16, const void* k, const void* v);
+bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v);
 // Work-groups per row's keys: enough to fill `compute_units`, at least two key blocks each.
 int64_t flash_attention_split(const AttentionShape& s, int64_t compute_units);
 template <typename QT>

@@ -149,7 +149,7 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
     }
     if constexpr (std::is_same_v<KV, half>) {
         const bool want = plan.path == AttentionPath::Auto || plan.path == AttentionPath::Flash;
-        if (want && plan.flash_device && flash_attention_fits(s, qp, std::is_same_v<QT, half>, k, v)) {
+        if (want && plan.flash_device && flash_attention_fits(s, k, v)) {
             const int64_t split = flash_attention_split(s, plan.compute_units);
             float* part = nullptr;
             if (split > 1) {
