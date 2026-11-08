@@ -25,8 +25,8 @@ def bytes_of(shape, bits, group):
     return rows * (k * bits // 8 + (k // group) * 2 * (1 if bits == 8 else 2))
 
 
-def load(sweep, configs=None):
-    """-> {name: {config: (err array per expert, bytes)}}."""
+def load(sweep, configs=None, key="err"):
+    """-> {name: {config: (err array per expert, bytes)}}; key "err_rtn" reads the round-to-nearest errors."""
     table = {}
     for c in sorted(configs or os.listdir(sweep)):
         p = os.path.join(sweep, c, "errors.json")
@@ -36,7 +36,7 @@ def load(sweep, configs=None):
         errs = json.load(open(p))
         for name, e in errs.items():
             m = man[name]
-            table.setdefault(name, {})[c] = (np.array(e["err"]), bytes_of(m["shape"], int(c[1]), m["group"]))
+            table.setdefault(name, {})[c] = (np.array(e.get(key, e["err"])), bytes_of(m["shape"], int(c[1]), m["group"]))
     return table
 
 
@@ -97,17 +97,18 @@ def main():
     ap.add_argument("--frontier", action="store_true")
     ap.add_argument("--per-expert", action="store_true", help="a format per expert (a qx bank; one group size)")
     ap.add_argument("--configs", default="", help="comma-separated formats to choose from (default: all swept)")
+    ap.add_argument("--errors", default="err", choices=["err", "err_rtn"], help="which sweep error the choice uses")
     ap.add_argument("--out")
     args = ap.parse_args()
-    table = load(args.sweep, args.configs.split(",") if args.configs else None)
+    table = load(args.sweep, args.configs.split(",") if args.configs else None, args.errors)
     s = sensitivities(table, json.load(open(args.sens)))
     if args.frontier:
-        for gib in np.arange(8.5, 17.5, 0.5):
+        for gib in np.arange(9.0, 20.5, 1.0):
             a = solve(table, s, gib * 2**30)
             b = solve(table, s, gib * 2**30, per_expert=True)
-            if a:
-                print(f"{gib:5.1f} GiB experts: predicted dKL per bank {a[1]:.4f}" +
-                      (f", per expert {b[1]:.4f}" if b else ""))
+            if a or b:
+                print(f"{gib:5.1f} GiB experts: predicted KL from experts, one format per bank " +
+                      (f"{a[1]:.4f}" if a else "  -   ") + (f", per expert {b[1]:.4f}" if b else ""))
         return
     alloc, kl, size = solve(table, s, args.budget_gib * 2**30, args.per_expert)
     counts = {}

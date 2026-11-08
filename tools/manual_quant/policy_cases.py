@@ -3,20 +3,22 @@
 
     python policy_cases.py --dataset <dir> --out <dir> --episodes 0:32 --frames 4 [--seed 0]
 
-Writes <out>/manifest.json and per case the camera images (PNG, as stored), and fixed noise (f32 [50, 32]). Cameras:
-`image` -> base_0_rgb, `wrist_image` -> left_wrist_0_rgb (π0.5's names). The state is mapped to [-1, 1] with the
+Writes <out>/manifest.json and per case the camera images (PNG, resized to --size), and fixed noise (f32 [50, 32]). Cameras:
+`image` -> observation.images.base_0_rgb, `wrist_image` -> observation.images.left_wrist_0_rgb (π0.5's features). The state is mapped to [-1, 1] with the
 dataset's min / max and zero-padded to 32 values.
 """
 
 import argparse
 import glob
+import io
 import json
 import os
 
 import numpy as np
 import pyarrow.parquet as pq
+from PIL import Image
 
-CAMERAS = {"image": "base_0_rgb", "wrist_image": "left_wrist_0_rgb"}
+CAMERAS = {"image": "observation.images.base_0_rgb", "wrist_image": "observation.images.left_wrist_0_rgb"}
 
 
 def main():
@@ -28,6 +30,7 @@ def main():
     ap.add_argument("--horizon", type=int, default=50)
     ap.add_argument("--noise-dim", type=int, default=32)
     ap.add_argument("--state-dim", type=int, default=32)
+    ap.add_argument("--size", type=int, default=224, help="image side the policy reads (bicubic resize)")
     ap.add_argument("--seed", type=int, default=0, help="frame choice")
     ap.add_argument("--noise-seed", type=int, default=0, help="the flow noise (same frames, another draw)")
     args = ap.parse_args()
@@ -50,8 +53,9 @@ def main():
             name = f"e{r['episode_index']:04d}_f{r['frame_index']:04d}"
             cams = {}
             for col, cam in CAMERAS.items():
-                path = f"{name}_{cam}.png"
-                open(os.path.join(args.out, path), "wb").write(r[col]["bytes"])
+                path = f"{name}_{cam.rsplit('.', 1)[-1]}.png"
+                img = Image.open(io.BytesIO(r[col]["bytes"])).convert("RGB")
+                img.resize((args.size, args.size), Image.BICUBIC).save(os.path.join(args.out, path))
                 cams[cam] = path
             state = np.clip(2 * (np.array(r["state"]) - lo) / np.maximum(hi - lo, 1e-8) - 1, -1, 1)
             state = np.concatenate([state, np.zeros(args.state_dim - len(state))]).astype(np.float32)

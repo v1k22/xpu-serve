@@ -59,12 +59,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--stats", required=True)
-    ap.add_argument("--match", required=True)
+    ap.add_argument("--match", default="", help="regex of tensors to quantize")
+    ap.add_argument("--from-stats", action="store_true", help="quantize every weight linear.pt has a Hessian for")
     ap.add_argument("--configs", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--batch", type=int, default=64, help="experts per GPTQ batch")
     ap.add_argument("--capture", help="quant-capture dir (moe_in) for the expert Hessian prior")
     ap.add_argument("--prior-tokens", type=float, default=32)
+    ap.add_argument("--damp", type=float, default=0.01, help="GPTQ damping, a fraction of the mean H diagonal")
+    ap.add_argument("--rtn-errors", action="store_true",
+                    help="also record each format's round-to-nearest error (err_rtn): GPTQ's in-sample error is "
+                         "optimistic where calibration is thin (rarely routed experts), RTN's is not")
     ap.add_argument("--device", default="xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
     args = ap.parse_args()
     torch.set_num_threads(os.cpu_count())
@@ -79,7 +84,16 @@ def main():
     layer = (None, None)
     pool = concurrent.futures.ThreadPoolExecutor(1)
     t0 = time.time()
-    for name in sorted(n for n in ckpt.names() if re.search(args.match, n)):
+    if args.from_stats:
+        linear = torch.load(os.path.join(args.stats, "linear.pt"))["linear"]
+        names = sorted(n for n in linear if n in ckpt.where)
+    else:
+        names = sorted(n for n in ckpt.names() if re.search(args.match, n))
+    max_group = max(parse_config(c)[1] for c in configs)
+    for name in names:
+        if ckpt.shape(name)[-1] % max_group:
+            print(f"{name}: skipped, {ckpt.shape(name)[-1]} columns are not a multiple of {max_group}", flush=True)
+            continue
         t1 = time.time()
         w = ckpt.get(name).to(dev).float()
         shape = list(w.shape)
@@ -103,11 +117,11 @@ def main():
             h = (linear[name] if name in linear else linear[module_key(name)]).unsqueeze(0)
             w = w.reshape(1, -1, k)
             batch = 1
-        out = {c: ([], [], [], [], []) for c in configs}  # codes, scales, biases, err, energy
+        out = {c: ([], [], [], [], [], []) for c in configs}  # codes, scales, biases, err, energy, err_rtn
         # The Cholesky factorizations run on the CPU (no XPU kernel), one batch ahead of the GPU work.
         w_cpu, h_cpu = w.cpu(), h.cpu()
         starts = list(range(0, w.shape[0], batch))
-        prep = lambda b0: mq.gptq_prepare(w_cpu[b0:b0 + batch], h_cpu[b0:b0 + batch])
+        prep = lambda b0: mq.gptq_prepare(w_cpu[b0:b0 + batch], h_cpu[b0:b0 + batch], args.damp)
         pending = pool.submit(prep, starts[0])
         for j, b0 in enumerate(starts):
             wp, hinv, diag = (t.to(dev) for t in pending.result())
@@ -123,18 +137,25 @@ def main():
                 o = out[c]
                 o[0].append(codes.cpu()), o[1].append(scales.cpu()), o[2].append(None if biases is None else biases.cpu())
                 o[3].append(err.cpu()), o[4].append(energy.cpu())
+                if args.rtn_errors:
+                    nb, rows = wb.shape[0], wb.shape[1]
+                    cw = torch.diagonal(hb, dim1=1, dim2=2).unsqueeze(1).expand(nb, rows, k).reshape(-1, k)
+                    rc, rs, rbias = mq.quantize_rtn(wb.reshape(-1, k), bits, group, col_weight=cw)
+                    o[5].append(mq.output_error(wb, mq.dequant(rc, rs, rbias, bits, group).reshape(wb.shape), hb)[0].cpu())
                 del codes, scales, biases, deq
             del wp, hinv, diag, hb
         line = []
         for c in configs:
             bits, group = parse_config(c)
-            codes, scales, biases, err, energy = out[c]
+            codes, scales, biases, err, energy, err_rtn = out[c]
             rows = w.numel() // k
             writers[c].quantized(name, shape, bits, group, torch.cat(codes).reshape(rows, k),
                                  torch.cat(scales).reshape(rows, -1),
                                  None if bits == 8 else torch.cat(biases).reshape(rows, -1))
             err, energy = torch.cat(err), torch.cat(energy)
             errors[c][name] = {"err": err.tolist(), "energy": energy.tolist()}
+            if err_rtn:
+                errors[c][name]["err_rtn"] = torch.cat(err_rtn).tolist()
             line.append(f"{c} {err.sum() / energy.sum():.2e}")
         print(f"{name}: {', '.join(line)} ({time.time() - t1:.0f} s)", flush=True)
     for c in configs:
