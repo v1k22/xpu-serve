@@ -979,6 +979,44 @@ XS_INSTANTIATE_OUT(float)
 XS_INSTANTIATE_OUT(half)
 #undef XS_INSTANTIATE_OUT
 
+namespace {
+
+// One work-item per unit U of the output; the part is found by its byte range.
+template <typename U>
+void concat_t(sycl::queue& q, const ConcatParts& parts, void* out, int64_t outer) {
+    struct Units {
+        const U* src[kConcatParts];
+        int64_t start[kConcatParts + 1];  // a part's first unit in an output row
+    } u{};
+    for (int k = 0; k < parts.count; ++k) {
+        u.src[k] = static_cast<const U*>(parts.src[k]);
+        u.start[k + 1] = u.start[k] + static_cast<int64_t>(parts.bytes[k] / sizeof(U));
+    }
+    const int count = parts.count;
+    const int64_t row = u.start[count];
+    U* dst = static_cast<U*>(out);
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(outer * row)), [=](sycl::id<1> idx) {
+        const int64_t i = static_cast<int64_t>(idx[0]);
+        const int64_t o = i / row;
+        const int64_t c = i % row;
+        int k = 0;
+        while (k + 1 < count && c >= u.start[k + 1]) ++k;
+        const int64_t width = u.start[k + 1] - u.start[k];
+        dst[i] = u.src[k][o * width + c - u.start[k]];
+    });
+}
+
+}  // namespace
+
+void concat(sycl::queue& q, const ConcatParts& parts, void* out, int64_t outer) {
+    size_t all = reinterpret_cast<uintptr_t>(out);
+    for (int k = 0; k < parts.count; ++k) all |= parts.bytes[k] | reinterpret_cast<uintptr_t>(parts.src[k]);
+    if (all % 16 == 0) return concat_t<sycl::vec<uint32_t, 4>>(q, parts, out, outer);
+    if (all % 4 == 0) return concat_t<uint32_t>(q, parts, out, outer);
+    if (all % 2 == 0) return concat_t<uint16_t>(q, parts, out, outer);
+    concat_t<uint8_t>(q, parts, out, outer);
+}
+
 template <typename T, typename I>
 void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n, int64_t width) {
     syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(n), static_cast<size_t>(width)), [=](sycl::item<2> it) {

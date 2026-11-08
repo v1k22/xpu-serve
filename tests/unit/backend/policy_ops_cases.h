@@ -81,15 +81,16 @@ inline void concat_axes(const Env& env) {
 }
 
 // Non-causal attention over a static number of queries with keys masked by a -inf bias: SigLIP's shape (head dim 72,
-// 16 heads, only the GEMM path covers it) and the action expert's (50 queries over a padded prefix, MQA, head dim 256).
-// Operands as graph inputs, and through a reshape (an f16 session stores those in f16, which the fused matrix-engine
-// kernel needs). 300 keys against 50 queries of an MQA head split the keys between work-groups there.
+// 16 heads, outside the per-row kernels) and the action expert's (50 queries over a padded prefix, MQA, head dim 256,
+// and the same at 128). Operands as graph inputs, and through a reshape (an f16 session stores those in f16, which the
+// fused matrix-engine kernel needs): 300 keys against 50 queries of an MQA head at 128 split the keys between
+// work-groups there.
 inline void attention_key_bias(const Env& env) {
     TensorRng rng(43);
     struct Case {
         int64_t queries, keys, heads, kv_heads, dim;
     };
-    for (const Case c : {Case{40, 40, 16, 16, 72}, Case{50, 300, 8, 1, 256}}) {
+    for (const Case c : {Case{40, 40, 16, 16, 72}, Case{50, 300, 8, 1, 256}, Case{50, 300, 8, 1, 128}}) {
         CAPTURE(c.dim);
         const HostTensor q = rng.uniform(DType::F32, {c.queries, c.heads, c.dim});
         const HostTensor k = rng.uniform(DType::F32, {c.keys, c.kv_heads, c.dim});

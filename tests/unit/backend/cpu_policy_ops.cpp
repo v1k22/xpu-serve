@@ -19,7 +19,7 @@ xs::test::policy_ops::Env cpu_env() {
 TEST_SUITE("cpu-ref policy ops") {
     TEST_CASE("layer norm subtracts the mean") { xs::test::policy_ops::layer_norm_rows(cpu_env()); }
     TEST_CASE("concat along the first, a middle and an int axis") { xs::test::policy_ops::concat_axes(cpu_env()); }
-    TEST_CASE("attention with a key bias over static queries, head dims 72 and 256") {
+    TEST_CASE("attention with a key bias over static queries, head dims 72, 128 and 256") {
         xs::test::policy_ops::attention_key_bias(cpu_env());
     }
 }

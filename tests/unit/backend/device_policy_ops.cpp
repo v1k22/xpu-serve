@@ -28,7 +28,7 @@ xs::test::policy_ops::Env device_env() {
 TEST_SUITE("device policy ops" * doctest::skip(!dev::enabled())) {
     TEST_CASE("layer norm subtracts the mean") { xs::test::policy_ops::layer_norm_rows(device_env()); }
     TEST_CASE("concat along the first, a middle and an int axis") { xs::test::policy_ops::concat_axes(device_env()); }
-    TEST_CASE("attention with a key bias over static queries, head dims 72 and 256, both paths") {
+    TEST_CASE("attention with a key bias over static queries, head dims 72, 128 and 256, every path") {
         xs::test::policy_ops::attention_key_bias(device_env());
     }
 }

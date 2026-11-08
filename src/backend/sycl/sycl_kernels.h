@@ -71,6 +71,16 @@ template <typename Y>
 void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, Y* y, int64_t rows, int64_t width,
                 float eps);
 
+// Concat as one copy kernel: `outer` rows, each the parts' rows (part k: bytes[k] from src[k] + o * bytes[k]) laid end
+// to end in `out`. Up to kConcatParts parts.
+inline constexpr int kConcatParts = 8;
+struct ConcatParts {
+    int count = 0;
+    const void* src[kConcatParts] = {};
+    size_t bytes[kConcatParts] = {};  // per outer row
+};
+void concat(sycl::queue& q, const ConcatParts& parts, void* out, int64_t outer);
+
 template <typename T, typename I>
 void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n, int64_t width);
 

@@ -1457,6 +1457,15 @@ private:
                 for (int d = 0; d < axis; ++d)
                     outer *= out_shape[static_cast<size_t>(d)];
                 const size_t out_row = static_cast<size_t>(out_n / outer) * esize;
+                if (n.inputs.size() <= static_cast<size_t>(sycl_be::kConcatParts)) {
+                    sycl_be::ConcatParts parts;  // one kernel: a copy per part costs a launch each
+                    for (size_t k = 0; k < n.inputs.size(); ++k) {
+                        parts.src[parts.count] = in_ptr(k);
+                        parts.bytes[parts.count++] = static_cast<size_t>(numel(in_shape(k)) / outer) * esize;
+                    }
+                    sycl_be::concat(q_, parts, out_raw, outer);
+                    return;
+                }
                 size_t offset = 0;
                 for (size_t k = 0; k < n.inputs.size(); ++k) {
                     const size_t row = static_cast<size_t>(numel(in_shape(k)) / outer) * esize;
