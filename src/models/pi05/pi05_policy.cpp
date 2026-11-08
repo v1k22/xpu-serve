@@ -290,20 +290,20 @@ private:
             Graph::Scope ls(g, "layers." + std::to_string(l));
             const std::string L = kVision + "encoder.layers." + std::to_string(l) + ".";
             Value h = g.layer_norm(x, weight(g, L + "layer_norm1.weight"), weight(g, L + "layer_norm1.bias"), kNormEps);
-            // [cameras * patches, width] -> [patches, cameras * heads, head_dim]: camera c's head h is head c * H + h.
-            const auto heads = [&](Value v) {
-                if (n_cam == 1) return g.reshape(v, {patches_, vision_heads_, head_dim});
-                return g.reshape(g.transpose(g.reshape(v, {n_cam, patches_, vision_heads_, head_dim}), {1, 0, 2, 3}),
-                                 {patches_, n_cam * vision_heads_, head_dim});
-            };
-            const Value q = heads(linear_bias(g, h, L + "self_attn.q_proj."));
-            const Value k = heads(linear_bias(g, h, L + "self_attn.k_proj."));
-            const Value v = heads(linear_bias(g, h, L + "self_attn.v_proj."));
-            Value att = g.attention(q, k, v, attrs);
-            if (n_cam > 1) {
-                att = g.transpose(g.reshape(att, {patches_, n_cam, vision_heads_, head_dim}), {1, 0, 2, 3});
+            // Attention per camera: a camera's rows of q, k and v are a view, and the outputs concatenate along tokens
+            // (cheaper than folding the cameras into heads, which takes four transposes per layer).
+            const Value q = linear_bias(g, h, L + "self_attn.q_proj.");
+            const Value k = linear_bias(g, h, L + "self_attn.k_proj.");
+            const Value v = linear_bias(g, h, L + "self_attn.v_proj.");
+            std::vector<Value> per_camera;
+            for (int64_t c = 0; c < n_cam; ++c) {
+                const auto rows = [&](Value t) {
+                    return g.reshape(g.slice(t, 0, c * patches_, (c + 1) * patches_), {patches_, vision_heads_, head_dim});
+                };
+                per_camera.push_back(g.reshape(g.attention(rows(q), rows(k), rows(v), attrs), {patches_, w}));
             }
-            x = g.add(x, linear_bias(g, g.reshape(att, {tokens, w}), L + "self_attn.out_proj."));
+            const Value att = n_cam == 1 ? per_camera[0] : g.concat(per_camera, 0);
+            x = g.add(x, linear_bias(g, att, L + "self_attn.out_proj."));
             h = g.layer_norm(x, weight(g, L + "layer_norm2.weight"), weight(g, L + "layer_norm2.bias"), kNormEps);
             h = linear_bias(g, g.gelu_tanh(linear_bias(g, h, L + "mlp.fc1.")), L + "mlp.fc2.");
             x = g.add(x, h);

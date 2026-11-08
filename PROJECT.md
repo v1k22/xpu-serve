@@ -49,7 +49,8 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
   `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`, `XS_PARITY_KV_DTYPE`; `XS_QWEN35_DIR` (a Qwen3.5
   checkpoint, for tokenizer parity). `tests/parity/model/make_tiny.py` writes a tiny random checkpoint of an
   architecture (real layer pattern and tensor names) to run `hf_reference.py` and the parity test on in seconds.
-- `XS_SYCL_PROFILE=1` logs the SYCL backend's per-op time per step (each op runs alone); `XS_SYCL_SYNC=1` waits after
+- `XS_SYCL_PROFILE=1` logs the SYCL backend's per-op device time per step (barrier timestamps between ops, no host
+  round trip); `XS_SYCL_SYNC=1` waits after
   every op and names the op a device error comes from (`XS_SYCL_TRACE=1` also prints each op before it runs).
 - The GPU suites ("device ops", "device attention", "device session", "device vs cpu-ref", ...) run when
   `XS_DEVICE_TEST_DEVICE=GPU.0` is set (`XS_DEVICE_TEST_PRECISION=f32` for f32; `XS_DEVICE_BENCH=1` adds the decode

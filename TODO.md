@@ -251,9 +251,9 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
 - [x] Policy kind: `models/policy.h`, `model_kind`, `load_policy`; `src/policy/` runtime (programs per camera subset
       and flow steps, warm-up, timings); `xpu-serve bench <policy-dir>`
 - [x] π0.5 (`lerobot/pi05_base`): parity with LeRobot f32 (cpu-ref 5e-6, Arc B390 f16 1e-3), 1 / 2 / 3 cameras
-- [x] π0.5 latency, first pass: f16 operands, fusions, SigLIP batched across cameras, fused flash attention (XMX) up
-      to head_dim 128, Concat as one kernel (Arc B390, 3 cameras: 428.5 -> 311.9 ms; docs/design-vla.md §6)
-- [ ] π0.5 latency, next: device-timestamp profile (the per-op sync profile overstates small ops), the prefix down
+- [x] π0.5 latency, first pass: f16 operands, fusions, fused flash attention (XMX) up to head_dim 128 with SigLIP
+      per camera, Concat as one kernel (Arc B390, 3 cameras: 428.5 -> 302.2 ms; docs/design-vla.md §6)
+- [ ] π0.5 latency, next: the prefix down
       projection's GEMM (~30 TFLOPS against ~50 for gate / up), in-place expert K/V, gate and up in one GEMM,
       record / replay of the program
 - [ ] π0.5 int8 weights (opt-in, lossy): the action expert re-reads ~620 MB of f16 weights per flow step (~60 ms of

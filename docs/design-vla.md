@@ -483,11 +483,13 @@ f16, Intel Panther Lake (Arc B390 iGPU), steady state after warm-up (`xpu-serve 
 | Attention operands in f16 (projections and RoPE write f16; the attention GEMMs run on the matrix engines instead of in f32) | 343.1 ms | | 213.7 ms | 5.4e-4 / 5.8e-4 |
 | GeGLU gate / up in f16; bias folded into GELU and into residual adds; SigLIP attention batched across cameras | 326.3 ms | 253.5 ms | 202.8 ms | 1.8e-3 / 7.5e-4 |
 | Fused flash attention on the matrix engines (head_dim up to 128: SigLIP); Concat as one copy kernel | 311.9 ms | 244.8 ms | 196.8 ms | parity gates green |
+| SigLIP attention per camera on row views (no transposes; the fused kernel is faster per camera than batched) | 302.2 ms | 237.1 ms | 197.0 ms | 5.2e-6 / 1.5e-6 cpu-ref f32; gates green |
 
 Where the time goes now (per-op profile, ops run one at a time, which overstates small ops): the prefix MLP GEMMs
 (~85 ms: gate / up near 50 TFLOPS, down near 30), the expert's GEMMs (~80 ms; they re-read ~620 MB of f16 weights
-per flow step, a memory floor near 60 ms), attention (~45 ms: SigLIP 7 ms in the fused kernel, the prefix and the
-expert on oneMKL GEMMs) and the remaining elementwise passes.
+per flow step, a memory floor near 60 ms), attention (~45 ms: SigLIP ~5 ms in the fused kernel, the prefix and the
+expert on oneMKL GEMMs) and the remaining elementwise passes (residual adds, the GeGLU product, RoPE, the expert's
+K / V concat: bandwidth-bound).
 
 The fused attention kernel keeps scores in registers and reads K and V tiles with 2D block loads. At head_dim 256
 (the prefix and the expert) a sub-group's accumulators for 8 query rows fill its registers, so each K / V tile it

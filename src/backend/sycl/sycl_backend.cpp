@@ -262,6 +262,7 @@ public:
             const auto submit_start = std::chrono::steady_clock::now();
             // The first run of a step shape compiles kernels (JIT, oneMKL): not part of the profile.
             const bool profile_step = profiling_ && !profiled_shapes_.insert(step.tokens).second;
+            if (profile_step) marks_.assign(1, {std::string(), q_.ext_oneapi_submit_barrier()});
             for (size_t i = 0; i < nodes.size(); ++i) {
                 if (plan.alias[i] != 0 || nodes[i].kind == OpKind::Input) continue;
                 if (profile_step) {
@@ -308,6 +309,17 @@ public:
         if (graph_.stateful()) cached_ = step.kv_len;  // a graph without slots is stateless
         for (StateBuffers& s : fixed_state_)
             s.cur = 1 - s.cur;
+        if (!marks_.empty()) {
+            // Device time between consecutive barriers is the op's: no host round trip in the measurement.
+            auto& ms = step.tokens == 1 ? decode_ms_ : prefill_ms_;
+            uint64_t prev = marks_[0].second.get_profiling_info<sycl::info::event_profiling::command_end>();
+            for (size_t m = 1; m < marks_.size(); ++m) {
+                const uint64_t end = marks_[m].second.get_profiling_info<sycl::info::event_profiling::command_end>();
+                ms[marks_[m].first] += static_cast<double>(end - prev) * 1e-6;
+                prev = end;
+            }
+            marks_.clear();
+        }
         if (profiling_ && profiled_shapes_.count(step.tokens) != 0 && profiled_runs_[step.tokens]++ > 0) {
             ++(step.tokens == 1 ? decode_steps_ : prefill_steps_);
         }
@@ -1573,13 +1585,10 @@ private:
         fail(where(i), ": unhandled op");
     }
 
-    // XS_SYCL_PROFILE=1: each op runs alone and its wall time (launch included) adds to its kind's total.
+    // XS_SYCL_PROFILE=1: op i's device time (between its barrier and the previous one's) adds to its kind's total;
+    // the run reads the barriers' timestamps once it is done.
     void timed_launch(size_t i, const Plan& p, const Step& step) {
-        q_.wait();
-        const auto start = std::chrono::steady_clock::now();
         launch(i, p, step);
-        q_.wait();
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         const Node& n = graph_.nodes()[i];
         std::string key(graph::op_name(n.kind));
         const auto shape = [&](size_t k) -> const Dims& {
@@ -1591,7 +1600,7 @@ private:
             key += str_cat(" T=", shape(0)[0] == kT ? step.tokens : shape(0)[0], " N=",
                            shape(1)[0] == kL ? step.kv_len : shape(1)[0], " D=", shape(0)[2]);
         }
-        (step.tokens == 1 ? decode_ms_ : prefill_ms_)[key] += ms;
+        marks_.emplace_back(std::move(key), q_.ext_oneapi_submit_barrier());
     }
 
     void report_profile() const {
@@ -1647,6 +1656,7 @@ private:
     GrowingScratch kv_scratch_{q_};  // the int8 KV cache dequantized for prefill attention
     int64_t cached_ = 0;
     std::map<std::string, double> decode_ms_, prefill_ms_;
+    std::vector<std::pair<std::string, sycl::event>> marks_;  // a profiled run's barriers: (op, event)
     std::set<int64_t> profiled_shapes_;      // step token counts seen (their first run is not profiled)
     std::map<int64_t, int64_t> profiled_runs_;
     int64_t decode_steps_ = 0;
@@ -1703,8 +1713,11 @@ public:
         if (it == queues_.end()) {
             // A context of this device alone: in the platform's default context (every GPU), device allocations of a
             // large model failed at 14 to 18 GiB of a 24 GiB card with two cards present.
-            sycl::queue q(sycl::context(devices_[index]), devices_[index],
-                          sycl::property_list{sycl::property::queue::in_order()});
+            sycl::property_list props{sycl::property::queue::in_order()};
+            if (env_flag("XS_SYCL_PROFILE")) {
+                props = sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()};
+            }
+            sycl::queue q(sycl::context(devices_[index]), devices_[index], props);
             it = queues_.emplace(index, std::move(q)).first;
         }
         attention.flash_device = sycl_be::flash_attention_device(devices_[index]);
