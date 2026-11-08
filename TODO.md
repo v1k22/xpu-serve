@@ -252,7 +252,7 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
       and flow steps, warm-up, timings); `xpu-serve bench <policy-dir>`
 - [x] π0.5 (`lerobot/pi05_base`): parity with LeRobot f32 (cpu-ref 5e-6, Arc B390 f16 1e-3), 1 / 2 / 3 cameras
 - [x] π0.5 latency, first pass: f16 operands, fusions, fused flash attention (XMX) up to head_dim 128 with SigLIP
-      per camera, Concat as one kernel (Arc B390, 3 cameras: 428.5 -> 302.2 ms; docs/design-vla.md §6)
+      per camera, Concat as one kernel, a cheaper GELU (Arc B390, 3 cameras: 428.5 -> 298.8 ms; design-vla.md §6)
 - [ ] π0.5 latency, next: the prefix down
       projection's GEMM (~30 TFLOPS against ~50 for gate / up), in-place expert K/V, gate and up in one GEMM,
       record / replay of the program

@@ -1599,6 +1599,11 @@ private:
         } else if (n.kind == OpKind::Attention) {
             key += str_cat(" T=", shape(0)[0] == kT ? step.tokens : shape(0)[0], " N=",
                            shape(1)[0] == kL ? step.kv_len : shape(1)[0], " D=", shape(0)[2]);
+        } else {  // elementwise passes: by output shape, dtype and fusion
+            const Dims& o = p.shapes[i][0];
+            key += " [";
+            for (size_t d = 0; d < o.size(); ++d) key += str_cat(d ? "," : "", o[d]);
+            key += str_cat("] ", dtype_name(dtype_[i][0]), fused_[i] != Fused::No ? " fused" : "");
         }
         marks_.emplace_back(std::move(key), q_.ext_oneapi_submit_barrier());
     }

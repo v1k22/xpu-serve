@@ -28,8 +28,10 @@ inline float apply_unary(float x, float a, float b) {
     } else if constexpr (Op == UnaryOp::Tanh) {
         return sycl::tanh(x);
     } else if constexpr (Op == UnaryOp::GeluTanh) {
+        // 1 + tanh(u) = 2 - 2 / (exp(2u) + 1): the hardware exponential instead of sycl::tanh's long sequence (the
+        // product with the gate is a large pass), absolute error near 1e-7.
         const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-        return 0.5f * x * (1.0f + sycl::tanh(inner));
+        return x * (1.0f - 1.0f / (sycl::native::exp(2.0f * inner) + 1.0f));
     } else if constexpr (Op == UnaryOp::Softcap) {
         return a * sycl::tanh(x / a);
     } else if constexpr (Op == UnaryOp::Sigmoid) {

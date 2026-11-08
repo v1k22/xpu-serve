@@ -484,6 +484,7 @@ f16, Intel Panther Lake (Arc B390 iGPU), steady state after warm-up (`xpu-serve 
 | GeGLU gate / up in f16; bias folded into GELU and into residual adds; SigLIP attention batched across cameras | 326.3 ms | 253.5 ms | 202.8 ms | 1.8e-3 / 7.5e-4 |
 | Fused flash attention on the matrix engines (head_dim up to 128: SigLIP); Concat as one copy kernel | 311.9 ms | 244.8 ms | 196.8 ms | parity gates green |
 | SigLIP attention per camera on row views (no transposes; the fused kernel is faster per camera than batched) | 302.2 ms | 237.1 ms | 197.0 ms | 5.2e-6 / 1.5e-6 cpu-ref f32; gates green |
+| GELU (tanh) through the hardware exponential instead of `sycl::tanh` (the GeGLU product is a large pass) | 298.8 ms | 233.0 ms | 194.0 ms | gates green |
 
 Where the time goes now (per-op profile, ops run one at a time, which overstates small ops): the prefix MLP GEMMs
 (~85 ms: gate / up near 50 TFLOPS, down near 30), the expert's GEMMs (~80 ms; they re-read ~620 MB of f16 weights
