@@ -246,6 +246,33 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
 
 ---
 
+## Robot policies (VLA) — docs/design-vla.md
+
+- [x] Policy kind: `models/policy.h`, `model_kind`, `load_policy`; `src/policy/` runtime (programs per camera subset
+      and flow steps, warm-up, timings); `xpu-serve bench <policy-dir>`
+- [x] π0.5 (`lerobot/pi05_base`): parity with LeRobot f32 (cpu-ref 5e-6, Arc B390 f16 1e-3), 1 / 2 / 3 cameras
+- [ ] π0.5 latency: fused attention for the three shapes, in-place expert K/V, SigLIP attention across cameras, gate
+      and up in one GEMM, bias adds folded into consumers, record / replay of the program
+- [ ] Normalization statistics (quantiles, mean/std) and resize-with-pad for other image sizes
+- [ ] Policy service and API: `/v1/policy/info`, `/v1/policy/act` (JSON + msgpack), latest-wins queue, `/ready` after
+      warm-up; then the openpi-compatible WebSocket; RTC (previous chunk + delay)
+- [ ] More policies: π0, SmolVLA, GR00T N1.6 / N1.7, π0-FAST (through the language engine), OpenVLA-OFT
+
+## World models
+
+- [ ] `WorldModel` kind and `world/` runtime; first model: V-JEPA 2-AC (planning, batch axis) or Matrix-Game
+      (interactive streaming)
+- [ ] Ops: Conv2d / Conv3d, GroupNorm, Upsample, 3-D RoPE, block-causal masks, a batch dim
+
+## Audio models
+
+- [ ] `AudioModel` kind, `audio/` (decode, resample, log-mel), `/v1/audio/transcriptions` and `/v1/audio/speech`
+- [ ] Speech recognition (Whisper-style encoder-decoder; streaming encoder state)
+- [ ] Speech synthesis (codec-token TTS: token loop + codec decoder, streaming output)
+- [ ] Audio in chat (an audio encoder in front of an LLM, like images)
+
+---
+
 ## Phase 7: Packaging and release
 
 - [ ] Linux release build (bundled runtimes), Windows release build
