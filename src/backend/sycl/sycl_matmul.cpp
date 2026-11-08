@@ -189,9 +189,14 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
         }
         const int64_t keys = k_hi - k_lo;
         const int64_t rows = cur * group;
-        attention_pack_q(q, qp, packed_q, s, t0, cur);
+        // One KV head and q already in KV's type: q's rows t0.. are the packed layout [1, cur, G, D].
+        const KV* qa = packed_q;
+        if constexpr (std::is_same_v<QT, KV>) {
+            if (hkv == 1) qa = qp + t0 * s.q_heads * d;
+        }
+        if (qa == packed_q) attention_pack_q(q, qp, packed_q, s, t0, cur);
         ordered(q, [&](const std::vector<sycl::event>& deps) {
-            return blas::gemm_batch(q, transpose::nontrans, transpose::trans, rows, keys, d, s.scale, packed_q, d,
+            return blas::gemm_batch(q, transpose::nontrans, transpose::trans, rows, keys, d, s.scale, qa, d,
                                     rows * d, k + k_lo * hkv * d, hkv * d, d, 0.0f, scores, keys, rows * keys, hkv,
                                     deps);
         });
