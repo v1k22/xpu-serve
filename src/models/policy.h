@@ -2,9 +2,11 @@
 
 // A robot policy (a vision-language-action model): an observation in (camera images, robot state, an instruction), a
 // chunk of actions out. The model code builds one static graph per call shape (which cameras are present, how many
-// denoising steps): pixels to actions in a single program, so a call runs without host round trips. Tokenizing the
+// denoising steps, how long the padded prompt is): pixels to actions in a single program, so a call runs without host
+// round trips. Tokenizing the
 // prompt and running the program are the policy runtime's job (src/policy/); docs/design-vla.md has the design.
 
+#include <compare>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -46,22 +48,33 @@ struct Observation {
     std::string instruction;
 };
 
+// What one program is built for: the cameras present (indices into spec().cameras, ascending), the flow steps, and
+// the prompt tokens it reads (the prompt is padded up to that many).
+struct CallShape {
+    std::vector<int> cameras;
+    int steps = 0;
+    int64_t prompt_tokens = 0;
+    auto operator<=>(const CallShape&) const = default;
+};
+
 class Policy {
 public:
     virtual ~Policy() = default;
     virtual const PolicySpec& spec() const = 0;
     virtual const WeightStore& weights() const = 0;
-    // The program for calls with exactly these cameras (indices into spec().cameras, ascending) and `steps` flow steps:
-    // inputs as prepare() fills them, output "actions" [horizon, noise_dim].
-    virtual graph::Graph build(const std::vector<int>& cameras, int steps) const = 0;
+    // The program for calls of this shape: inputs as prepare() fills them, output "actions" [horizon, noise_dim].
+    virtual graph::Graph build(const CallShape& shape) const = 0;
     // The prompt text the network reads (the instruction, plus whatever the model puts there, such as state bins).
     virtual std::string prompt(const Observation& obs) const = 0;
     // The token placed first in the prompt (the runtime prepends it to the tokenized prompt), or -1 for none.
     virtual int32_t prompt_bos() const = 0;
-    // Host side of a call: images, prompt ids and noise [horizon, noise_dim] -> the inputs of build(cameras, steps).
-    // `cameras` are the observation's camera indices as camera_indices() returns them.
-    virtual void prepare(const Observation& obs, const std::vector<int>& cameras, std::span<const int32_t> prompt_ids,
-                         const HostTensor& noise, int steps, TensorMap& inputs) const = 0;
+    // The prompt tokens a program reads for a prompt of `tokens` ids: padded up to a bucket (prompts of nearby
+    // lengths share a program) and never past the model's maximum (longer prompts are truncated).
+    virtual int64_t prompt_tokens(int64_t tokens) const = 0;
+    // Host side of a call: images, prompt ids and noise [horizon, noise_dim] -> the inputs of build(shape).
+    // `shape.cameras` are the observation's camera indices as camera_indices() returns them.
+    virtual void prepare(const Observation& obs, const CallShape& shape, std::span<const int32_t> prompt_ids,
+                         const HostTensor& noise, TensorMap& inputs) const = 0;
     // The program's "actions" -> [horizon, action_dim] in the robot's units.
     virtual HostTensor finish(const TensorMap& outputs) const = 0;
 

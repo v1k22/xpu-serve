@@ -1,8 +1,9 @@
 #pragma once
 
 // The policy runtime: one robot policy on one device. It tokenizes the prompt, keeps one compiled program per call
-// shape (camera subset, flow steps), compiled and run once at warm-up so no request pays for kernel compilation or
-// memory planning, and reports where each call's time goes. Calls run one at a time (latency first, no batching).
+// shape (camera subset, flow steps, padded prompt length), compiled and run at warm-up so requests of that shape pay
+// for no kernel compilation or memory planning, and reports where each call's time goes. Calls run one at a time
+// (latency first, no batching).
 
 #include <cstdint>
 #include <filesystem>
@@ -52,20 +53,21 @@ public:
     PolicyRunner& operator=(const PolicyRunner&) = delete;
 
     const PolicySpec& spec() const { return policy_->spec(); }
-    // Builds and compiles the program for these cameras (spec indices, ascending) and steps, then runs it `runs` times
-    // on a synthetic observation. Returns the compile time in ms.
-    double warm_up(const std::vector<int>& cameras, int steps, int runs = 2);
+    // Builds and compiles the program for calls like `obs` (its cameras and prompt length) with `steps` flow steps,
+    // then runs it `runs` times. Returns the compile time in ms (0 when the program existed).
+    double warm_up(const Observation& obs, int steps, int runs = 2);
     ActResult act(const Observation& obs, const ActOptions& options);
 
 private:
     PolicyRunner() = default;
-    Session& program(const std::vector<int>& cameras, int steps, double* compile_ms = nullptr);
+    CallShape shape_of(const Observation& obs, int steps, std::vector<int32_t>* prompt_ids) const;
+    Session& program(const CallShape& shape, double* compile_ms = nullptr);
 
     std::unique_ptr<Policy> policy_;
     std::unique_ptr<Backend> backend_;
     std::unique_ptr<tok::Tokenizer> tokenizer_;
     SessionOptions session_;
-    std::map<std::pair<std::vector<int>, int>, std::unique_ptr<Session>> programs_;
+    std::map<CallShape, std::unique_ptr<Session>> programs_;
 };
 
 // An observation with every listed camera (gray-gradient images of the spec's size), a zero state and an

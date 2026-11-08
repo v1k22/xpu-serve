@@ -21,6 +21,7 @@ using graph::Value;
 constexpr int64_t kPatch = 14;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr float kNormEps = 1e-6f;
+constexpr int64_t kPromptBucket = 32;  // programs read the prompt padded to a multiple of this
 const std::string kRoot = "paligemma_with_expert.";
 const std::string kVision = kRoot + "paligemma.model.vision_tower.vision_model.";
 const std::string kVlm = kRoot + "paligemma.model.language_model.";
@@ -127,14 +128,23 @@ public:
         return "Task: " + task + ", State: " + state + ";\nAction: ";
     }
 
-    graph::Graph build(const std::vector<int>& cameras, int steps) const override {
-        XS_CHECK(!cameras.empty() && steps > 0, "pi05: a program needs at least one camera and one step");
+    // LeRobot pads every prompt to tokenizer_max_length. The pads are masked out as keys and nothing reads their
+    // outputs, so a program reads the prompt padded only to the next multiple of kPromptBucket: the same actions.
+    int64_t prompt_tokens(int64_t tokens) const override {
+        return std::min(cfg_.prompt_tokens, (std::max<int64_t>(tokens, 1) + kPromptBucket - 1) / kPromptBucket * kPromptBucket);
+    }
+
+    graph::Graph build(const CallShape& shape) const override {
+        const int steps = shape.steps;
+        XS_CHECK(!shape.cameras.empty() && steps > 0, "pi05: a program needs at least one camera and one step");
+        XS_CHECK(shape.prompt_tokens > 0 && shape.prompt_tokens <= cfg_.prompt_tokens, "pi05: ", shape.prompt_tokens,
+                 " prompt tokens; the policy reads 1 to ", cfg_.prompt_tokens);
         Graph g;
-        const auto n_cam = static_cast<int64_t>(cameras.size());
+        const auto n_cam = static_cast<int64_t>(shape.cameras.size());
         const int64_t image_tokens = n_cam * patches_;
-        const int64_t prefix = image_tokens + cfg_.prompt_tokens;
+        const int64_t prefix = image_tokens + shape.prompt_tokens;
         const Value pixels = g.input("pixels", DType::F32, {image_tokens, 3 * kPatch * kPatch});
-        const Value text = g.input("text", DType::F32, {cfg_.prompt_tokens, cfg_.vlm.width});
+        const Value text = g.input("text", DType::F32, {shape.prompt_tokens, cfg_.vlm.width});
         const Value prefix_bias = g.input("prefix_bias", DType::F32, {prefix});
         const Value positions = g.input("positions", DType::I32, {prefix});
         const Value suffix_positions = g.input("suffix_positions", DType::I32, {cfg_.horizon});
@@ -164,13 +174,14 @@ public:
         }
         g.output("actions", x);
         g.validate();
-        log::debug("pi05: program for ", n_cam, " camera(s), ", steps, " steps: ", g.nodes().size(), " nodes");
+        log::debug("pi05: program for ", n_cam, " camera(s), ", steps, " steps, ", shape.prompt_tokens, " prompt tokens: ",
+                   g.nodes().size(), " nodes");
         return g;
     }
 
-    void prepare(const Observation& obs, const std::vector<int>& cameras, std::span<const int32_t> prompt_ids,
-                 const HostTensor& noise, int steps, TensorMap& inputs) const override {
-        (void)steps;
+    void prepare(const Observation& obs, const CallShape& shape, std::span<const int32_t> prompt_ids,
+                 const HostTensor& noise, TensorMap& inputs) const override {
+        const std::vector<int>& cameras = shape.cameras;
         const auto n_cam = static_cast<int64_t>(cameras.size());
         const int64_t side = cfg_.image_size / kPatch;
         const int64_t patch_dim = 3 * kPatch * kPatch;
@@ -204,14 +215,15 @@ public:
         }
         inputs["pixels"] = std::move(pixels);
 
-        // The prompt, truncated to and padded up to prompt_tokens; pads are masked out as keys and keep the last
-        // valid position (big_vision make_att_2d_masks with cumsum positions).
-        const int64_t valid = std::min<int64_t>(static_cast<int64_t>(prompt_ids.size()), cfg_.prompt_tokens);
+        // The prompt, truncated to and padded up to the shape's prompt tokens; pads are masked out as keys and keep
+        // the last valid position (big_vision make_att_2d_masks with cumsum positions).
+        const int64_t slots = shape.prompt_tokens;
+        const int64_t valid = std::min<int64_t>(static_cast<int64_t>(prompt_ids.size()), slots);
         const TensorView& table = weights_->get(kEmbed);
-        HostTensor text(DType::F32, {cfg_.prompt_tokens, cfg_.vlm.width});
+        HostTensor text(DType::F32, {slots, cfg_.vlm.width});
         float* tx = text.data<float>();
         const int64_t width = cfg_.vlm.width;
-        for (int64_t i = 0; i < cfg_.prompt_tokens; ++i) {
+        for (int64_t i = 0; i < slots; ++i) {
             float* row = tx + i * width;
             if (i >= valid) {
                 std::fill(row, row + width, 0.0f);
@@ -235,7 +247,7 @@ public:
         inputs["text"] = std::move(text);
 
         const int64_t image_tokens = n_cam * patches_;
-        const int64_t prefix = image_tokens + cfg_.prompt_tokens;
+        const int64_t prefix = image_tokens + slots;
         HostTensor bias(DType::F32, {prefix});
         HostTensor pos(DType::I32, {prefix});
         for (int64_t i = 0; i < prefix; ++i) {

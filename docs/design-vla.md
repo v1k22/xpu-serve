@@ -256,7 +256,8 @@ policies, later the world and audio layouts); `serve` mounts only that kind's AP
   call on another device.
 - **Readiness.** Every service compiles its programs and runs a warm-up before `/ready` reports ready: kernels are
   compiled (JIT or ahead of time), oneMKL is initialized, memory is planned. Requests never pay first-run costs.
-  For policies, warm-up covers every camera subset the deployment declares (or all of them).
+  For policies, warm-up covers every camera subset the deployment declares (or all of them) and the prompt lengths
+  its instructions take (programs are per padded prompt length, in steps of 32 tokens).
 - **Admission and backpressure.** Language models queue (bounded, `429` beyond); policies keep one pending slot
   where a newer observation replaces the queued one (a stale observation is worse than none); world-model jobs queue
   with a bound; audio streams are admitted while their real-time budget holds.
@@ -485,6 +486,7 @@ f16, Intel Panther Lake (Arc B390 iGPU), steady state after warm-up (`xpu-serve 
 | Fused flash attention on the matrix engines (head_dim up to 128: SigLIP); Concat as one copy kernel | 311.9 ms | 244.8 ms | 196.8 ms | parity gates green |
 | SigLIP attention per camera on row views (no transposes; the fused kernel is faster per camera than batched) | 302.2 ms | 237.1 ms | 197.0 ms | 5.2e-6 / 1.5e-6 cpu-ref f32; gates green |
 | GELU (tanh) through the hardware exponential instead of `sycl::tanh` (the GeGLU product is a large pass) | 298.8 ms | 233.0 ms | 194.0 ms | gates green |
+| The prompt padded to the next multiple of 32 tokens instead of 200 (pads are masked and never read: the same actions) | 285.3 ms | 226.3 ms | 189.4 ms | 5.2e-6 / 1.5e-6 cpu-ref f32 (prompt of 137 tokens); gates green |
 
 Where the time goes now (per-op profile, ops run one at a time, which overstates small ops): the prefix MLP GEMMs
 (~85 ms: gate / up near 50 TFLOPS, down near 30), the expert's GEMMs (~80 ms; they re-read ~620 MB of f16 weights
@@ -499,7 +501,9 @@ Next steps: a device-timestamp profile, the down projection's GEMM, the expert's
 GEMM, record / replay of the program; int8 weights for the expert as an opt-in setting (lossy) would halve its floor.
 
 Missing cameras cost nothing: the program for a camera subset contains only those cameras, and its result equals
-LeRobot's padded, masked cameras (the 1-camera parity case checks it).
+LeRobot's padded, masked cameras (the 1-camera parity case checks it). Prompt padding costs little: LeRobot pads every
+prompt to 200 tokens, which are masked out as keys and never read; a program reads the prompt padded to the next
+multiple of 32 instead (the same actions), so prompts of nearby lengths share a program.
 
 Two GPUs in one box serve two robots, one per GPU. Splitting one call across two GPUs (tensor-parallel prefix) is out
 of scope until the single-GPU path is tuned: PCIe all-reduces at every layer would eat most of the gain.

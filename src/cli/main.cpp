@@ -363,8 +363,8 @@ int bench_policy(const Args& a, const std::string& dir) {
     std::vector<int> cameras;
     for (int c = 0; c < n_cam; ++c) cameras.push_back(c);
     const int steps = a.get_int("steps") > 0 ? a.get_int("steps") : spec.denoise_steps;
-    const double compile_ms = runner->warm_up(cameras, steps, a.get_int("warmup"));
     const Observation obs = synthetic_observation(spec, cameras, "pick up the red cup and place it on the plate");
+    const double compile_ms = runner->warm_up(obs, steps, a.get_int("warmup"));
     std::vector<double> total, prepare, device;
     size_t prompt_tokens = 0;
     for (int run = 0; run < a.get_int("runs"); ++run) {

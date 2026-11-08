@@ -30,26 +30,38 @@ std::unique_ptr<PolicyRunner> PolicyRunner::create(const std::filesystem::path& 
 
 PolicyRunner::~PolicyRunner() = default;
 
-Session& PolicyRunner::program(const std::vector<int>& cameras, int steps, double* compile_ms) {
-    const auto key = std::make_pair(cameras, steps);
-    auto it = programs_.find(key);
+CallShape PolicyRunner::shape_of(const Observation& obs, int steps, std::vector<int32_t>* prompt_ids) const {
+    const int32_t bos = policy_->prompt_bos();
+    if (bos >= 0) prompt_ids->push_back(bos);
+    const std::vector<int32_t> ids = tokenizer_->encode(policy_->prompt(obs), false);
+    prompt_ids->insert(prompt_ids->end(), ids.begin(), ids.end());
+    CallShape shape;
+    shape.cameras = policy_->camera_indices(obs);
+    shape.steps = steps > 0 ? steps : spec().denoise_steps;
+    shape.prompt_tokens = policy_->prompt_tokens(static_cast<int64_t>(prompt_ids->size()));
+    return shape;
+}
+
+Session& PolicyRunner::program(const CallShape& shape, double* compile_ms) {
+    auto it = programs_.find(shape);
     if (it == programs_.end()) {
         const auto start = std::chrono::steady_clock::now();
-        const graph::Graph g = policy_->build(cameras, steps);
+        const graph::Graph g = policy_->build(shape);
         auto session = backend_->compile(g, policy_->weights(), session_);
         const double ms = ms_since(start);
         if (compile_ms != nullptr) *compile_ms = ms;
-        log::info("policy: program for ", cameras.size(), " camera(s), ", steps, " steps: ", g.nodes().size(),
-                  " nodes, compiled in ", static_cast<int64_t>(ms), " ms");
-        it = programs_.emplace(key, std::move(session)).first;
+        log::info("policy: program for ", shape.cameras.size(), " camera(s), ", shape.steps, " steps, ",
+                  shape.prompt_tokens, " prompt tokens: ", g.nodes().size(), " nodes, compiled in ",
+                  static_cast<int64_t>(ms), " ms");
+        it = programs_.emplace(shape, std::move(session)).first;
     }
     return *it->second;
 }
 
-double PolicyRunner::warm_up(const std::vector<int>& cameras, int steps, int runs) {
+double PolicyRunner::warm_up(const Observation& obs, int steps, int runs) {
+    std::vector<int32_t> ids;
     double compile_ms = 0;
-    program(cameras, steps, &compile_ms);
-    const Observation obs = synthetic_observation(spec(), cameras, "warm up");
+    program(shape_of(obs, steps, &ids), &compile_ms);
     for (int i = 0; i < runs; ++i) {
         ActOptions o;
         o.steps = steps;
@@ -62,15 +74,10 @@ double PolicyRunner::warm_up(const std::vector<int>& cameras, int steps, int run
 ActResult PolicyRunner::act(const Observation& obs, const ActOptions& options) {
     const auto start = std::chrono::steady_clock::now();
     const PolicySpec& s = spec();
-    const int steps = options.steps > 0 ? options.steps : s.denoise_steps;
-    const std::vector<int> cameras = policy_->camera_indices(obs);
-    Session& session = program(cameras, steps);
-
     ActResult r;
-    const int32_t bos = policy_->prompt_bos();
-    if (bos >= 0) r.prompt_ids.push_back(bos);
-    const std::vector<int32_t> ids = tokenizer_->encode(policy_->prompt(obs), false);
-    r.prompt_ids.insert(r.prompt_ids.end(), ids.begin(), ids.end());
+    const CallShape shape = shape_of(obs, options.steps, &r.prompt_ids);
+    Session& session = program(shape);
+
     HostTensor noise(DType::F32, {s.horizon, s.noise_dim});
     if (options.noise != nullptr) {
         noise = *options.noise;
@@ -81,7 +88,7 @@ ActResult PolicyRunner::act(const Observation& obs, const ActOptions& options) {
             v = normal(rng);
     }
     TensorMap inputs, outputs;
-    policy_->prepare(obs, cameras, r.prompt_ids, noise, steps, inputs);
+    policy_->prepare(obs, shape, r.prompt_ids, noise, inputs);
     r.timing.prepare_ms = ms_since(start);
 
     const auto device_start = std::chrono::steady_clock::now();
