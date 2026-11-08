@@ -105,8 +105,9 @@ inline void expert_matmul_shared_and_per_slot(const Env& env) {
     }
 }
 
-// Q8 / Q4 expert banks against the dequantized bank: few (token, slot) pairs (one GEMV each on SYCL) and many (grouped
-// by expert), shared and per-slot inputs, experts repeated across tokens, N not a multiple of the row blocks.
+// Q8 / Q4 expert banks against the dequantized bank: few (token, slot) pairs (one GEMV each on SYCL), more (grouped by
+// expert) and many (grouped GEMMs), shared and per-slot inputs, experts repeated across tokens, N not a multiple of
+// the row blocks.
 struct BankShape {
     int64_t experts, n, k, slots;
 };
@@ -125,7 +126,7 @@ inline void expert_matmul_quantized(const Env& env) {
             CAPTURE(group);
             MemoryWeights w;
             w.add_quantized("w", quant::quantize(dense.view(), format, group));
-            for (const int64_t tokens : {1, 5, 13, 40}) {  // 3, 15, 39 and 120 pairs
+            for (const int64_t tokens : {1, 5, 13, 40, 150}) {  // up to 450 pairs
                 CAPTURE(tokens);
                 std::vector<int32_t> idx;
                 for (int64_t i = 0; i < tokens * slots; ++i)
@@ -185,7 +186,23 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
     w.add("s_up", rng.uniform(DType::BF16, {inter, hidden}, s_in));
     w.add("s_down", rng.uniform(DType::BF16, {hidden, inter}, 1.0f / std::sqrt(static_cast<float>(inter))));
     w.add("s_gg", rng.uniform(DType::F32, {1, hidden}, s_in));
-    const HostTensor x = rng.uniform(DType::F32, {tokens, hidden});
+    // Tokens whose k-th and (k+1)-th router logits are within 0.05 are drawn again: both routers rank by logit, and a
+    // near tie could pick differently at f16 without a bug.
+    HostTensor x = rng.uniform(DType::F32, {tokens, hidden});
+    const Tensor64 router_w = to_f64(w.tensor("router"));
+    for (int64_t t = 0; t < tokens; ++t) {
+        for (int attempt = 0;; ++attempt) {
+            REQUIRE(attempt < 100);
+            std::vector<double> row(static_cast<size_t>(experts), 0.0);
+            for (int64_t e = 0; e < experts; ++e)
+                for (int64_t c = 0; c < hidden; ++c)
+                    row[static_cast<size_t>(e)] += router_w[e * hidden + c] * x.data<float>()[t * hidden + c];
+            std::sort(row.rbegin(), row.rend());
+            if (row[static_cast<size_t>(top_k - 1)] - row[static_cast<size_t>(top_k)] > 0.05) break;
+            const HostTensor redraw = rng.uniform(DType::F32, {1, hidden});
+            std::copy(redraw.data<float>(), redraw.data<float>() + hidden, x.data<float>() + t * hidden);
+        }
+    }
 
     Graph g;
     blocks::MoeSpec spec;
@@ -213,12 +230,7 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
 
     // fp64: router, top-k, renormalize, scale, experts, weighted sum, shared expert.
     const Tensor64 x64 = to_f64(x);
-    const Tensor64 logits = ref::matmul(x64, to_f64(w.tensor("router")));
-    for (int64_t t = 0; t < tokens; ++t) {  // both routers rank by logit: a clear gap makes the picks unambiguous
-        std::vector<double> row(logits.data.begin() + t * experts, logits.data.begin() + (t + 1) * experts);
-        std::sort(row.rbegin(), row.rend());
-        REQUIRE(row[top_k - 1] - row[top_k] > 0.05);
-    }
+    const Tensor64 logits = ref::matmul(x64, router_w);
     const Tensor64 probs = router == blocks::Router::Softmax
                                ? ref::softmax(logits)
                                : ref::map(logits, [](double v) { return 1.0 / (1.0 + std::exp(-v)); });

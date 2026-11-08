@@ -27,9 +27,10 @@ TEST_SUITE("cpu-ref moe ops") {
     TEST_CASE("moe block: softmax router, renormalized top-k") {
         xs::test::moe::moe_block(cpu_env(), xs::blocks::Router::Softmax, false);
     }
-    TEST_CASE("moe block: q4 fused gate_up and down banks, 5 and 40 tokens") {
+    TEST_CASE("moe block: q4 fused gate_up and down banks, 5, 40 and 150 tokens") {
         xs::test::moe::moe_block(cpu_env(), xs::blocks::Router::Softmax, true, true, 5);
         xs::test::moe::moe_block(cpu_env(), xs::blocks::Router::Softmax, true, true, 40);
+        xs::test::moe::moe_block(cpu_env(), xs::blocks::Router::Softmax, true, true, 150);
     }
     TEST_CASE("moe block: sigmoid router, routed scale, gated shared expert") {
         xs::test::moe::moe_block(cpu_env(), xs::blocks::Router::Sigmoid, true);

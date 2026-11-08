@@ -1,6 +1,7 @@
 #include "backend/sycl/sycl_backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +51,10 @@ bool env_flag(const char* name) {
     return v != nullptr && *v != '\0' && std::string(v) != "0";
 }
 
+// Live USM device allocations of this process (all sessions), for out-of-memory reports.
+std::atomic<size_t> g_device_bytes{0};
+std::atomic<size_t> g_device_buffers{0};
+
 // One USM device allocation. The owner makes sure the queue no longer uses it before it goes away.
 class DeviceBuffer {
 public:
@@ -57,7 +62,10 @@ public:
     DeviceBuffer(sycl::queue& q, size_t bytes) : q_(&q), bytes_(bytes) {
         if (bytes == 0) return;
         ptr_ = sycl::malloc_device(bytes, q);
-        XS_CHECK(ptr_ != nullptr, "sycl: out of device memory allocating ", bytes, " bytes");
+        XS_CHECK(ptr_ != nullptr, "sycl: out of device memory allocating ", bytes, " bytes (", g_device_bytes.load() >> 20,
+                 " MiB already in ", g_device_buffers.load(), " buffers)");
+        g_device_bytes += bytes;
+        ++g_device_buffers;
     }
     DeviceBuffer(DeviceBuffer&& o) noexcept
         : q_(o.q_), ptr_(std::exchange(o.ptr_, nullptr)), bytes_(std::exchange(o.bytes_, 0)) {}
@@ -79,7 +87,11 @@ public:
 
 private:
     void release() {
-        if (ptr_ != nullptr) sycl::free(ptr_, *q_);
+        if (ptr_ != nullptr) {
+            sycl::free(ptr_, *q_);
+            g_device_bytes -= bytes_;
+            --g_device_buffers;
+        }
         ptr_ = nullptr;
         bytes_ = 0;
     }
@@ -131,6 +143,7 @@ public:
         }
         return buf_.get();
     }
+    void* get_host(size_t) override { fail("sycl: this scratch has no host memory"); }
 
 private:
     sycl::queue& q_;
@@ -215,6 +228,7 @@ public:
             q_.wait();
         } catch (...) {
         }
+        if (host_ != nullptr) sycl::free(host_, q_);
         if (profiling_) report_profile();
     }
 
@@ -304,6 +318,16 @@ private:
             scratch_ = DeviceBuffer(q_, align_up(bytes + bytes / 4));
         }
         return scratch_.get();
+    }
+    void* get_host(size_t bytes) override {
+        if (bytes > host_bytes_) {
+            q_.wait();
+            if (host_ != nullptr) sycl::free(host_, q_);
+            host_bytes_ = align_up(bytes);
+            host_ = sycl::malloc_host(host_bytes_, q_);
+            XS_CHECK(host_ != nullptr, "sycl: out of pinned host memory allocating ", host_bytes_, " bytes");
+        }
+        return host_;
     }
 
     std::string where(size_t i) const {
@@ -1181,6 +1205,19 @@ private:
                 if (is_quantized(in_dt(1))) {
                     const sycl_be::QuantWeight& w = leaf_quant_[static_cast<size_t>(n.inputs[1].node)];
                     const int64_t pairs = is[0] * is[1];
+                    if (pairs >= sycl_be::kExpertPairsGemm) {
+                        const bool f32 = precision_ == DType::F32;
+                        if (in_dt(2) == DType::I32) {
+                            sycl_be::expert_matmul_quant_gemm(q_, *this, in_f32(0), per_slot, w,
+                                                              reinterpret_cast<const int32_t*>(in_ptr(2)), out, is[0],
+                                                              is[1], ws[0], ws[1], ws[2], f32);
+                        } else {
+                            sycl_be::expert_matmul_quant_gemm(q_, *this, in_f32(0), per_slot, w,
+                                                              reinterpret_cast<const int64_t*>(in_ptr(2)), out, is[0],
+                                                              is[1], ws[0], ws[1], ws[2], f32);
+                        }
+                        return;
+                    }
                     auto* grouping = pairs > sycl_be::kExpertPairsDirect
                                          ? static_cast<int32_t*>(get(sycl_be::expert_grouping_bytes(pairs, ws[0])))
                                          : nullptr;
@@ -1293,6 +1330,8 @@ private:
     std::map<std::pair<int64_t, int64_t>, Plan> plans_;
     DeviceBuffer arena_;
     DeviceBuffer scratch_;
+    void* host_ = nullptr;  // get_host()
+    size_t host_bytes_ = 0;
     GrowingScratch kv_scratch_{q_};  // the int8 KV cache dequantized for prefill attention
     int64_t cached_ = 0;
     std::map<std::string, double> decode_ms_, prefill_ms_;
@@ -1346,7 +1385,10 @@ public:
         }
         auto it = queues_.find(index);
         if (it == queues_.end()) {
-            sycl::queue q(devices_[index], sycl::property_list{sycl::property::queue::in_order()});
+            // A context of this device alone: in the platform's default context (every GPU), device allocations of a
+            // large model failed at 14 to 18 GiB of a 24 GiB card with two cards present.
+            sycl::queue q(sycl::context(devices_[index]), devices_[index],
+                          sycl::property_list{sycl::property::queue::in_order()});
             it = queues_.emplace(index, std::move(q)).first;
         }
         return std::make_unique<SyclSession>(graph, weights, options, it->second, attention_path);

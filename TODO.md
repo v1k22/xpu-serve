@@ -160,8 +160,10 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Bandwidth probe in SYCL (matches 0.2)
 - [x] int4 / int8 GEMV for decode; dequantize + GEMM for prefill; quantized gather (device suites, groups 32 / 128)
 - [ ] int4 / int8 GEMV at ≥ 85% of measured bandwidth; prefill without the f16 copy of each weight
-- [ ] MoE grouped GEMV (top-8 of 128) incl. the expert union at verify width k+1; today ExpertMatMul is one GEMV
-      per (token, slot), fine for decode, slow for prefill; quantized expert banks (q4/q8) in packs
+- [x] MoE expert matmuls over q8 / q4 banks: one GEMV per (token, expert) up to 32 pairs (decode), pairs grouped by
+      expert up to 256, grouped oneMKL GEMMs on dequantized banks beyond (prefill)
+- [ ] MoE prefill without the f16 copy of each expert bank (a GEMM that dequantizes in registers); the expert union
+      at verify width k+1
 - [ ] Paged decode attention: head dims 256 / 512, GQA, sliding window, chain and **tree** masks
 - [x] Prefill: oneMKL GEMM (f16 x f16 -> f32); prefill attention through two batched GEMMs per query chunk
 - [ ] Prefill attention on XMX without the score matrix (flash attention, e.g. SYCL*TLA)

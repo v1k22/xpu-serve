@@ -1055,6 +1055,36 @@ void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const Qu
     }
 }
 
+template <typename I>
+void expert_group(sycl::queue& q, const I* idx, int64_t pairs, int64_t experts, int32_t* grouping) {
+    group_by_expert(q, idx, pairs, experts, ExpertGrouping(grouping, experts));
+}
+
+template <typename CT>
+void expert_gather_rows(sycl::queue& q, const float* x, bool per_slot, int64_t slots, const int32_t* order,
+                        int64_t pairs, int64_t k, CT* rows) {
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(pairs), static_cast<size_t>(k)), [=](sycl::item<2> it) {
+        const auto i = static_cast<int64_t>(it[0]);
+        const auto c = static_cast<int64_t>(it[1]);
+        const int64_t p = order[i];
+        rows[i * k + c] = static_cast<CT>(x[(per_slot ? p : p / slots) * k + c]);
+    });
+}
+
+void expert_scatter_rows(sycl::queue& q, const float* rows, const int32_t* order, int64_t pairs, int64_t n, float* out) {
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(pairs), static_cast<size_t>(n)), [=](sycl::item<2> it) {
+        const auto i = static_cast<int64_t>(it[0]);
+        const auto c = static_cast<int64_t>(it[1]);
+        out[static_cast<int64_t>(order[i]) * n + c] = rows[i * n + c];
+    });
+}
+
+template void expert_group<int32_t>(sycl::queue&, const int32_t*, int64_t, int64_t, int32_t*);
+template void expert_group<int64_t>(sycl::queue&, const int64_t*, int64_t, int64_t, int32_t*);
+template void expert_gather_rows<half>(sycl::queue&, const float*, bool, int64_t, const int32_t*, int64_t, int64_t, half*);
+template void expert_gather_rows<float>(sycl::queue&, const float*, bool, int64_t, const int32_t*, int64_t, int64_t,
+                                        float*);
+
 template void expert_matmul_quant<int32_t>(sycl::queue&, const float*, bool, const QuantWeight&, const int32_t*, float*,
                                            int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*);
 template void expert_matmul_quant<int64_t>(sycl::queue&, const float*, bool, const QuantWeight&, const int64_t*, float*,

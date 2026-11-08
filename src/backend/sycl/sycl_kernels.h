@@ -152,6 +152,18 @@ void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, 
 // per kGemvMaxRows of its pairs.
 inline constexpr int64_t kExpertPairsDirect = 32;
 size_t expert_grouping_bytes(int64_t pairs, int64_t experts);
+// Groups the (token, slot) pairs by expert in `grouping` (expert_grouping_bytes): offsets [E + 1] at grouping + E,
+// the pairs in expert order at grouping + 4 E + 2 (the order inside an expert is not deterministic).
+template <typename I>
+void expert_group(sycl::queue& q, const I* idx, int64_t pairs, int64_t experts, int32_t* grouping);
+inline const int32_t* expert_offsets(const int32_t* grouping, int64_t experts) { return grouping + experts; }
+inline const int32_t* expert_order(const int32_t* grouping, int64_t experts) { return grouping + 4 * experts + 2; }
+// rows [pairs, K] in CT: row i is x's row for pair order[i] (x [T, K], or per_slot [T, S, K]).
+template <typename CT>
+void expert_gather_rows(sycl::queue& q, const float* x, bool per_slot, int64_t slots, const int32_t* order,
+                        int64_t pairs, int64_t k, CT* rows);
+// out row order[i] (of [pairs, N]) = rows row i.
+void expert_scatter_rows(sycl::queue& q, const float* rows, const int32_t* order, int64_t pairs, int64_t n, float* out);
 template <typename I>
 void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const QuantWeight& w, const I* idx, float* out,
                          int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping);
