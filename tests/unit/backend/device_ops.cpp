@@ -54,11 +54,11 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
-    TEST_CASE("matmul and gather on q8 / q4 pack weights against fp64 of the dequantized values") {
+    TEST_CASE("matmul and gather on q8 / q4 / q3 / q2 pack weights against fp64 of the dequantized values") {
         test::TensorRng rng(41);
         const int64_t n = 96;
         const int64_t k = 512;
-        for (const DType format : {DType::Q8, DType::Q4}) {
+        for (const DType format : {DType::Q8, DType::Q4, DType::Q3, DType::Q2}) {
             for (const int64_t group : {32, 128}) {
                 CAPTURE(dtype_name(format));
                 CAPTURE(group);

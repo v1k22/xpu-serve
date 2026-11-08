@@ -1,11 +1,17 @@
 // xpu-serve command line: serve | run | bench | convert | info.
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <map>
 #include <iostream>
 #include <iterator>
 #include <nlohmann/json.hpp>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -14,12 +20,15 @@
 #include "chat/output_parser.h"
 #include "cli/args.h"
 #include "convert/convert.h"
+#include "models/config_util.h"
+#include "models/model.h"
 #include "models/policy.h"
 #include "policy/runner.h"
 #include "server/server.h"
 #include "service/engine_service.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
+#include "util/half.h"
 #include "util/log.h"
 
 #ifndef XS_VERSION
@@ -164,6 +173,169 @@ int cmd_convert(const std::vector<std::string>& argv) {
     if (r.awq > 0) {
         std::printf("awq: %lld q4 tensors, weighted error %.1f%% below round to nearest on average\n",
                     static_cast<long long>(r.awq), 100.0 * r.awq_gain);
+    }
+    return 0;
+}
+
+// Branch exp/manual-quant: next-token distributions of a model (or pack) against a reference written by
+// tools/manual_quant/ref_logits.py (tokens.bin, logprobs.bin, manifest.json). Every position runs as a decode step,
+// as serving decodes. Prints mean KL(reference || model), top-1 agreement and perplexity, overall and per source.
+int cmd_quant_eval(const std::vector<std::string>& argv) {
+    namespace fs = std::filesystem;
+    Args a;
+    add_engine_options(a);
+    a.value("ref", "directory of the reference (ref_logits.py --out)").value("seqs", "sequences to use (0 = all)", "0");
+    a.flag("prefill", "score every position from one prefill per sequence (XS_ALL_LOGITS) instead of decode steps");
+    a.parse(argv);
+    if (wants_help(a, "quant-eval", "<model-dir> --ref <dir> [options]")) return 0;
+    log::set_level(log::parse_level(a.get("log-level")));
+    const bool prefill = a.has("prefill");
+    if (prefill) setenv("XS_ALL_LOGITS", "1", 1);
+    const std::string dir = model_dir_arg(a, "quant-eval");
+    const fs::path ref = a.get("ref");
+    const auto manifest = cfg::read_json(ref / "manifest.json");
+    const int64_t seq = manifest.at("seq").get<int64_t>();
+    const int64_t vocab = manifest.at("vocab").get<int64_t>();
+    int64_t count = manifest.at("count").get<int64_t>();
+    if (a.get_int("seqs") > 0) count = std::min<int64_t>(count, a.get_int("seqs"));
+    const auto sources = manifest.at("sources").get<std::vector<std::string>>();
+    std::vector<int32_t> tokens(static_cast<size_t>(count * seq));
+    std::ifstream(ref / "tokens.bin", std::ios::binary)
+        .read(reinterpret_cast<char*>(tokens.data()), static_cast<std::streamsize>(tokens.size() * sizeof(int32_t)));
+    std::ifstream lp_file(ref / "logprobs.bin", std::ios::binary);
+
+    const ServiceOptions so = service_options(a);
+    auto model = load_model(dir);
+    SessionOptions opts = so.session;
+    opts.max_context = seq + 8;
+    auto backend = make_backend(so.backend);
+    auto session = backend->compile(model->graph(), model->weights(), opts);
+    struct Acc {
+        double kl = 0, nll = 0, ref_nll = 0;
+        int64_t top1 = 0, n = 0;
+    };
+    std::map<std::string, Acc> by_source;
+    Acc all;
+    std::vector<uint16_t> ref_lp(static_cast<size_t>(vocab));
+    std::vector<double> ours(static_cast<size_t>(vocab));
+    const auto start = std::chrono::steady_clock::now();
+    for (int64_t s = 0; s < count; ++s) {
+        session->reset();
+        Acc acc;
+        TensorMap all_outputs;
+        if (prefill) {
+            TensorMap inputs;
+            model->prepare_inputs(std::span<const int32_t>(tokens.data() + s * seq, static_cast<size_t>(seq)), 0, {},
+                                  inputs);
+            session->run(inputs, all_outputs);
+        }
+        for (int64_t p = 0; p < seq; ++p) {
+            lp_file.read(reinterpret_cast<char*>(ref_lp.data()), static_cast<std::streamsize>(vocab * 2));
+            TensorMap inputs, outputs;
+            if (!prefill) {
+                const int32_t tok = tokens[static_cast<size_t>(s * seq + p)];
+                model->prepare_inputs(std::span<const int32_t>(&tok, 1), p, {}, inputs);
+                session->run(inputs, outputs);
+            }
+            if (p == seq - 1) break;  // the last position has no next token
+            const float* l = prefill ? all_outputs.at("logits").data<float>() + p * vocab
+                                     : outputs.at("logits").data<float>();
+            double mx = -1e30;
+            int64_t arg = 0;
+            for (int64_t v = 0; v < vocab; ++v) {
+                if (l[v] > mx) mx = l[v], arg = v;
+            }
+            double sum = 0;
+            for (int64_t v = 0; v < vocab; ++v) sum += std::exp(static_cast<double>(l[v]) - mx);
+            const double lse = mx + std::log(sum);
+            double kl = 0;
+            int64_t ref_arg = 0;
+            float ref_best = -1e30f;
+            for (int64_t v = 0; v < vocab; ++v) {
+                const float r = f16_to_f32(ref_lp[static_cast<size_t>(v)]);
+                if (r > ref_best) ref_best = r, ref_arg = v;
+                const double pr = std::exp(static_cast<double>(r));
+                if (pr > 0) kl += pr * (static_cast<double>(r) - (static_cast<double>(l[v]) - lse));
+            }
+            const int32_t next = tokens[static_cast<size_t>(s * seq + p + 1)];
+            acc.kl += kl;
+            acc.nll += lse - l[next];
+            acc.ref_nll -= f16_to_f32(ref_lp[static_cast<size_t>(next)]);
+            acc.top1 += arg == ref_arg ? 1 : 0;
+            ++acc.n;
+        }
+        if (seq > 0) lp_file.seekg(static_cast<std::streamoff>(s + 1) * seq * vocab * 2);
+        const std::string& src = sources[static_cast<size_t>(s)];
+        for (Acc* t : {&by_source[src], &all}) {
+            t->kl += acc.kl, t->nll += acc.nll, t->ref_nll += acc.ref_nll, t->top1 += acc.top1, t->n += acc.n;
+        }
+        std::printf("seq %2lld (%s): kl %.5f top1 %.4f ppl %.3f (ref %.3f)\n", static_cast<long long>(s), src.c_str(),
+                    acc.kl / acc.n, static_cast<double>(acc.top1) / acc.n, std::exp(acc.nll / acc.n),
+                    std::exp(acc.ref_nll / acc.n));
+        std::fflush(stdout);
+    }
+    const auto line = [](const std::string& name, const Acc& t) {
+        std::printf("%-10s kl %.5f  top1 %.4f  ppl %.4f  (ref %.4f, +%.2f%%)  positions %lld\n", name.c_str(),
+                    t.kl / t.n, static_cast<double>(t.top1) / t.n, std::exp(t.nll / t.n), std::exp(t.ref_nll / t.n),
+                    100.0 * (std::exp((t.nll - t.ref_nll) / t.n) - 1.0), static_cast<long long>(t.n));
+    };
+    for (const auto& [name, t] : by_source) line(name, t);
+    line("all", all);
+    std::printf("eval time %.0f s\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    return 0;
+}
+
+// Branch exp/manual-quant: runs calibration token sequences (int32 [N, seq]) through a qwen3_5 model built with
+// XS_CAPTURE=1 and appends each "cap.*" output (the inputs of the linear maps) as f16 rows to <out>/<name>.f16.
+int cmd_quant_capture(const std::vector<std::string>& argv) {
+    namespace fs = std::filesystem;
+    Args a;
+    add_engine_options(a);
+    a.value("tokens", "int32 token file [N, seq]").value("seq", "tokens per sequence", "2048").value("out", "output dir");
+    a.parse(argv);
+    if (wants_help(a, "quant-capture", "<model-dir> --tokens <file> --out <dir> [options]")) return 0;
+    log::set_level(log::parse_level(a.get("log-level")));
+    setenv("XS_CAPTURE", "1", 1);
+    const std::string dir = model_dir_arg(a, "quant-capture");
+    const int64_t seq = a.get_int("seq");
+    const int64_t chunk = a.get_int("prefill-chunk");
+    std::ifstream in(a.get("tokens"), std::ios::binary | std::ios::ate);
+    const auto bytes = static_cast<int64_t>(in.tellg());
+    std::vector<int32_t> tokens(static_cast<size_t>(bytes / 4));
+    in.seekg(0);
+    in.read(reinterpret_cast<char*>(tokens.data()), bytes);
+    const int64_t count = static_cast<int64_t>(tokens.size()) / seq;
+    const fs::path out = a.get("out");
+    fs::create_directories(out);
+    const ServiceOptions so = service_options(a);
+    auto model = load_model(dir);
+    SessionOptions opts = so.session;
+    opts.max_context = seq + 8;
+    auto session = make_backend(so.backend)->compile(model->graph(), model->weights(), opts);
+    std::map<std::string, std::ofstream> files;
+    const auto start = std::chrono::steady_clock::now();
+    for (int64_t s = 0; s < count; ++s) {
+        session->reset();
+        for (int64_t p = 0; p < seq; p += chunk) {
+            const int64_t n = std::min(chunk, seq - p);
+            TensorMap inputs, outputs;
+            model->prepare_inputs(std::span<const int32_t>(tokens.data() + s * seq + p, static_cast<size_t>(n)), p, {},
+                                  inputs);
+            session->run(inputs, outputs);
+            for (const auto& [name, t] : outputs) {
+                if (name.rfind("cap.", 0) != 0) continue;
+                auto it = files.find(name);
+                if (it == files.end()) it = files.emplace(name, std::ofstream(out / (name.substr(4) + ".f16"), std::ios::binary)).first;
+                const std::vector<float> v = t.to_f32();
+                std::vector<uint16_t> h(v.size());
+                for (size_t i = 0; i < v.size(); ++i) h[i] = f32_to_f16(v[i]);
+                it->second.write(reinterpret_cast<const char*>(h.data()), static_cast<std::streamsize>(h.size() * 2));
+            }
+        }
+        std::printf("seq %lld captured (%.0f s)\n", static_cast<long long>(s),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        std::fflush(stdout);
     }
     return 0;
 }
@@ -454,6 +626,8 @@ int main(int argc, char** argv) {
         if (command == "run") return cmd_run(args);
         if (command == "bench") return cmd_bench(args);
         if (command == "convert") return cmd_convert(args);
+        if (command == "quant-eval") return cmd_quant_eval(args);
+        if (command == "quant-capture") return cmd_quant_capture(args);
         if (command == "info") return cmd_info();
         if (command == "--version" || command == "version") {
             std::printf("xpu-serve %s\n", XS_VERSION);

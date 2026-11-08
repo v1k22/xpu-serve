@@ -496,12 +496,12 @@ private:
                     need(0, !is_quantized(dt(n.inputs[0])), "an unquantized tensor");
                     break;
                 case OpKind::Gather:
-                    need(0, is_fp(0) || is_packed(0), "f16, f32, q8 or q4");
+                    need(0, is_fp(0) || is_packed(0), "f16, f32, q8, q4, q3 or q2");
                     need(1, is_int(1), "i32 or i64");
                     break;
                 case OpKind::MatMul: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8 or q4");
+                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8, q4, q3 or q2");
                     const int64_t k = graph_.type(n.inputs[1]).shape[1];
                     XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized weight needs a multiple of 32 "
                              "columns, got ", k);
@@ -514,7 +514,7 @@ private:
                     break;
                 case OpKind::ExpertMatMul: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8 or q4");
+                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8, q4, q3 or q2");
                     need(2, is_int(2), "i32 or i64");
                     const int64_t k = graph_.type(n.inputs[1]).shape[2];
                     XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized expert bank needs a multiple of 32 "
@@ -784,7 +784,7 @@ private:
         if (halved > 0) log::debug("sycl: ", halved, " values kept in f16 for GEMMs and attention");
     }
 
-    // A pack's quantized weight: codes, scales and (Q4) biases as stored.
+    // A pack's quantized weight: codes, scales and (all but Q8) biases as stored.
     void upload_quantized(size_t node, const TensorView& view) {
         const int64_t cols = view.shape.back();
         const int64_t rows = numel(view.shape) / cols;  // an expert bank [E, N, K] is E * N rows
@@ -795,11 +795,11 @@ private:
             return leaves_.back().get();
         };
         sycl_be::QuantWeight w;
-        w.q4 = view.dtype == DType::Q4;
+        w.bits = quant_bits(view.dtype);
         w.group = view.quant.group;
         w.codes = reinterpret_cast<const uint8_t*>(copy(view.data, view.nbytes()));
         w.scales = reinterpret_cast<const half*>(copy(view.quant.scales, scale_bytes));
-        if (w.q4) w.biases = reinterpret_cast<const half*>(copy(view.quant.biases, scale_bytes));
+        if (w.bits != 8) w.biases = reinterpret_cast<const half*>(copy(view.quant.biases, scale_bytes));
         if (view.quant.input_scales != nullptr) {
             w.input_scales = reinterpret_cast<const float*>(
                 copy(view.quant.input_scales, static_cast<size_t>(cols) * sizeof(float)));

@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "models/common/blocks.h"
@@ -77,6 +78,11 @@ private:
     blocks::Linear proj(const std::string& suffix) {
         return [this, suffix](Value x) { return graph_.matmul(x, weight(suffix)); };
     }
+    // XS_CAPTURE=1 (branch exp/manual-quant): extra outputs with the inputs of the layers' linear maps, for
+    // quantization calibration (xpu-serve quant-capture).
+    void capture(const std::string& name, Value v) {
+        if (capture_) graph_.output("cap." + name, v);
+    }
 
     void build_graph() {
         Graph& g = graph_;
@@ -84,6 +90,8 @@ private:
         const Value pos = g.input("positions", DType::I32, {kT});
         const Value embed = weight("embed_tokens.weight");
         Value h = g.gather(embed, ids);
+        const char* cap = std::getenv("XS_CAPTURE");
+        capture_ = cap != nullptr && std::string(cap) == "1";
 
         inv_freq_ = g.constant(
             blocks::rope_inv_freq(cfg_.rope_theta, cfg_.rotary_dim, cfg_.rotary_dim / 2, cfg_.rotary_dim / 2));
@@ -91,7 +99,11 @@ private:
         for (int64_t i = 0; i < cfg_.num_layers; ++i) h = decoder_layer(i, h, pos);
 
         Graph::Scope head(g, "head");
-        const Value last = norm(g.slice(h, 0, -1), "norm.weight");
+        if (capture_) capture("final", norm(h, "norm.weight"));
+        // XS_ALL_LOGITS=1 (branch exp/manual-quant): logits at every position, for quant-eval --prefill.
+        const char* all = std::getenv("XS_ALL_LOGITS");
+        const bool all_logits = all != nullptr && std::string(all) == "1";
+        const Value last = norm(all_logits ? h : g.slice(h, 0, -1), "norm.weight");
         const Value lm_head = weights_->contains("lm_head.weight") ? g.weight(*weights_, "lm_head.weight") : embed;
         g.output("logits", g.matmul(last, lm_head));
         g.validate();
@@ -104,10 +116,12 @@ private:
         const std::string L = "layers." + std::to_string(i) + ".";
         Graph::Scope s(g, "layers." + std::to_string(i));
         const Value x = norm(h, L + "input_layernorm.weight");
+        capture("attn_in." + std::to_string(i), x);
         const Value mixed = cfg_.layer_kinds[static_cast<size_t>(i)] == LayerKind::Linear ? linear_attention(i, x)
                                                                                            : full_attention(i, x, pos);
         h = g.add(h, mixed);
         const Value y = norm(h, L + "post_attention_layernorm.weight");
+        capture("moe_in." + std::to_string(i), y);
         if (cfg_.num_experts > 0) return g.add(h, moe(i, y));
         return g.add(h, blocks::gated_mlp(g, y, proj(L + "mlp.gate_proj.weight"), proj(L + "mlp.up_proj.weight"),
                                           proj(L + "mlp.down_proj.weight"), blocks::Act::Silu));
@@ -178,7 +192,9 @@ private:
         // Qwen3_5RMSNormGated: rms_norm(o) * w * silu(z), per value head.
         const Value z = g.reshape(g.matmul(x, weight(L + "in_proj_z.weight")), {kT, hv, dv});
         o = blocks::gated_rms_norm(g, o, weight(L + "norm.weight"), z, eps());
-        return g.matmul(g.reshape(o, {kT, value_width}), weight(L + "out_proj.weight"));
+        const Value o_in = g.reshape(o, {kT, value_width});
+        capture("attn_out." + std::to_string(i), o_in);
+        return g.matmul(o_in, weight(L + "out_proj.weight"));
     }
 
     // Qwen3_5Attention: q_proj yields [query | gate] per head; the output is gated by sigmoid(gate).
@@ -197,7 +213,10 @@ private:
         parts.q = proj(L + "q_proj.weight");
         parts.k = proj(L + "k_proj.weight");
         parts.v = proj(L + "v_proj.weight");
-        parts.o = proj(L + "o_proj.weight");
+        parts.o = [this, L, i](Value x) {
+            capture("attn_out." + std::to_string(i), x);
+            return graph_.matmul(x, weight(L + "o_proj.weight"));
+        };
         parts.q_norm = [this, L](Value q) { return norm(q, L + "q_norm.weight"); };
         parts.k_norm = [this, L](Value k) { return norm(k, L + "k_norm.weight"); };
         return blocks::attention(graph_, spec, parts, x, pos, inv_freq_).out;
@@ -209,6 +228,7 @@ private:
     std::string prefix_;
     graph::Graph graph_;
     Value inv_freq_;
+    bool capture_ = false;
 };
 
 }  // namespace

@@ -56,19 +56,40 @@ double worst_step_error(const std::vector<float>& w, const quant::Quantized& q) 
 }  // namespace
 
 TEST_SUITE("quant") {
-    TEST_CASE("q8 and q4 stay within half a step of the input for every group size") {
-        for (const DType format : {DType::Q8, DType::Q4}) {
+    TEST_CASE("q8, q4, q3 and q2 stay within half a step of the input for every group size") {
+        for (const DType format : {DType::Q8, DType::Q4, DType::Q3, DType::Q2}) {
             for (const int64_t group : {32, 64, 128}) {
                 CAPTURE(dtype_name(format));
                 CAPTURE(group);
                 const std::vector<float> w = random_matrix(7, 256, 11);
                 const quant::Quantized q = quant::quantize(f32_view(w, 7, 256), format, group);
-                CHECK(q.codes.size() == (format == DType::Q4 ? 7 * 128u : 7 * 256u));
+                CHECK(q.codes.size() == static_cast<size_t>(7 * 256 * quant_bits(format) / 8));
                 CHECK(q.scales.size() == static_cast<size_t>(7 * 256 / group));
-                CHECK(q.biases.size() == (format == DType::Q4 ? q.scales.size() : 0u));
+                CHECK(q.biases.size() == (format != DType::Q8 ? q.scales.size() : 0u));
                 CHECK(worst_step_error(w, q) <= 0.52);
             }
         }
+    }
+
+    TEST_CASE("q3 and q2 codes: two-bit plane by four, (q3) high-bit plane by eight; grid values come back exactly") {
+        std::vector<float> w(64);
+        for (int i = 0; i < 64; ++i)
+            w[static_cast<size_t>(i)] = static_cast<float>(i % 8);  // min 0, max 7: q3 step 1, bias 0
+        const quant::Quantized q3 = quant::quantize(f32_view(w, 1, 64), DType::Q3, 32);
+        REQUIRE(q3.codes.size() == 24u);
+        CHECK(q3.codes[0] == 0xE4);   // columns 0..3: low bits 0, 1, 2, 3
+        CHECK(q3.codes[1] == 0xE4);   // columns 4..7: codes 4..7 have low bits 0..3
+        CHECK(q3.codes[8] == 0xF0);   // columns 0..7: high bit set for codes 4..7
+        CHECK(dequantized(q3) == w);
+        for (int i = 0; i < 64; ++i)
+            w[static_cast<size_t>(i)] = static_cast<float>(i % 4);
+        const quant::Quantized q2 = quant::quantize(f32_view(w, 1, 64), DType::Q2, 32);
+        REQUIRE(q2.codes.size() == 16u);
+        CHECK(q2.codes[0] == 0xE4);
+        CHECK(dequantized(q2) == w);
+        std::vector<uint8_t> row(12, 0);
+        for (int c = 0; c < 32; ++c) quant::set_code(row.data(), 3, c, (c * 5) % 8);
+        for (int c = 0; c < 32; ++c) CHECK(quant::code_at(row.data(), 3, c) == (c * 5) % 8);
     }
 
     TEST_CASE("q4 codes: low nibble is the even column; values on the grid come back exactly") {
@@ -176,7 +197,7 @@ TEST_SUITE("quant") {
     TEST_CASE("unsupported shapes and settings are refused by name") {
         CHECK(quant::unsupported_reason(DType::Q4, 4, 96, 64).find("multiple of the group size") != std::string::npos);
         CHECK(quant::unsupported_reason(DType::Q4, 4, 128, 48).find("group size 48") != std::string::npos);
-        CHECK(quant::unsupported_reason(DType::F16, 4, 128, 64).find("not q8 or q4") != std::string::npos);
+        CHECK(quant::unsupported_reason(DType::F16, 4, 128, 64).find("not q8, q4, q3 or q2") != std::string::npos);
         CHECK(quant::unsupported_reason(DType::Q8, 4, 128, 64).empty());
         const std::vector<float> w = random_matrix(2, 96, 1);
         CHECK_THROWS_AS(quant::quantize(f32_view(w, 2, 96), DType::Q4, 64), Error);

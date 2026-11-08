@@ -188,7 +188,7 @@ void gemv(sycl::queue& q, const float* x, const W* w, float* y, int64_t m, int64
 // A quantized weight [N, K] on the device (pack formats, tensor.h QuantParams): Q8 codes int8 [N, K]; Q4 codes
 // [N, K / 2] with the even column in the low nibble; f16 scales and (Q4) biases [N, K / group]; group >= 32.
 struct QuantWeight {
-    bool q4 = true;
+    int bits = 4;  // 8 (symmetric int8) or 4 / 3 / 2 (affine: code * scale + bias), quant.h's layouts
     const uint8_t* codes = nullptr;
     const half* scales = nullptr;
     const half* biases = nullptr;

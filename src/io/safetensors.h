@@ -48,6 +48,8 @@ inline constexpr int kPackVersion = 1;
 // quantized weight appears under its own name as one Q8 / Q4 view over its codes, `.scales` and `.biases` tensors.
 class SafetensorsWeights final : public WeightStore {
 public:
+    // XS_PACK_OVERLAY=<dir>[:<dir>...] (branch exp/manual-quant): tensors of those packs (later ones win) replace
+    // the same names in `dir`, so a quantization experiment writes only the tensors it changes.
     static std::unique_ptr<SafetensorsWeights> open_dir(const std::filesystem::path& dir);
 
     const TensorView* find(const std::string& name) const override;
@@ -61,6 +63,7 @@ private:
     std::vector<std::unique_ptr<SafetensorsFile>> files_;
     std::map<std::string, const TensorView*> index_;
     std::map<std::string, TensorView> quant_views_;
+    std::vector<std::unique_ptr<SafetensorsWeights>> overlays_;
     bool is_pack_ = false;
 };
 

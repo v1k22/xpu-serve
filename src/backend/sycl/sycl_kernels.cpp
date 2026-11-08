@@ -1,4 +1,5 @@
 #include "backend/sycl/sycl_kernels.h"
+#include "util/error.h"
 
 #include <algorithm>
 #include <cmath>
@@ -434,13 +435,62 @@ void gemv_t(sycl::queue& q, const float* x, const W* w, float* y, int64_t n, int
 constexpr int kQRows = 4;
 constexpr int kQSgPerWg = 8;
 
-template <bool Q4, int M>
+// A lane's chunk of a quantized row: kCols columns from a multiple of kCols (16 for q8, 32 for q4 / q3 / q2; one
+// group), its codes as kWords dwords (quant.h's layouts), decoded column by column with constant shifts.
+template <int Bits>
+struct QChunk {
+    static constexpr int kCols = Bits == 8 ? 16 : 32;
+    static constexpr int kWords = kCols * Bits / 32;
+    static constexpr bool kAffine = Bits != 8;  // code * scale + bias
+    struct Raw {
+        uint32_t w[kWords];
+    };
+    static int64_t row_bytes(int64_t k) { return k * Bits / 8; }
+    static Raw load(const uint8_t* row, int64_t c0) {
+        Raw r;
+        if constexpr (Bits == 8 || Bits == 4) {  // one 16-byte load
+            const auto v = sycl::bit_cast<sycl::vec<uint32_t, 4>>(
+                *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(row + c0 * Bits / 8));
+            for (int i = 0; i < 4; ++i) r.w[i] = v[i];
+        } else {
+            const auto* p = reinterpret_cast<const uint32_t*>(row + c0 * Bits / 8);
+            for (int i = 0; i < kWords; ++i) r.w[i] = p[i];
+        }
+        return r;
+    }
+    static float code(const Raw& r, int j) {
+        if constexpr (Bits == 8) {
+            return static_cast<float>(static_cast<int8_t>((r.w[j / 4] >> (8 * (j % 4))) & 0xFF));
+        } else if constexpr (Bits == 4) {
+            return static_cast<float>((r.w[j / 8] >> (4 * (j % 8))) & 0x0F);
+        } else {
+            uint32_t c = (r.w[j / 16] >> (2 * (j % 16))) & 3u;
+            if constexpr (Bits == 3) c |= ((r.w[2] >> j) & 1u) << 2;
+            return static_cast<float>(c);
+        }
+    }
+};
+
+// f(std::integral_constant<int, Bits>) for the weight's code width.
+template <typename F>
+void with_bits(int bits, F&& f) {
+    switch (bits) {
+        case 8: return f(std::integral_constant<int, 8>{});
+        case 4: return f(std::integral_constant<int, 4>{});
+        case 3: return f(std::integral_constant<int, 3>{});
+        case 2: return f(std::integral_constant<int, 2>{});
+        default: fail("sycl: quantized weights of ", bits, " bits are not supported");
+    }
+}
+
+template <int Bits, int M>
 void gemv_quant_t(sycl::queue& q, const float* x, QuantWeight w, float* y, int64_t n, int64_t k) {
-    constexpr int kChunk = Q4 ? 32 : 16;
+    using C = QChunk<Bits>;
+    constexpr int kChunk = C::kCols;
     constexpr int64_t kRowsPerWg = kQSgPerWg * kQRows;
     const int64_t wgs = ceil_div(n, kRowsPerWg);
     const int64_t groups = k / w.group;
-    const int64_t row_bytes = Q4 ? k / 2 : k;
+    const int64_t row_bytes = C::row_bytes(k);
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(wgs * kQSgPerWg * kSubGroup), kQSgPerWg * kSubGroup),
                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
         const sycl::sub_group sg = it.get_sub_group();
@@ -476,24 +526,19 @@ void gemv_quant_t(sycl::queue& q, const float* x, QuantWeight w, float* y, int64
                     }
                 }
                 float xsum = 0.0f;
-                if constexpr (Q4) {
+                if constexpr (C::kAffine) {
                     for (int i = 0; i < kChunk; ++i)
                         xsum += xv[i];
                 }
                 for (int r = 0; r < kQRows; ++r) {
-                    const sycl::vec<uint8_t, 16> c =
-                        *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(w.codes + rows[r] * row_bytes + (Q4 ? k0 / 2 : k0));
+                    const typename C::Raw c = C::load(w.codes + rows[r] * row_bytes, k0);
                     const float s = static_cast<float>(w.scales[rows[r] * groups + g]);
                     float dot = 0.0f;
-                    if constexpr (Q4) {
-                        for (int i = 0; i < 16; ++i) {
-                            dot += static_cast<float>(c[i] & 0x0F) * xv[2 * i];
-                            dot += static_cast<float>(c[i] >> 4) * xv[2 * i + 1];
-                        }
+                    for (int i = 0; i < kChunk; ++i)
+                        dot += C::code(c, i) * xv[i];
+                    if constexpr (C::kAffine) {
                         acc[r][mm] += s * dot + static_cast<float>(w.biases[rows[r] * groups + g]) * xsum;
                     } else {
-                        for (int i = 0; i < 16; ++i)
-                            dot += static_cast<float>(static_cast<int8_t>(c[i])) * xv[i];
                         acc[r][mm] += s * dot;
                     }
                 }
@@ -508,37 +553,38 @@ void gemv_quant_t(sycl::queue& q, const float* x, QuantWeight w, float* y, int64
     });
 }
 
-template <bool Q4>
+template <int Bits>
 void gemv_quant_q(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k) {
     switch (m) {
-        case 1: return gemv_quant_t<Q4, 1>(q, x, w, y, n, k);
-        case 2: return gemv_quant_t<Q4, 2>(q, x, w, y, n, k);
-        case 3: return gemv_quant_t<Q4, 3>(q, x, w, y, n, k);
-        case 4: return gemv_quant_t<Q4, 4>(q, x, w, y, n, k);
-        case 5: return gemv_quant_t<Q4, 5>(q, x, w, y, n, k);
-        case 6: return gemv_quant_t<Q4, 6>(q, x, w, y, n, k);
-        case 7: return gemv_quant_t<Q4, 7>(q, x, w, y, n, k);
-        default: return gemv_quant_t<Q4, 8>(q, x, w, y, n, k);
+        case 1: return gemv_quant_t<Bits, 1>(q, x, w, y, n, k);
+        case 2: return gemv_quant_t<Bits, 2>(q, x, w, y, n, k);
+        case 3: return gemv_quant_t<Bits, 3>(q, x, w, y, n, k);
+        case 4: return gemv_quant_t<Bits, 4>(q, x, w, y, n, k);
+        case 5: return gemv_quant_t<Bits, 5>(q, x, w, y, n, k);
+        case 6: return gemv_quant_t<Bits, 6>(q, x, w, y, n, k);
+        case 7: return gemv_quant_t<Bits, 7>(q, x, w, y, n, k);
+        default: return gemv_quant_t<Bits, 8>(q, x, w, y, n, k);
     }
 }
 
 // acc[r][m] += dequant(row rows[r] of w) . xs[m] over this lane's chunks (gemv_quant_t's chunking; each row's codes
 // and scales load once for all M inputs).
-template <bool Q4, int M>
+template <int Bits, int M>
 inline void quant_rows_dot(const QuantWeight& w, const int64_t (&rows)[kQRows], const float* const (&xs)[M], int lane,
                            int64_t k, float (&acc)[kQRows][M]) {
-    constexpr int kChunk = Q4 ? 32 : 16;
+    using C = QChunk<Bits>;
+    constexpr int kChunk = C::kCols;
     const int64_t groups = k / w.group;
-    const int64_t row_bytes = Q4 ? k / 2 : k;
+    const int64_t row_bytes = C::row_bytes(k);
     for (int64_t k0 = static_cast<int64_t>(lane) * kChunk; k0 < k; k0 += kSubGroup * kChunk) {
         const int64_t g = k0 / w.group;
-        sycl::vec<uint8_t, 16> c[kQRows];
+        typename C::Raw c[kQRows];
         float s[kQRows];
         float b[kQRows];
         for (int r = 0; r < kQRows; ++r) {
-            c[r] = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(w.codes + rows[r] * row_bytes + (Q4 ? k0 / 2 : k0));
+            c[r] = C::load(w.codes + rows[r] * row_bytes, k0);
             s[r] = static_cast<float>(w.scales[rows[r] * groups + g]);
-            b[r] = Q4 ? static_cast<float>(w.biases[rows[r] * groups + g]) : 0.0f;
+            b[r] = C::kAffine ? static_cast<float>(w.biases[rows[r] * groups + g]) : 0.0f;
         }
         for (int mm = 0; mm < M; ++mm) {
             float xv[kChunk];
@@ -555,23 +601,15 @@ inline void quant_rows_dot(const QuantWeight& w, const int64_t (&rows)[kQRows], 
                     xv[i] *= w.input_scales[k0 + i];
             }
             float xsum = 0.0f;
-            if constexpr (Q4) {
+            if constexpr (C::kAffine) {
                 for (int i = 0; i < kChunk; ++i)
                     xsum += xv[i];
             }
             for (int r = 0; r < kQRows; ++r) {
                 float dot = 0.0f;
-                if constexpr (Q4) {
-                    for (int i = 0; i < 16; ++i) {
-                        dot += static_cast<float>(c[r][i] & 0x0F) * xv[2 * i];
-                        dot += static_cast<float>(c[r][i] >> 4) * xv[2 * i + 1];
-                    }
-                    acc[r][mm] += s[r] * dot + b[r] * xsum;
-                } else {
-                    for (int i = 0; i < 16; ++i)
-                        dot += static_cast<float>(static_cast<int8_t>(c[r][i])) * xv[i];
-                    acc[r][mm] += s[r] * dot;
-                }
+                for (int i = 0; i < kChunk; ++i)
+                    dot += C::code(c[r], i) * xv[i];
+                acc[r][mm] += C::kAffine ? s[r] * dot + b[r] * xsum : s[r] * dot;
             }
         }
     }
@@ -584,7 +622,7 @@ inline int64_t expert_of(const I* idx, int64_t pair, int64_t experts) {
 }
 
 // One work-group per (pair, block of kQSgPerWg * kQRows rows).
-template <bool Q4, typename I>
+template <int Bits, typename I>
 void expert_quant_pairs_t(sycl::queue& q, const float* x, bool per_slot, QuantWeight w, const I* idx, float* out,
                           int64_t pairs, int64_t slots, int64_t experts, int64_t n, int64_t k) {
     constexpr int64_t kRowsPerWg = kQSgPerWg * kQRows;
@@ -603,7 +641,7 @@ void expert_quant_pairs_t(sycl::queue& q, const float* x, bool per_slot, QuantWe
             rows[r] = base + std::min<int64_t>(row0 + r, n - 1);
         const float* const xs[1] = {x + (per_slot ? p : p / slots) * k};
         float acc[kQRows][1] = {};
-        quant_rows_dot<Q4, 1>(w, rows, xs, lane, k, acc);
+        quant_rows_dot<Bits, 1>(w, rows, xs, lane, k, acc);
         for (int r = 0; r < kQRows; ++r) {
             const float sum = sycl::reduce_over_group(sg, acc[r][0], sycl::plus<float>());
             if (lane == 0 && row0 + r < n) out[p * n + row0 + r] = sum;
@@ -660,7 +698,7 @@ void group_by_expert(sycl::queue& q, const I* idx, int64_t pairs, int64_t expert
 }
 
 // One work-group per (active expert, row block); it walks the expert's pairs kGemvMaxRows at a time.
-template <bool Q4>
+template <int Bits>
 void expert_quant_grouped_t(sycl::queue& q, const float* x, bool per_slot, QuantWeight w, float* out, int64_t slots,
                             int64_t n, int64_t k, ExpertGrouping g, int64_t max_active) {
     constexpr int M = static_cast<int>(kGemvMaxRows);
@@ -689,7 +727,7 @@ void expert_quant_grouped_t(sycl::queue& q, const float* x, bool per_slot, Quant
                 xs[mm] = x + (per_slot ? ps[mm] : ps[mm] / slots) * k;
             }
             float acc[kQRows][M] = {};
-            quant_rows_dot<Q4, M>(w, rows, xs, lane, k, acc);
+            quant_rows_dot<Bits, M>(w, rows, xs, lane, k, acc);
             for (int r = 0; r < kQRows; ++r) {
                 for (int mm = 0; mm < M; ++mm) {
                     const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
@@ -705,12 +743,18 @@ inline float dequant_at(const QuantWeight& w, int64_t r, int64_t c, int64_t k) {
     const int64_t sg = r * (k / w.group) + c / w.group;
     const float s = static_cast<float>(w.scales[sg]);
     const float in = w.input_scales != nullptr ? w.input_scales[c] : 1.0f;
-    if (w.q4) {
-        const uint8_t byte = w.codes[(r * k + c) / 2];
-        const int code = (c & 1) == 0 ? (byte & 0x0F) : (byte >> 4);
-        return (s * static_cast<float>(code) + static_cast<float>(w.biases[sg])) * in;
+    if (w.bits == 8) return s * static_cast<float>(static_cast<int8_t>(w.codes[r * k + c])) * in;
+    const uint8_t* row = w.codes + r * (k * w.bits / 8);
+    int code = 0;
+    if (w.bits == 4) {
+        code = (c & 1) == 0 ? (row[c / 2] & 0x0F) : (row[c / 2] >> 4);
+    } else {
+        const uint8_t* chunk = row + (c / 32) * (w.bits == 3 ? 12 : 8);
+        const int j = static_cast<int>(c % 32);
+        code = (chunk[j / 4] >> (2 * (j % 4))) & 3;
+        if (w.bits == 3) code |= ((chunk[8 + j / 8] >> (j % 8)) & 1) << 2;
     }
-    return s * static_cast<float>(static_cast<int8_t>(w.codes[r * k + c])) * in;
+    return (s * static_cast<float>(code) + static_cast<float>(w.biases[sg])) * in;
 }
 
 template <typename W, int M>
@@ -1159,21 +1203,17 @@ void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const Qu
                          int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping) {
     const int64_t pairs = tokens * slots;
     if (pairs <= kExpertPairsDirect || grouping == nullptr) {
-        if (w.q4) {
-            expert_quant_pairs_t<true>(q, x, per_slot, w, idx, out, pairs, slots, experts, n, k);
-        } else {
-            expert_quant_pairs_t<false>(q, x, per_slot, w, idx, out, pairs, slots, experts, n, k);
-        }
+        with_bits(w.bits, [&](auto b) {
+            expert_quant_pairs_t<decltype(b)::value>(q, x, per_slot, w, idx, out, pairs, slots, experts, n, k);
+        });
         return;
     }
     const ExpertGrouping g(grouping, experts);
     group_by_expert(q, idx, pairs, experts, g);
     const int64_t max_active = std::min(pairs, experts);
-    if (w.q4) {
-        expert_quant_grouped_t<true>(q, x, per_slot, w, out, slots, n, k, g, max_active);
-    } else {
-        expert_quant_grouped_t<false>(q, x, per_slot, w, out, slots, n, k, g, max_active);
-    }
+    with_bits(w.bits, [&](auto b) {
+        expert_quant_grouped_t<decltype(b)::value>(q, x, per_slot, w, out, slots, n, k, g, max_active);
+    });
 }
 
 template <typename I>
@@ -1324,39 +1364,31 @@ void gemv(sycl::queue& q, const float* x, const W* w, float* y, int64_t m, int64
 }
 
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k) {
-    if (w.q4) {
-        gemv_quant_q<true>(q, x, w, y, m, n, k);
-    } else {
-        gemv_quant_q<false>(q, x, w, y, m, n, k);
-    }
+    with_bits(w.bits, [&](auto b) { gemv_quant_q<decltype(b)::value>(q, x, w, y, m, n, k); });
 }
 
-// One work item per 16 bytes of codes (32 q4 or 16 q8 values, all in one group), vector loads and stores.
-template <typename T, bool Q4>
+// One work item per chunk of codes (16 q8 or 32 q4 / q3 / q2 values, all in one group), vector stores.
+template <typename T, int Bits>
 void dequantize_t(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k) {
-    constexpr int kChunk = Q4 ? 32 : 16;
+    using C = QChunk<Bits>;
+    constexpr int kChunk = C::kCols;
     const QuantWeight wc = w;
     const int64_t chunks = k / kChunk;
     const int64_t groups = k / w.group;
+    const int64_t row_bytes = C::row_bytes(k);
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n * chunks)), [=](sycl::id<1> idx) {
         const int64_t i = static_cast<int64_t>(idx[0]);
         const int64_t r = i / chunks;
         const int64_t c0 = (i % chunks) * kChunk;
-        const sycl::vec<uint8_t, 16> c = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(wc.codes + i * 16);
+        const typename C::Raw c = C::load(wc.codes + r * row_bytes, c0);
         const int64_t sg = r * groups + c0 / wc.group;
         const float s = static_cast<float>(wc.scales[sg]);
+        const float b = C::kAffine ? static_cast<float>(wc.biases[sg]) : 0.0f;
         sycl::vec<T, 16> v[kChunk / 16];  // sycl::vec holds at most 16 elements
         const float* in = wc.input_scales != nullptr ? wc.input_scales + c0 : nullptr;
-        const auto col = [&](int j) { return in != nullptr ? in[j] : 1.0f; };
-        if constexpr (Q4) {
-            const float b = static_cast<float>(wc.biases[sg]);
-            for (int j = 0; j < 16; ++j) {
-                v[j / 8][(2 * j) % 16] = static_cast<T>((s * static_cast<float>(c[j] & 0x0F) + b) * col(2 * j));
-                v[j / 8][(2 * j + 1) % 16] = static_cast<T>((s * static_cast<float>(c[j] >> 4) + b) * col(2 * j + 1));
-            }
-        } else {
-            for (int j = 0; j < 16; ++j)
-                v[0][j] = static_cast<T>(s * static_cast<float>(static_cast<int8_t>(c[j])) * col(j));
+        for (int j = 0; j < kChunk; ++j) {
+            const float val = s * C::code(c, j) + b;
+            v[j / 16][j % 16] = static_cast<T>(in != nullptr ? val * in[j] : val);
         }
         for (int h = 0; h < kChunk / 16; ++h)
             *reinterpret_cast<sycl::vec<T, 16>*>(out + r * k + c0 + 16 * h) = v[h];
@@ -1365,11 +1397,7 @@ void dequantize_t(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64
 
 template <typename T>
 void dequantize(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k) {
-    if (w.q4) {
-        dequantize_t<T, true>(q, w, out, n, k);
-    } else {
-        dequantize_t<T, false>(q, w, out, n, k);
-    }
+    with_bits(w.bits, [&](auto b) { dequantize_t<T, decltype(b)::value>(q, w, out, n, k); });
 }
 
 template void dequantize<half>(sycl::queue&, const QuantWeight&, half*, int64_t, int64_t);

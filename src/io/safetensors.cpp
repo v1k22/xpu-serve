@@ -1,5 +1,6 @@
 #include "io/safetensors.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -7,6 +8,7 @@
 #include <algorithm>
 
 #include "util/error.h"
+#include "util/log.h"
 
 namespace xs {
 
@@ -87,6 +89,25 @@ std::unique_ptr<SafetensorsWeights> SafetensorsWeights::open_dir(const std::file
         weights->files_.push_back(std::move(file));
     }
     if (fs::exists(dir / kPackManifest)) weights->apply_pack_manifest(dir / kPackManifest);
+    if (const char* overlays = std::getenv("XS_PACK_OVERLAY"); overlays != nullptr && *overlays != '\0') {
+        const std::string saved = overlays;
+        unsetenv("XS_PACK_OVERLAY");
+        for (size_t at = 0; at <= saved.size();) {  // ':'-separated, later overlays win
+            const size_t end = std::min(saved.find(':', at), saved.size());
+            const std::string path = saved.substr(at, end - at);
+            at = end + 1;
+            if (path.empty()) continue;
+            auto& overlay = weights->overlays_.emplace_back(open_dir(path));
+            int64_t replaced = 0;
+            for (const std::string& name : overlay->names()) {
+                if (weights->index_.count(name) == 0) fail("overlay tensor '", name, "' is not in '", dir.string(), "'");
+                weights->index_[name] = overlay->find(name);
+                ++replaced;
+            }
+            log::info("weights: ", replaced, " tensors from overlay ", path);
+        }
+        setenv("XS_PACK_OVERLAY", saved.c_str(), 1);
+    }
     return weights;
 }
 
@@ -113,14 +134,19 @@ void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) 
     };
     for (const auto& [name, entry] : manifest.at("tensors").items()) {
         const std::string format = entry.at("format").get<std::string>();
-        const DType dtype = format == "q4" ? DType::Q4 : format == "q8" ? DType::Q8 : DType::F32;
+        const DType dtype = format == "q4"   ? DType::Q4
+                            : format == "q8" ? DType::Q8
+                            : format == "q3" ? DType::Q3
+                            : format == "q2" ? DType::Q2
+                                             : DType::F32;
         if (dtype == DType::F32) fail("pack: tensor '", name, "' has unknown format '", format, "'");
         const int64_t group = entry.at("group").get<int64_t>();
         const Dims shape = entry.at("shape").get<Dims>();
         XS_CHECK(shape.size() >= 2 && group > 0 && shape.back() % group == 0 &&
-                     (dtype == DType::Q8 || shape.back() % 2 == 0),
+                     (dtype == DType::Q8 || shape.back() % 2 == 0) &&
+                     ((dtype != DType::Q3 && dtype != DType::Q2) || shape.back() % 32 == 0),
                  "pack: tensor '", name, "' has shape ", dims_to_string(shape), " and group ", group);
-        // Components keep the leading dims; the last is columns, column pairs (q4 codes) or groups.
+        // Components keep the leading dims; the last is columns (q8 codes), code bytes per row (q4 / q3 / q2) or groups.
         const auto with_last = [&](int64_t last) {
             Dims d = shape;
             d.back() = last;
@@ -130,12 +156,13 @@ void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) 
         TensorView v;
         v.dtype = dtype;
         v.shape = shape;
-        v.data = component(name, dtype == DType::Q4 ? DType::U8 : DType::I8,
-                           dtype == DType::Q4 ? with_last(shape.back() / 2) : shape).data;
+        v.data = component(name, dtype == DType::Q8 ? DType::I8 : DType::U8,
+                           dtype == DType::Q8 ? shape : with_last(static_cast<int64_t>(storage_bytes(dtype, shape.back()))))
+                     .data;
         v.quant.group = group;
         v.quant.scales = component(name + ".scales", DType::F16, groups).data;
         index_.erase(name + ".scales");
-        if (dtype == DType::Q4) {
+        if (dtype != DType::Q8) {
             v.quant.biases = component(name + ".biases", DType::F16, groups).data;
             index_.erase(name + ".biases");
         }

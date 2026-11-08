@@ -11,8 +11,11 @@
 namespace xs::quant {
 
 // A quantized tensor of shape [..., cols] is a matrix of rows = numel / cols (an expert bank [E, N, K] is E * N rows
-// of K). Q8: int8 codes [rows, cols]; Q4: uint8 [rows, cols / 2] with the even column in the low nibble. f16 scales
-// and (Q4) biases [rows, cols / group]. Stored components keep the leading dims (component_shape).
+// of K). Q8: int8 codes [rows, cols]; Q4: uint8 [rows, cols / 2] with the even column in the low nibble. Q3 and Q2
+// pack 32 columns in 12 and 8 bytes: column j of a 32-column chunk has its low two bits at byte j / 4, bits
+// 2 (j % 4), and (Q3) its high bit at byte 8 + j / 8, bit j % 8; codes are 0..7 / 0..3. f16 scales and (all but
+// Q8: value = code * scale + bias) biases [rows, cols / group]. Stored components keep the leading dims
+// (component_shape).
 inline int64_t matrix_rows(const Dims& shape) {
     int64_t rows = 1;
     for (size_t d = 0; d + 1 < shape.size(); ++d)
@@ -44,7 +47,7 @@ struct Quantized {
 std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t group);
 
 // Round to nearest per group of `group` columns of `w` (at least 2-D, f32 / f16 / bf16). Q8 is symmetric (scale = max|w| / 127,
-// codes in [-127, 127]); Q4 is asymmetric (bias = min, scale = (max - min) / 15, codes in [0, 15]). Codes are chosen
+// codes in [-127, 127]); Q4 / Q3 / Q2 are asymmetric (bias = min, scale = (max - min) / (2^bits - 1)). Codes are chosen
 // against the f16-rounded scale and bias, so dequantization reproduces exactly the values the rounding picked.
 Quantized quantize(const TensorView& w, DType format, int64_t group);
 
@@ -60,8 +63,12 @@ struct AwqReport {
 };
 Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<double>& act_ms, AwqReport* report);
 
-// Float values of rows [first, first + count) of a Q8 / Q4 view, row-major into `out` (input_scales applied).
+// Float values of rows [first, first + count) of a quantized view, row-major into `out` (input_scales applied).
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out);
+
+// The code of column c in a row of `bits`-bit codes (`row` points at the row's first byte), and its inverse.
+int code_at(const uint8_t* row, int bits, int64_t c);
+void set_code(uint8_t* row, int bits, int64_t c, int code);
 
 // The int8 KV cache rounding of one row (one token's head): code = rint(x * 127 / max|x|) and scale = max|x| / 127,
 // so the value is code * scale. Writes `codes` and returns the scale (0 for an all-zero row). Backends match it.

@@ -119,7 +119,7 @@ inline void expert_matmul_quantized(const Env& env) {
     CAPTURE(experts);
     CAPTURE(k);
     const HostTensor dense = rng.uniform(DType::F32, {experts, n, k}, 1.0f / std::sqrt(static_cast<float>(k)));
-    for (const DType format : {DType::Q8, DType::Q4}) {
+    for (const DType format : {DType::Q8, DType::Q4, DType::Q3, DType::Q2}) {
         for (const int64_t group : {32, 64}) {
             if (k % group != 0) continue;
             CAPTURE(dtype_name(format));

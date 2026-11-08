@@ -232,7 +232,7 @@ bool quant_gemm_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w, cons
     const auto aligned = [](const void* p, size_t a) { return reinterpret_cast<uintptr_t>(p) % a == 0; };
     // 2D block loads of x: a 64-byte aligned base, rows of at least 64 bytes and a multiple of 16
     // and of the codes ([N, K] bytes at q8, [N, K / 2] at q4): rows of at least 64 bytes
-    const bool pow2_group = w.group >= kTk && (w.group & (w.group - 1)) == 0;
+    const bool pow2_group = w.group >= kTk && (w.group & (w.group - 1)) == 0 && (w.bits == 8 || w.bits == 4);
     return m > 0 && m <= kQuantGemmMaxRows && n % (kNt * kSg) == 0 && k % 128 == 0 && pow2_group &&
            aligned(x, 64) && aligned(w.codes, 64) && k * 2 < (int64_t{1} << 24) && n < (int64_t{1} << 24);
 }
@@ -247,7 +247,7 @@ int64_t quant_gemm_split(int64_t n, int64_t k, int64_t compute_units) {
 template <typename Y>
 void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, float* part, int64_t m, int64_t n,
                 int64_t k, int64_t split) {
-    if (w.q4) {
+    if (w.bits == 4) {
         quant_gemm_q<true, Y>(q, x, w, y, part, m, n, k, split);
     } else {
         quant_gemm_q<false, Y>(q, x, w, y, part, m, n, k, split);

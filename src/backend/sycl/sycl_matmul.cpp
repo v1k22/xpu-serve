@@ -250,7 +250,7 @@ namespace {
 // Rows [first, first + count) of a quantized weight, as a weight of its own.
 QuantWeight quant_rows(const QuantWeight& w, int64_t first, int64_t k) {
     QuantWeight r = w;
-    const int64_t row_bytes = w.q4 ? k / 2 : k;
+    const int64_t row_bytes = k * w.bits / 8;
     const int64_t groups = k / w.group;
     r.codes = w.codes + first * row_bytes;
     r.scales = w.scales + first * groups;

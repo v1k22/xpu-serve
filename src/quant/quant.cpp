@@ -53,16 +53,19 @@ TensorView Quantized::view() const {
     v.data = codes.data();
     v.quant.group = group;
     v.quant.scales = scales.data();
-    v.quant.biases = format == DType::Q4 ? biases.data() : nullptr;
+    v.quant.biases = format != DType::Q8 ? biases.data() : nullptr;
     v.quant.input_scales = input_scales.empty() ? nullptr : input_scales.data();
     return v;
 }
 
 std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t group) {
-    if (format != DType::Q8 && format != DType::Q4) return str_cat("format ", dtype_name(format), " is not q8 or q4");
+    if (!is_quantized(format)) return str_cat("format ", dtype_name(format), " is not q8, q4, q3 or q2");
     if (rows <= 0 || cols <= 0) return "the matrix is empty";
     if (group != 32 && group != 64 && group != 128) return str_cat("group size ", group, " is not 32, 64 or 128");
     if (cols % group != 0) return str_cat(cols, " columns are not a multiple of the group size ", group);
+    if ((format == DType::Q3 || format == DType::Q2) && cols % 32 != 0) {
+        return str_cat(dtype_name(format), " packs 32 columns at a time; ", cols, " is not a multiple");
+    }
     return {};
 }
 
@@ -80,7 +83,10 @@ Quantized quantize(const TensorView& w, DType format, int64_t group) {
     const int64_t groups = cols / group;
     q.codes.resize(storage_bytes(format, rows * cols));
     q.scales.resize(static_cast<size_t>(rows * groups));
-    if (format == DType::Q4) q.biases.resize(static_cast<size_t>(rows * groups));
+    if (format != DType::Q8) q.biases.resize(static_cast<size_t>(rows * groups));
+    const int bits = quant_bits(format);
+    const float top = static_cast<float>((1 << bits) - 1);
+    const int64_t row_bytes = static_cast<int64_t>(storage_bytes(format, cols));
 
     parallel_rows(rows, [&](int64_t first, int64_t end) {
         std::vector<float> row(static_cast<size_t>(cols));
@@ -110,20 +116,17 @@ Quantized quantize(const TensorView& w, DType format, int64_t group) {
                         hi = std::max(hi, x[i]);
                     }
                     const uint16_t b16 = f32_to_f16(lo);
-                    const uint16_t s16 = f32_to_f16((hi - lo) / 15.0f);
+                    const uint16_t s16 = f32_to_f16((hi - lo) / top);
                     const float b = f16_to_f32(b16);
                     const float s = f16_to_f32(s16);
                     XS_CHECK(std::isfinite(s) && std::isfinite(b), "quantize: row ", r,
                              " has values beyond the f16 range");
                     q.scales[sg] = s16;
                     q.biases[sg] = b16;
-                    uint8_t* bytes = q.codes.data() + (r * cols + g * group) / 2;
-                    for (int64_t i = 0; i < group; i += 2) {
-                        const auto code = [&](float v) {
-                            const float c = s > 0.0f ? std::round((v - b) / s) : 0.0f;
-                            return static_cast<uint8_t>(std::clamp(c, 0.0f, 15.0f));
-                        };
-                        bytes[i / 2] = static_cast<uint8_t>(code(x[i]) | (code(x[i + 1]) << 4));
+                    uint8_t* row_codes = q.codes.data() + r * row_bytes;
+                    for (int64_t i = 0; i < group; ++i) {
+                        const float c = s > 0.0f ? std::round((x[i] - b) / s) : 0.0f;
+                        set_code(row_codes, bits, g * group + i, static_cast<int>(std::clamp(c, 0.0f, top)));
                     }
                 }
             }
@@ -293,27 +296,53 @@ void round_trip_kv_i8(float* x, int64_t rows, int64_t width) {
 }
 
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
-    XS_CHECK(is_quantized(v.dtype) && v.shape.size() >= 2, "dequantize needs a q8 / q4 tensor, got ",
+    XS_CHECK(is_quantized(v.dtype) && v.shape.size() >= 2, "dequantize needs a quantized tensor, got ",
              dtype_name(v.dtype), " ", dims_to_string(v.shape));
     const int64_t cols = v.shape.back();
     const int64_t group = v.quant.group;
     const int64_t groups = cols / group;
+    const int bits = quant_bits(v.dtype);
+    const auto row_bytes = static_cast<int64_t>(storage_bytes(v.dtype, cols));
     const auto* scales = static_cast<const uint16_t*>(v.quant.scales);
     const auto* biases = static_cast<const uint16_t*>(v.quant.biases);
     for (int64_t r = first; r < first + count; ++r) {
         float* o = out + (r - first) * cols;
+        const auto* row = static_cast<const uint8_t*>(v.data) + r * row_bytes;
         for (int64_t c = 0; c < cols; ++c) {
             const size_t sg = static_cast<size_t>(r * groups + c / group);
             const float s = f16_to_f32(scales[sg]);
             if (v.dtype == DType::Q8) {
-                o[c] = s * static_cast<float>(static_cast<const int8_t*>(v.data)[r * cols + c]);
+                o[c] = s * static_cast<float>(static_cast<int8_t>(row[c]));
             } else {
-                const uint8_t byte = static_cast<const uint8_t*>(v.data)[(r * cols + c) / 2];
-                const int code = (c % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
-                o[c] = s * static_cast<float>(code) + f16_to_f32(biases[sg]);
+                o[c] = s * static_cast<float>(code_at(row, bits, c)) + f16_to_f32(biases[sg]);
             }
             if (v.quant.input_scales != nullptr) o[c] *= v.quant.input_scales[c];
         }
+    }
+}
+
+int code_at(const uint8_t* row, int bits, int64_t c) {
+    if (bits == 4) return (c % 2 == 0) ? (row[c / 2] & 0x0F) : (row[c / 2] >> 4);
+    const uint8_t* chunk = row + (c / 32) * (bits == 3 ? 12 : 8);
+    const int j = static_cast<int>(c % 32);
+    int code = (chunk[j / 4] >> (2 * (j % 4))) & 3;
+    if (bits == 3) code |= ((chunk[8 + j / 8] >> (j % 8)) & 1) << 2;
+    return code;
+}
+
+void set_code(uint8_t* row, int bits, int64_t c, int code) {
+    if (bits == 4) {
+        uint8_t& byte = row[c / 2];
+        byte = (c % 2 == 0) ? static_cast<uint8_t>((byte & 0xF0) | code) : static_cast<uint8_t>((byte & 0x0F) | (code << 4));
+        return;
+    }
+    uint8_t* chunk = row + (c / 32) * (bits == 3 ? 12 : 8);
+    const int j = static_cast<int>(c % 32);
+    uint8_t& lo = chunk[j / 4];
+    lo = static_cast<uint8_t>((lo & ~(3 << (2 * (j % 4)))) | ((code & 3) << (2 * (j % 4))));
+    if (bits == 3) {
+        uint8_t& hi = chunk[8 + j / 8];
+        hi = static_cast<uint8_t>((hi & ~(1 << (j % 8))) | (((code >> 2) & 1) << (j % 8)));
     }
 }
 
