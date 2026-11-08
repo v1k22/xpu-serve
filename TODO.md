@@ -257,8 +257,15 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
 - [ ] π0.5 latency, next: the prefix down
       projection's GEMM (~30 TFLOPS against ~50 for gate / up), in-place expert K/V, gate and up in one GEMM,
       record / replay of the program
-- [ ] π0.5 int8 weights (opt-in, lossy): the action expert re-reads ~620 MB of f16 weights per flow step (~60 ms of
-      a 3-camera call at the memory floor); int8 halves it. Needs a GEMM that dequantizes in registers (50 rows)
+- [x] Generic weight quantization by a graph rule (`convert --scope bandwidth|all`): weights of matmuls with a
+      step-dependent row count or at most 64 rows per call; policies convert too. π0.5 q8 (the rule picks the action
+      expert): 245 -> 231 ms at 3 cameras on Arc B390, actions cosine 0.99999; q4 misses the 0.999 gate
+- [x] SYCL quant_gemm: quantized matmuls of 9 to 64 rows read the q8 / q4 weight once and dequantize in registers
+      (DPAS and 2D block load builtins), 2.5 to 4x the dequantize + GEMM path
+- [ ] quant_gemm at 50 rows: x tiles are re-read per 32 output features, so it runs near 4-5 TFLOPS instead of at the
+      weight's bandwidth (q8 should be about 2x f16 there); share x tiles across features (local memory or larger
+      sub-group tiles)
+- [ ] q4 for policies: AWQ-style calibration on policy activations (or q4 with q8 for the most sensitive matmuls)
 - [ ] Flash attention at head_dim 256 (Gemma): 8 rows per sub-group fill the registers, so every K/V tile feeds one
       DPAS and oneMKL's GEMMs match it; needs K/V or P shared across sub-groups through local memory
 - [ ] Low precision on Panther Lake: the B390 compiles fp8 (E4M3 / E5M2) DPAS but returns wrong results; int8 DPAS is

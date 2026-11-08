@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "backend/backend_test_util.h"
 #include "backend/cpu_ref/cpu_backend.h"
 #include "backend/device_test_support.h"
 #include "convert/convert.h"
@@ -330,6 +331,36 @@ TEST_SUITE("convert") {
                 }
             }
         }
+    }
+
+    TEST_CASE("the plan quantizes the weights of bandwidth-bound matmuls; scope all takes every matmul weight") {
+        // Rows per call decide, not names: 50 rows (an action expert) or a step-dependent count (decode) are
+        // bandwidth-bound, 500 rows (an image encoder, a policy's prefix) compute-bound.
+        test::MemoryWeights w;
+        test::TensorRng rng(9);
+        for (const char* name : {"few", "many", "shared", "decode", "table"}) w.add(name, rng.uniform(DType::F32, {2048, 512}));
+        graph::Graph g;
+        const graph::Value x50 = g.input("x50", DType::F32, {50, 512});
+        const graph::Value x500 = g.input("x500", DType::F32, {500, 512});
+        g.output("a", g.matmul(x50, g.weight(w, "few")));
+        g.output("b", g.matmul(x500, g.weight(w, "many")));
+        g.output("c", g.matmul(x50, g.weight(w, "shared")));
+        g.output("d", g.matmul(x500, g.weight(w, "shared")));
+        g.output("e", g.matmul(g.input("t", DType::F32, {graph::kT, 512}), g.weight(w, "decode")));
+        g.output("f", g.gather(g.weight(w, "table"), g.input("ids", DType::I32, {4})));
+        ConvertOptions o;
+        o.group = 32;
+        const auto plan = plan_graph_formats(g, w, DType::Q4, o);
+        CHECK(plan.at("few") == DType::Q4);
+        CHECK(plan.at("decode") == DType::Q4);
+        CHECK(plan.at("table") == DType::Q8);
+        CHECK(plan.count("many") == 0);
+        CHECK(plan.count("shared") == 0);  // one compute-bound reader keeps it
+        o.scope = QuantScope::All;
+        const auto all = plan_graph_formats(g, w, DType::Q4, o);
+        CHECK(all.at("many") == DType::Q4);
+        CHECK(all.at("shared") == DType::Q4);
+        CHECK(all.size() == 5);
     }
 
     TEST_CASE("refuses to overwrite, to convert a pack, and bad formats") {

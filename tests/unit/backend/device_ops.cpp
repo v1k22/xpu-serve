@@ -72,7 +72,8 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
                 } else {
                     w.add_quantized("w", quant::quantize(dense.view(), format, group));
                 }
-                for (const int64_t m : {1, 3, 8, 37}) {  // the GEMV for up to 8 rows, dequantize + GEMM beyond
+                // the GEMV up to 8 rows, quant_gemm up to 64 (with the matrix engines), dequantize + GEMM beyond
+                for (const int64_t m : {1, 3, 8, 9, 37, 64, 65}) {
                     CAPTURE(m);
                     const HostTensor x = rng.uniform(DType::F32, {m, k});
                     Graph g;

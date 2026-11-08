@@ -173,13 +173,22 @@ bool is_suffix_broadcast(const Dims& b, const Dims& out) {
     return true;
 }
 
+// An integrated GPU (it shares the system's memory, so streaming weights bounds its small matmuls).
+bool integrated_gpu(const sycl::device& d) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return d.get_info<sycl::info::device::host_unified_memory>();
+#pragma clang diagnostic pop
+}
+
 class SyclSession final : public Session, private sycl_be::Scratch {
 public:
     SyclSession(const graph::Graph& graph, const WeightStore& weights, const SessionOptions& options, sycl::queue q,
-                const sycl_be::AttentionPlan& attention)
+                const sycl_be::AttentionPlan& attention, bool quant_gemm)
         : graph_(graph),
           q_(std::move(q)),
           attention_(attention),
+          quant_gemm_(quant_gemm),
           precision_(options.precision),
           kv_i8_(options.kv_dtype == DType::I8),
           max_context_(options.max_context),
@@ -1222,7 +1231,8 @@ private:
                 const int64_t m = numel(in_shape(0)) / k;
                 if (is_quantized(in_dt(1))) {
                     sycl_be::matmul_quant(q_, *this, in_f32(0), leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out,
-                                          m, rows, k, precision_ == DType::F32);
+                                          m, rows, k, precision_ == DType::F32, quant_gemm_,
+                                          attention_.compute_units);
                 } else if (dt(Value{static_cast<int32_t>(i), 0}) == DType::F16) {  // plan_half_values: y in f16
                     auto* y = reinterpret_cast<half*>(out_raw);
                     const auto* w = reinterpret_cast<const half*>(in_ptr(1));
@@ -1629,6 +1639,7 @@ private:
     const graph::Graph graph_;
     sycl::queue q_;
     const sycl_be::AttentionPlan attention_;
+    const bool quant_gemm_;  // quantized matmuls of up to kQuantGemmMaxRows rows take quant_gemm
     const DType precision_;
     const bool kv_i8_;  // KV slots that only attention reads are int8 (SessionOptions::kv_dtype)
     const int64_t max_context_;
@@ -1681,6 +1692,7 @@ public:
             d.id = str_cat("GPU.", i);
             d.name = devices_[i].get_info<sycl::info::device::name>();
             d.memory_bytes = devices_[i].get_info<sycl::info::device::global_mem_size>();
+            d.integrated = integrated_gpu(devices_[i]);
             out.push_back(std::move(d));
         }
         return out;
@@ -1725,9 +1737,12 @@ public:
             sycl::queue q(sycl::context(devices_[index]), devices_[index], props);
             it = queues_.emplace(index, std::move(q)).first;
         }
-        attention.flash_device = sycl_be::flash_attention_device(devices_[index]);
+        attention.xmx = sycl_be::xmx_device(devices_[index]);
         attention.compute_units = devices_[index].get_info<sycl::info::device::max_compute_units>();
-        return std::make_unique<SyclSession>(graph, weights, options, it->second, attention);
+        // quant_gemm wins where streaming the weight bounds small matmuls (system memory); on a discrete card's
+        // faster memory, dequantizing to f16 for oneMKL's GEMM is still ahead of it (TODO: quant_gemm at 50 rows).
+        const bool quant_gemm = attention.xmx && integrated_gpu(devices_[index]);
+        return std::make_unique<SyclSession>(graph, weights, options, it->second, attention, quant_gemm);
     }
 
 private:

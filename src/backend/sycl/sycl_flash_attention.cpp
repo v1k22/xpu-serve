@@ -339,7 +339,7 @@ void flash_t(sycl::queue& q, const QT* qp, const half* k, const half* v, float* 
 
 }  // namespace
 
-bool flash_attention_device(const sycl::device& d) {
+bool xmx_device(const sycl::device& d) {
     using mx::matrix_type;
     try {
         for (const auto& c : d.get_info<syclex::info::device::matrix_combinations>()) {

@@ -29,10 +29,11 @@ void matmul_half_x(sycl::queue& q, const half* x, const half* w, float* y, int64
 template <typename X>
 void matmul_half_y(sycl::queue& q, Scratch& scratch, const X* x, const half* w, half* y, int64_t m, int64_t n, int64_t k);
 
-// y [M, N] = x [M, K] @ dequant(w)^T: the quantized GEMV up to kGemvMaxRows rows; beyond, w is dequantized once
-// (to f16, or f32 when `f32`) and multiplied with oneMKL's GEMM.
+// y [M, N] = x [M, K] @ dequant(w)^T: the quantized GEMV up to kGemvMaxRows rows; up to kQuantGemmMaxRows with
+// `use_quant_gemm` (a device with matrix engines where it wins) quant_gemm, which reads the weight once; beyond (or when
+// `f32`), w is dequantized once (to f16, or f32 when `f32`) and multiplied with oneMKL's GEMM.
 void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantWeight& w, float* y, int64_t m,
-                  int64_t n, int64_t k, bool f32);
+                  int64_t n, int64_t k, bool f32, bool use_quant_gemm, int64_t compute_units);
 
 // ExpertMatMul over a quantized bank (expert_matmul_quant's contract) through oneMKL, for many (token, slot) pairs
 // (prefill): the pairs are grouped by expert, each expert's input rows gathered, its bank dequantized (to f16, or f32
@@ -51,7 +52,7 @@ inline constexpr int64_t kAttentionRowsMax = 8;
 
 struct AttentionPlan {
     AttentionPath path = AttentionPath::Auto;
-    bool flash_device = false;  // flash_attention_device()
+    bool xmx = false;  // xmx_device(): the matrix-engine kernels run
     int64_t compute_units = 0;
 };
 

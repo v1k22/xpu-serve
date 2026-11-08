@@ -158,8 +158,9 @@ void attention_combine(sycl::queue& q, const float* part, float* out, int64_t ro
 // scores never leaving registers. head_dim up to 128, k and v f16, q f32 or f16. split > 1 shares each
 // row's keys between work-groups, which write [D partial sums, max, denominator] rows to `part` (attention_combine's
 // layout) instead of `out`.
-// The device runs it: f16 joint_matrix tiles 8x16x16 accumulating f32 on 16-lane sub-groups (Xe2 and later).
-bool flash_attention_device(const sycl::device& d);
+// The device runs the matrix-engine kernels (this one and quant_gemm): f16 8x16x16 tiles accumulating f32 on 16-lane
+// sub-groups (Xe2 and later).
+bool xmx_device(const sycl::device& d);
 // The shape and the operands' addresses suit it (head_dim, the 2D block loads' alignment and extents).
 bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v);
 // Work-groups per row's keys: enough to fill `compute_units`, at least two key blocks each.
@@ -196,6 +197,15 @@ struct QuantWeight {
 };
 // y [M, N] = x [M, K] @ dequant(w)^T for M <= kGemvMaxRows; K a multiple of 32.
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k);
+// The same for kGemvMaxRows < M <= kQuantGemmMaxRows on the matrix engines (sycl_quant_gemm.cpp; needs xmx_device),
+// x in f16: the weight is read once and dequantized on the way. split > 1 divides K between work-groups, their partial
+// sums in `part` ([split, M, N] f32).
+inline constexpr int64_t kQuantGemmMaxRows = 64;
+bool quant_gemm_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const void* x);
+int64_t quant_gemm_split(int64_t n, int64_t k, int64_t compute_units);
+template <typename Y>
+void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, float* part, int64_t m, int64_t n,
+                int64_t k, int64_t split);
 // ExpertMatMul over a quantized expert bank (rows = E * N of K columns): out [T, S, N], x [T, K] or (per_slot)
 // [T, S, K], expert ids outside [0, E) read expert 0. Up to kExpertPairsDirect (token, slot) pairs run one GEMV each;
 // more are grouped by expert on the device in `grouping` (expert_grouping_bytes) so an expert's rows are read once

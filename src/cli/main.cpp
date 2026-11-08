@@ -116,6 +116,8 @@ int cmd_convert(const std::vector<std::string>& argv) {
         .value("quant", "format of the matmul weights: q4 | q8 (embedding tables are always q8)", "q4")
         .value("group", "columns per scale: 32 | 64 | 128 (default: 32 for q4, 64 for q8)")
         .value("q8", "comma-separated parts of weight names to keep at q8 (e.g. linear_attn,down_proj)")
+        .value("scope", "which matmul weights: bandwidth (those it makes faster: decode, a policy's action expert) | all",
+               "bandwidth")
         .value("method", "q4 quantization: rtn | awq (activation-aware, calibrates on a backend)", "rtn")
         .value("calib", "AWQ: a text file to calibrate with (default: a built-in sample)")
         .value("calib-tokens", "AWQ: calibration tokens, at most", "8192")
@@ -139,6 +141,9 @@ int cmd_convert(const std::vector<std::string>& argv) {
         o.q8_names.push_back(list.substr(0, comma));
         list = comma == std::string::npos ? std::string() : list.substr(comma + 1);
     }
+    const std::string& scope = a.get("scope");
+    if (scope != "bandwidth" && scope != "all") fail("--scope must be bandwidth or all, got '", scope, "'");
+    o.scope = scope == "all" ? QuantScope::All : QuantScope::Bandwidth;
     const std::string& method = a.get("method");
     if (method != "rtn" && method != "awq") fail("--method must be rtn or awq, got '", method, "'");
     o.method = method == "awq" ? QuantMethod::Awq : QuantMethod::Rtn;

@@ -84,7 +84,7 @@ area).
 | `tensor/` | xs_core | `DType` (incl. `Q8` / `Q4` pack weights), `TensorView` (non-owning, e.g. into an mmap; `quant` points at a pack weight's scales and biases), `HostTensor` (owning), `TensorMap` (name -> HostTensor) |
 | `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped; a pack's quantized weights appear as one Q8 / Q4 view each); `safetensors_writer` (streamed writing) |
 | `quant/` | xs_core | round-to-nearest quantization into the pack formats (DESIGN.md 6.3) and dequantization; a tensor `[..., K]` is a matrix of `numel / K` rows (expert banks `[E, N, K]` included) |
-| `convert/` | xs_core | `convert_model`: checkpoint -> pack; the model's own graph decides which weights to quantize |
+| `convert/` | xs_core | `convert_model`: checkpoint (language model or policy) -> pack; the model's own graph decides which weights to quantize (`plan_graph_formats`: bandwidth-bound matmuls, or all with `--scope all`) |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
 | `models/` | xs_core | `model.h` (the `Model` interface: language models), `policy.h` (the `Policy` interface: robot policies, one static program per call shape: camera subset, step count, padded prompt length), `registry.cpp` (model_type / LeRobot type -> code, `model_kind`), `config_util` (checked JSON readers), `common/blocks` (the shared building blocks: gated MLPs, mixture of experts, RMSNorm variants, RoPE frequencies, attention), one folder per architecture (`pi05/`: π0.5) |
@@ -112,7 +112,9 @@ area).
 | `src/backend/cpu_ref/ops.cpp` | f32/f64 reference kernels, one per op: the accuracy oracle |
 | `src/backend/sycl/sycl_backend.cpp` | SYCL session: device dtypes, fusions, per-T memory plan (one arena), op dispatch, KV and state buffers |
 | `src/backend/sycl/sycl_kernels.cpp` | SYCL kernels: elementwise, norms, RoPE, gather, copies, causal conv, gated delta, decode attention, GEMV |
-| `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond) and Attention (per-row kernel with split-K, or GEMMs) |
+| `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond; quantized: quant_gemm up to 64 rows) and Attention (per-row kernel with split-K, the fused kernel, or GEMMs) |
+| `src/backend/sycl/sycl_flash_attention.cpp` | Fused attention on the matrix engines (joint_matrix; head_dim up to 128) |
+| `src/backend/sycl/sycl_quant_gemm.cpp` | Quantized matmul of 9 to 64 rows reading the q8 / q4 weight once (DPAS and 2D block load builtins) |
 | `src/engine/engine.cpp` | Generation loop for one sequence; encodes images and splices their rows into prefill chunks |
 | `src/service/engine_service.cpp` | Wiring from a model directory to a ready service |
 | `src/server/completion_handlers.cpp` | `/v1/chat/completions` and `/v1/completions` |

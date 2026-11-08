@@ -79,7 +79,7 @@ template void matmul_half_y<float>(sycl::queue&, Scratch&, const float*, const h
 template void matmul_half_y<half>(sycl::queue&, Scratch&, const half*, const half*, half*, int64_t, int64_t, int64_t);
 
 void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantWeight& w, float* y, int64_t m,
-                  int64_t n, int64_t k, bool f32) {
+                  int64_t n, int64_t k, bool f32, bool use_quant_gemm, int64_t compute_units) {
     if (m <= kGemvMaxRows) {
         if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the kernel loads x in float4s
             auto* aligned = static_cast<float*>(scratch.get(static_cast<size_t>(m * k) * sizeof(float)));
@@ -88,6 +88,17 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantW
         }
         gemv_quant(q, x, w, y, m, n, k);
         return;
+    }
+    if (!f32 && use_quant_gemm && m <= kQuantGemmMaxRows) {
+        const int64_t split = quant_gemm_split(n, k, compute_units);
+        const size_t x_bytes = align_up(static_cast<size_t>(m * k) * sizeof(half));
+        auto* base = static_cast<char*>(scratch.get(x_bytes + static_cast<size_t>(split * m * n) * sizeof(float)));
+        auto* xh = reinterpret_cast<half*>(base);
+        if (quant_gemm_fits(m, n, k, w, xh)) {
+            to_half(q, x, xh, m * k);
+            quant_gemm(q, xh, w, y, split > 1 ? reinterpret_cast<float*>(base + x_bytes) : nullptr, m, n, k, split);
+            return;
+        }
     }
     if (f32) {
         auto* wf = static_cast<float*>(scratch.get(static_cast<size_t>(n * k) * sizeof(float)));
@@ -149,7 +160,7 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
     }
     if constexpr (std::is_same_v<KV, half>) {
         const bool want = plan.path == AttentionPath::Auto || plan.path == AttentionPath::Flash;
-        if (want && plan.flash_device && flash_attention_fits(s, k, v)) {
+        if (want && plan.xmx && flash_attention_fits(s, k, v)) {
             const int64_t split = flash_attention_split(s, plan.compute_units);
             float* part = nullptr;
             if (split > 1) {

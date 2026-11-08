@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -17,6 +18,7 @@
 #include "io/safetensors_writer.h"
 #include "models/config_util.h"
 #include "models/model.h"
+#include "models/policy.h"
 #include "quant/quant.h"
 #include "util/error.h"
 #include "util/log.h"
@@ -58,19 +60,34 @@ std::set<std::string> router_weights(const graph::Graph& g) {
     return out;
 }
 
+// A matmul that reads its weight more than it computes: a step-dependent row count (decode) or at most kBandwidthRows
+// rows per call. Expert banks count as bandwidth-bound (few tokens per expert).
+bool bandwidth_bound(const graph::Graph& g, const graph::Node& reader) {
+    if (reader.kind != OpKind::MatMul) return true;
+    const Dims& x = g.type(reader.inputs[0]).shape;
+    if (std::find(x.begin(), x.end(), graph::kT) != x.end()) return true;
+    return numel(x) / x.back() <= kBandwidthRows;
+}
+
 // The format each weight of `g` gets: what the graph does with it decides. A weight read only as a matmul weight (or
-// an expert bank) takes `matmul_format`; one that is also (or only) a gather table takes q8; routers and anything else
-// are copied.
-void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_format, const ConvertOptions& o,
-                std::map<std::string, DType>& plan) {
+// an expert bank) takes `matmul_format` when the scope admits its matmuls; one that is also (or only) a gather table
+// takes q8; routers and anything else are copied.
+void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_format, QuantScope scope,
+                const ConvertOptions& o, std::map<std::string, DType>& plan) {
     const auto& nodes = g.nodes();
-    std::vector<std::vector<std::pair<OpKind, size_t>>> readers(nodes.size());  // per node: (reader op, input index)
+    // per node: (reader op, input index, the reader is bandwidth-bound)
+    struct Reader {
+        OpKind kind;
+        size_t index;
+        bool bandwidth;
+    };
+    std::vector<std::vector<Reader>> readers(nodes.size());
     for (const auto& n : nodes) {
         for (size_t k = 0; k < n.inputs.size(); ++k)
-            readers[static_cast<size_t>(n.inputs[k].node)].emplace_back(n.kind, k);
+            readers[static_cast<size_t>(n.inputs[k].node)].push_back(Reader{n.kind, k, bandwidth_bound(g, n)});
     }
     for (const auto& out : g.outputs())
-        readers[static_cast<size_t>(out.value.node)].emplace_back(OpKind::Input, 0);  // a graph output: keep
+        readers[static_cast<size_t>(out.value.node)].push_back(Reader{OpKind::Input, 0, false});  // an output: keep
     const std::set<std::string> routers = router_weights(g);
     for (size_t i = 0; i < nodes.size(); ++i) {
         if (nodes[i].kind != OpKind::Weight || readers[i].empty()) continue;
@@ -82,16 +99,19 @@ void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_
         bool matmul = false;
         bool table = false;
         bool other = false;
-        for (const auto& [kind, k] : readers[i]) {
-            if ((kind == OpKind::MatMul || kind == OpKind::ExpertMatMul) && k == 1) {
+        bool compute = false;  // read by a compute-bound matmul
+        for (const Reader& r : readers[i]) {
+            if ((r.kind == OpKind::MatMul || r.kind == OpKind::ExpertMatMul) && r.index == 1) {
                 matmul = true;
-            } else if (kind == OpKind::Gather && k == 0) {
+                compute = compute || !r.bandwidth;
+            } else if (r.kind == OpKind::Gather && r.index == 0) {
                 table = true;
             } else {
                 other = true;
             }
         }
         if (other || (!matmul && !table)) continue;
+        if (!table && compute && scope == QuantScope::Bandwidth) continue;
         const bool q8_by_name = std::any_of(o.q8_names.begin(), o.q8_names.end(), [&](const std::string& part) {
             return !part.empty() && name.find(part) != std::string::npos;
         });
@@ -101,15 +121,28 @@ void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_
     }
 }
 
-// The text decoder's graph at the requested format, the vision tower's at q8 (it runs once per image; its quality
-// is not measured at q4 yet), and the tables the model reads on the host at q8.
+// A language model: the text decoder's graph at the requested format, the vision tower's at q8 (it runs once per
+// image and is compute-bound: only with scope All; its quality is not measured at q4 yet), and the tables the model
+// reads on the host at q8.
 std::map<std::string, DType> plan_formats(const Model& model, const ConvertOptions& o) {
     std::map<std::string, DType> plan;
-    plan_graph(model.graph(), model.weights(), o.format, o, plan);
-    if (model.vision() != nullptr) plan_graph(model.vision()->graph(), model.weights(), DType::Q8, o, plan);
+    plan_graph(model.graph(), model.weights(), o.format, o.scope, o, plan);
+    if (model.vision() != nullptr) plan_graph(model.vision()->graph(), model.weights(), DType::Q8, o.scope, o, plan);
     for (const std::string& name : model.host_tables()) {
         if (const auto f = fitting(name, model.weights().get(name), DType::Q8, o)) plan[name] = *f;
     }
+    return plan;
+}
+
+// A policy: the program for every camera, the checkpoint's flow steps and its longest prompt (the call shape every
+// other one is a part of).
+std::map<std::string, DType> plan_formats(const Policy& policy, const ConvertOptions& o) {
+    CallShape shape;
+    for (int c = 0; c < static_cast<int>(policy.spec().cameras.size()); ++c) shape.cameras.push_back(c);
+    shape.steps = policy.spec().denoise_steps;
+    shape.prompt_tokens = policy.prompt_tokens(std::numeric_limits<int32_t>::max());
+    std::map<std::string, DType> plan;
+    plan_graph(policy.build(shape), policy.weights(), o.format, o.scope, o, plan);
     return plan;
 }
 
@@ -171,6 +204,13 @@ void copy_side_files(const fs::path& from, const fs::path& to) {
 
 }  // namespace
 
+std::map<std::string, DType> plan_graph_formats(const graph::Graph& g, const WeightStore& weights, DType matmul_format,
+                                                const ConvertOptions& o) {
+    std::map<std::string, DType> plan;
+    plan_graph(g, weights, matmul_format, o.scope, o, plan);
+    return plan;
+}
+
 ConvertReport convert_model(const ConvertOptions& o) {
     XS_CHECK(o.format == DType::Q4 || o.format == DType::Q8, "convert: the format must be q4 or q8, got ",
              dtype_name(o.format));
@@ -181,9 +221,17 @@ ConvertReport convert_model(const ConvertOptions& o) {
     }
     if (fs::exists(o.output) && fs::equivalent(o.source, o.output)) fail("convert: the output is the source");
 
-    const auto model = load_model(o.source);
-    const WeightStore& weights = model->weights();
-    const std::map<std::string, DType> plan = plan_formats(*model, o);
+    const bool policy = model_kind(o.source) == ModelKind::Policy;
+    XS_CHECK(!policy || o.method == QuantMethod::Rtn, "convert: AWQ calibrates on text; policies take round to nearest");
+    std::unique_ptr<Model> model;
+    std::unique_ptr<Policy> policy_model;
+    if (policy) {
+        policy_model = load_policy(o.source);
+    } else {
+        model = load_model(o.source);
+    }
+    const WeightStore& weights = policy ? policy_model->weights() : model->weights();
+    const std::map<std::string, DType> plan = policy ? plan_formats(*policy_model, o) : plan_formats(*model, o);
 
     ConvertReport report;
     // AWQ: activation statistics for the text decoder's q4 weights.
@@ -274,10 +322,10 @@ ConvertReport convert_model(const ConvertOptions& o) {
     fs::path source_dir = fs::absolute(o.source).lexically_normal();
     if (source_dir.filename().empty()) source_dir = source_dir.parent_path();
     manifest["source"] = {{"name", source_dir.filename().string()},
-                          {"model_type", config.value("model_type", "")}};
+                          {"model_type", config.value("model_type", config.value("type", ""))}};
     manifest["quant"] = {{"format", o.format == DType::Q4 ? "q4" : "q8"}, {"group", o.group},
                          {"method", report.awq > 0 ? "awq" : "rtn"}, {"min_elements", o.min_elements},
-                         {"q8_names", o.q8_names}};
+                         {"q8_names", o.q8_names}, {"scope", o.scope == QuantScope::All ? "all" : "bandwidth"}};
     manifest["tensors"] = tensors;
     std::ofstream(o.output / kPackManifest) << manifest.dump(1) << "\n";
     return report;

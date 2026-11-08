@@ -490,6 +490,11 @@ f16, Intel Panther Lake (Arc B390 iGPU), steady state after warm-up (`xpu-serve 
 | GEMM-path attention reads q in place with one KV head (the pack was a copy: the prefix and the expert are MQA) | 279.9 ms | 222.0 ms | 185.3 ms | gates green |
 | No queue barriers around oneMKL calls (the in-order queue orders them; a barrier between busy kernels stalls the GPU ~50 us) | 243.9 ms | 191.2 ms | 158.8 ms | gates green; device suites 3x on both GPUs |
 
+Opt-in, lossy: `xpu-serve convert --quant q8` quantizes the weights of bandwidth-bound matmuls (one rule for every
+model; for π0.5 it picks the action expert's, 50 rows per flow step): 230.6 ms (3 cameras) and 149.6 ms (1 camera)
+against 245.0 and 159.1 for f16 in the same session, actions within cosine 0.99999 of LeRobot (max error 9.5e-3).
+q4 runs at 227.3 ms but misses the 0.999 gate (cosine 0.9975 to 0.9985).
+
 Where the time goes now (per-op profile, ops run one at a time, which overstates small ops): the prefix MLP GEMMs
 (~85 ms: gate / up near 50 TFLOPS, down near 30), the expert's GEMMs (~80 ms; they re-read ~620 MB of f16 weights
 per flow step, a memory floor near 60 ms), attention (~45 ms: SigLIP ~5 ms in the fused kernel, the prefix and the
@@ -500,7 +505,8 @@ The fused attention kernel keeps scores in registers and reads K and V tiles wit
 (the prefix and the expert) a sub-group's accumulators for 8 query rows fill its registers, so each K / V tile it
 loads feeds one matrix instruction: load-bound, it only matched oneMKL end to end, and those shapes stay on GEMMs.
 Next steps: a device-timestamp profile, the down projection's GEMM, the expert's K / V in place, gate and up in one
-GEMM, record / replay of the program; int8 weights for the expert as an opt-in setting (lossy) would halve its floor.
+GEMM, record / replay of the program; a quantized-weight GEMM that reaches the weight's bandwidth at 50 rows (q8 is
+opt-in today and gains 6 %, below).
 
 Missing cameras cost nothing: the program for a camera subset contains only those cameras, and its result equals
 LeRobot's padded, masked cameras (the 1-camera parity case checks it). Prompt padding costs little: LeRobot pads every
