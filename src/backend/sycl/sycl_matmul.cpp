@@ -23,13 +23,13 @@ size_t align_up(size_t n) {
     return (n + 255) & ~size_t{255};
 }
 
-// oneMKL orders its kernels by the dependency list, not by the queue being in-order: hand it everything submitted
-// so far, and make later work wait for it.
+// oneMKL submits to the queue it is given, so on the in-order queue its kernels run after everything submitted before
+// and before everything after. No barriers around the calls: a barrier between busy kernels stalls the GPU (about
+// 50 us each on Arc B390; the two per GEMM were 13 % of a pi05 call).
 template <typename Fn>
 void ordered(sycl::queue& q, Fn&& gemm) {
-    const sycl::event before = q.ext_oneapi_submit_barrier();
-    const sycl::event done = gemm(std::vector<sycl::event>{before});
-    q.ext_oneapi_submit_barrier({done});
+    (void)q;
+    gemm(std::vector<sycl::event>{});
 }
 
 }  // namespace

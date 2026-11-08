@@ -253,7 +253,7 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
 - [x] π0.5 (`lerobot/pi05_base`): parity with LeRobot f32 (cpu-ref 5e-6, Arc B390 f16 1e-3), 1 / 2 / 3 cameras
 - [x] π0.5 latency, first pass: f16 operands, fusions, fused flash attention (XMX) up to head_dim 128 with SigLIP
       per camera, Concat as one kernel, a cheaper GELU, prompt padded to 32-token buckets (Arc B390, 3 cameras:
-      428.5 -> 279.9 ms; design-vla.md §6)
+      428.5 -> 243.9 ms; design-vla.md §6)
 - [ ] π0.5 latency, next: the prefix down
       projection's GEMM (~30 TFLOPS against ~50 for gate / up), in-place expert K/V, gate and up in one GEMM,
       record / replay of the program
@@ -261,6 +261,8 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
       a 3-camera call at the memory floor); int8 halves it. Needs a GEMM that dequantizes in registers (50 rows)
 - [ ] Flash attention at head_dim 256 (Gemma): 8 rows per sub-group fill the registers, so every K/V tile feeds one
       DPAS and oneMKL's GEMMs match it; needs K/V or P shared across sub-groups through local memory
+- [ ] SYCL: other queue operations that may stall like barriers (the per-layer memset of MoE expert grouping, memcpys
+      in the f32 KV write and the Concat fallback): measure and replace with kernels where they cost
 - [ ] Low precision on Panther Lake: the B390 compiles fp8 (E4M3 / E5M2) DPAS but returns wrong results; int8 DPAS is
       exact at ~122 TOPS (2x f16). A w8a8 path is the low-precision option there (lossy, opt-in)
 - [ ] Normalization statistics (quantiles, mean/std) and resize-with-pad for other image sizes

@@ -488,6 +488,7 @@ f16, Intel Panther Lake (Arc B390 iGPU), steady state after warm-up (`xpu-serve 
 | GELU (tanh) through the hardware exponential instead of `sycl::tanh` (the GeGLU product is a large pass) | 298.8 ms | 233.0 ms | 194.0 ms | gates green |
 | The prompt padded to the next multiple of 32 tokens instead of 200 (pads are masked and never read: the same actions) | 285.3 ms | 226.3 ms | 189.4 ms | 5.2e-6 / 1.5e-6 cpu-ref f32 (prompt of 137 tokens); gates green |
 | GEMM-path attention reads q in place with one KV head (the pack was a copy: the prefix and the expert are MQA) | 279.9 ms | 222.0 ms | 185.3 ms | gates green |
+| No queue barriers around oneMKL calls (the in-order queue orders them; a barrier between busy kernels stalls the GPU ~50 us) | 243.9 ms | 191.2 ms | 158.8 ms | gates green; device suites 3x on both GPUs |
 
 Where the time goes now (per-op profile, ops run one at a time, which overstates small ops): the prefix MLP GEMMs
 (~85 ms: gate / up near 50 TFLOPS, down near 30), the expert's GEMMs (~80 ms; they re-read ~620 MB of f16 weights
