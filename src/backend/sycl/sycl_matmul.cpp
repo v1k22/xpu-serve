@@ -6,6 +6,8 @@
 
 #include <oneapi/mkl/blas.hpp>
 
+#include "util/error.h"
+
 namespace xs::sycl_be {
 
 namespace {
@@ -56,6 +58,25 @@ void matmul_half_x(sycl::queue& q, const half* x, const half* w, float* y, int64
         return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, 1.0f, x, k, w, k, 0.0f, y, n, deps);
     });
 }
+
+template <typename X>
+void matmul_half_y(sycl::queue& q, Scratch& scratch, const X* x, const half* w, half* y, int64_t m, int64_t n, int64_t k) {
+    const half* xh = nullptr;
+    if constexpr (std::is_same_v<X, half>) {
+        xh = x;
+    } else {
+        auto* conv = static_cast<half*>(scratch.get(static_cast<size_t>(m * k) * sizeof(half)));
+        to_half(q, x, conv, m * k);
+        xh = conv;
+    }
+    ordered(q, [&](const std::vector<sycl::event>& deps) {
+        return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, half(1.0f), xh, k, w, k, half(0.0f), y, n,
+                          deps);
+    });
+}
+
+template void matmul_half_y<float>(sycl::queue&, Scratch&, const float*, const half*, half*, int64_t, int64_t, int64_t);
+template void matmul_half_y<half>(sycl::queue&, Scratch&, const half*, const half*, half*, int64_t, int64_t, int64_t);
 
 void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantWeight& w, float* y, int64_t m,
                   int64_t n, int64_t k, bool f32) {
@@ -112,13 +133,19 @@ void attention_by_rows(sycl::queue& q, Scratch& scratch, float* out, const Atten
 
 }  // namespace
 
-template <typename KV>
-void attention(sycl::queue& q, Scratch& scratch, const float* qp, const KV* k, const KV* v, float* out,
+bool attention_gemm_path(const AttentionShape& s, AttentionPath path) { return !rows_path(s, path); }
+
+template <typename KV, typename QT>
+void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, const KV* v, float* out,
                const AttentionShape& s, AttentionPath path) {
     if (rows_path(s, path)) {
-        attention_by_rows(q, scratch, out, s,
-                          [&](int64_t split, float* part) { attention_rows(q, qp, k, v, out, s, split, part); });
-        return;
+        if constexpr (std::is_same_v<QT, float>) {
+            attention_by_rows(q, scratch, out, s,
+                              [&](int64_t split, float* part) { attention_rows(q, qp, k, v, out, s, split, part); });
+            return;
+        } else {
+            fail("sycl attention: an f16 query takes the GEMM path only");
+        }
     }
     const int64_t group = s.q_heads / s.kv_heads;
     const int64_t d = s.head_dim;
@@ -298,10 +325,14 @@ template void expert_matmul_quant_gemm<int64_t>(sycl::queue&, Scratch&, const fl
 
 template void matmul<half>(sycl::queue&, Scratch&, const float*, const half*, float*, int64_t, int64_t, int64_t);
 template void matmul<float>(sycl::queue&, Scratch&, const float*, const float*, float*, int64_t, int64_t, int64_t);
-template void attention<half>(sycl::queue&, Scratch&, const float*, const half*, const half*, float*,
-                              const AttentionShape&, AttentionPath);
-template void attention<float>(sycl::queue&, Scratch&, const float*, const float*, const float*, float*,
-                               const AttentionShape&, AttentionPath);
+template void attention<half, float>(sycl::queue&, Scratch&, const float*, const half*, const half*, float*,
+                                     const AttentionShape&, AttentionPath);
+template void attention<float, float>(sycl::queue&, Scratch&, const float*, const float*, const float*, float*,
+                                      const AttentionShape&, AttentionPath);
+template void attention<half, half>(sycl::queue&, Scratch&, const half*, const half*, const half*, float*,
+                                    const AttentionShape&, AttentionPath);
+template void attention<float, half>(sycl::queue&, Scratch&, const half*, const float*, const float*, float*,
+                                     const AttentionShape&, AttentionPath);
 template void attention_i8<half>(sycl::queue&, Scratch&, Scratch&, const float*, const KvI8&, float*,
                                  const AttentionShape&, AttentionPath);
 template void attention_i8<float>(sycl::queue&, Scratch&, Scratch&, const float*, const KvI8&, float*,

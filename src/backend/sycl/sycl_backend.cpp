@@ -546,6 +546,8 @@ private:
         conv_silu_.assign(nodes.size(), 0);
         norm_bias_.assign(nodes.size(), -1);
         add_mul_.assign(nodes.size(), -1);
+        unary_bias_.assign(nodes.size(), -1);
+        add3_.assign(nodes.size(), -1);
         reads_.resize(nodes.size());
         for (size_t i = 0; i < nodes.size(); ++i)
             reads_[i] = nodes[i].inputs;
@@ -583,11 +585,30 @@ private:
                 }
             }
         }
-        // Add(RmsNorm(x, w), c) with c a row vector: one norm with a bias (adaptive norms' shift). Add(a, Mul(b, c))
-        // with a and b of the output's shape and c the same or a row vector: one a + b * c (gated residuals).
+        // act(Add(x, b)) with b a row vector and the Add read only by act: one act(x + b) (a matmul's bias).
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
-            if (n.kind != OpKind::Add) continue;
+            if (act_of(n.kind) < 0 || fused_[i] != Fused::No) continue;
+            const auto u = static_cast<size_t>(n.inputs[0].node);
+            const Node& add = nodes[u];
+            if (add.kind != OpKind::Add || readers[u] != 1 || fused_[u] != Fused::No) continue;
+            const Dims& out = n.outputs[0].shape;
+            for (size_t k = 0; k < 2; ++k) {
+                const Dims& bs = graph_.type(add.inputs[1 - k]).shape;
+                if (graph_.type(add.inputs[k]).shape != out || bs.size() != 1 || bs[0] != out.back()) continue;
+                fused_[u] = Fused::Skip;
+                unary_bias_[i] = static_cast<int32_t>(u);
+                reads_[i] = {add.inputs[k], add.inputs[1 - k]};
+                reads_[u].clear();
+                break;
+            }
+        }
+        // Add(RmsNorm(x, w), c) with c a row vector: one norm with a bias (adaptive norms' shift). Add(a, Mul(b, c))
+        // with a and b of the output's shape and c the same or a row vector: one a + b * c (gated residuals).
+        // Add(a, Add(b, c)) with c a row vector: one a + (b + c) (a residual and a biased matmul).
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const Node& n = nodes[i];
+            if (n.kind != OpKind::Add || fused_[i] != Fused::No) continue;
             const Dims& out = n.outputs[0].shape;
             const auto row_vector = [&](Value v) {
                 const Dims& s = graph_.type(v).shape;
@@ -603,6 +624,19 @@ private:
                     norm_bias_[i] = static_cast<int32_t>(u);
                     reads_[i] = nodes[u].inputs;
                     reads_[i].push_back(other);
+                    reads_[u].clear();
+                    break;
+                }
+                if (nodes[u].kind == OpKind::Add && graph_.type(other).shape == out && norm_bias_[u] < 0 &&
+                    add_mul_[u] < 0 && add3_[u] < 0) {
+                    const Value b = nodes[u].inputs[0];
+                    const Value c = nodes[u].inputs[1];
+                    const bool c_row = graph_.type(b).shape == out && row_vector(c);
+                    const bool b_row = graph_.type(c).shape == out && row_vector(b);
+                    if (!c_row && !b_row) continue;
+                    fused_[u] = Fused::Skip;
+                    add3_[i] = static_cast<int32_t>(u);
+                    reads_[i] = c_row ? std::vector<Value>{other, b, c} : std::vector<Value>{other, c, b};
                     reads_[u].clear();
                     break;
                 }
@@ -622,57 +656,102 @@ private:
         }
     }
 
-    // Values that only GEMMs read as their input x are written in f16 by the kernel that makes them: the GEMM rounds
-    // x to f16 anyway, so this skips a conversion pass and halves the traffic without changing a result. Only static
-    // shapes with more rows than the GEMV path takes (which reads f32), and producers that can write f16.
+    // Values that only GEMM-path matmuls (as x) and GEMM-path attention (as q, k, v) read are kept in f16, written so
+    // by the kernel that makes them: those GEMMs run on f16 operands anyway, so a conversion pass disappears and the
+    // traffic halves. Attention operands produced in f16 (projections, RoPE) round q, k and v to f16 before the
+    // scores, the convention of the f16 KV cache. Static shapes only (dynamic ones can take the f32-only GEMV and
+    // per-row paths). A fixed point: start from every eligible value, drop any whose readers cannot take f16.
     void plan_half_values() {
         if (precision_ != DType::F16) return;
         const auto& nodes = graph_.nodes();
-        std::vector<std::vector<size_t>> readers(nodes.size());  // device readers of each node's output 0
-        for (size_t i = 0; i < nodes.size(); ++i) {
-            for (const Value& in : reads_[i]) {
-                if (in.index == 0) readers[static_cast<size_t>(in.node)].push_back(i);
+        const size_t count = nodes.size();
+        std::vector<std::vector<std::pair<size_t, size_t>>> readers(count);  // (reader, input index) of output 0
+        for (size_t i = 0; i < count; ++i) {
+            for (size_t k = 0; k < reads_[i].size(); ++k) {
+                if (reads_[i][k].index == 0) readers[static_cast<size_t>(reads_[i][k].node)].emplace_back(i, k);
             }
         }
-        std::vector<uint8_t> output(nodes.size(), 0);
+        std::vector<uint8_t> output(count, 0);
         for (const auto& o : graph_.outputs())
             output[static_cast<size_t>(o.value.node)] = 1;
         const auto static_shape = [](const Dims& d) {
             return std::none_of(d.begin(), d.end(), [](int64_t v) { return v == kT || v == kL; });
         };
-        // Every reader (looking through reshapes) is a GEMM-path matmul reading it as x, with an f16 weight.
-        std::function<bool(size_t)> gemm_only = [&](size_t v) {
-            if (output[v] != 0 || readers[v].empty()) return false;
-            for (const size_t r : readers[v]) {
-                const Node& rn = nodes[r];
-                if (rn.kind == OpKind::Reshape) {
-                    if (!gemm_only(r)) return false;
-                    continue;
-                }
-                if (rn.kind != OpKind::MatMul || fused_[r] != Fused::No || rn.inputs[0].node != static_cast<int32_t>(v) ||
-                    dt(rn.inputs[1]) != DType::F16) {
-                    return false;
-                }
-                const Dims& x = graph_.type(rn.inputs[0]).shape;
-                if (!static_shape(x) || numel(x) / x.back() <= sycl_be::kGemvMaxRows) return false;
-            }
-            return true;
+        const auto gemm_matmul = [&](size_t m) {  // the matmul runs on the GEMM path with an f16 weight
+            const Node& n = nodes[m];
+            if (n.kind != OpKind::MatMul || dt(n.inputs[1]) != DType::F16) return false;
+            const Dims& x = graph_.type(n.inputs[0]).shape;
+            return static_shape(x) && numel(x) / x.back() > sycl_be::kGemvMaxRows;
         };
-        size_t halved = 0;
-        for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto gemm_attention = [&](size_t a) {
+            const Node& n = nodes[a];
+            if (n.kind != OpKind::Attention || attention_path_ == sycl_be::AttentionPath::Rows) return false;
+            const Dims& q = graph_.type(n.inputs[0]).shape;
+            const Dims& k = graph_.type(n.inputs[1]).shape;
+            if (!static_shape(q) || !static_shape(k) || dt(n.inputs[1]) == DType::I8) return false;
+            sycl_be::AttentionShape sh;
+            sh.tokens = q[0];
+            sh.head_dim = q[2];
+            return sycl_be::attention_gemm_path(sh, attention_path_);
+        };
+        std::vector<uint8_t> half(count, 0);
+        for (size_t i = 0; i < count; ++i) {
             const OpKind k = nodes[i].kind;
-            const bool writes_half = k == OpKind::RmsNorm || k == OpKind::LayerNorm || k == OpKind::Add ||
-                                     k == OpKind::Mul || k == OpKind::GeluTanh || k == OpKind::Silu;
-            if (!writes_half || fused_[i] != Fused::No || dtype_[i][0] != DType::F32) continue;
-            if (!static_shape(nodes[i].outputs[0].shape) || !gemm_only(i)) continue;
-            dtype_[i][0] = DType::F16;
-            ++halved;
+            const bool producer = k == OpKind::RmsNorm || k == OpKind::LayerNorm || k == OpKind::Add ||
+                                  k == OpKind::Mul || k == OpKind::GeluTanh || k == OpKind::Silu ||
+                                  k == OpKind::Rope || k == OpKind::Reshape || k == OpKind::Slice ||
+                                  k == OpKind::Transpose || k == OpKind::Concat || (k == OpKind::MatMul && gemm_matmul(i));
+            half[i] = producer && fused_[i] == Fused::No && dtype_[i][0] == DType::F32 && output[i] == 0 &&
+                      nodes[i].outputs.size() == 1 && static_shape(nodes[i].outputs[0].shape) && !readers[i].empty();
         }
-        for (size_t i = 0; i < nodes.size(); ++i) {  // views take their input's dtype
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (size_t i = 0; i < count; ++i) {
+                if (half[i] == 0) continue;
+                const Node& n = nodes[i];
+                bool ok = true;
+                if (n.kind == OpKind::Reshape || n.kind == OpKind::Slice || n.kind == OpKind::Transpose) {
+                    ok = half[static_cast<size_t>(n.inputs[0].node)];
+                }
+                if (n.kind == OpKind::Concat) {
+                    for (const Value& in : n.inputs)
+                        ok = ok && half[static_cast<size_t>(in.node)] != 0;
+                }
+                for (const auto& [r, k] : readers[i]) {
+                    const OpKind rk = nodes[r].kind;
+                    bool accept = false;
+                    if (rk == OpKind::MatMul) {
+                        accept = k == 0 && fused_[r] == Fused::No && gemm_matmul(r);
+                    } else if (rk == OpKind::Attention) {
+                        const auto kv = [&](size_t idx) { return half[static_cast<size_t>(nodes[r].inputs[idx].node)] != 0; };
+                        accept = gemm_attention(r) && (k == 0 || ((k == 1 || k == 2) && kv(1) && kv(2)));
+                    } else if (rk == OpKind::Reshape || rk == OpKind::Slice || rk == OpKind::Transpose ||
+                               rk == OpKind::Concat) {
+                        accept = half[r] != 0;
+                    } else if (rk == OpKind::Mul && act_mul_[r] >= 0) {  // a fused activation reads both in one type
+                        accept = half[static_cast<size_t>(reads_[r][0].node)] != 0 &&
+                                 half[static_cast<size_t>(reads_[r][1].node)] != 0;
+                    }
+                    ok = ok && accept;
+                }
+                if (!ok) {
+                    half[i] = 0;
+                    changed = true;
+                }
+            }
+        }
+        size_t halved = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (half[i] != 0) {
+                dtype_[i][0] = DType::F16;
+                ++halved;
+            }
+        }
+        for (size_t i = 0; i < count; ++i) {  // views take their input's dtype
             const OpKind k = nodes[i].kind;
             if (k == OpKind::Reshape || k == OpKind::Slice || k == OpKind::Transpose) dtype_[i][0] = dt(nodes[i].inputs[0]);
         }
-        if (halved > 0) log::debug("sycl: ", halved, " values feed GEMMs in f16");
+        if (halved > 0) log::debug("sycl: ", halved, " values kept in f16 for GEMMs and attention");
     }
 
     // A pack's quantized weight: codes, scales and (Q4) biases as stored.
@@ -1072,6 +1151,12 @@ private:
         };
         const auto read_f32 = [&](size_t k) { return reinterpret_cast<const float*>(ptr(p, reads_[i][k])); };
         const auto unary = [&](UnaryOp op, float a = 0.0f, float b = 0.0f) {
+            if (unary_bias_[i] >= 0) {  // act(x + bias): op is Silu, GeluTanh or Sigmoid
+                const Value bias = reads_[i][1];
+                const int64_t period = numel(p.shapes[static_cast<size_t>(bias.node)][static_cast<size_t>(bias.index)]);
+                with_out([&](auto* y) { sycl_be::unary_bias(q_, op, read_f32(0), read_f32(1), y, out_n, period); });
+                return;
+            }
             with_out([&](auto* y) { sycl_be::unary(q_, op, in_f32(0), y, out_n, a, b); });
         };
         switch (n.kind) {
@@ -1117,6 +1202,14 @@ private:
                 if (is_quantized(in_dt(1))) {
                     sycl_be::matmul_quant(q_, *this, in_f32(0), leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out,
                                           m, rows, k, precision_ == DType::F32);
+                } else if (dt(Value{static_cast<int32_t>(i), 0}) == DType::F16) {  // plan_half_values: y in f16
+                    auto* y = reinterpret_cast<half*>(out_raw);
+                    const auto* w = reinterpret_cast<const half*>(in_ptr(1));
+                    if (in_dt(0) == DType::F16) {
+                        sycl_be::matmul_half_y(q_, *this, reinterpret_cast<const half*>(in_ptr(0)), w, y, m, rows, k);
+                    } else {
+                        sycl_be::matmul_half_y(q_, *this, in_f32(0), w, y, m, rows, k);
+                    }
                 } else if (in_dt(0) == DType::F16) {  // plan_half_values: x is already f16 (GEMM path)
                     sycl_be::matmul_half_x(q_, reinterpret_cast<const half*>(in_ptr(0)),
                                            reinterpret_cast<const half*>(in_ptr(1)), out, m, rows, k);
@@ -1131,9 +1224,21 @@ private:
             case OpKind::Mul:
             case OpKind::Div: {
                 if (act_mul_[i] >= 0) {
+                    const auto act = static_cast<UnaryOp>(act_mul_[i]);
                     with_out([&](auto* y) {
-                        sycl_be::act_mul(q_, static_cast<UnaryOp>(act_mul_[i]), read_f32(0), read_f32(1), y, out_n);
+                        if (dt(reads_[i][0]) == DType::F16) {
+                            sycl_be::act_mul(q_, act, reinterpret_cast<const half*>(ptr(p, reads_[i][0])),
+                                             reinterpret_cast<const half*>(ptr(p, reads_[i][1])), y, out_n);
+                        } else {
+                            sycl_be::act_mul(q_, act, read_f32(0), read_f32(1), y, out_n);
+                        }
                     });
+                    return;
+                }
+                if (add3_[i] >= 0) {
+                    const Value c = reads_[i][2];
+                    const int64_t period = numel(p.shapes[static_cast<size_t>(c.node)][static_cast<size_t>(c.index)]);
+                    with_out([&](auto* y) { sycl_be::add3(q_, read_f32(0), read_f32(1), read_f32(2), y, out_n, period); });
                     return;
                 }
                 if (norm_bias_[i] >= 0) {
@@ -1248,13 +1353,15 @@ private:
                 const int64_t sections = pos.size() == 2 ? pos[1] : 1;
                 const int64_t rotary_attr = std::get<graph::RopeAttrs>(n.attrs).rotary_dim;
                 const int64_t rotary = rotary_attr == 0 ? x[2] : rotary_attr;
-                if (in_dt(1) == DType::I32) {
-                    sycl_be::rope(q_, in_f32(0), reinterpret_cast<const int32_t*>(in_ptr(1)), in_f32(2), out, x[0], x[1],
-                                  x[2], rotary, sections);
-                } else {
-                    sycl_be::rope(q_, in_f32(0), reinterpret_cast<const int64_t*>(in_ptr(1)), in_f32(2), out, x[0], x[1],
-                                  x[2], rotary, sections);
-                }
+                with_out([&](auto* y) {
+                    if (in_dt(1) == DType::I32) {
+                        sycl_be::rope(q_, in_f32(0), reinterpret_cast<const int32_t*>(in_ptr(1)), in_f32(2), y, x[0],
+                                      x[1], x[2], rotary, sections);
+                    } else {
+                        sycl_be::rope(q_, in_f32(0), reinterpret_cast<const int64_t*>(in_ptr(1)), in_f32(2), y, x[0],
+                                      x[1], x[2], rotary, sections);
+                    }
+                });
                 return;
             }
             case OpKind::KvCache: {
@@ -1309,11 +1416,20 @@ private:
                     } else {
                         sycl_be::attention_i8<float>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_path_);
                     }
-                } else if (in_dt(1) == DType::F16) {
-                    sycl_be::attention(q_, *this, in_f32(0), reinterpret_cast<const half*>(in_ptr(1)),
-                                       reinterpret_cast<const half*>(in_ptr(2)), out, s, attention_path_);
                 } else {
-                    sycl_be::attention(q_, *this, in_f32(0), in_f32(1), in_f32(2), out, s, attention_path_);
+                    const auto run = [&](const auto* qp) {
+                        if (in_dt(1) == DType::F16) {
+                            sycl_be::attention(q_, *this, qp, reinterpret_cast<const half*>(in_ptr(1)),
+                                               reinterpret_cast<const half*>(in_ptr(2)), out, s, attention_path_);
+                        } else {
+                            sycl_be::attention(q_, *this, qp, in_f32(1), in_f32(2), out, s, attention_path_);
+                        }
+                    };
+                    if (in_dt(0) == DType::F16) {
+                        run(reinterpret_cast<const half*>(in_ptr(0)));
+                    } else {
+                        run(in_f32(0));
+                    }
                 }
                 return;
             }
@@ -1497,6 +1613,8 @@ private:
     std::vector<uint8_t> conv_silu_;         // CausalConv that applies the SiLU after it
     std::vector<int32_t> norm_bias_;         // Add run as RmsNorm(node) + bias: the norm node, or -1
     std::vector<int32_t> add_mul_;           // Add run as a + b * c with the Mul node folded in, or -1
+    std::vector<int32_t> unary_bias_;        // activation run as act(x + bias) with the Add folded in, or -1
+    std::vector<int32_t> add3_;              // Add run as a + (b + c) with the inner Add folded in, or -1
     std::vector<DeviceBuffer> leaves_;
     std::vector<char*> leaf_ptr_;  // by node index, weights and constants
     std::vector<sycl_be::QuantWeight> leaf_quant_;  // by node index, quantized weights

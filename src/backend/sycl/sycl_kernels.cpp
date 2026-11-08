@@ -49,10 +49,18 @@ void unary_t(sycl::queue& q, const float* x, Y* y, int64_t n, float a, float b) 
                    [=](sycl::id<1> i) { y[i] = static_cast<Y>(apply_unary<Op>(x[i], a, b)); });
 }
 
-template <UnaryOp Act, typename Y>
-void act_mul_t(sycl::queue& q, const float* x, const float* b, Y* y, int64_t n) {
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)),
-                         [=](sycl::id<1> i) { y[i] = static_cast<Y>(apply_unary<Act>(x[i], 0.0f, 0.0f) * b[i]); });
+template <UnaryOp Act, typename X, typename Y>
+void act_mul_t(sycl::queue& q, const X* x, const X* b, Y* y, int64_t n) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
+        y[i] = static_cast<Y>(apply_unary<Act>(static_cast<float>(x[i]), 0.0f, 0.0f) * static_cast<float>(b[i]));
+    });
+}
+
+template <UnaryOp Op, typename Y>
+void unary_bias_t(sycl::queue& q, const float* x, const float* bias, Y* y, int64_t n, int64_t period) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
+        y[i] = static_cast<Y>(apply_unary<Op>(x[i] + bias[static_cast<int64_t>(i[0]) % period], 0.0f, 0.0f));
+    });
 }
 
 template <BinaryOp Op>
@@ -730,12 +738,21 @@ void unary(sycl::queue& q, UnaryOp op, const float* x, Y* y, int64_t n, float a,
     }
 }
 
-template <typename Y>
-void act_mul(sycl::queue& q, UnaryOp act, const float* x, const float* b, Y* y, int64_t n) {
+template <typename X, typename Y>
+void act_mul(sycl::queue& q, UnaryOp act, const X* x, const X* b, Y* y, int64_t n) {
     switch (act) {
-        case UnaryOp::Silu: return act_mul_t<UnaryOp::Silu, Y>(q, x, b, y, n);
-        case UnaryOp::GeluTanh: return act_mul_t<UnaryOp::GeluTanh, Y>(q, x, b, y, n);
-        default: return act_mul_t<UnaryOp::Sigmoid, Y>(q, x, b, y, n);
+        case UnaryOp::Silu: return act_mul_t<UnaryOp::Silu, X, Y>(q, x, b, y, n);
+        case UnaryOp::GeluTanh: return act_mul_t<UnaryOp::GeluTanh, X, Y>(q, x, b, y, n);
+        default: return act_mul_t<UnaryOp::Sigmoid, X, Y>(q, x, b, y, n);
+    }
+}
+
+template <typename Y>
+void unary_bias(sycl::queue& q, UnaryOp act, const float* x, const float* bias, Y* y, int64_t n, int64_t period) {
+    switch (act) {
+        case UnaryOp::Silu: return unary_bias_t<UnaryOp::Silu, Y>(q, x, bias, y, n, period);
+        case UnaryOp::GeluTanh: return unary_bias_t<UnaryOp::GeluTanh, Y>(q, x, bias, y, n, period);
+        default: return unary_bias_t<UnaryOp::Sigmoid, Y>(q, x, bias, y, n, period);
     }
 }
 
@@ -939,9 +956,19 @@ void add_mul(sycl::queue& q, const float* a, const float* b, const float* c, Y* 
     });
 }
 
+template <typename Y>
+void add3(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
+        y[i] = static_cast<Y>(a[i] + (b[i] + c[static_cast<int64_t>(i[0]) % period]));
+    });
+}
+
 #define XS_INSTANTIATE_OUT(Y)                                                                                         \
     template void unary<Y>(sycl::queue&, UnaryOp, const float*, Y*, int64_t, float, float);                           \
-    template void act_mul<Y>(sycl::queue&, UnaryOp, const float*, const float*, Y*, int64_t);                         \
+    template void act_mul<float, Y>(sycl::queue&, UnaryOp, const float*, const float*, Y*, int64_t);                  \
+    template void act_mul<half, Y>(sycl::queue&, UnaryOp, const half*, const half*, Y*, int64_t);                     \
+    template void unary_bias<Y>(sycl::queue&, UnaryOp, const float*, const float*, Y*, int64_t, int64_t);             \
+    template void add3<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t);              \
     template void binary<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, const Broadcast&);      \
     template void binary_same<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t);                   \
     template void binary_period<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, int64_t);        \
@@ -961,8 +988,8 @@ void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n,
     });
 }
 
-template <typename I>
-void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_freq, float* y, int64_t tokens,
+template <typename I, typename Y>
+void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_freq, Y* y, int64_t tokens,
           int64_t heads, int64_t dim, int64_t rotary, int64_t sections) {
     const int64_t width = rotary / sections;
     const int64_t half_w = width / 2;
@@ -970,7 +997,7 @@ void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_f
         const int64_t i = static_cast<int64_t>(idx[0]);
         const int64_t d = i % dim;
         if (d >= rotary) {
-            y[i] = x[i];
+            y[i] = static_cast<Y>(x[i]);
             return;
         }
         const int64_t t = i / (heads * dim);
@@ -982,7 +1009,7 @@ void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_f
         const float cs = sycl::cos(angle);
         const float sn = sycl::sin(angle);
         const int64_t base = i - c;
-        y[i] = c < half_w ? x[i] * cs - x[base + c + half_w] * sn : x[i] * cs + x[base + c - half_w] * sn;
+        y[i] = static_cast<Y>(c < half_w ? x[i] * cs - x[base + c + half_w] * sn : x[i] * cs + x[base + c - half_w] * sn);
     });
 }
 
@@ -1169,8 +1196,8 @@ void attention_combine(sycl::queue& q, const float* part, float* out, int64_t ro
     });
 }
 
-template <typename CT>
-void attention_pack_q(sycl::queue& q, const float* qp, CT* packed, const AttentionShape& s, int64_t t0, int64_t tc) {
+template <typename CT, typename QT>
+void attention_pack_q(sycl::queue& q, const QT* qp, CT* packed, const AttentionShape& s, int64_t t0, int64_t tc) {
     const int64_t d_n = s.head_dim;
     const int64_t group = s.q_heads / s.kv_heads;
     const int64_t hq_n = s.q_heads;
@@ -1180,7 +1207,7 @@ void attention_pack_q(sycl::queue& q, const float* qp, CT* packed, const Attenti
         const int64_t g = (i / d_n) % group;
         const int64_t tl = (i / (d_n * group)) % tc;
         const int64_t kh = i / (d_n * group * tc);
-        packed[i] = static_cast<CT>(qp[((t0 + tl) * hq_n + kh * group + g) * d_n + d]);
+        packed[i] = static_cast<CT>(static_cast<float>(qp[((t0 + tl) * hq_n + kh * group + g) * d_n + d]));
     });
 }
 
@@ -1324,14 +1351,22 @@ template void gather<half, int32_t>(sycl::queue&, const half*, const int32_t*, f
 template void gather<half, int64_t>(sycl::queue&, const half*, const int64_t*, float*, int64_t, int64_t);
 template void gather<float, int32_t>(sycl::queue&, const float*, const int32_t*, float*, int64_t, int64_t);
 template void gather<float, int64_t>(sycl::queue&, const float*, const int64_t*, float*, int64_t, int64_t);
-template void rope<int32_t>(sycl::queue&, const float*, const int32_t*, const float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);
-template void rope<int64_t>(sycl::queue&, const float*, const int64_t*, const float*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);
+#define XS_INSTANTIATE_ROPE(I, Y)                                                                                     \
+    template void rope<I, Y>(sycl::queue&, const float*, const I*, const float*, Y*, int64_t, int64_t, int64_t, int64_t, \
+                             int64_t);
+XS_INSTANTIATE_ROPE(int32_t, float)
+XS_INSTANTIATE_ROPE(int64_t, float)
+XS_INSTANTIATE_ROPE(int32_t, half)
+XS_INSTANTIATE_ROPE(int64_t, half)
+#undef XS_INSTANTIATE_ROPE
 template void attention_rows<half>(sycl::queue&, const float*, const half*, const half*, float*, const AttentionShape&,
                                    int64_t, float*);
 template void attention_rows<float>(sycl::queue&, const float*, const float*, const float*, float*,
                                     const AttentionShape&, int64_t, float*);
-template void attention_pack_q<half>(sycl::queue&, const float*, half*, const AttentionShape&, int64_t, int64_t);
-template void attention_pack_q<float>(sycl::queue&, const float*, float*, const AttentionShape&, int64_t, int64_t);
+template void attention_pack_q<half, float>(sycl::queue&, const float*, half*, const AttentionShape&, int64_t, int64_t);
+template void attention_pack_q<float, float>(sycl::queue&, const float*, float*, const AttentionShape&, int64_t, int64_t);
+template void attention_pack_q<half, half>(sycl::queue&, const half*, half*, const AttentionShape&, int64_t, int64_t);
+template void attention_pack_q<float, half>(sycl::queue&, const half*, float*, const AttentionShape&, int64_t, int64_t);
 template void attention_softmax<half>(sycl::queue&, const float*, half*, const AttentionShape&, int64_t, int64_t, int64_t, int64_t);
 template void attention_softmax<float>(sycl::queue&, const float*, float*, const AttentionShape&, int64_t, int64_t, int64_t, int64_t);
 template void gemv<half>(sycl::queue&, const float*, const half*, float*, int64_t, int64_t, int64_t);

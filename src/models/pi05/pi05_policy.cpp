@@ -272,7 +272,8 @@ private:
     }
 
     // SigLIP So400m/14 (transformers SiglipVisionModel, last hidden state) and the PaliGemma projector. The cameras'
-    // tokens share every matmul; attention stays within each camera's patches.
+    // tokens share every matmul; attention stays within each camera's patches: with several cameras, one attention
+    // call whose heads are (camera, head) pairs.
     Value vision(Graph& g, Value pixels, int64_t n_cam) const {
         Graph::Scope s(g, "vision");
         const int64_t tokens = n_cam * patches_;
@@ -289,16 +290,19 @@ private:
             Graph::Scope ls(g, "layers." + std::to_string(l));
             const std::string L = kVision + "encoder.layers." + std::to_string(l) + ".";
             Value h = g.layer_norm(x, weight(g, L + "layer_norm1.weight"), weight(g, L + "layer_norm1.bias"), kNormEps);
-            const auto heads = [&](Value v) { return g.reshape(v, {tokens, vision_heads_, head_dim}); };
+            // [cameras * patches, width] -> [patches, cameras * heads, head_dim]: camera c's head h is head c * H + h.
+            const auto heads = [&](Value v) {
+                if (n_cam == 1) return g.reshape(v, {patches_, vision_heads_, head_dim});
+                return g.reshape(g.transpose(g.reshape(v, {n_cam, patches_, vision_heads_, head_dim}), {1, 0, 2, 3}),
+                                 {patches_, n_cam * vision_heads_, head_dim});
+            };
             const Value q = heads(linear_bias(g, h, L + "self_attn.q_proj."));
             const Value k = heads(linear_bias(g, h, L + "self_attn.k_proj."));
             const Value v = heads(linear_bias(g, h, L + "self_attn.v_proj."));
-            std::vector<Value> per_camera;
-            for (int64_t c = 0; c < n_cam; ++c) {
-                const int64_t b = c * patches_, e = b + patches_;
-                per_camera.push_back(g.attention(g.slice(q, 0, b, e), g.slice(k, 0, b, e), g.slice(v, 0, b, e), attrs));
+            Value att = g.attention(q, k, v, attrs);
+            if (n_cam > 1) {
+                att = g.transpose(g.reshape(att, {patches_, n_cam, vision_heads_, head_dim}), {1, 0, 2, 3});
             }
-            const Value att = per_camera.size() == 1 ? per_camera[0] : g.concat(per_camera, 0);
             x = g.add(x, linear_bias(g, g.reshape(att, {tokens, w}), L + "self_attn.out_proj."));
             h = g.layer_norm(x, weight(g, L + "layer_norm2.weight"), weight(g, L + "layer_norm2.bias"), kNormEps);
             h = linear_bias(g, g.gelu_tanh(linear_bias(g, h, L + "mlp.fc1.")), L + "mlp.fc2.");

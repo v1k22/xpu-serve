@@ -480,13 +480,14 @@ f16, Intel Panther Lake (Arc B390 iGPU), steady state after warm-up (`xpu-serve 
 |---|---|---|---|---|
 | First correct version (oneMKL GEMMs, per-op launches) | 428.5 ms | 325.9 ms | 253.7 ms | 1.1e-3 / 5.1e-4 |
 | f16 GEMM inputs written by their producers; norm + shift and gated-residual fusions; no attention unpack with one KV head | 380.3 ms | | 227.1 ms | 1.1e-3 / 5.7e-4 |
+| Attention operands in f16 (projections and RoPE write f16; the attention GEMMs run on the matrix engines instead of in f32) | 343.1 ms | | 213.7 ms | 5.4e-4 / 5.8e-4 |
+| GeGLU gate / up in f16; bias folded into GELU and into residual adds; SigLIP attention batched across cameras | 326.3 ms | 253.5 ms | 202.8 ms | 1.8e-3 / 7.5e-4 |
 
-Where the time goes now (per-op profile, ops run one at a time): the prefix MLP GEMMs (~92 ms), attention (~98 ms
-across SigLIP, the prefix and the expert, mostly GEMM-path overhead and score traffic), the expert's GEMMs (~83 ms,
-near their bandwidth floor of ~56 ms), and elementwise passes (bias adds, GeGLU) (~60 ms). Next steps in order of
-expected gain: a fused attention kernel for the three shapes, the expert's K / V written in place instead of
-concatenated per step, SigLIP attention batched across cameras, gate and up projections in one GEMM, bias adds folded
-into their consumers, then record / replay of the whole program.
+Where the time goes now (per-op profile, ops run one at a time): the prefix MLP GEMMs (~90 ms at 30 to 40 TFLOPS),
+the expert's GEMMs (~83 ms, near their bandwidth floor of ~56 ms), attention (~60 ms across SigLIP, the prefix and
+the expert, mostly GEMM-path overhead) and the remaining elementwise passes. Next steps in order of expected gain: a
+fused attention kernel for the three shapes, the expert's K / V written in place instead of concatenated per step,
+gate and up projections in one GEMM, then record / replay of the whole program.
 
 Missing cameras cost nothing: the program for a camera subset contains only those cameras, and its result equals
 LeRobot's padded, masked cameras (the 1-camera parity case checks it).

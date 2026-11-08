@@ -25,6 +25,9 @@ template <typename W>
 void matmul(sycl::queue& q, Scratch& scratch, const float* x, const W* w, float* y, int64_t m, int64_t n, int64_t k);
 // The same through the GEMM path with x already in f16 (M > kGemvMaxRows).
 void matmul_half_x(sycl::queue& q, const half* x, const half* w, float* y, int64_t m, int64_t n, int64_t k);
+// The GEMM path writing y in f16 (an attention operand); x in f32 (converted in scratch) or f16.
+template <typename X>
+void matmul_half_y(sycl::queue& q, Scratch& scratch, const X* x, const half* w, half* y, int64_t m, int64_t n, int64_t k);
 
 // y [M, N] = x [M, K] @ dequant(w)^T: the quantized GEMV up to kGemvMaxRows rows; beyond, w is dequantized once
 // (to f16, or f32 when `f32`) and multiplied with oneMKL's GEMM.
@@ -45,10 +48,12 @@ void expert_matmul_quant_gemm(sycl::queue& q, Scratch& scratch, const float* x, 
 enum class AttentionPath : uint8_t { Auto, Rows, Gemm };
 inline constexpr int64_t kAttentionRowsMax = 8;
 
-// out [T, Hq, D] from q [T, Hq, D] and k, v [N, Hkv, D] (graph.h Attention).
-template <typename KV>
-void attention(sycl::queue& q, Scratch& scratch, const float* qp, const KV* k, const KV* v, float* out,
+// out [T, Hq, D] from q [T, Hq, D] and k, v [N, Hkv, D] (graph.h Attention). An f16 q takes the GEMM path.
+template <typename KV, typename QT = float>
+void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, const KV* v, float* out,
                const AttentionShape& s, AttentionPath path);
+// True when attention() takes the GEMM path for this shape.
+bool attention_gemm_path(const AttentionShape& s, AttentionPath path);
 
 // attention() over an int8 KV cache. The rows path reads the codes; the GEMM path first dequantizes the keys the
 // queries can see to CT in `kv_scratch` (a second scratch: the GEMM path uses `scratch` for its own buffers).

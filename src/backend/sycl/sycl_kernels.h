@@ -22,8 +22,11 @@ template <typename Y>
 void unary(sycl::queue& q, UnaryOp op, const float* x, Y* y, int64_t n, float a, float b);
 
 // y = act(x) * b, same shapes; act is Silu, GeluTanh or Sigmoid (a fused activation-times-gate).
+template <typename X, typename Y>
+void act_mul(sycl::queue& q, UnaryOp act, const X* x, const X* b, Y* y, int64_t n);
+// y = act(x + bias), bias repeating every `period` elements (a matmul's bias folded into its activation).
 template <typename Y>
-void act_mul(sycl::queue& q, UnaryOp act, const float* x, const float* b, Y* y, int64_t n);
+void unary_bias(sycl::queue& q, UnaryOp act, const float* x, const float* bias, Y* y, int64_t n, int64_t period);
 
 enum class BinaryOp : uint8_t { Add, Mul, Div };
 // numpy broadcasting over at most kMaxRank dims: out shape and the element strides of a and b per out dim (0 where
@@ -44,6 +47,9 @@ void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, 
 // y = a + b * c, c repeating every `period` elements (period == n: the same shape): a gated residual.
 template <typename Y>
 void add_mul(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period);
+// y = a + (b + c), c repeating every `period` elements (a residual plus a matmul with its bias).
+template <typename Y>
+void add3(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period);
 
 // Rows of `width`.
 void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width);
@@ -69,8 +75,8 @@ template <typename T, typename I>
 void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n, int64_t width);
 
 // x [T, H, D]; positions [T] or [T, sections]; inv_freq [rotary / (2 sections)].
-template <typename I>
-void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_freq, float* y, int64_t tokens,
+template <typename I, typename Y>
+void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_freq, Y* y, int64_t tokens,
           int64_t heads, int64_t dim, int64_t rotary, int64_t sections);
 
 // For each of `outer` blocks: rows [begin, begin + len) of `dim` rows of `inner` elements of `elem` bytes.
@@ -140,8 +146,8 @@ void attention_combine(sycl::queue& q, const float* part, float* out, int64_t ro
 
 // Prefill attention for queries [t0, t0 + tc) through GEMMs, steps of attention_gemm (sycl_matmul.cpp):
 // q -> [Hkv, tc, G, D] packed in CT
-template <typename CT>
-void attention_pack_q(sycl::queue& q, const float* qp, CT* packed, const AttentionShape& s, int64_t t0, int64_t tc);
+template <typename CT, typename QT>
+void attention_pack_q(sycl::queue& q, const QT* qp, CT* packed, const AttentionShape& s, int64_t t0, int64_t tc);
 // scores [Hkv, tc, G, keys] (keys [k_lo, k_lo + keys)) -> probabilities in CT, masked keys 0.
 template <typename CT>
 void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const AttentionShape& s, int64_t t0, int64_t tc,
