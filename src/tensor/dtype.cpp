@@ -17,12 +17,14 @@ size_t dtype_size(DType t) {
         case DType::Q8: return 1;
         case DType::Q4:
         case DType::Q3:
-        case DType::Q2: fail(dtype_name(t), " packs several values per byte; use storage_bytes");
+        case DType::Q2:
+        case DType::QX: fail(dtype_name(t), " packs several values per byte; use storage_bytes");
     }
     fail("unknown dtype");
 }
 
 size_t storage_bytes(DType t, int64_t numel) {
+    if (t == DType::QX) fail("qx: the size depends on each expert's bits (TensorView::nbytes)");
     if (t == DType::Q4 || t == DType::Q3 || t == DType::Q2) {
         return static_cast<size_t>((numel * quant_bits(t) + 7) / 8);  // Q3 / Q2: 12 / 8 bytes per 32 values
     }
@@ -43,6 +45,7 @@ std::string_view dtype_name(DType t) {
         case DType::Q4: return "q4";
         case DType::Q3: return "q3";
         case DType::Q2: return "q2";
+        case DType::QX: return "qx";
     }
     return "?";
 }
@@ -61,7 +64,9 @@ DType dtype_from_safetensors(std::string_view s) {
 
 bool is_float(DType t) { return t == DType::F32 || t == DType::F16 || t == DType::BF16; }
 
-bool is_quantized(DType t) { return t == DType::Q8 || t == DType::Q4 || t == DType::Q3 || t == DType::Q2; }
+bool is_quantized(DType t) {
+    return t == DType::Q8 || t == DType::Q4 || t == DType::Q3 || t == DType::Q2 || t == DType::QX;
+}
 
 int quant_bits(DType t) {
     switch (t) {
@@ -69,6 +74,7 @@ int quant_bits(DType t) {
         case DType::Q4: return 4;
         case DType::Q3: return 3;
         case DType::Q2: return 2;
+        case DType::QX: return 0;
         default: fail(dtype_name(t), " is not a quantized dtype");
     }
 }

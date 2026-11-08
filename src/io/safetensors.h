@@ -63,6 +63,7 @@ private:
     std::vector<std::unique_ptr<SafetensorsFile>> files_;
     std::map<std::string, const TensorView*> index_;
     std::map<std::string, TensorView> quant_views_;
+    std::map<std::string, std::vector<int8_t>> expert_bits_;  // QX views' per-expert code bits
     std::vector<std::unique_ptr<SafetensorsWeights>> overlays_;
     bool is_pack_ = false;
 };

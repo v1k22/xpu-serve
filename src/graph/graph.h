@@ -285,6 +285,7 @@ private:
     std::vector<ConvSlot> conv_slots_;
     std::vector<RecurrentSlot> recurrent_slots_;
     std::string scope_;
+    int captures_ = 0;  // XS_CAPTURE=matmul (branch exp/manual-quant): matmul inputs emitted so far
 };
 
 }  // namespace xs::graph

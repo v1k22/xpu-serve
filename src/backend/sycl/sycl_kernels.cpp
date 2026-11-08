@@ -615,13 +615,34 @@ inline void quant_rows_dot(const QuantWeight& w, const int64_t (&rows)[kQRows], 
     }
 }
 
+// QX: rows [row0, row0 + kQRows) of expert e (of n rows), decoded at the expert's own width. The width is uniform
+// across a work-group (one expert each), so the switch does not diverge.
+template <int M>
+inline void mixed_rows_dot(const QuantWeight& w, int64_t e, int64_t n, int64_t row0, const float* const (&xs)[M],
+                           int lane, int64_t k, float (&acc)[kQRows][M]) {
+    QuantWeight we = w;
+    const int64_t groups = k / w.group;
+    we.codes = w.codes + w.expert_offsets[e];
+    we.scales = w.scales + e * n * groups;
+    we.biases = w.biases + e * n * groups;
+    int64_t rows[kQRows];
+    for (int r = 0; r < kQRows; ++r)
+        rows[r] = std::min<int64_t>(row0 + r, n - 1);
+    switch (w.expert_bits[e]) {
+        case 8: quant_rows_dot<8, M>(we, rows, xs, lane, k, acc); break;
+        case 4: quant_rows_dot<4, M>(we, rows, xs, lane, k, acc); break;
+        case 3: quant_rows_dot<3, M>(we, rows, xs, lane, k, acc); break;
+        default: quant_rows_dot<2, M>(we, rows, xs, lane, k, acc); break;
+    }
+}
+
 template <typename I>
 inline int64_t expert_of(const I* idx, int64_t pair, int64_t experts) {
     const int64_t e = static_cast<int64_t>(idx[pair]);
     return e < 0 || e >= experts ? 0 : e;
 }
 
-// One work-group per (pair, block of kQSgPerWg * kQRows rows).
+// One work-group per (pair, block of kQSgPerWg * kQRows rows). Bits 0: QX.
 template <int Bits, typename I>
 void expert_quant_pairs_t(sycl::queue& q, const float* x, bool per_slot, QuantWeight w, const I* idx, float* out,
                           int64_t pairs, int64_t slots, int64_t experts, int64_t n, int64_t k) {
@@ -635,13 +656,17 @@ void expert_quant_pairs_t(sycl::queue& q, const float* x, bool per_slot, QuantWe
         const int64_t p = static_cast<int64_t>(it.get_group(0)) / blocks;
         const int64_t block = static_cast<int64_t>(it.get_group(0)) % blocks;
         const int64_t row0 = (block * kQSgPerWg + sg.get_group_linear_id()) * kQRows;
-        const int64_t base = expert_of(idx, p, experts) * n;
-        int64_t rows[kQRows];
-        for (int r = 0; r < kQRows; ++r)
-            rows[r] = base + std::min<int64_t>(row0 + r, n - 1);
+        const int64_t e = expert_of(idx, p, experts);
         const float* const xs[1] = {x + (per_slot ? p : p / slots) * k};
         float acc[kQRows][1] = {};
-        quant_rows_dot<Bits, 1>(w, rows, xs, lane, k, acc);
+        if constexpr (Bits == 0) {
+            mixed_rows_dot<1>(w, e, n, row0, xs, lane, k, acc);
+        } else {
+            int64_t rows[kQRows];
+            for (int r = 0; r < kQRows; ++r)
+                rows[r] = e * n + std::min<int64_t>(row0 + r, n - 1);
+            quant_rows_dot<Bits, 1>(w, rows, xs, lane, k, acc);
+        }
         for (int r = 0; r < kQRows; ++r) {
             const float sum = sycl::reduce_over_group(sg, acc[r][0], sycl::plus<float>());
             if (lane == 0 && row0 + r < n) out[p * n + row0 + r] = sum;
@@ -697,7 +722,7 @@ void group_by_expert(sycl::queue& q, const I* idx, int64_t pairs, int64_t expert
     });
 }
 
-// One work-group per (active expert, row block); it walks the expert's pairs kGemvMaxRows at a time.
+// One work-group per (active expert, row block); it walks the expert's pairs kGemvMaxRows at a time. Bits 0: QX.
 template <int Bits>
 void expert_quant_grouped_t(sycl::queue& q, const float* x, bool per_slot, QuantWeight w, float* out, int64_t slots,
                             int64_t n, int64_t k, ExpertGrouping g, int64_t max_active) {
@@ -727,7 +752,11 @@ void expert_quant_grouped_t(sycl::queue& q, const float* x, bool per_slot, Quant
                 xs[mm] = x + (per_slot ? ps[mm] : ps[mm] / slots) * k;
             }
             float acc[kQRows][M] = {};
-            quant_rows_dot<Bits, M>(w, rows, xs, lane, k, acc);
+            if constexpr (Bits == 0) {
+                mixed_rows_dot<M>(w, e, n, row0, xs, lane, k, acc);
+            } else {
+                quant_rows_dot<Bits, M>(w, rows, xs, lane, k, acc);
+            }
             for (int r = 0; r < kQRows; ++r) {
                 for (int mm = 0; mm < M; ++mm) {
                     const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
@@ -1202,8 +1231,13 @@ template <typename I>
 void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const QuantWeight& w, const I* idx, float* out,
                          int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping) {
     const int64_t pairs = tokens * slots;
+    // f(width) for the bank's code width, 0 for a QX bank (each expert its own).
+    const auto with_width = [&](auto&& f) {
+        if (w.bits == 0) return f(std::integral_constant<int, 0>{});
+        with_bits(w.bits, f);
+    };
     if (pairs <= kExpertPairsDirect || grouping == nullptr) {
-        with_bits(w.bits, [&](auto b) {
+        with_width([&](auto b) {
             expert_quant_pairs_t<decltype(b)::value>(q, x, per_slot, w, idx, out, pairs, slots, experts, n, k);
         });
         return;
@@ -1211,7 +1245,7 @@ void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const Qu
     const ExpertGrouping g(grouping, experts);
     group_by_expert(q, idx, pairs, experts, g);
     const int64_t max_active = std::min(pairs, experts);
-    with_bits(w.bits, [&](auto b) {
+    with_width([&](auto b) {
         expert_quant_grouped_t<decltype(b)::value>(q, x, per_slot, w, out, slots, n, k, g, max_active);
     });
 }

@@ -6,6 +6,7 @@
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cmath>
 #include <functional>
 #include <memory>
@@ -105,7 +106,7 @@ inline void expert_matmul_shared_and_per_slot(const Env& env) {
     }
 }
 
-// Q8 / Q4 expert banks against the dequantized bank: few (token, slot) pairs (one GEMV each on SYCL), more (grouped by
+// Q8 / Q4 / Q3 / Q2 / QX (mixed widths) expert banks against the dequantized bank: few (token, slot) pairs (one GEMV each on SYCL), more (grouped by
 // expert) and many (grouped GEMMs), shared and per-slot inputs, experts repeated across tokens, N not a multiple of
 // the row blocks.
 struct BankShape {
@@ -119,13 +120,17 @@ inline void expert_matmul_quantized(const Env& env) {
     CAPTURE(experts);
     CAPTURE(k);
     const HostTensor dense = rng.uniform(DType::F32, {experts, n, k}, 1.0f / std::sqrt(static_cast<float>(k)));
-    for (const DType format : {DType::Q8, DType::Q4, DType::Q3, DType::Q2}) {
+    for (const DType format : {DType::Q8, DType::Q4, DType::Q3, DType::Q2, DType::QX}) {
         for (const int64_t group : {32, 64}) {
             if (k % group != 0) continue;
             CAPTURE(dtype_name(format));
             CAPTURE(group);
             MemoryWeights w;
-            w.add_quantized("w", quant::quantize(dense.view(), format, group));
+            std::vector<int8_t> bits;  // QX: the experts cycle through 4, 2, 8 and 3 bits
+            for (int64_t e = 0; e < experts; ++e)
+                bits.push_back(static_cast<int8_t>(std::array<int, 4>{4, 2, 8, 3}[static_cast<size_t>(e % 4)]));
+            w.add_quantized("w", format == DType::QX ? quant::quantize_experts(dense.view(), bits, group)
+                                                     : quant::quantize(dense.view(), format, group));
             for (const int64_t tokens : {1, 5, 13, 40, 150}) {  // up to 450 pairs
                 CAPTURE(tokens);
                 std::vector<int32_t> idx;

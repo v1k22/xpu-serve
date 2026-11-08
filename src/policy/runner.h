@@ -41,6 +41,7 @@ struct ActTiming {
 
 struct ActResult {
     HostTensor actions;  // [horizon, action_dim]
+    TensorMap captures;  // XS_CAPTURE=matmul: the "cap.*" outputs (branch exp/manual-quant)
     std::vector<int32_t> prompt_ids;
     ActTiming timing;
 };

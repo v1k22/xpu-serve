@@ -137,6 +137,39 @@ TEST_SUITE("quant") {
         }
     }
 
+    TEST_CASE("qx: each expert dequantizes as its own q8 / q4 / q3 / q2 matrix; the view's size sums the experts") {
+        std::mt19937 gen(10);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        const int64_t experts = 4, n = 8, k = 64;
+        std::vector<float> w(static_cast<size_t>(experts * n * k));
+        for (float& v : w)
+            v = dist(gen);
+        TensorView bank;
+        bank.dtype = DType::F32;
+        bank.shape = {experts, n, k};
+        bank.data = w.data();
+        const std::vector<int8_t> bits = {3, 2, 8, 4};
+        const quant::Quantized q = quant::quantize_experts(bank, bits, 32);
+        const TensorView v = q.view();
+        CHECK(v.dtype == DType::QX);
+        CHECK(v.nbytes() == static_cast<size_t>(n * k * (3 + 2 + 8 + 4) / 8));
+        CHECK(v.nbytes() == q.codes.size());
+        std::vector<float> got(w.size());
+        quant::dequantize_rows(v, 0, experts * n, got.data());
+        for (int64_t e = 0; e < experts; ++e) {
+            CAPTURE(e);
+            const int b = bits[static_cast<size_t>(e)];
+            const DType f = b == 8 ? DType::Q8 : b == 4 ? DType::Q4 : b == 3 ? DType::Q3 : DType::Q2;
+            const quant::Quantized one = quant::quantize(f32_view(std::vector<float>(w.begin() + e * n * k, w.begin() + (e + 1) * n * k), n, k), f, 32);
+            std::vector<float> want(static_cast<size_t>(n * k));
+            quant::dequantize_rows(one.view(), 0, n, want.data());
+            CHECK(std::equal(want.begin(), want.end(), got.begin() + e * n * k));
+        }
+        std::vector<float> tail(static_cast<size_t>(n * k));  // a row range starting inside the last expert
+        quant::dequantize_rows(v, 3 * n + 3, n - 3, tail.data());
+        CHECK(std::equal(tail.begin(), tail.begin() + (n - 3) * k, got.begin() + (3 * n + 3) * k));
+    }
+
     TEST_CASE("int8 KV rows: within half a step, the largest magnitude is +-127, zero rows stay zero") {
         std::mt19937 gen(7);
         std::uniform_real_distribution<float> dist(-3.0f, 3.0f);

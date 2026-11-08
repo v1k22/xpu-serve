@@ -194,7 +194,15 @@ struct QuantWeight {
     const half* biases = nullptr;
     const float* input_scales = nullptr;  // AWQ: [K], multiplies column k of the dequantized weight; or null
     int64_t group = 0;
+    // bits 0 (DType::QX, branch exp/manual-quant): an expert bank whose expert e has expert_bits[e]-bit codes
+    // starting at byte expert_offsets[e] (device arrays; the host_ copies for host-side dispatch).
+    const int8_t* expert_bits = nullptr;
+    const int64_t* expert_offsets = nullptr;
+    const int8_t* host_expert_bits = nullptr;
+    const int64_t* host_expert_offsets = nullptr;
 };
+// Expert e of a bank [E, n, k] as a plain weight (any width, QX included; host side).
+QuantWeight expert_weight(const QuantWeight& w, int64_t e, int64_t n, int64_t k);
 // y [M, N] = x [M, K] @ dequant(w)^T for M <= kGemvMaxRows; K a multiple of 32.
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k);
 // The same for kGemvMaxRows < M <= kQuantGemmMaxRows on the matrix engines (sycl_quant_gemm.cpp; needs xmx_device),

@@ -38,10 +38,14 @@ struct Quantized {
     std::vector<uint16_t> scales;
     std::vector<uint16_t> biases;  // Q4 only
     std::vector<float> input_scales;  // AWQ: per column, multiplies the dequantized weight; empty otherwise
+    std::vector<int8_t> expert_bits;  // QX: code bits of each expert
 
     // The logical view (dtype Q8 / Q4, shape [rows, cols]) over this storage.
     TensorView view() const;
 };
+
+// An expert bank [E, N, K] as QX: expert e rounded to nearest at bits[e] (8, 4, 3 or 2) as quantize() does.
+Quantized quantize_experts(const TensorView& w, const std::vector<int8_t>& bits, int64_t group);
 
 // Why a [rows, cols] matrix cannot be stored as `format` with this group size, or empty when it can.
 std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t group);

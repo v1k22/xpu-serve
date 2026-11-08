@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <sstream>
@@ -171,6 +172,16 @@ Value Graph::matmul(Value x, Value w) {
              shape_to_string(wt.shape), "^T: inner dims differ (", where(x), ", ", where(w), ")");
     Dims out = xt.shape;
     out.back() = wt.shape[0];
+    // XS_CAPTURE=matmul (branch exp/manual-quant): every weight matmul's input becomes an output
+    // "cap.<weight>#<n>", for quantization calibration (policy-eval --capture).
+    static const bool capture = [] {
+        const char* c = std::getenv("XS_CAPTURE");
+        return c != nullptr && std::string(c) == "matmul";
+    }();
+    if (capture && nodes_[static_cast<size_t>(w.node)].kind == OpKind::Weight)
+        output("cap." + std::get<WeightAttrs>(nodes_[static_cast<size_t>(w.node)].attrs).name + "#" +
+                   std::to_string(captures_++),
+               x);
     return add_node(OpKind::MatMul, {x, w}, {}, {TensorType{DType::F32, std::move(out)}}, "matmul");
 }
 

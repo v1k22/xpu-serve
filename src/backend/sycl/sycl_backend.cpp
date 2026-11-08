@@ -496,12 +496,12 @@ private:
                     need(0, !is_quantized(dt(n.inputs[0])), "an unquantized tensor");
                     break;
                 case OpKind::Gather:
-                    need(0, is_fp(0) || is_packed(0), "f16, f32, q8, q4, q3 or q2");
+                    need(0, is_fp(0) || (is_packed(0) && dt(n.inputs[0]) != DType::QX), "f16, f32, q8, q4, q3 or q2");
                     need(1, is_int(1), "i32 or i64");
                     break;
                 case OpKind::MatMul: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8, q4, q3 or q2");
+                    need(1, is_fp(1) || (is_packed(1) && dt(n.inputs[1]) != DType::QX), "f16, f32, q8, q4, q3 or q2");
                     const int64_t k = graph_.type(n.inputs[1]).shape[1];
                     XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized weight needs a multiple of 32 "
                              "columns, got ", k);
@@ -514,7 +514,7 @@ private:
                     break;
                 case OpKind::ExpertMatMul: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8, q4, q3 or q2");
+                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8, q4, q3, q2 or qx");
                     need(2, is_int(2), "i32 or i64");
                     const int64_t k = graph_.type(n.inputs[1]).shape[2];
                     XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized expert bank needs a multiple of 32 "
@@ -798,6 +798,18 @@ private:
         w.bits = quant_bits(view.dtype);
         w.group = view.quant.group;
         w.codes = reinterpret_cast<const uint8_t*>(copy(view.data, view.nbytes()));
+        if (view.dtype == DType::QX) {  // per-expert widths: the table on the device and on the host
+            const int64_t experts = view.shape[0];
+            const int64_t expert_values = numel(view.shape) / experts;
+            auto& bits = host_expert_bits_.emplace_back(view.quant.expert_bits, view.quant.expert_bits + experts);
+            auto& offsets = host_expert_offsets_.emplace_back(static_cast<size_t>(experts));
+            for (int64_t e = 0, at = 0; e < experts; at += expert_values * bits[static_cast<size_t>(e)] / 8, ++e)
+                offsets[static_cast<size_t>(e)] = at;
+            w.host_expert_bits = bits.data();
+            w.host_expert_offsets = offsets.data();
+            w.expert_bits = reinterpret_cast<const int8_t*>(copy(bits.data(), bits.size()));
+            w.expert_offsets = reinterpret_cast<const int64_t*>(copy(offsets.data(), offsets.size() * sizeof(int64_t)));
+        }
         w.scales = reinterpret_cast<const half*>(copy(view.quant.scales, scale_bytes));
         if (w.bits != 8) w.biases = reinterpret_cast<const half*>(copy(view.quant.biases, scale_bytes));
         if (view.quant.input_scales != nullptr) {
@@ -1659,6 +1671,8 @@ private:
     std::vector<int32_t> unary_bias_;        // activation run as act(x + bias) with the Add folded in, or -1
     std::vector<int32_t> add3_;              // Add run as a + (b + c) with the inner Add folded in, or -1
     std::vector<DeviceBuffer> leaves_;
+    std::vector<std::vector<int8_t>> host_expert_bits_;      // QX weights' tables (QuantWeight::host_expert_*)
+    std::vector<std::vector<int64_t>> host_expert_offsets_;
     std::vector<char*> leaf_ptr_;  // by node index, weights and constants
     std::vector<sycl_be::QuantWeight> leaf_quant_;  // by node index, quantized weights
     std::vector<KvBuffers> kv_;

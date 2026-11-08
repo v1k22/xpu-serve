@@ -132,8 +132,11 @@ def gptq_prepare(w, h, damp=0.01):
     h[:, ar, ar] = diag_safe
     w[dead.unsqueeze(1).expand_as(w)] = 0
     h[:, ar, ar] += damp * diag_safe.mean(-1, keepdim=True)
-    hinv = torch.cholesky_inverse(torch.linalg.cholesky(h))
-    return w, torch.linalg.cholesky(hinv, upper=True), diag
+    # Upper Cholesky factor U of H^-1 (H^-1 = U^T U) without forming H^-1: with J the index reversal and
+    # J H J = L L^T, U = J L^-1 J. (cholesky_inverse is ~25x slower on the CPU.)
+    eye = torch.eye(k, device=w.device, dtype=h.dtype).expand_as(h)
+    lr = torch.linalg.cholesky(h.flip(-1, -2))
+    return w, torch.linalg.solve_triangular(lr, eye, upper=False).flip(-1, -2), diag
 
 
 def gptq_run(w, hinv, diag, bits, group, block=128, clips=CLIPS):
@@ -208,12 +211,22 @@ class Checkpoint:
 
     def __init__(self, path):
         self.path = path
-        idx = json.load(open(os.path.join(path, "model.safetensors.index.json")))["weight_map"]
-        self.where = idx
+        index = os.path.join(path, "model.safetensors.index.json")
+        if os.path.exists(index):
+            self.where = json.load(open(index))["weight_map"]
+        else:  # a single-file checkpoint
+            with safe_open(os.path.join(path, "model.safetensors"), framework="pt") as f:
+                self.where = {n: "model.safetensors" for n in f.keys()}
         self._open = {}
 
     def names(self):
         return list(self.where)
+
+    def shape(self, name):
+        f = self.where[name]
+        if f not in self._open:
+            self._open[f] = safe_open(os.path.join(self.path, f), framework="pt")
+        return self._open[f].get_slice(name).get_shape()
 
     def get(self, name):
         f = self.where[name]

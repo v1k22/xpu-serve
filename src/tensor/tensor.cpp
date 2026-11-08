@@ -17,6 +17,15 @@ int64_t numel(const Dims& dims) {
     return n;
 }
 
+size_t TensorView::nbytes() const {
+    if (dtype != DType::QX) return storage_bytes(dtype, numel());
+    const int64_t per_expert = numel() / shape.at(0);
+    size_t total = 0;
+    for (int64_t e = 0; e < shape[0]; ++e)
+        total += static_cast<size_t>(per_expert * quant.expert_bits[e] / 8);
+    return total;
+}
+
 std::string dims_to_string(const Dims& dims) {
     std::string s = "[";
     for (size_t i = 0; i < dims.size(); ++i) {

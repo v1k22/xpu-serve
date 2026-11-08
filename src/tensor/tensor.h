@@ -28,6 +28,7 @@ struct QuantParams {
     const void* scales = nullptr;        // f16
     const void* biases = nullptr;        // f16, Q4 only
     const float* input_scales = nullptr;  // f32 [cols], or null
+    const int8_t* expert_bits = nullptr;  // QX: code bits (8, 4, 3 or 2) of each expert [shape[0]]
 };
 
 struct TensorView {
@@ -37,7 +38,7 @@ struct TensorView {
     QuantParams quant;  // dtype Q8 / Q4 only
 
     int64_t numel() const { return xs::numel(shape); }
-    size_t nbytes() const { return storage_bytes(dtype, numel()); }
+    size_t nbytes() const;
 };
 
 // Owning (or borrowing) dense row-major host tensor. Copies share storage; use clone() for a deep copy.

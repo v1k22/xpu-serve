@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -340,6 +341,78 @@ int cmd_quant_capture(const std::vector<std::string>& argv) {
     return 0;
 }
 
+// policy-eval (branch exp/manual-quant): a policy's actions on recorded observations with fixed noise, as f32
+// [cases, horizon, action_dim], to compare quantized packs. <cases>/manifest.json: {"cases": [{"cameras": {name:
+// image file}, "state": [...], "instruction": "...", "noise": "<f32 [horizon, noise_dim] file>"}, ...]}.
+int cmd_policy_eval(const std::vector<std::string>& argv) {
+    namespace fs = std::filesystem;
+    Args a;
+    add_engine_options(a);
+    a.value("cases", "directory with manifest.json").value("out", "actions file").value("steps", "flow steps (0 = the checkpoint's)", "0");
+    a.value("capture", "also write every weight matmul's input as f16 rows to <dir>/<weight>.f16 (XS_CAPTURE=matmul)");
+    a.parse(argv);
+    if (wants_help(a, "policy-eval", "<policy-dir> --cases <dir> --out <file> [options]")) return 0;
+    log::set_level(log::parse_level(a.get("log-level")));
+    const std::string dir = model_dir_arg(a, "policy-eval");
+    const fs::path cases = a.get("cases");
+    const std::string capture = a.get("capture");
+    if (!capture.empty()) {
+        setenv("XS_CAPTURE", "matmul", 1);
+        fs::create_directories(capture);
+    }
+    std::map<std::string, std::ofstream> capture_files;
+    const auto manifest = cfg::read_json(cases / "manifest.json");
+    const ServiceOptions so = service_options(a);
+    PolicyRunnerOptions ro;
+    ro.backend = so.backend;
+    ro.session = so.session;
+    auto runner = PolicyRunner::create(dir, ro);
+    const PolicySpec& spec = runner->spec();
+    const int steps = a.get_int("steps") > 0 ? a.get_int("steps") : spec.denoise_steps;
+    const auto read_file = [](const fs::path& p) {
+        std::ifstream f(p, std::ios::binary);
+        XS_CHECK(f.good(), "cannot read ", p.string());
+        return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {});
+    };
+    std::ofstream out(a.get("out"), std::ios::binary);
+    int64_t n = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (const auto& c : manifest.at("cases")) {
+        Observation obs;
+        for (const CameraSpec& cam : spec.cameras) {
+            if (c.at("cameras").contains(cam.name))
+                obs.cameras.emplace_back(cam.name, image::decode(read_file(cases / c.at("cameras").at(cam.name).get<std::string>())));
+        }
+        obs.state = c.at("state").get<std::vector<float>>();
+        obs.instruction = c.at("instruction").get<std::string>();
+        const std::vector<uint8_t> raw = read_file(cases / c.at("noise").get<std::string>());
+        std::vector<float> noise(static_cast<size_t>(spec.horizon * spec.noise_dim));
+        XS_CHECK(raw.size() == noise.size() * sizeof(float), "noise file size: want [", spec.horizon, ", ", spec.noise_dim, "] f32");
+        std::memcpy(noise.data(), raw.data(), raw.size());
+        const HostTensor nt = HostTensor::from_vector(DType::F32, {spec.horizon, spec.noise_dim}, noise);
+        ActOptions o;
+        o.steps = steps;
+        o.noise = &nt;
+        const ActResult r = runner->act(obs, o);
+        out.write(reinterpret_cast<const char*>(r.actions.data<float>()), static_cast<std::streamsize>(r.actions.nbytes()));
+        for (const auto& [name, t] : r.captures) {  // "cap.<weight>#<n>": rows of every use go to one file
+            const std::string weight = name.substr(4, name.rfind('#') - 4);
+            auto it = capture_files.find(weight);
+            if (it == capture_files.end())
+                it = capture_files.emplace(weight, std::ofstream(fs::path(capture) / (weight + ".f16"), std::ios::binary)).first;
+            const std::vector<float> v = t.to_f32();
+            std::vector<uint16_t> h(v.size());
+            for (size_t i = 0; i < v.size(); ++i) h[i] = f32_to_f16(v[i]);
+            it->second.write(reinterpret_cast<const char*>(h.data()), static_cast<std::streamsize>(h.size() * 2));
+        }
+        ++n;
+    }
+    std::printf("%lld cases, actions [%lld, %lld] each, %.1f s\n", static_cast<long long>(n),
+                static_cast<long long>(spec.horizon), static_cast<long long>(spec.action_dim),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    return 0;
+}
+
 int cmd_info() {
     std::printf("xpu-serve %s\n", XS_VERSION);
     for (const auto& name : available_backends()) {
@@ -628,6 +701,7 @@ int main(int argc, char** argv) {
         if (command == "convert") return cmd_convert(args);
         if (command == "quant-eval") return cmd_quant_eval(args);
         if (command == "quant-capture") return cmd_quant_capture(args);
+        if (command == "policy-eval") return cmd_policy_eval(args);
         if (command == "info") return cmd_info();
         if (command == "--version" || command == "version") {
             std::printf("xpu-serve %s\n", XS_VERSION);

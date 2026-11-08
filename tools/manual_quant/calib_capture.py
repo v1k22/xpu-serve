@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 """Calibration statistics from engine activations (branch exp/manual-quant): the fast path to what calibrate.py makes.
 
-    python calib_capture.py tokens --model-dir <hf dir> --data <dir> --seqs 64 --len 2048 --out calib_tokens.bin
+    python calib_capture.py tokens --model-dir <hf dir> --data <dir> --seqs 56 --len 2048 --out calib_tokens.bin \
+        [--code <site-packages>:*.py:28 --code /usr/include:*.h:12]
     xpu-serve quant-capture <pack> --tokens calib_tokens.bin --seq 2048 --out <capture dir>
     python calib_capture.py stats --model-dir <hf dir> --capture <capture dir> --out <stats dir> [--device xpu]
 
 quant-capture writes, per layer, the inputs of its linear maps as f16 [tokens, width]: attn_in.N (input_layernorm
 out), moe_in.N (post_attention_layernorm out), attn_out.N (out_proj / o_proj input) and final (the LM head input).
 `stats` recomputes the routing and the expert intermediates from the bfloat16 checkpoint and writes the same files
-calibrate.py does (layerNN.pt, linear.pt), so quantize.py reads either.
+calibrate.py does (layerNN.pt, linear.pt), so quantize.py reads either. `linear` makes linear.pt from the per-weight
+captures of policy-eval --capture (any model whose linear maps are plain matmuls).
 """
 
 import argparse
 import json
 import os
+import random
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -24,6 +28,25 @@ import mq
 P = "model.language_model."
 
 
+def code_tokens(tok, root, pattern, seqs, length, seed=0):
+    """`seqs` windows of `length` tokens from source files under root (shuffled, concatenated)."""
+    files = sorted(str(p) for p in Path(root).rglob(pattern) if p.is_file() and 8 << 10 < p.stat().st_size < 512 << 10)
+    random.Random(seed).shuffle(files)
+    ids, out = [], []
+    for f in files:
+        try:
+            text = open(f, encoding="utf-8").read()
+        except (UnicodeDecodeError, OSError):
+            continue
+        ids += tok(text, add_special_tokens=False)["input_ids"] + [tok.eos_token_id]
+        while len(ids) >= length and len(out) < seqs:
+            out.append(ids[:length])
+            ids = ids[length:]
+        if len(out) == seqs:
+            break
+    return out
+
+
 def cmd_tokens(args):
     from transformers import AutoTokenizer
 
@@ -31,6 +54,9 @@ def cmd_tokens(args):
 
     tok = AutoTokenizer.from_pretrained(args.model_dir)
     seqs = calibration_tokens(tok, args.data, args.seqs, args.len)
+    for spec in args.code:  # <root>:<glob>:<seqs>
+        root, pattern, n = spec.rsplit(":", 2)
+        seqs += code_tokens(tok, root, pattern, int(n), args.len)
     np.asarray(seqs, dtype=np.int32).tofile(args.out)
     print(f"wrote {len(seqs)} x {args.len} tokens to {args.out}")
 
@@ -119,6 +145,22 @@ def cmd_stats(args):
     print(f"done: {tokens} tokens in {time.time() - t0:.0f} s", flush=True)
 
 
+def cmd_linear(args):
+    """Hessians of every weight from policy-eval --capture files (<weight>.f16, f16 rows of its input), keyed by the
+    weight's name."""
+    dev = torch.device(args.device)
+    ckpt = mq.Checkpoint(args.model_dir)
+    linear = {}
+    for f in sorted(os.listdir(args.capture)):
+        name = f[: -len(".f16")]
+        k = ckpt.shape(name)[-1]
+        x = load_capture(os.path.join(args.capture, f), k, dev)
+        linear[name] = gram(x).cpu()
+        print(f"{name}: {x.shape[0]} rows", flush=True)
+    os.makedirs(args.out, exist_ok=True)
+    torch.save({"linear": linear}, os.path.join(args.out, "linear.pt"))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -128,14 +170,21 @@ def main():
     t.add_argument("--seqs", type=int, default=64)
     t.add_argument("--len", type=int, default=2048)
     t.add_argument("--out", required=True)
+    t.add_argument("--code", action="append", default=[],
+                   help="<root>:<glob>:<seqs>: also windows of source code (keep the evaluation's files out)")
     s = sub.add_parser("stats")
     s.add_argument("--model-dir", required=True)
     s.add_argument("--capture", required=True)
     s.add_argument("--out", required=True)
     s.add_argument("--device", default="xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
+    lin = sub.add_parser("linear")
+    lin.add_argument("--model-dir", required=True)
+    lin.add_argument("--capture", required=True)
+    lin.add_argument("--out", required=True)
+    lin.add_argument("--device", default="xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cpu")
     args = ap.parse_args()
     torch.set_num_threads(os.cpu_count())
-    cmd_tokens(args) if args.cmd == "tokens" else cmd_stats(args)
+    {"tokens": cmd_tokens, "stats": cmd_stats, "linear": cmd_linear}[args.cmd](args)
 
 
 if __name__ == "__main__":

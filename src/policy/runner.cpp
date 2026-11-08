@@ -97,6 +97,14 @@ ActResult PolicyRunner::act(const Observation& obs, const ActOptions& options) {
 
     const auto finish_start = std::chrono::steady_clock::now();
     r.actions = policy_->finish(outputs);
+    for (auto it = outputs.begin(); it != outputs.end();) {
+        if (it->first.rfind("cap.", 0) == 0) {
+            r.captures.emplace(it->first, std::move(it->second));
+            it = outputs.erase(it);
+        } else {
+            ++it;
+        }
+    }
     r.timing.finish_ms = ms_since(finish_start);
     r.timing.total_ms = ms_since(start);
     return r;

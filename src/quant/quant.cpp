@@ -55,7 +55,38 @@ TensorView Quantized::view() const {
     v.quant.scales = scales.data();
     v.quant.biases = format != DType::Q8 ? biases.data() : nullptr;
     v.quant.input_scales = input_scales.empty() ? nullptr : input_scales.data();
+    v.quant.expert_bits = expert_bits.empty() ? nullptr : expert_bits.data();
     return v;
+}
+
+Quantized quantize_experts(const TensorView& w, const std::vector<int8_t>& bits, int64_t group) {
+    XS_CHECK(w.shape.size() == 3 && static_cast<int64_t>(bits.size()) == w.shape[0] && is_float(w.dtype),
+             "quantize_experts needs a float bank [E, N, K] and E bit widths, got ", dims_to_string(w.shape), " and ",
+             bits.size());
+    Quantized q;
+    q.format = DType::QX;
+    q.shape = w.shape;
+    q.rows = matrix_rows(w.shape);
+    q.cols = w.shape[2];
+    q.group = group;
+    q.expert_bits = bits;
+    const int64_t per_expert = w.shape[1] * w.shape[2];
+    for (int64_t e = 0; e < w.shape[0]; ++e) {
+        const int8_t b = bits[static_cast<size_t>(e)];
+        XS_CHECK(b == 8 || b == 4 || b == 3 || b == 2, "quantize_experts: expert ", e, " has ", int(b), " bits");
+        TensorView one = w;
+        one.shape = {w.shape[1], w.shape[2]};
+        one.data = static_cast<const char*>(w.data) + e * per_expert * static_cast<int64_t>(dtype_size(w.dtype));
+        const Quantized qe = quantize(one, b == 8 ? DType::Q8 : b == 4 ? DType::Q4 : b == 3 ? DType::Q3 : DType::Q2, group);
+        q.codes.insert(q.codes.end(), qe.codes.begin(), qe.codes.end());
+        q.scales.insert(q.scales.end(), qe.scales.begin(), qe.scales.end());
+        if (b == 8) {
+            q.biases.resize(q.biases.size() + qe.scales.size(), 0);  // keeps biases [E, N, K / group]
+        } else {
+            q.biases.insert(q.biases.end(), qe.biases.begin(), qe.biases.end());
+        }
+    }
+    return q;
 }
 
 std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t group) {
@@ -301,17 +332,32 @@ void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* o
     const int64_t cols = v.shape.back();
     const int64_t group = v.quant.group;
     const int64_t groups = cols / group;
-    const int bits = quant_bits(v.dtype);
-    const auto row_bytes = static_cast<int64_t>(storage_bytes(v.dtype, cols));
     const auto* scales = static_cast<const uint16_t*>(v.quant.scales);
     const auto* biases = static_cast<const uint16_t*>(v.quant.biases);
+    // QX: each expert's rows take its own width, the experts' codes one after the other.
+    const int64_t expert_rows = v.dtype == DType::QX ? matrix_rows(v.shape) / v.shape[0] : 0;
+    std::vector<int64_t> expert_start;
+    if (v.dtype == DType::QX) {
+        expert_start.assign(static_cast<size_t>(v.shape[0]) + 1, 0);
+        for (int64_t e = 0; e < v.shape[0]; ++e)
+            expert_start[static_cast<size_t>(e) + 1] = expert_start[static_cast<size_t>(e)] + expert_rows * cols * v.quant.expert_bits[e] / 8;
+    }
     for (int64_t r = first; r < first + count; ++r) {
         float* o = out + (r - first) * cols;
-        const auto* row = static_cast<const uint8_t*>(v.data) + r * row_bytes;
+        int bits = 0;
+        const uint8_t* row = nullptr;
+        if (v.dtype == DType::QX) {
+            const int64_t e = r / expert_rows;
+            bits = v.quant.expert_bits[e];
+            row = static_cast<const uint8_t*>(v.data) + expert_start[static_cast<size_t>(e)] + (r % expert_rows) * cols * bits / 8;
+        } else {
+            bits = quant_bits(v.dtype);
+            row = static_cast<const uint8_t*>(v.data) + r * static_cast<int64_t>(storage_bytes(v.dtype, cols));
+        }
         for (int64_t c = 0; c < cols; ++c) {
             const size_t sg = static_cast<size_t>(r * groups + c / group);
             const float s = f16_to_f32(scales[sg]);
-            if (v.dtype == DType::Q8) {
+            if (bits == 8) {
                 o[c] = s * static_cast<float>(static_cast<int8_t>(row[c]));
             } else {
                 o[c] = s * static_cast<float>(code_at(row, bits, c)) + f16_to_f32(biases[sg]);

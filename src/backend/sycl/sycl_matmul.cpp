@@ -10,6 +10,22 @@
 
 namespace xs::sycl_be {
 
+QuantWeight expert_weight(const QuantWeight& w, int64_t e, int64_t n, int64_t k) {
+    QuantWeight r = w;
+    const int64_t groups = k / w.group;
+    if (w.bits == 0) {
+        r.bits = w.host_expert_bits[e];
+        r.codes = w.codes + w.host_expert_offsets[e];
+        r.expert_bits = r.host_expert_bits = nullptr;
+        r.expert_offsets = r.host_expert_offsets = nullptr;
+    } else {
+        r.codes = w.codes + e * n * (k * w.bits / 8);
+    }
+    r.scales = w.scales + e * n * groups;
+    if (w.biases != nullptr) r.biases = w.biases + e * n * groups;
+    return r;
+}
+
 namespace {
 
 namespace blas = oneapi::mkl::blas::row_major;
@@ -247,16 +263,6 @@ void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const f
 
 namespace {
 
-// Rows [first, first + count) of a quantized weight, as a weight of its own.
-QuantWeight quant_rows(const QuantWeight& w, int64_t first, int64_t k) {
-    QuantWeight r = w;
-    const int64_t row_bytes = k * w.bits / 8;
-    const int64_t groups = k / w.group;
-    r.codes = w.codes + first * row_bytes;
-    r.scales = w.scales + first * groups;
-    if (w.biases != nullptr) r.biases = w.biases + first * groups;
-    return r;
-}
 
 template <typename CT, typename I>
 void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const QuantWeight& w, const I* idx,
@@ -304,10 +310,13 @@ void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_sl
                 ++e;
                 continue;
             }
+            // A run: consecutive experts with pairs (and, for QX, the same width), dequantized at once.
+            const auto width = [&](int64_t x) { return w.bits != 0 ? w.bits : w.host_expert_bits[x]; };
             int64_t run_end = e;
-            while (run_end < e1 && offsets[static_cast<size_t>(run_end + 1)] > offsets[static_cast<size_t>(run_end)])
+            while (run_end < e1 && offsets[static_cast<size_t>(run_end + 1)] > offsets[static_cast<size_t>(run_end)] &&
+                   width(run_end) == width(e))
                 ++run_end;
-            dequantize(q, quant_rows(w, e * n, k), wd + (e - e0) * n * k, (run_end - e) * n, k);
+            dequantize(q, expert_weight(w, e, n, k), wd + (e - e0) * n * k, (run_end - e) * n, k);
             for (; e < run_end; ++e) {
                 const int64_t first = offsets[static_cast<size_t>(e)];
                 pm[groups] = offsets[static_cast<size_t>(e + 1)] - first;

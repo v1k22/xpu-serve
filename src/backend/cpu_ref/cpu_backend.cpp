@@ -49,6 +49,7 @@ HostTensor weight_to_f32(const std::string& name, const TensorView& view) {
         case DType::Q4:
         case DType::Q3:
         case DType::Q2:
+        case DType::QX:
             quant::dequantize_rows(view, 0, quant::matrix_rows(view.shape), out.data<float>());
             break;
         default:

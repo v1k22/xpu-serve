@@ -138,13 +138,15 @@ void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) 
                             : format == "q8" ? DType::Q8
                             : format == "q3" ? DType::Q3
                             : format == "q2" ? DType::Q2
+                            : format == "qx" ? DType::QX
                                              : DType::F32;
         if (dtype == DType::F32) fail("pack: tensor '", name, "' has unknown format '", format, "'");
         const int64_t group = entry.at("group").get<int64_t>();
         const Dims shape = entry.at("shape").get<Dims>();
         XS_CHECK(shape.size() >= 2 && group > 0 && shape.back() % group == 0 &&
                      (dtype == DType::Q8 || shape.back() % 2 == 0) &&
-                     ((dtype != DType::Q3 && dtype != DType::Q2) || shape.back() % 32 == 0),
+                     ((dtype != DType::Q3 && dtype != DType::Q2 && dtype != DType::QX) || shape.back() % 32 == 0) &&
+                     (dtype != DType::QX || shape.size() == 3),
                  "pack: tensor '", name, "' has shape ", dims_to_string(shape), " and group ", group);
         // Components keep the leading dims; the last is columns (q8 codes), code bytes per row (q4 / q3 / q2) or groups.
         const auto with_last = [&](int64_t last) {
@@ -156,10 +158,20 @@ void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) 
         TensorView v;
         v.dtype = dtype;
         v.shape = shape;
-        v.data = component(name, dtype == DType::Q8 ? DType::I8 : DType::U8,
-                           dtype == DType::Q8 ? shape : with_last(static_cast<int64_t>(storage_bytes(dtype, shape.back()))))
-                     .data;
         v.quant.group = group;
+        if (dtype == DType::QX) {  // codes: every expert's rows at its own width, expert after expert
+            std::vector<int8_t>& bits = expert_bits_[name] = entry.at("expert_bits").get<std::vector<int8_t>>();
+            XS_CHECK(static_cast<int64_t>(bits.size()) == shape[0], "pack: tensor '", name, "' has ", bits.size(),
+                     " expert bit widths for ", shape[0], " experts");
+            for (const int8_t b : bits)
+                XS_CHECK(b == 8 || b == 4 || b == 3 || b == 2, "pack: tensor '", name, "': an expert of ", int(b), " bits");
+            v.quant.expert_bits = bits.data();
+            v.data = component(name, DType::U8, {static_cast<int64_t>(v.nbytes())}).data;
+        } else {
+            v.data = component(name, dtype == DType::Q8 ? DType::I8 : DType::U8,
+                               dtype == DType::Q8 ? shape : with_last(static_cast<int64_t>(storage_bytes(dtype, shape.back()))))
+                         .data;
+        }
         v.quant.scales = component(name + ".scales", DType::F16, groups).data;
         index_.erase(name + ".scales");
         if (dtype != DType::Q8) {
