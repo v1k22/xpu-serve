@@ -23,6 +23,8 @@ public:
 // y [M, N] = x [M, K] @ w [N, K]^T
 template <typename W>
 void matmul(sycl::queue& q, Scratch& scratch, const float* x, const W* w, float* y, int64_t m, int64_t n, int64_t k);
+// The same through the GEMM path with x already in f16 (M > kGemvMaxRows).
+void matmul_half_x(sycl::queue& q, const half* x, const half* w, float* y, int64_t m, int64_t n, int64_t k);
 
 // y [M, N] = x [M, K] @ dequant(w)^T: the quantized GEMV up to kGemvMaxRows rows; beyond, w is dequantized once
 // (to f16, or f32 when `f32`) and multiplied with oneMKL's GEMM.

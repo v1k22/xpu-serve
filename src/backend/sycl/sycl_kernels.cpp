@@ -43,16 +43,16 @@ inline float apply_unary(float x, float a, float b) {
     }
 }
 
-template <UnaryOp Op>
-void unary_t(sycl::queue& q, const float* x, float* y, int64_t n, float a, float b) {
+template <UnaryOp Op, typename Y>
+void unary_t(sycl::queue& q, const float* x, Y* y, int64_t n, float a, float b) {
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)),
-                   [=](sycl::id<1> i) { y[i] = apply_unary<Op>(x[i], a, b); });
+                   [=](sycl::id<1> i) { y[i] = static_cast<Y>(apply_unary<Op>(x[i], a, b)); });
 }
 
-template <UnaryOp Act>
-void act_mul_t(sycl::queue& q, const float* x, const float* b, float* y, int64_t n) {
+template <UnaryOp Act, typename Y>
+void act_mul_t(sycl::queue& q, const float* x, const float* b, Y* y, int64_t n) {
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)),
-                         [=](sycl::id<1> i) { y[i] = apply_unary<Act>(x[i], 0.0f, 0.0f) * b[i]; });
+                         [=](sycl::id<1> i) { y[i] = static_cast<Y>(apply_unary<Act>(x[i], 0.0f, 0.0f) * b[i]); });
 }
 
 template <BinaryOp Op>
@@ -66,8 +66,8 @@ inline float apply_binary(float a, float b) {
     }
 }
 
-template <BinaryOp Op>
-void binary_t(sycl::queue& q, const float* a, const float* b, float* y, int64_t n, const Broadcast& s) {
+template <BinaryOp Op, typename Y>
+void binary_t(sycl::queue& q, const float* a, const float* b, Y* y, int64_t n, const Broadcast& s) {
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> idx) {
         int64_t i = static_cast<int64_t>(idx[0]);
         int64_t oa = 0;
@@ -78,19 +78,20 @@ void binary_t(sycl::queue& q, const float* a, const float* b, float* y, int64_t 
             oa += c * s.stride_a[d];
             ob += c * s.stride_b[d];
         }
-        y[idx] = apply_binary<Op>(a[oa], b[ob]);
+        y[idx] = static_cast<Y>(apply_binary<Op>(a[oa], b[ob]));
     });
 }
 
-template <BinaryOp Op>
-void binary_same_t(sycl::queue& q, const float* a, const float* b, float* y, int64_t n) {
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) { y[i] = apply_binary<Op>(a[i], b[i]); });
+template <BinaryOp Op, typename Y>
+void binary_same_t(sycl::queue& q, const float* a, const float* b, Y* y, int64_t n) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)),
+                         [=](sycl::id<1> i) { y[i] = static_cast<Y>(apply_binary<Op>(a[i], b[i])); });
 }
 
-template <BinaryOp Op>
-void binary_period_t(sycl::queue& q, const float* a, const float* b, float* y, int64_t n, int64_t period) {
+template <BinaryOp Op, typename Y>
+void binary_period_t(sycl::queue& q, const float* a, const float* b, Y* y, int64_t n, int64_t period) {
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
-        y[i] = apply_binary<Op>(a[i], b[static_cast<int64_t>(i[0]) % period]);
+        y[i] = static_cast<Y>(apply_binary<Op>(a[i], b[static_cast<int64_t>(i[0]) % period]));
     });
 }
 
@@ -715,48 +716,53 @@ void gemv_m(sycl::queue& q, const float* x, const W* w, float* y, int64_t n, int
 
 }  // namespace
 
-void unary(sycl::queue& q, UnaryOp op, const float* x, float* y, int64_t n, float a, float b) {
+template <typename Y>
+void unary(sycl::queue& q, UnaryOp op, const float* x, Y* y, int64_t n, float a, float b) {
     switch (op) {
-        case UnaryOp::Scale: return unary_t<UnaryOp::Scale>(q, x, y, n, a, b);
-        case UnaryOp::Tanh: return unary_t<UnaryOp::Tanh>(q, x, y, n, a, b);
-        case UnaryOp::GeluTanh: return unary_t<UnaryOp::GeluTanh>(q, x, y, n, a, b);
-        case UnaryOp::Softcap: return unary_t<UnaryOp::Softcap>(q, x, y, n, a, b);
-        case UnaryOp::Sigmoid: return unary_t<UnaryOp::Sigmoid>(q, x, y, n, a, b);
-        case UnaryOp::Silu: return unary_t<UnaryOp::Silu>(q, x, y, n, a, b);
-        case UnaryOp::Softplus: return unary_t<UnaryOp::Softplus>(q, x, y, n, a, b);
-        case UnaryOp::Clamp: return unary_t<UnaryOp::Clamp>(q, x, y, n, a, b);
+        case UnaryOp::Scale: return unary_t<UnaryOp::Scale, Y>(q, x, y, n, a, b);
+        case UnaryOp::Tanh: return unary_t<UnaryOp::Tanh, Y>(q, x, y, n, a, b);
+        case UnaryOp::GeluTanh: return unary_t<UnaryOp::GeluTanh, Y>(q, x, y, n, a, b);
+        case UnaryOp::Softcap: return unary_t<UnaryOp::Softcap, Y>(q, x, y, n, a, b);
+        case UnaryOp::Sigmoid: return unary_t<UnaryOp::Sigmoid, Y>(q, x, y, n, a, b);
+        case UnaryOp::Silu: return unary_t<UnaryOp::Silu, Y>(q, x, y, n, a, b);
+        case UnaryOp::Softplus: return unary_t<UnaryOp::Softplus, Y>(q, x, y, n, a, b);
+        case UnaryOp::Clamp: return unary_t<UnaryOp::Clamp, Y>(q, x, y, n, a, b);
     }
 }
 
-void act_mul(sycl::queue& q, UnaryOp act, const float* x, const float* b, float* y, int64_t n) {
+template <typename Y>
+void act_mul(sycl::queue& q, UnaryOp act, const float* x, const float* b, Y* y, int64_t n) {
     switch (act) {
-        case UnaryOp::Silu: return act_mul_t<UnaryOp::Silu>(q, x, b, y, n);
-        case UnaryOp::GeluTanh: return act_mul_t<UnaryOp::GeluTanh>(q, x, b, y, n);
-        default: return act_mul_t<UnaryOp::Sigmoid>(q, x, b, y, n);
+        case UnaryOp::Silu: return act_mul_t<UnaryOp::Silu, Y>(q, x, b, y, n);
+        case UnaryOp::GeluTanh: return act_mul_t<UnaryOp::GeluTanh, Y>(q, x, b, y, n);
+        default: return act_mul_t<UnaryOp::Sigmoid, Y>(q, x, b, y, n);
     }
 }
 
-void binary(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n, const Broadcast& shape) {
+template <typename Y>
+void binary(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, const Broadcast& shape) {
     switch (op) {
-        case BinaryOp::Add: return binary_t<BinaryOp::Add>(q, a, b, y, n, shape);
-        case BinaryOp::Mul: return binary_t<BinaryOp::Mul>(q, a, b, y, n, shape);
-        case BinaryOp::Div: return binary_t<BinaryOp::Div>(q, a, b, y, n, shape);
+        case BinaryOp::Add: return binary_t<BinaryOp::Add, Y>(q, a, b, y, n, shape);
+        case BinaryOp::Mul: return binary_t<BinaryOp::Mul, Y>(q, a, b, y, n, shape);
+        case BinaryOp::Div: return binary_t<BinaryOp::Div, Y>(q, a, b, y, n, shape);
     }
 }
 
-void binary_same(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n) {
+template <typename Y>
+void binary_same(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n) {
     switch (op) {
-        case BinaryOp::Add: return binary_same_t<BinaryOp::Add>(q, a, b, y, n);
-        case BinaryOp::Mul: return binary_same_t<BinaryOp::Mul>(q, a, b, y, n);
-        case BinaryOp::Div: return binary_same_t<BinaryOp::Div>(q, a, b, y, n);
+        case BinaryOp::Add: return binary_same_t<BinaryOp::Add, Y>(q, a, b, y, n);
+        case BinaryOp::Mul: return binary_same_t<BinaryOp::Mul, Y>(q, a, b, y, n);
+        case BinaryOp::Div: return binary_same_t<BinaryOp::Div, Y>(q, a, b, y, n);
     }
 }
 
-void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n, int64_t period) {
+template <typename Y>
+void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, int64_t period) {
     switch (op) {
-        case BinaryOp::Add: return binary_period_t<BinaryOp::Add>(q, a, b, y, n, period);
-        case BinaryOp::Mul: return binary_period_t<BinaryOp::Mul>(q, a, b, y, n, period);
-        case BinaryOp::Div: return binary_period_t<BinaryOp::Div>(q, a, b, y, n, period);
+        case BinaryOp::Add: return binary_period_t<BinaryOp::Add, Y>(q, a, b, y, n, period);
+        case BinaryOp::Mul: return binary_period_t<BinaryOp::Mul, Y>(q, a, b, y, n, period);
+        case BinaryOp::Div: return binary_period_t<BinaryOp::Div, Y>(q, a, b, y, n, period);
     }
 }
 
@@ -885,29 +891,32 @@ template void expert_matmul<float, int32_t>(sycl::queue&, const float*, bool, co
 template void expert_matmul<float, int64_t>(sycl::queue&, const float*, bool, const float*, const int64_t*, float*,
                                             int64_t, int64_t, int64_t, int64_t, int64_t);
 
-void rms_norm(sycl::queue& q, const float* x, const float* w, float* y, int64_t rows, int64_t width, float eps) {
+template <typename Y>
+void rms_norm(sycl::queue& q, const float* x, const float* w, const float* bias, Y* y, int64_t rows, int64_t width,
+              float eps) {
     const size_t wg = width >= 1024 ? 512 : (width >= 256 ? 256 : 128);
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * wg, wg), [=](sycl::nd_item<1> it) {
         const int64_t r = static_cast<int64_t>(it.get_group(0));
         const float* xr = x + r * width;
-        float* yr = y + r * width;
+        Y* yr = y + r * width;
         float sum = 0.0f;
         for (int64_t i = static_cast<int64_t>(it.get_local_id(0)); i < width; i += static_cast<int64_t>(wg))
             sum += xr[i] * xr[i];
         sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
         const float inv = 1.0f / sycl::sqrt(sum / static_cast<float>(width) + eps);
         for (int64_t i = static_cast<int64_t>(it.get_local_id(0)); i < width; i += static_cast<int64_t>(wg))
-            yr[i] = w != nullptr ? xr[i] * inv * w[i] : xr[i] * inv;
+            yr[i] = static_cast<Y>((w != nullptr ? xr[i] * inv * w[i] : xr[i] * inv) + (bias != nullptr ? bias[i] : 0.0f));
     });
 }
 
-void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t width,
+template <typename Y>
+void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, Y* y, int64_t rows, int64_t width,
                 float eps) {
     const size_t wg = width >= 1024 ? 512 : (width >= 256 ? 256 : 128);
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * wg, wg), [=](sycl::nd_item<1> it) {
         const int64_t r = static_cast<int64_t>(it.get_group(0));
         const float* xr = x + r * width;
-        float* yr = y + r * width;
+        Y* yr = y + r * width;
         const auto lid = static_cast<int64_t>(it.get_local_id(0));
         float sum = 0.0f;
         for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
@@ -919,9 +928,29 @@ void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, 
         const float var = sycl::reduce_over_group(it.get_group(), sq, sycl::plus<float>()) / static_cast<float>(width);
         const float inv = 1.0f / sycl::sqrt(var + eps);
         for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
-            yr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+            yr[i] = static_cast<Y>((xr[i] - mean) * inv * w[i] + b[i]);
     });
 }
+
+template <typename Y>
+void add_mul(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
+        y[i] = static_cast<Y>(a[i] + b[i] * c[static_cast<int64_t>(i[0]) % period]);
+    });
+}
+
+#define XS_INSTANTIATE_OUT(Y)                                                                                         \
+    template void unary<Y>(sycl::queue&, UnaryOp, const float*, Y*, int64_t, float, float);                           \
+    template void act_mul<Y>(sycl::queue&, UnaryOp, const float*, const float*, Y*, int64_t);                         \
+    template void binary<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, const Broadcast&);      \
+    template void binary_same<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t);                   \
+    template void binary_period<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, int64_t);        \
+    template void rms_norm<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t, float);   \
+    template void layer_norm<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t, float); \
+    template void add_mul<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t);
+XS_INSTANTIATE_OUT(float)
+XS_INSTANTIATE_OUT(half)
+#undef XS_INSTANTIATE_OUT
 
 template <typename T, typename I>
 void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n, int64_t width) {

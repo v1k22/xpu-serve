@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -201,6 +202,7 @@ public:
         infer_dtypes();
         check_ops();
         plan_fusions();
+        plan_half_values();
         upload_leaves(weights);
         for (const graph::KvSlot& s : graph_.kv_slots()) {
             KvBuffers b;
@@ -542,6 +544,8 @@ private:
         fused_.assign(nodes.size(), Fused::No);
         act_mul_.assign(nodes.size(), -1);
         conv_silu_.assign(nodes.size(), 0);
+        norm_bias_.assign(nodes.size(), -1);
+        add_mul_.assign(nodes.size(), -1);
         reads_.resize(nodes.size());
         for (size_t i = 0; i < nodes.size(); ++i)
             reads_[i] = nodes[i].inputs;
@@ -579,6 +583,96 @@ private:
                 }
             }
         }
+        // Add(RmsNorm(x, w), c) with c a row vector: one norm with a bias (adaptive norms' shift). Add(a, Mul(b, c))
+        // with a and b of the output's shape and c the same or a row vector: one a + b * c (gated residuals).
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const Node& n = nodes[i];
+            if (n.kind != OpKind::Add) continue;
+            const Dims& out = n.outputs[0].shape;
+            const auto row_vector = [&](Value v) {
+                const Dims& s = graph_.type(v).shape;
+                return s.size() == 1 && !out.empty() && s[0] == out.back();
+            };
+            for (size_t k = 0; k < 2; ++k) {
+                const Value x = n.inputs[k];
+                const Value other = n.inputs[1 - k];
+                const auto u = static_cast<size_t>(x.node);
+                if (readers[u] != 1 || fused_[u] != Fused::No || graph_.type(x).shape != out) continue;
+                if (nodes[u].kind == OpKind::RmsNorm && row_vector(other)) {
+                    fused_[u] = Fused::Skip;
+                    norm_bias_[i] = static_cast<int32_t>(u);
+                    reads_[i] = nodes[u].inputs;
+                    reads_[i].push_back(other);
+                    reads_[u].clear();
+                    break;
+                }
+                if (nodes[u].kind == OpKind::Mul && act_mul_[u] < 0 && graph_.type(other).shape == out) {
+                    const Value b = nodes[u].inputs[0];
+                    const Value c = nodes[u].inputs[1];
+                    const bool b_full = graph_.type(b).shape == out;
+                    const bool c_full = graph_.type(c).shape == out;
+                    if (!(b_full && (c_full || row_vector(c))) && !(c_full && row_vector(b))) continue;
+                    fused_[u] = Fused::Skip;
+                    add_mul_[i] = static_cast<int32_t>(u);
+                    reads_[i] = b_full ? std::vector<Value>{other, b, c} : std::vector<Value>{other, c, b};
+                    reads_[u].clear();
+                    break;
+                }
+            }
+        }
+    }
+
+    // Values that only GEMMs read as their input x are written in f16 by the kernel that makes them: the GEMM rounds
+    // x to f16 anyway, so this skips a conversion pass and halves the traffic without changing a result. Only static
+    // shapes with more rows than the GEMV path takes (which reads f32), and producers that can write f16.
+    void plan_half_values() {
+        if (precision_ != DType::F16) return;
+        const auto& nodes = graph_.nodes();
+        std::vector<std::vector<size_t>> readers(nodes.size());  // device readers of each node's output 0
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            for (const Value& in : reads_[i]) {
+                if (in.index == 0) readers[static_cast<size_t>(in.node)].push_back(i);
+            }
+        }
+        std::vector<uint8_t> output(nodes.size(), 0);
+        for (const auto& o : graph_.outputs())
+            output[static_cast<size_t>(o.value.node)] = 1;
+        const auto static_shape = [](const Dims& d) {
+            return std::none_of(d.begin(), d.end(), [](int64_t v) { return v == kT || v == kL; });
+        };
+        // Every reader (looking through reshapes) is a GEMM-path matmul reading it as x, with an f16 weight.
+        std::function<bool(size_t)> gemm_only = [&](size_t v) {
+            if (output[v] != 0 || readers[v].empty()) return false;
+            for (const size_t r : readers[v]) {
+                const Node& rn = nodes[r];
+                if (rn.kind == OpKind::Reshape) {
+                    if (!gemm_only(r)) return false;
+                    continue;
+                }
+                if (rn.kind != OpKind::MatMul || fused_[r] != Fused::No || rn.inputs[0].node != static_cast<int32_t>(v) ||
+                    dt(rn.inputs[1]) != DType::F16) {
+                    return false;
+                }
+                const Dims& x = graph_.type(rn.inputs[0]).shape;
+                if (!static_shape(x) || numel(x) / x.back() <= sycl_be::kGemvMaxRows) return false;
+            }
+            return true;
+        };
+        size_t halved = 0;
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const OpKind k = nodes[i].kind;
+            const bool writes_half = k == OpKind::RmsNorm || k == OpKind::LayerNorm || k == OpKind::Add ||
+                                     k == OpKind::Mul || k == OpKind::GeluTanh || k == OpKind::Silu;
+            if (!writes_half || fused_[i] != Fused::No || dtype_[i][0] != DType::F32) continue;
+            if (!static_shape(nodes[i].outputs[0].shape) || !gemm_only(i)) continue;
+            dtype_[i][0] = DType::F16;
+            ++halved;
+        }
+        for (size_t i = 0; i < nodes.size(); ++i) {  // views take their input's dtype
+            const OpKind k = nodes[i].kind;
+            if (k == OpKind::Reshape || k == OpKind::Slice || k == OpKind::Transpose) dtype_[i][0] = dt(nodes[i].inputs[0]);
+        }
+        if (halved > 0) log::debug("sycl: ", halved, " values feed GEMMs in f16");
     }
 
     // A pack's quantized weight: codes, scales and (Q4) biases as stored.
@@ -968,8 +1062,17 @@ private:
         const Dims& out_shape = p.shapes[i][0];
         const int64_t out_n = n.kind == OpKind::KvCache ? 0 : numel(out_shape);  // KvCache outputs may keep kL
         using sycl_be::UnaryOp;
+        // Kernels that may write f16 (plan_half_values) get the output as float* or half*.
+        const auto with_out = [&](auto&& fn) {
+            if (dt(Value{static_cast<int32_t>(i), 0}) == DType::F16) {
+                fn(reinterpret_cast<half*>(out_raw));
+            } else {
+                fn(out);
+            }
+        };
+        const auto read_f32 = [&](size_t k) { return reinterpret_cast<const float*>(ptr(p, reads_[i][k])); };
         const auto unary = [&](UnaryOp op, float a = 0.0f, float b = 0.0f) {
-            sycl_be::unary(q_, op, in_f32(0), out, out_n, a, b);
+            with_out([&](auto* y) { sycl_be::unary(q_, op, in_f32(0), y, out_n, a, b); });
         };
         switch (n.kind) {
             case OpKind::Input:
@@ -1014,6 +1117,9 @@ private:
                 if (is_quantized(in_dt(1))) {
                     sycl_be::matmul_quant(q_, *this, in_f32(0), leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out,
                                           m, rows, k, precision_ == DType::F32);
+                } else if (in_dt(0) == DType::F16) {  // plan_half_values: x is already f16 (GEMM path)
+                    sycl_be::matmul_half_x(q_, reinterpret_cast<const half*>(in_ptr(0)),
+                                           reinterpret_cast<const half*>(in_ptr(1)), out, m, rows, k);
                 } else if (in_dt(1) == DType::F16) {
                     sycl_be::matmul(q_, *this, in_f32(0), reinterpret_cast<const half*>(in_ptr(1)), out, m, rows, k);
                 } else {
@@ -1025,8 +1131,25 @@ private:
             case OpKind::Mul:
             case OpKind::Div: {
                 if (act_mul_[i] >= 0) {
-                    sycl_be::act_mul(q_, static_cast<UnaryOp>(act_mul_[i]), reinterpret_cast<const float*>(ptr(p, reads_[i][0])),
-                                     reinterpret_cast<const float*>(ptr(p, reads_[i][1])), out, out_n);
+                    with_out([&](auto* y) {
+                        sycl_be::act_mul(q_, static_cast<UnaryOp>(act_mul_[i]), read_f32(0), read_f32(1), y, out_n);
+                    });
+                    return;
+                }
+                if (norm_bias_[i] >= 0) {
+                    const Node& norm = graph_.nodes()[static_cast<size_t>(norm_bias_[i])];
+                    const int64_t width = out_shape.back();
+                    const bool weighted = norm.inputs.size() == 2;
+                    with_out([&](auto* y) {
+                        sycl_be::rms_norm(q_, read_f32(0), weighted ? read_f32(1) : nullptr, read_f32(weighted ? 2 : 1), y,
+                                          out_n / width, width, std::get<graph::NormAttrs>(norm.attrs).eps);
+                    });
+                    return;
+                }
+                if (add_mul_[i] >= 0) {
+                    const Value c = reads_[i][2];
+                    const int64_t period = numel(p.shapes[static_cast<size_t>(c.node)][static_cast<size_t>(c.index)]);
+                    with_out([&](auto* y) { sycl_be::add_mul(q_, read_f32(0), read_f32(1), read_f32(2), y, out_n, period); });
                     return;
                 }
                 const auto op = n.kind == OpKind::Add   ? sycl_be::BinaryOp::Add
@@ -1035,11 +1158,12 @@ private:
                 const Dims& a = in_shape(0);
                 const Dims& b = in_shape(1);
                 if (a == b) {
-                    sycl_be::binary_same(q_, op, in_f32(0), in_f32(1), out, out_n);
+                    with_out([&](auto* y) { sycl_be::binary_same(q_, op, in_f32(0), in_f32(1), y, out_n); });
                 } else if (a == out_shape && is_suffix_broadcast(b, out_shape)) {
-                    sycl_be::binary_period(q_, op, in_f32(0), in_f32(1), out, out_n, numel(b));
+                    with_out([&](auto* y) { sycl_be::binary_period(q_, op, in_f32(0), in_f32(1), y, out_n, numel(b)); });
                 } else if (op != sycl_be::BinaryOp::Div && b == out_shape && is_suffix_broadcast(a, out_shape)) {
-                    sycl_be::binary_period(q_, op, in_f32(1), in_f32(0), out, out_n, numel(a));  // add, mul commute
+                    // add, mul commute
+                    with_out([&](auto* y) { sycl_be::binary_period(q_, op, in_f32(1), in_f32(0), y, out_n, numel(a)); });
                 } else {
                     XS_CHECK(out_shape.size() <= static_cast<size_t>(sycl_be::kMaxRank), where(i), ": rank ",
                              out_shape.size(), " exceeds ", sycl_be::kMaxRank);
@@ -1057,7 +1181,7 @@ private:
                         s.out[d] = out_shape[d];
                     strides(a, s.stride_a);
                     strides(b, s.stride_b);
-                    sycl_be::binary(q_, op, in_f32(0), in_f32(1), out, out_n, s);
+                    with_out([&](auto* y) { sycl_be::binary(q_, op, in_f32(0), in_f32(1), y, out_n, s); });
                 }
                 return;
             }
@@ -1082,8 +1206,10 @@ private:
             case OpKind::RmsNorm: {
                 const int64_t width = out_shape.back();
                 const float* w = n.inputs.size() == 2 ? in_f32(1) : nullptr;
-                sycl_be::rms_norm(q_, in_f32(0), w, out, out_n / width, width,
-                                  std::get<graph::NormAttrs>(n.attrs).eps);
+                with_out([&](auto* y) {
+                    sycl_be::rms_norm(q_, in_f32(0), w, static_cast<const float*>(nullptr), y, out_n / width, width,
+                                      std::get<graph::NormAttrs>(n.attrs).eps);
+                });
                 return;
             }
             case OpKind::Slice: {  // the aliasing case returned earlier: a copy
@@ -1193,8 +1319,10 @@ private:
             }
             case OpKind::LayerNorm: {
                 const int64_t width = out_shape.back();
-                sycl_be::layer_norm(q_, in_f32(0), in_f32(1), in_f32(2), out, out_n / width, width,
-                                    std::get<graph::NormAttrs>(n.attrs).eps);
+                with_out([&](auto* y) {
+                    sycl_be::layer_norm(q_, in_f32(0), in_f32(1), in_f32(2), y, out_n / width, width,
+                                        std::get<graph::NormAttrs>(n.attrs).eps);
+                });
                 return;
             }
             case OpKind::Concat: {
@@ -1367,6 +1495,8 @@ private:
     std::vector<std::vector<Value>> reads_;  // what each node reads on the device (its inputs, or a fusion's)
     std::vector<int8_t> act_mul_;            // Mul run as act(reads[0]) * reads[1]: the UnaryOp, or -1
     std::vector<uint8_t> conv_silu_;         // CausalConv that applies the SiLU after it
+    std::vector<int32_t> norm_bias_;         // Add run as RmsNorm(node) + bias: the norm node, or -1
+    std::vector<int32_t> add_mul_;           // Add run as a + b * c with the Mul node folded in, or -1
     std::vector<DeviceBuffer> leaves_;
     std::vector<char*> leaf_ptr_;  // by node index, weights and constants
     std::vector<sycl_be::QuantWeight> leaf_quant_;  // by node index, quantized weights

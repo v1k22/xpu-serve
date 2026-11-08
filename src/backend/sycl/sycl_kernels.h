@@ -17,10 +17,13 @@ inline constexpr int kMaxRank = 6;
 
 enum class UnaryOp : uint8_t { Scale, Tanh, GeluTanh, Softcap, Sigmoid, Silu, Softplus, Clamp };
 // y = op(x); `a` is the scale factor, softcap or lower bound, `b` the upper bound.
-void unary(sycl::queue& q, UnaryOp op, const float* x, float* y, int64_t n, float a, float b);
+// Elementwise and norm kernels write f32 or f16 (Y = float or half): an f16 output feeds a GEMM directly.
+template <typename Y>
+void unary(sycl::queue& q, UnaryOp op, const float* x, Y* y, int64_t n, float a, float b);
 
 // y = act(x) * b, same shapes; act is Silu, GeluTanh or Sigmoid (a fused activation-times-gate).
-void act_mul(sycl::queue& q, UnaryOp act, const float* x, const float* b, float* y, int64_t n);
+template <typename Y>
+void act_mul(sycl::queue& q, UnaryOp act, const float* x, const float* b, Y* y, int64_t n);
 
 enum class BinaryOp : uint8_t { Add, Mul, Div };
 // numpy broadcasting over at most kMaxRank dims: out shape and the element strides of a and b per out dim (0 where
@@ -31,10 +34,16 @@ struct Broadcast {
     int64_t stride_a[kMaxRank] = {};
     int64_t stride_b[kMaxRank] = {};
 };
-void binary(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n, const Broadcast& shape);
+template <typename Y>
+void binary(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, const Broadcast& shape);
 // Fast paths: same shape, and b repeating every `period` elements of a (a row vector over the leading dims).
-void binary_same(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n);
-void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n, int64_t period);
+template <typename Y>
+void binary_same(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n);
+template <typename Y>
+void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, int64_t period);
+// y = a + b * c, c repeating every `period` elements (period == n: the same shape): a gated residual.
+template <typename Y>
+void add_mul(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period);
 
 // Rows of `width`.
 void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width);
@@ -47,10 +56,13 @@ template <typename W, typename I>
 void expert_matmul(sycl::queue& q, const float* x, bool per_slot, const W* w, const I* idx, float* out, int64_t tokens,
                    int64_t slots, int64_t experts, int64_t n, int64_t k);
 
-// Rows of `width`; w may be null.
-void rms_norm(sycl::queue& q, const float* x, const float* w, float* y, int64_t rows, int64_t width, float eps);
+// Rows of `width`: x / rms(x) [* w] [+ bias]; w and bias may be null.
+template <typename Y>
+void rms_norm(sycl::queue& q, const float* x, const float* w, const float* bias, Y* y, int64_t rows, int64_t width,
+              float eps);
 // Rows of `width`: (x - mean) / sqrt(var + eps) * w + b.
-void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, float* y, int64_t rows, int64_t width,
+template <typename Y>
+void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, Y* y, int64_t rows, int64_t width,
                 float eps);
 
 template <typename T, typename I>

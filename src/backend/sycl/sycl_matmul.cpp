@@ -51,6 +51,12 @@ void matmul(sycl::queue& q, Scratch& scratch, const float* x, const W* w, float*
     }
 }
 
+void matmul_half_x(sycl::queue& q, const half* x, const half* w, float* y, int64_t m, int64_t n, int64_t k) {
+    ordered(q, [&](const std::vector<sycl::event>& deps) {
+        return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, 1.0f, x, k, w, k, 0.0f, y, n, deps);
+    });
+}
+
 void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantWeight& w, float* y, int64_t m,
                   int64_t n, int64_t k, bool f32) {
     if (m <= kGemvMaxRows) {
@@ -149,12 +155,13 @@ void attention(sycl::queue& q, Scratch& scratch, const float* qp, const KV* k, c
                                     deps);
         });
         attention_softmax(q, scores, probs, s, t0, cur, k_lo, keys);
+        // One KV head: the packed layout [1, cur, G, D] is the output's rows t0.. already, so the GEMM writes there.
+        float* o = hkv == 1 ? out + t0 * s.q_heads * d : packed_o;
         ordered(q, [&](const std::vector<sycl::event>& deps) {
             return blas::gemm_batch(q, transpose::nontrans, transpose::nontrans, rows, d, keys, 1.0f, probs, keys,
-                                    rows * keys, v + k_lo * hkv * d, hkv * d, d, 0.0f, packed_o, d, rows * d, hkv,
-                                    deps);
+                                    rows * keys, v + k_lo * hkv * d, hkv * d, d, 0.0f, o, d, rows * d, hkv, deps);
         });
-        attention_unpack(q, packed_o, out, s, t0, cur);
+        if (hkv != 1) attention_unpack(q, packed_o, out, s, t0, cur);
     }
 }
 
