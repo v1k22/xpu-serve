@@ -63,6 +63,13 @@ enum class OpKind : uint8_t {
     Attention,  // (q [T, Hq, D], k [N, Hkv, D], v [N, Hkv, D]) -> [T, Hq, D]; see AttentionAttrs; GQA
     CausalConv, // (x [T, C], w [C, K]) -> [T, C]; depthwise causal conv over the slot's last K-1 inputs, see below
     GatedDelta, // (q [T, Hk, Dk], k [T, Hk, Dk], v [T, Hv, Dv], g [T, Hv], beta [T, Hv]) -> [T, Hv, Dv]; see below
+    Div,        // (a, b) numpy broadcasting: a / b
+    Softmax,    // softmax over the last axis, computed in f32
+    TopK,       // (x [..., N]) -> (values [..., k] f32, indices [..., k] i32): the k largest along the last axis,
+                // largest first; equal values keep the lower index first
+    ReduceSum,  // sum over one axis (ReduceAttrs::axis), which is removed; f32
+    ExpertMatMul, // (x [T, K] or [T, S, K], w [E, N, K], idx [T, S] int) -> [T, S, N]: out[t, s] = x[t] (or
+                  // x[t, s]) @ w[idx[t, s]]^T; every idx in [0, E). The expert matmuls of a mixture of experts
 };
 
 // CausalConv: with x' = [the slot's K-1 previous inputs (zeros at the start), x], out[t, c] = sum_j w[c, j] x'[t + j, c];
@@ -120,6 +127,12 @@ struct KvCacheAttrs {
 struct RopeAttrs {
     int64_t rotary_dim = 0;  // 0 = the whole head dim
 };
+struct TopKAttrs {
+    int64_t k = 1;
+};
+struct ReduceAttrs {
+    int axis = 0;
+};
 struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op's state across runs
     int slot = -1;
     float qk_l2norm_eps = 0.0f;  // GatedDelta only; 0 = no l2norm of q and k
@@ -139,7 +152,7 @@ struct AttentionAttrs {
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
                            ClampAttrs, RmsNormAttrs, ReshapeAttrs, SliceAttrs, TransposeAttrs, KvCacheAttrs,
-                           RopeAttrs, StateAttrs, AttentionAttrs>;
+                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, ReduceAttrs>;
 
 struct TensorType {
     DType dtype = DType::F32;
@@ -213,6 +226,11 @@ public:
     Value causal_conv(int slot, Value x, Value w);
     int add_recurrent_slot(int64_t heads, int64_t key_dim, int64_t value_dim, std::string label);
     Value gated_delta(int slot, Value q, Value k, Value v, Value g, Value beta, float qk_l2norm_eps);
+    Value div(Value a, Value b);
+    Value softmax(Value x);
+    std::pair<Value, Value> topk(Value x, int64_t k);  // (values, indices)
+    Value reduce_sum(Value x, int axis);
+    Value expert_matmul(Value x, Value w, Value idx);
 
     void output(const std::string& name, Value v);
 

@@ -282,6 +282,18 @@ class CpuSession final : public Session {
             }
             case OpKind::Attention:
                 return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), std::get<graph::AttentionAttrs>(n.attrs))};
+            case OpKind::Div:
+                return {cpu_ref::div(f32(0), f32(1))};
+            case OpKind::Softmax:
+                return {cpu_ref::softmax(f32(0))};
+            case OpKind::TopK: {
+                auto [top_values, top_indices] = cpu_ref::topk(f32(0), std::get<graph::TopKAttrs>(n.attrs).k);
+                return {std::move(top_values), std::move(top_indices)};
+            }
+            case OpKind::ReduceSum:
+                return {cpu_ref::reduce_sum(f32(0), std::get<graph::ReduceAttrs>(n.attrs).axis)};
+            case OpKind::ExpertMatMul:
+                return {cpu_ref::expert_matmul(*pool_, f32(0), f32(1), in(2))};
         }
         fail("cpu-ref: unhandled op ", graph::op_name(n.kind));
     }

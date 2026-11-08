@@ -64,3 +64,22 @@ TEST_CASE("misuse is refused with a named error") {
     g.output("x", x);
     CHECK_THROWS_AS(g.validate(), xs::Error);  // slot never appended
 }
+
+TEST_CASE("mixture-of-experts ops: shapes and refusals") {
+    Graph g;
+    const Value x = g.input("x", DType::F32, {kT, 16});
+    const Value probs = g.softmax(x);
+    CHECK(g.type(probs).shape == (xs::Dims{kT, 16}));
+    const auto [values, indices] = g.topk(probs, 4);
+    CHECK(g.type(values).shape == (xs::Dims{kT, 4}));
+    CHECK(g.type(indices).dtype == DType::I32);
+    CHECK(g.type(g.reduce_sum(values, 1)).shape == (xs::Dims{kT}));
+    CHECK(g.type(g.div(values, g.reshape(g.reduce_sum(values, 1), {kT, 1}))).shape == (xs::Dims{kT, 4}));
+    FakeWeights w;
+    w.add("experts", DType::F32, {6, 24, 16});
+    const Value up = g.expert_matmul(x, g.weight(w, "experts"), indices);
+    CHECK(g.type(up).shape == (xs::Dims{kT, 4, 24}));
+    CHECK_THROWS_AS(g.topk(probs, 17), xs::Error);                    // k larger than the axis
+    CHECK_THROWS_AS(g.reduce_sum(x, 2), xs::Error);                   // no such axis
+    CHECK_THROWS_AS(g.expert_matmul(up, g.weight(w, "experts"), indices), xs::Error);  // inner dims 24 vs 16
+}

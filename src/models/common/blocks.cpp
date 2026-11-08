@@ -19,6 +19,25 @@ Value gated_mlp(Graph& g, Value x, const Linear& gate, const Linear& up, const L
     return down(g.mul(a, up(x)));
 }
 
+Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p) {
+    Graph::Scope scope(g, "moe");
+    XS_CHECK(s.top_k >= 1 && s.top_k <= s.experts, "moe: top_k ", s.top_k, " of ", s.experts, " experts");
+    const Value logits = g.matmul(x, p.router);  // [T, E]
+    const Value probs = s.router == Router::Softmax ? g.softmax(logits) : g.sigmoid(logits);
+    auto [weights, idx] = g.topk(probs, s.top_k);  // [T, k]
+    if (s.normalize) weights = g.div(weights, g.reshape(g.reduce_sum(weights, 1), {kT, 1}));
+    if (s.routed_scale != 1.0f) weights = g.scale(weights, s.routed_scale);
+    const Value h = g.mul(activation(g, s.act, g.expert_matmul(x, p.gate, idx)), g.expert_matmul(x, p.up, idx));
+    const Value y = g.expert_matmul(h, p.down, idx);  // [T, k, hidden]
+    Value out = g.reduce_sum(g.mul(y, g.reshape(weights, {kT, s.top_k, 1})), 1);
+    if (p.shared_gate) {
+        Value shared = gated_mlp(g, x, p.shared_gate, p.shared_up, p.shared_down, s.act);
+        if (p.shared_expert_gate.valid()) shared = g.mul(shared, g.sigmoid(g.matmul(x, p.shared_expert_gate)));
+        out = g.add(out, shared);
+    }
+    return out;
+}
+
 Value rms_norm_one_plus(Graph& g, Value x, const WeightStore& weights, const std::string& name, float eps) {
     const TensorView& w = weights.get(name);
     XS_CHECK(is_float(w.dtype) && w.shape.size() == 1, "norm weight '", name, "' must be a float vector, got ",

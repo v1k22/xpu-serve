@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <numbers>
+#include <utility>
 #include <vector>
 
 #include "backend_test_util.h"
@@ -306,6 +307,81 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
                 for (int64_t j = 0; j < l_len; ++j)
                     acc += scores[static_cast<size_t>(j)] / sum * v[(j * hkv + kvh) * dim + d];
                 out[(i * hq + h) * dim + d] = acc;
+            }
+        }
+    }
+    return out;
+}
+
+inline Tensor64 softmax(const Tensor64& x) {
+    const int64_t width = x.shape.back();
+    Tensor64 out(x.shape);
+    for (int64_t r = 0; r < x.numel() / width; ++r) {
+        double peak = -std::numeric_limits<double>::infinity();
+        for (int64_t i = 0; i < width; ++i)
+            peak = std::max(peak, x[r * width + i]);
+        double sum = 0;
+        for (int64_t i = 0; i < width; ++i)
+            sum += std::exp(x[r * width + i] - peak);
+        for (int64_t i = 0; i < width; ++i)
+            out[r * width + i] = std::exp(x[r * width + i] - peak) / sum;
+    }
+    return out;
+}
+
+// The k largest per row of the last axis, largest first, ties to the lower index: (values, indices).
+inline std::pair<Tensor64, std::vector<int64_t>> topk(const Tensor64& x, int64_t k) {
+    const int64_t width = x.shape.back();
+    Dims shape = x.shape;
+    shape.back() = k;
+    Tensor64 values(shape);
+    std::vector<int64_t> indices;
+    for (int64_t r = 0; r < x.numel() / width; ++r) {
+        std::vector<int64_t> order(static_cast<size_t>(width));
+        for (int64_t i = 0; i < width; ++i)
+            order[static_cast<size_t>(i)] = i;
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int64_t a, int64_t b) { return x[r * width + a] > x[r * width + b]; });
+        for (int64_t j = 0; j < k; ++j) {
+            values[r * k + j] = x[r * width + order[static_cast<size_t>(j)]];
+            indices.push_back(order[static_cast<size_t>(j)]);
+        }
+    }
+    return {values, indices};
+}
+
+inline Tensor64 reduce_sum(const Tensor64& x, size_t axis) {
+    int64_t outer = 1;
+    for (size_t i = 0; i < axis; ++i)
+        outer *= x.shape[i];
+    const int64_t dim = x.shape[axis];
+    const int64_t inner = x.numel() / (outer * dim);
+    Dims shape = x.shape;
+    shape.erase(shape.begin() + static_cast<std::ptrdiff_t>(axis));
+    Tensor64 out(shape);
+    for (int64_t o = 0; o < outer; ++o)
+        for (int64_t d = 0; d < dim; ++d)
+            for (int64_t i = 0; i < inner; ++i)
+                out[o * inner + i] += x[(o * dim + d) * inner + i];
+    return out;
+}
+
+// x [T, K] or [T, S, K], w [E, N, K], idx T * S entries -> [T, S, N].
+inline Tensor64 expert_matmul(const Tensor64& x, const Tensor64& w, const std::vector<int64_t>& idx, int64_t slots) {
+    const int64_t tokens = x.shape[0];
+    const int64_t n = w.shape[1];
+    const int64_t k = w.shape[2];
+    const bool per_slot = x.shape.size() == 3;
+    Tensor64 out({tokens, slots, n});
+    for (int64_t t = 0; t < tokens; ++t) {
+        for (int64_t s = 0; s < slots; ++s) {
+            const int64_t e = idx[static_cast<size_t>(t * slots + s)];
+            const int64_t row = per_slot ? t * slots + s : t;
+            for (int64_t c = 0; c < n; ++c) {
+                double acc = 0;
+                for (int64_t i = 0; i < k; ++i)
+                    acc += x[row * k + i] * w[(e * n + c) * k + i];
+                out[(t * slots + s) * n + c] = acc;
             }
         }
     }

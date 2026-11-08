@@ -58,8 +58,10 @@ template <BinaryOp Op>
 inline float apply_binary(float a, float b) {
     if constexpr (Op == BinaryOp::Add) {
         return a + b;
-    } else {
+    } else if constexpr (Op == BinaryOp::Mul) {
         return a * b;
+    } else {
+        return a / b;
     }
 }
 
@@ -510,28 +512,153 @@ void act_mul(sycl::queue& q, UnaryOp act, const float* x, const float* b, float*
 }
 
 void binary(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n, const Broadcast& shape) {
-    if (op == BinaryOp::Add) {
-        binary_t<BinaryOp::Add>(q, a, b, y, n, shape);
-    } else {
-        binary_t<BinaryOp::Mul>(q, a, b, y, n, shape);
+    switch (op) {
+        case BinaryOp::Add: return binary_t<BinaryOp::Add>(q, a, b, y, n, shape);
+        case BinaryOp::Mul: return binary_t<BinaryOp::Mul>(q, a, b, y, n, shape);
+        case BinaryOp::Div: return binary_t<BinaryOp::Div>(q, a, b, y, n, shape);
     }
 }
 
 void binary_same(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n) {
-    if (op == BinaryOp::Add) {
-        binary_same_t<BinaryOp::Add>(q, a, b, y, n);
-    } else {
-        binary_same_t<BinaryOp::Mul>(q, a, b, y, n);
+    switch (op) {
+        case BinaryOp::Add: return binary_same_t<BinaryOp::Add>(q, a, b, y, n);
+        case BinaryOp::Mul: return binary_same_t<BinaryOp::Mul>(q, a, b, y, n);
+        case BinaryOp::Div: return binary_same_t<BinaryOp::Div>(q, a, b, y, n);
     }
 }
 
 void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n, int64_t period) {
-    if (op == BinaryOp::Add) {
-        binary_period_t<BinaryOp::Add>(q, a, b, y, n, period);
-    } else {
-        binary_period_t<BinaryOp::Mul>(q, a, b, y, n, period);
+    switch (op) {
+        case BinaryOp::Add: return binary_period_t<BinaryOp::Add>(q, a, b, y, n, period);
+        case BinaryOp::Mul: return binary_period_t<BinaryOp::Mul>(q, a, b, y, n, period);
+        case BinaryOp::Div: return binary_period_t<BinaryOp::Div>(q, a, b, y, n, period);
     }
 }
+
+void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width) {
+    const size_t wg = width >= 256 ? 256 : 64;
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * wg, wg), [=](sycl::nd_item<1> it) {
+        const int64_t r = static_cast<int64_t>(it.get_group(0));
+        const float* xr = x + r * width;
+        float* yr = y + r * width;
+        const int64_t lid = static_cast<int64_t>(it.get_local_id(0));
+        float peak = -std::numeric_limits<float>::infinity();
+        for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
+            peak = sycl::fmax(peak, xr[i]);
+        peak = sycl::reduce_over_group(it.get_group(), peak, sycl::maximum<float>());
+        float sum = 0.0f;
+        for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
+            sum += sycl::exp(xr[i] - peak);
+        sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+        const float inv = 1.0f / sum;
+        for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
+            yr[i] = sycl::exp(xr[i] - peak) * inv;
+    });
+}
+
+void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64_t rows, int64_t width, int64_t k) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(rows)), [=](sycl::id<1> idx) {
+        const int64_t r = static_cast<int64_t>(idx[0]);
+        const float* xr = x + r * width;
+        // Pick j: the largest (value, then lowest index) strictly after pick j - 1 in that order.
+        float prev_v = std::numeric_limits<float>::infinity();
+        int64_t prev_i = -1;
+        for (int64_t j = 0; j < k; ++j) {
+            float best_v = -std::numeric_limits<float>::infinity();
+            int64_t best_i = -1;
+            for (int64_t i = 0; i < width; ++i) {
+                const float v = xr[i];
+                const bool after_prev = v < prev_v || (v == prev_v && i > prev_i);
+                if (after_prev && (best_i < 0 || v > best_v)) {
+                    best_v = v;
+                    best_i = i;
+                }
+            }
+            values[r * k + j] = best_v;
+            indices[r * k + j] = static_cast<int32_t>(best_i);
+            prev_v = best_v;
+            prev_i = best_i;
+        }
+    });
+}
+
+void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner) {
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(outer), static_cast<size_t>(inner)), [=](sycl::item<2> it) {
+        const int64_t o = static_cast<int64_t>(it[0]);
+        const int64_t i = static_cast<int64_t>(it[1]);
+        float sum = 0.0f;
+        for (int64_t d = 0; d < dim; ++d)
+            sum += x[(o * dim + d) * inner + i];
+        y[o * inner + i] = sum;
+    });
+}
+
+// One sub-group per kGemvRows output rows of one (token, slot): the GEMV of gemv_t on the slot's expert.
+template <typename W, typename I, bool Vec>
+void expert_matmul_t(sycl::queue& q, const float* x, bool per_slot, const W* w, const I* idx, float* out,
+                     int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k) {
+    constexpr int64_t kRowsPerWg = kGemvSgPerWg * kGemvRows;
+    const int64_t blocks = ceil_div(n, kRowsPerWg);
+    const int64_t items = tokens * slots;
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(items * blocks * kGemvSgPerWg * kSubGroup),
+                                           kGemvSgPerWg * kSubGroup),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const int64_t item = static_cast<int64_t>(it.get_group(0)) / blocks;
+        const int64_t block = static_cast<int64_t>(it.get_group(0)) % blocks;
+        const int64_t row0 = (block * kGemvSgPerWg + sg.get_group_linear_id()) * kGemvRows;
+        int64_t e = static_cast<int64_t>(idx[item]);
+        if (e < 0 || e >= experts) e = 0;
+        const float* xr = x + (per_slot ? item : item / slots) * k;
+        const W* we = w + e * n * k;
+        float acc[kGemvRows];
+        int64_t rows[kGemvRows];
+        for (int r = 0; r < kGemvRows; ++r) {
+            acc[r] = 0.0f;
+            rows[r] = std::min<int64_t>(row0 + r, n - 1);
+        }
+        if constexpr (Vec) {
+            for (int64_t k0 = static_cast<int64_t>(lane) * 8; k0 < k; k0 += kSubGroup * 8) {
+                const sycl::vec<float, 8> xv = *reinterpret_cast<const sycl::vec<float, 8>*>(xr + k0);
+                for (int r = 0; r < kGemvRows; ++r) {
+                    const sycl::vec<float, 8> p =
+                        reinterpret_cast<const sycl::vec<W, 8>*>(we + rows[r] * k + k0)->template convert<float>() * xv;
+                    acc[r] += ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
+                }
+            }
+        } else {
+            for (int64_t kk = lane; kk < k; kk += kSubGroup)
+                for (int r = 0; r < kGemvRows; ++r)
+                    acc[r] += static_cast<float>(we[rows[r] * k + kk]) * xr[kk];
+        }
+        for (int r = 0; r < kGemvRows; ++r) {
+            const float sum = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+            if (lane == 0 && row0 + r < n) out[item * n + row0 + r] = sum;
+        }
+    });
+}
+
+template <typename W, typename I>
+void expert_matmul(sycl::queue& q, const float* x, bool per_slot, const W* w, const I* idx, float* out, int64_t tokens,
+                   int64_t slots, int64_t experts, int64_t n, int64_t k) {
+    const bool vec = k % 8 == 0 && reinterpret_cast<uintptr_t>(x) % 32 == 0 &&
+                     reinterpret_cast<uintptr_t>(w) % (8 * sizeof(W)) == 0;
+    if (vec) {
+        expert_matmul_t<W, I, true>(q, x, per_slot, w, idx, out, tokens, slots, experts, n, k);
+    } else {
+        expert_matmul_t<W, I, false>(q, x, per_slot, w, idx, out, tokens, slots, experts, n, k);
+    }
+}
+
+template void expert_matmul<half, int32_t>(sycl::queue&, const float*, bool, const half*, const int32_t*, float*,
+                                           int64_t, int64_t, int64_t, int64_t, int64_t);
+template void expert_matmul<half, int64_t>(sycl::queue&, const float*, bool, const half*, const int64_t*, float*,
+                                           int64_t, int64_t, int64_t, int64_t, int64_t);
+template void expert_matmul<float, int32_t>(sycl::queue&, const float*, bool, const float*, const int32_t*, float*,
+                                            int64_t, int64_t, int64_t, int64_t, int64_t);
+template void expert_matmul<float, int64_t>(sycl::queue&, const float*, bool, const float*, const int64_t*, float*,
+                                            int64_t, int64_t, int64_t, int64_t, int64_t);
 
 void rms_norm(sycl::queue& q, const float* x, const float* w, float* y, int64_t rows, int64_t width, float eps) {
     const size_t wg = width >= 1024 ? 512 : (width >= 256 ? 256 : 128);

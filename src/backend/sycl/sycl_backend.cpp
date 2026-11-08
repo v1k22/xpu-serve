@@ -309,7 +309,7 @@ private:
                     continue;
                 }
                 if (!((kind == OpKind::MatMul && k == 1) || (kind == OpKind::Gather && k == 0) ||
-                      (kind == OpKind::Attention && k > 0))) {
+                      (kind == OpKind::ExpertMatMul && k == 1) || (kind == OpKind::Attention && k > 0))) {
                     return false;
                 }
                 any = true;
@@ -355,6 +355,9 @@ private:
                     dtype_[i][0] = dtype_[i][1] =
                         precision_ == DType::F16 && f16_readers_only(i, consumers) ? DType::F16 : DType::F32;
                     break;
+                case OpKind::TopK:
+                    dtype_[i][1] = DType::I32;
+                    break;
                 default:
                     break;
             }
@@ -398,6 +401,11 @@ private:
                              "columns, got ", k);
                     break;
                 }
+                case OpKind::ExpertMatMul:
+                    need(0, is_f32(0), "f32");
+                    need(1, is_fp(1), "f16 or f32");
+                    need(2, is_int(2), "i32 or i64");
+                    break;
                 case OpKind::Rope:
                     need(0, is_f32(0), "f32");
                     need(1, is_int(1), "i32 or i64");
@@ -923,21 +931,24 @@ private:
                 return;
             }
             case OpKind::Add:
-            case OpKind::Mul: {
+            case OpKind::Mul:
+            case OpKind::Div: {
                 if (act_mul_[i] >= 0) {
                     sycl_be::act_mul(q_, static_cast<UnaryOp>(act_mul_[i]), reinterpret_cast<const float*>(ptr(p, reads_[i][0])),
                                      reinterpret_cast<const float*>(ptr(p, reads_[i][1])), out, out_n);
                     return;
                 }
-                const auto op = n.kind == OpKind::Add ? sycl_be::BinaryOp::Add : sycl_be::BinaryOp::Mul;
+                const auto op = n.kind == OpKind::Add   ? sycl_be::BinaryOp::Add
+                                : n.kind == OpKind::Mul ? sycl_be::BinaryOp::Mul
+                                                        : sycl_be::BinaryOp::Div;
                 const Dims& a = in_shape(0);
                 const Dims& b = in_shape(1);
                 if (a == b) {
                     sycl_be::binary_same(q_, op, in_f32(0), in_f32(1), out, out_n);
                 } else if (a == out_shape && is_suffix_broadcast(b, out_shape)) {
                     sycl_be::binary_period(q_, op, in_f32(0), in_f32(1), out, out_n, numel(b));
-                } else if (b == out_shape && is_suffix_broadcast(a, out_shape)) {
-                    sycl_be::binary_period(q_, op, in_f32(1), in_f32(0), out, out_n, numel(a));  // both commute
+                } else if (op != sycl_be::BinaryOp::Div && b == out_shape && is_suffix_broadcast(a, out_shape)) {
+                    sycl_be::binary_period(q_, op, in_f32(1), in_f32(0), out, out_n, numel(a));  // add, mul commute
                 } else {
                     XS_CHECK(out_shape.size() <= static_cast<size_t>(sycl_be::kMaxRank), where(i), ": rank ",
                              out_shape.size(), " exceeds ", sycl_be::kMaxRank);
@@ -1064,6 +1075,48 @@ private:
                                        reinterpret_cast<const half*>(in_ptr(2)), out, s, attention_path_);
                 } else {
                     sycl_be::attention(q_, *this, in_f32(0), in_f32(1), in_f32(2), out, s, attention_path_);
+                }
+                return;
+            }
+            case OpKind::Softmax: {
+                const int64_t width = out_shape.back();
+                sycl_be::softmax(q_, in_f32(0), out, out_n / width, width);
+                return;
+            }
+            case OpKind::TopK: {
+                const int64_t width = in_shape(0).back();
+                const int64_t k = std::get<graph::TopKAttrs>(n.attrs).k;
+                auto* indices = reinterpret_cast<int32_t*>(ptr(p, Value{static_cast<int32_t>(i), 1}));
+                sycl_be::topk(q_, in_f32(0), out, indices, numel(in_shape(0)) / width, width, k);
+                return;
+            }
+            case OpKind::ReduceSum: {
+                const int axis = std::get<graph::ReduceAttrs>(n.attrs).axis;
+                const Dims& in = in_shape(0);
+                int64_t outer = 1;
+                for (int d = 0; d < axis; ++d)
+                    outer *= in[static_cast<size_t>(d)];
+                const int64_t dim = in[static_cast<size_t>(axis)];
+                sycl_be::reduce_sum(q_, in_f32(0), out, outer, dim, numel(in) / (outer * dim));
+                return;
+            }
+            case OpKind::ExpertMatMul: {
+                const Dims& ws = in_shape(1);
+                const Dims& is = in_shape(2);
+                const bool per_slot = in_shape(0).size() == 3;
+                const auto run = [&](const auto* w) {
+                    if (in_dt(2) == DType::I32) {
+                        sycl_be::expert_matmul(q_, in_f32(0), per_slot, w, reinterpret_cast<const int32_t*>(in_ptr(2)),
+                                               out, is[0], is[1], ws[0], ws[1], ws[2]);
+                    } else {
+                        sycl_be::expert_matmul(q_, in_f32(0), per_slot, w, reinterpret_cast<const int64_t*>(in_ptr(2)),
+                                               out, is[0], is[1], ws[0], ws[1], ws[2]);
+                    }
+                };
+                if (in_dt(1) == DType::F16) {
+                    run(reinterpret_cast<const half*>(in_ptr(1)));
+                } else {
+                    run(in_f32(1));
                 }
                 return;
             }

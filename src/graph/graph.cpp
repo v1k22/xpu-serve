@@ -52,6 +52,11 @@ std::string_view op_name(OpKind kind) {
         case OpKind::Attention: return "Attention";
         case OpKind::CausalConv: return "CausalConv";
         case OpKind::GatedDelta: return "GatedDelta";
+        case OpKind::Div: return "Div";
+        case OpKind::Softmax: return "Softmax";
+        case OpKind::TopK: return "TopK";
+        case OpKind::ReduceSum: return "ReduceSum";
+        case OpKind::ExpertMatMul: return "ExpertMatMul";
     }
     return "?";
 }
@@ -187,11 +192,51 @@ Value Graph::elementwise_binary(OpKind kind, Value a, Value b) {
         }
     }
     return add_node(kind, {a, b}, {}, {TensorType{DType::F32, std::move(out)}},
-                    kind == OpKind::Add ? "add" : "mul");
+                    kind == OpKind::Add ? "add" : kind == OpKind::Mul ? "mul" : "div");
 }
 
 Value Graph::add(Value a, Value b) { return elementwise_binary(OpKind::Add, a, b); }
 Value Graph::mul(Value a, Value b) { return elementwise_binary(OpKind::Mul, a, b); }
+Value Graph::div(Value a, Value b) { return elementwise_binary(OpKind::Div, a, b); }
+
+Value Graph::softmax(Value x) {
+    XS_CHECK(!type(x).shape.empty(), "softmax of a scalar at ", where(x));
+    return add_node(OpKind::Softmax, {x}, {}, {TensorType{DType::F32, type(x).shape}}, "softmax");
+}
+
+std::pair<Value, Value> Graph::topk(Value x, int64_t k) {
+    const Dims& s = type(x).shape;
+    XS_CHECK(!s.empty() && !is_symbol(s.back()) && k >= 1 && k <= s.back(), "topk ", k, " of ", shape_to_string(s),
+             " at ", where(x), ": the last axis must be static and hold at least k values");
+    Dims out = s;
+    out.back() = k;
+    const Value v = add_node(OpKind::TopK, {x}, TopKAttrs{k}, {TensorType{DType::F32, out}, TensorType{DType::I32, out}},
+                             "topk");
+    return {v, Value{v.node, 1}};
+}
+
+Value Graph::reduce_sum(Value x, int axis) {
+    const Dims& s = type(x).shape;
+    XS_CHECK(axis >= 0 && static_cast<size_t>(axis) < s.size() && s.size() >= 2, "reduce_sum over axis ", axis, " of ",
+             shape_to_string(s), " at ", where(x));
+    Dims out = s;
+    out.erase(out.begin() + axis);
+    return add_node(OpKind::ReduceSum, {x}, ReduceAttrs{axis}, {TensorType{DType::F32, out}}, "reduce_sum");
+}
+
+Value Graph::expert_matmul(Value x, Value w, Value idx) {
+    const Dims& xs = type(x).shape;
+    const Dims& ws = type(w).shape;
+    const Dims& is = type(idx).shape;
+    XS_CHECK(ws.size() == 3, "expert_matmul weight must be [E, N, K], got ", shape_to_string(ws), " at ", where(w));
+    XS_CHECK(is.size() == 2 && is_int(type(idx).dtype), "expert_matmul indices must be [T, S] int, got ",
+             dtype_name(type(idx).dtype), shape_to_string(is));
+    XS_CHECK((xs.size() == 2 || (xs.size() == 3 && xs[1] == is[1])) && xs[0] == is[0] && xs.back() == ws[2],
+             "expert_matmul x ", shape_to_string(xs), " does not fit indices ", shape_to_string(is), " and weight ",
+             shape_to_string(ws));
+    return add_node(OpKind::ExpertMatMul, {x, w, idx}, {}, {TensorType{DType::F32, {is[0], is[1], ws[1]}}},
+                    "expert_matmul");
+}
 
 Value Graph::elementwise_unary(OpKind kind, Value x, Attrs attrs) {
     TensorType t{DType::F32, type(x).shape};
@@ -453,6 +498,10 @@ std::string attrs_to_string(const Attrs& a) {
                 os << "rotary_dim=" << v.rotary_dim;
             } else if constexpr (std::is_same_v<T, StateAttrs>) {
                 os << "slot=" << v.slot << " l2norm_eps=" << v.qk_l2norm_eps;
+            } else if constexpr (std::is_same_v<T, TopKAttrs>) {
+                os << "k=" << v.k;
+            } else if constexpr (std::is_same_v<T, ReduceAttrs>) {
+                os << "axis=" << v.axis;
             } else if constexpr (std::is_same_v<T, AttentionAttrs>) {
                 os << "scale=" << v.scale << " window=" << v.sliding_window << " softcap=" << v.softcap
                    << " causal=" << v.causal;

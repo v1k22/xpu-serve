@@ -464,4 +464,91 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
     return out;
 }
 
+HostTensor div(const HostTensor& a, const HostTensor& b) {
+    return map_binary(a, b, [](float x, float y) { return x / y; });
+}
+
+HostTensor softmax(const HostTensor& x) {
+    check_f32(x, "softmax x");
+    const int64_t width = x.shape().back();
+    HostTensor out(DType::F32, x.shape());
+    for (int64_t r = 0; r < x.numel() / width; ++r) {
+        const float* in = x.data<float>() + r * width;
+        float* o = out.data<float>() + r * width;
+        double peak = in[0];
+        for (int64_t i = 1; i < width; ++i)
+            peak = std::max(peak, static_cast<double>(in[i]));
+        double sum = 0;
+        for (int64_t i = 0; i < width; ++i)
+            sum += std::exp(static_cast<double>(in[i]) - peak);
+        for (int64_t i = 0; i < width; ++i)
+            o[i] = static_cast<float>(std::exp(static_cast<double>(in[i]) - peak) / sum);
+    }
+    return out;
+}
+
+std::pair<HostTensor, HostTensor> topk(const HostTensor& x, int64_t k) {
+    check_f32(x, "topk x");
+    const int64_t width = x.shape().back();
+    XS_CHECK(k >= 1 && k <= width, "topk ", k, " of rows of ", width);
+    Dims shape = x.shape();
+    shape.back() = k;
+    HostTensor values(DType::F32, shape);
+    HostTensor indices(DType::I32, shape);
+    std::vector<int32_t> order(static_cast<size_t>(width));
+    for (int64_t r = 0; r < x.numel() / width; ++r) {
+        const float* in = x.data<float>() + r * width;
+        for (int64_t i = 0; i < width; ++i)
+            order[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return in[a] > in[b]; });
+        for (int64_t j = 0; j < k; ++j) {
+            indices.data<int32_t>()[r * k + j] = order[static_cast<size_t>(j)];
+            values.data<float>()[r * k + j] = in[order[static_cast<size_t>(j)]];
+        }
+    }
+    return {std::move(values), std::move(indices)};
+}
+
+HostTensor reduce_sum(const HostTensor& x, int axis) {
+    check_f32(x, "reduce_sum x");
+    const int64_t dim = x.dim(static_cast<size_t>(axis));
+    int64_t outer = 1;
+    for (int i = 0; i < axis; ++i)
+        outer *= x.dim(static_cast<size_t>(i));
+    const int64_t inner = x.numel() / (outer * dim);
+    Dims shape = x.shape();
+    shape.erase(shape.begin() + axis);
+    HostTensor out(DType::F32, shape);
+    for (int64_t o = 0; o < outer; ++o) {
+        for (int64_t i = 0; i < inner; ++i) {
+            double sum = 0;
+            for (int64_t d = 0; d < dim; ++d)
+                sum += x.data<float>()[(o * dim + d) * inner + i];
+            out.data<float>()[o * inner + i] = static_cast<float>(sum);
+        }
+    }
+    return out;
+}
+
+HostTensor expert_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& w, const HostTensor& idx) {
+    check_f32(x, "expert_matmul x");
+    check_f32(w, "expert_matmul w");
+    const int64_t tokens = idx.dim(0);
+    const int64_t slots = idx.dim(1);
+    const int64_t experts = w.dim(0);
+    const int64_t n = w.dim(1);
+    const int64_t k = w.dim(2);
+    const bool per_slot = x.rank() == 3;
+    HostTensor out(DType::F32, {tokens, slots, n});
+    pool.parallel_for(tokens * slots, [&](int64_t item) {
+        const int64_t t = item / slots;
+        const int64_t e = int_at(idx, item);
+        XS_CHECK(e >= 0 && e < experts, "expert_matmul: expert ", e, " at token ", t, " is outside [0, ", experts, ")");
+        const float* row = x.data<float>() + (per_slot ? item : t) * k;
+        for (int64_t c = 0; c < n; ++c)
+            out.data<float>()[item * n + c] = static_cast<float>(dot(row, w.data<float>() + (e * n + c) * k, k));
+    });
+    return out;
+}
+
 }  // namespace xs::cpu_ref

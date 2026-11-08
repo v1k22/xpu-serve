@@ -22,7 +22,7 @@ void unary(sycl::queue& q, UnaryOp op, const float* x, float* y, int64_t n, floa
 // y = act(x) * b, same shapes; act is Silu, GeluTanh or Sigmoid (a fused activation-times-gate).
 void act_mul(sycl::queue& q, UnaryOp act, const float* x, const float* b, float* y, int64_t n);
 
-enum class BinaryOp : uint8_t { Add, Mul };
+enum class BinaryOp : uint8_t { Add, Mul, Div };
 // numpy broadcasting over at most kMaxRank dims: out shape and the element strides of a and b per out dim (0 where
 // the operand is broadcast).
 struct Broadcast {
@@ -35,6 +35,17 @@ void binary(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* 
 // Fast paths: same shape, and b repeating every `period` elements of a (a row vector over the leading dims).
 void binary_same(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n);
 void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, float* y, int64_t n, int64_t period);
+
+// Rows of `width`.
+void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width);
+// The k largest per row of x [rows, width]: values and indices [rows, k], largest first, ties to the lower index.
+void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64_t rows, int64_t width, int64_t k);
+// y [outer, inner] = the sum over the middle axis of x [outer, dim, inner].
+void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner);
+// out [T, S, N] = x[t] (per_slot: x[t, s]) @ w[idx[t, s]]^T, w [E, N, K]; expert ids outside [0, E) read expert 0.
+template <typename W, typename I>
+void expert_matmul(sycl::queue& q, const float* x, bool per_slot, const W* w, const I* idx, float* out, int64_t tokens,
+                   int64_t slots, int64_t experts, int64_t n, int64_t k);
 
 // Rows of `width`; w may be null.
 void rms_norm(sycl::queue& q, const float* x, const float* w, float* y, int64_t rows, int64_t width, float eps);

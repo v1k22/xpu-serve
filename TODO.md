@@ -91,7 +91,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ### 0.8 Gemma 4 model code
 - [x] `models/gemma4/config.cpp`: parse (`text_config` first, then root), validate, memory bill
-- [ ] `models/common/`: attention, GeGLU MLP, MoE, RMSNorm, RoPE variants
+- [x] `models/common/`: attention, GeGLU MLP, MoE, RMSNorm, RoPE variants (`blocks.h`; Gemma 4 and Qwen3.5 built
+      from them; MoE = router + top-k + ExpertMatMul over a stacked bank, cpu-ref and SYCL)
 - [x] `models/gemma4/model.cpp`: sliding + global attention, K=V global layers, MoE + dense MLP, tied head, softcap
 - [ ] `models/gemma4/README.md`: quirks, references, tested packs
 - [ ] `tests/parity/make_tiny.py`: tiny random Gemma 4 (sliding + global + MoE + K=V) → weights + fp32 logits and
@@ -159,7 +160,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Bandwidth probe in SYCL (matches 0.2)
 - [x] int4 / int8 GEMV for decode; dequantize + GEMM for prefill; quantized gather (device suites, groups 32 / 128)
 - [ ] int4 / int8 GEMV at ≥ 85% of measured bandwidth; prefill without the f16 copy of each weight
-- [ ] MoE grouped GEMV (top-8 of 128) incl. the expert union at verify width k+1
+- [ ] MoE grouped GEMV (top-8 of 128) incl. the expert union at verify width k+1; today ExpertMatMul is one GEMV
+      per (token, slot), fine for decode, slow for prefill; quantized expert banks (q4/q8) in packs
 - [ ] Paged decode attention: head dims 256 / 512, GQA, sliding window, chain and **tree** masks
 - [x] Prefill: oneMKL GEMM (f16 x f16 -> f32); prefill attention through two batched GEMMs per query chunk
 - [ ] Prefill attention on XMX without the score matrix (flash attention, e.g. SYCL*TLA)

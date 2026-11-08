@@ -4,6 +4,7 @@
 // allocated. Semantics follow the OpKind comments in graph/graph.h.
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "backend/cpu_ref/thread_pool.h"
@@ -41,5 +42,12 @@ HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& 
                        const HostTensor& g, const HostTensor& beta, float qk_l2norm_eps, std::vector<float>& state);
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
                      const graph::AttentionAttrs& attrs);
+HostTensor div(const HostTensor& a, const HostTensor& b);
+HostTensor softmax(const HostTensor& x);
+// (values f32, indices i32) of the k largest along the last axis, largest first; ties keep the lower index first.
+std::pair<HostTensor, HostTensor> topk(const HostTensor& x, int64_t k);
+HostTensor reduce_sum(const HostTensor& x, int axis);
+// x [T, K] or [T, S, K], w [E, N, K], idx [T, S] int -> [T, S, N].
+HostTensor expert_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& w, const HostTensor& idx);
 
 }  // namespace xs::cpu_ref

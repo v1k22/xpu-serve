@@ -35,6 +35,30 @@ Value activation(Graph& g, Act act, Value x);
 // down(act(gate(x)) * up(x)): SwiGLU with Silu, GeGLU with GeluTanh.
 Value gated_mlp(Graph& g, Value x, const Linear& gate, const Linear& up, const Linear& down, Act act);
 
+// ---- Mixture of experts
+
+enum class Router : uint8_t { Softmax, Sigmoid };
+
+struct MoeSpec {
+    int64_t experts = 0;
+    int64_t top_k = 0;
+    Router router = Router::Softmax;  // expert probabilities from the router logits
+    bool normalize = true;            // the k chosen probabilities rescaled to sum to 1
+    float routed_scale = 1.0f;        // the weights then times this
+    Act act = Act::Silu;
+};
+
+struct MoeParts {
+    Value router;                     // [E, hidden]
+    Value gate, up, down;             // [E, I, hidden], [E, I, hidden], [E, hidden, I]
+    Linear shared_gate, shared_up, shared_down;  // a shared expert every token uses; empty: none
+    Value shared_expert_gate;         // [1, hidden]: the shared output times sigmoid(x . w); invalid: no gate
+};
+
+// x [T, hidden] -> [T, hidden]: the router picks top_k experts per token, each runs a gated MLP, and their outputs
+// are summed with the routing weights; plus the (optionally gated) shared expert.
+Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p);
+
 // ---- RMSNorm variants (plain x * w is Graph::rms_norm)
 
 // x * rsqrt(mean(x^2) + eps) * (1 + w): zero-centered norms (Qwen3.5); `1 + w` is read on the host as a constant.
