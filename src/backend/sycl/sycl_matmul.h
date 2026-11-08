@@ -35,4 +35,10 @@ template <typename KV>
 void attention(sycl::queue& q, Scratch& scratch, const float* qp, const KV* k, const KV* v, float* out,
                const AttentionShape& s, AttentionPath path);
 
+// attention() over an int8 KV cache. The rows path reads the codes; the GEMM path first dequantizes the keys the
+// queries can see to CT in `kv_scratch` (a second scratch: the GEMM path uses `scratch` for its own buffers).
+template <typename CT>
+void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvI8& kv, float* out,
+                  const AttentionShape& s, AttentionPath path);
+
 }  // namespace xs::sycl_be

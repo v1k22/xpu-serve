@@ -14,13 +14,17 @@ namespace {
 const dev::Tolerance kCross = dev::tolerance({1e-4, 1e-4}, {3e-2, 2e-2});
 
 // Runs `steps` (token counts) through both backends and compares every output of every step.
-void compare_backends(const dev::TinyModelSpec& spec, const std::vector<int32_t>& steps, uint32_t seed) {
+void compare_backends(const dev::TinyModelSpec& spec, const std::vector<int32_t>& steps, uint32_t seed,
+                      bool kv_i8 = false) {
     test::TensorRng rng(seed);
     test::MemoryWeights weights;
     dev::add_tiny_weights(spec, weights, rng);
     const graph::Graph g = dev::tiny_model(spec, weights);
-    const auto oracle = make_cpu_ref_backend()->compile(g, weights, SessionOptions{});
-    const auto gpu = dev::backend().compile(g, weights, dev::options());
+    SessionOptions oracle_options;
+    SessionOptions gpu_options = dev::options();
+    if (kv_i8) oracle_options.kv_dtype = gpu_options.kv_dtype = DType::I8;
+    const auto oracle = make_cpu_ref_backend()->compile(g, weights, oracle_options);
+    const auto gpu = dev::backend().compile(g, weights, gpu_options);
     int32_t begin = 0;
     for (const int32_t t : steps) {
         CAPTURE(begin);
@@ -62,5 +66,15 @@ TEST_SUITE("device vs cpu-ref" * doctest::skip(!dev::enabled())) {
         spec.sliding_window = 16;
         spec.logits = false;
         compare_backends(spec, {12, 1, 1, 6}, 3);
+    }
+
+    TEST_CASE("tiny decoder with an int8 KV cache on both backends: sliding and global layers, GQA") {
+        compare_backends({}, {7, 1, 1, 3}, 4, true);
+        dev::TinyModelSpec spec;
+        spec.head_dim = 256;
+        spec.heads = 4;
+        spec.kv_heads = 1;
+        spec.sliding_window = 4;
+        compare_backends(spec, {9, 1, 2}, 5, true);
     }
 }

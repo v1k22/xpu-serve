@@ -42,7 +42,7 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
 - icpx turns the SYCL backend on (`XS_WITH_SYCL`); `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` compiles its kernels ahead
   of time for the Arc Pro B60. Any other C++20 compiler builds only the CPU reference backend (the test oracle).
 - Useful flags: `--backend sycl|cpu-ref` (default: sycl when built), `--device GPU|GPU.0|GPU.1`, `--precision f16|f32`,
-  `--ctx N`, `--prefill-chunk N`, `--backend-opt attention=auto|rows|gemm`, `--no-vision`, `--log-level debug`. `xpu-serve <command> --help` lists all of them;
+  `--kv-dtype auto|i8`, `--ctx N`, `--prefill-chunk N`, `--backend-opt attention=auto|rows|gemm`, `--no-vision`, `--log-level debug`. `xpu-serve <command> --help` lists all of them;
   `src/cli/main.cpp` is the source of truth.
 - Run one test case: `build/tests/xs_tests -tc='model matches*'`. Environment for the tests that need files:
   `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref` or `sycl`),
@@ -169,7 +169,7 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 | Backend | Status | Notes |
 |---|---|---|
 | `cpu-ref` | test oracle | f32 values, f64 accumulation, threaded matmul. Slow by design; correctness only |
-| `sycl` | main GPU backend, the default when built (icpx turns it on) | Runs the graph op by op on an in-order Level Zero queue with its own kernels; oneMKL for prefill GEMMs. Weights and KV f16 (f32 at f32 precision), activations f32. Memory: one arena per step, planned per T from value lifetimes; KV slots grow by doubling; conv/recurrent state double-buffered so a failed step changes nothing. Fuses act(x)*gate and conv+SiLU. Decode attention reads only the sliding window and splits long caches across work-groups. Option `attention=auto|rows|gemm`. See docs/decisions/0007 |
+| `sycl` | main GPU backend, the default when built (icpx turns it on) | Runs the graph op by op on an in-order Level Zero queue with its own kernels; oneMKL for prefill GEMMs. Weights and KV f16 (f32 at f32 precision), activations f32; `--kv-dtype i8` stores KV as int8 with an f32 scale per (token, KV head): decode attention reads the codes, prefill dequantizes the keys in view to f16 for its GEMMs. Memory: one arena per step, planned per T from value lifetimes; KV slots grow by doubling; conv/recurrent state double-buffered so a failed step changes nothing. Fuses act(x)*gate and conv+SiLU. Decode attention reads only the sliding window and splits long caches across work-groups. Option `attention=auto|rows|gemm`. See docs/decisions/0007 |
 
 ## 7. Tests (`tests/`)
 
@@ -180,7 +180,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/test_graph.cpp`, `test_half.cpp`, `test_base64.cpp` | IR shape inference and validation; f16/bf16 conversions; base64 | hand-written expectations, RFC 4648 vectors |
 | `tests/unit/image/` | decoding, resize, hashing | Pillow-written images; torchvision resize outputs in `tests/fixtures/image/` (bit-exact) |
 | `tests/unit/backend/cpu_*.cpp` | each op on cpu-ref (`cpu_encoder_ops.cpp`: the encoder ops and stateless sessions), KV sessions, attention masks | fp64 references in `reference_ops.h`, with planted-bug controls |
-| `tests/unit/backend/device_*.cpp` | each op on the GPU backend (`device_encoder_ops.cpp` likewise), sessions, agreement with cpu-ref, decode timing | the same references; skip unless `XS_DEVICE_TEST_DEVICE` is set |
+| `tests/unit/backend/device_*.cpp` | each op on the GPU backend (`device_encoder_ops.cpp` likewise), sessions, agreement with cpu-ref (also with an int8 KV cache on both), decode timing | the same references; skip unless `XS_DEVICE_TEST_DEVICE` is set |
 | `tests/unit/backend/*_moe_ops.cpp` | Div, Softmax, TopK (ties to the lower index), ReduceSum, ExpertMatMul and the `moe` block (softmax and sigmoid routers, shared expert), on cpu-ref and the GPU | fp64 references and an fp64 composition of the block (`moe_ops_cases.h`) |
 | `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on cpu-ref and the GPU | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |
 | `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`; tables from `gen_unicode_tables.py`) |

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -27,6 +28,9 @@ struct SessionOptions {
     std::string device;                // empty = backend default
     DType precision = DType::F16;      // compute precision for activations and weights (F16 or F32)
     int64_t max_context = 8192;        // upper bound on tokens per sequence (sizes caches)
+    // KV cache storage: empty = the backend's choice for `precision`; I8 = int8 codes with one f32 scale per (token,
+    // KV head), rounded as quant::quantize_kv_row_i8.
+    std::optional<DType> kv_dtype;
     std::map<std::string, std::string> extra;  // backend-specific options, refused by name when unknown
 };
 

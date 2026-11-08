@@ -72,6 +72,8 @@ void check_options(const SessionOptions& options) {
              "cpu-ref precision must be f32 or f16, got ", dtype_name(options.precision));
     XS_CHECK(options.max_context > 0, "cpu-ref max_context must be positive, got ", options.max_context);
     if (!options.extra.empty()) fail("cpu-ref does not know backend option '", options.extra.begin()->first, "'");
+    XS_CHECK(!options.kv_dtype || *options.kv_dtype == DType::I8, "cpu-ref KV cache dtype must be i8 when set, got ",
+             dtype_name(*options.kv_dtype));
 }
 
 struct KvState {
@@ -88,12 +90,13 @@ struct Step {
 class CpuSession final : public Session {
   public:
     CpuSession(graph::Graph graph, std::vector<HostTensor> leaves, std::shared_ptr<cpu_ref::ThreadPool> pool,
-               int64_t max_context)
+               int64_t max_context, bool kv_i8)
         : graph_(std::move(graph)),
           leaves_(std::move(leaves)),
           last_use_(graph_.nodes().size(), 0),
           pool_(std::move(pool)),
           max_context_(max_context),
+          kv_i8_(kv_i8),
           kv_(graph_.kv_slots().size()) {
         reset_fixed_state();
         const auto& nodes = graph_.nodes();
@@ -308,6 +311,11 @@ class CpuSession final : public Session {
         const size_t past = static_cast<size_t>(cached_) * row;
         std::copy(k.data<float>(), k.data<float>() + k.numel(), state.k.begin() + static_cast<std::ptrdiff_t>(past));
         std::copy(v.data<float>(), v.data<float>() + v.numel(), state.v.begin() + static_cast<std::ptrdiff_t>(past));
+        if (kv_i8_) {
+            const int64_t rows = k.numel() / s.head_dim;
+            quant::round_trip_kv_i8(state.k.data() + past, rows, s.head_dim);
+            quant::round_trip_kv_i8(state.v.data() + past, rows, s.head_dim);
+        }
         const Dims shape{step.kv_len, s.num_kv_heads, s.head_dim};
         return {HostTensor::from_vector(DType::F32, shape, state.k),
                 HostTensor::from_vector(DType::F32, shape, state.v)};
@@ -336,6 +344,7 @@ class CpuSession final : public Session {
     std::vector<size_t> last_use_;          // index of the last node reading each node; outputs live to the end
     const std::shared_ptr<cpu_ref::ThreadPool> pool_;
     const int64_t max_context_;
+    const bool kv_i8_;  // the cache holds each appended row as its int8 KV value
     std::vector<KvState> kv_;
     std::vector<std::vector<float>> conv_, recurrent_;                  // per slot, committed state
     std::vector<std::vector<float>> pending_conv_, pending_recurrent_;  // per slot, the running step's state
@@ -370,7 +379,8 @@ class CpuBackend final : public Backend {
                 leaves[i] = normalize_dtype(std::get<graph::ConstantAttrs>(n.attrs).value);
             }
         }
-        return std::make_unique<CpuSession>(graph, std::move(leaves), pool_, options.max_context);
+        return std::make_unique<CpuSession>(graph, std::move(leaves), pool_, options.max_context,
+                                            options.kv_dtype == DType::I8);
     }
 
   private:

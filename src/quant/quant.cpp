@@ -270,6 +270,26 @@ Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<dou
     return q;
 }
 
+float quantize_kv_row_i8(const float* x, int64_t width, int8_t* codes) {
+    float amax = 0.0f;
+    for (int64_t i = 0; i < width; ++i)
+        amax = std::max(amax, std::fabs(x[i]));
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    for (int64_t i = 0; i < width; ++i)
+        codes[i] = static_cast<int8_t>(std::clamp(std::nearbyint(x[i] * inv), -127.0f, 127.0f));
+    return amax / 127.0f;
+}
+
+void round_trip_kv_i8(float* x, int64_t rows, int64_t width) {
+    std::vector<int8_t> codes(static_cast<size_t>(width));
+    for (int64_t r = 0; r < rows; ++r) {
+        float* row = x + r * width;
+        const float scale = quantize_kv_row_i8(row, width, codes.data());
+        for (int64_t i = 0; i < width; ++i)
+            row[i] = static_cast<float>(codes[static_cast<size_t>(i)]) * scale;
+    }
+}
+
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
     XS_CHECK(is_quantized(v.dtype) && v.shape.size() == 2, "dequantize needs a q8 / q4 matrix, got ",
              dtype_name(v.dtype), " ", dims_to_string(v.shape));

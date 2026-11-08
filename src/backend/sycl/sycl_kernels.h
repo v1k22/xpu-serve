@@ -94,12 +94,28 @@ struct AttentionShape {
     bool causal = true;
 };
 
+// An int8 KV cache: codes [N, Hkv, D] and one f32 scale per (key, head); the value is code * scale.
+struct KvI8 {
+    const int8_t* k = nullptr;
+    const int8_t* v = nullptr;
+    const float* k_scale = nullptr;
+    const float* v_scale = nullptr;
+};
+// codes [rows, width] and scales [rows] of x, one sub-group per row, rounded as quant::quantize_kv_row_i8.
+void quantize_kv_i8(sycl::queue& q, const float* x, int8_t* codes, float* scales, int64_t rows, int64_t width);
+// out [rows, width] = codes * scale of the row.
+template <typename CT>
+void dequantize_kv_i8(sycl::queue& q, const int8_t* codes, const float* scales, CT* out, int64_t rows, int64_t width);
+
 // One work-group per (query, head, split), online softmax over its share of the visible keys. For few queries.
 // split == 1 writes `out`; otherwise each work-group writes [D partial sums, max, denominator] to `part`
 // ([T * Hq * split, D + 2]) and attention_combine merges them into `out` (flash-decoding for long contexts).
 template <typename KV>
 void attention_rows(sycl::queue& q, const float* qp, const KV* k, const KV* v, float* out, const AttentionShape& s,
                     int64_t split, float* part);
+// attention_rows reading an int8 cache (scales applied per key: to the score for k, to the probability for v).
+void attention_rows_i8(sycl::queue& q, const float* qp, const KvI8& kv, float* out, const AttentionShape& s,
+                       int64_t split, float* part);
 void attention_combine(sycl::queue& q, const float* part, float* out, int64_t rows, int64_t split, int64_t head_dim);
 
 // Prefill attention for queries [t0, t0 + tc) through GEMMs, steps of attention_gemm (sycl_matmul.cpp):

@@ -113,9 +113,28 @@ struct Plan {
 
 struct KvBuffers {
     DeviceBuffer k, v;
+    DeviceBuffer k_scale, v_scale;  // I8: one f32 per (token, KV head)
     int64_t capacity = 0;  // tokens
-    int64_t row = 0;       // elements per token: kv_heads * head_dim
+    int64_t heads = 0;
+    int64_t row = 0;       // elements per token: heads * head_dim
     DType dtype = DType::F16;
+};
+
+// A scratch buffer that grows on demand (sycl_be::Scratch).
+class GrowingScratch final : public sycl_be::Scratch {
+public:
+    explicit GrowingScratch(sycl::queue& q) : q_(q) {}
+    void* get(size_t bytes) override {
+        if (bytes > buf_.bytes()) {
+            q_.wait();
+            buf_ = DeviceBuffer(q_, bytes + bytes / 4);
+        }
+        return buf_.get();
+    }
+
+private:
+    sycl::queue& q_;
+    DeviceBuffer buf_;
 };
 
 // Conv and recurrent state: the step reads buf[cur] and writes buf[1 - cur]; a successful step flips cur, so a
@@ -147,6 +166,7 @@ public:
           q_(std::move(q)),
           attention_path_(attention_path),
           precision_(options.precision),
+          kv_i8_(options.kv_dtype == DType::I8),
           max_context_(options.max_context),
           profiling_(env_flag("XS_SYCL_PROFILE")),
           sync_(profiling_ || env_flag("XS_SYCL_SYNC")),
@@ -170,13 +190,18 @@ public:
         upload_leaves(weights);
         for (const graph::KvSlot& s : graph_.kv_slots()) {
             KvBuffers b;
+            b.heads = s.num_kv_heads;
             b.row = s.num_kv_heads * s.head_dim;
             kv_.push_back(std::move(b));
         }
+        size_t int8_slots = 0;
         for (size_t i = 0; i < graph_.nodes().size(); ++i) {
             const Node& n = graph_.nodes()[i];
-            if (n.kind == OpKind::KvCache) kv_[static_cast<size_t>(std::get<graph::KvCacheAttrs>(n.attrs).slot)].dtype = dtype_[i][0];
+            if (n.kind != OpKind::KvCache) continue;
+            kv_[static_cast<size_t>(std::get<graph::KvCacheAttrs>(n.attrs).slot)].dtype = dtype_[i][0];
+            int8_slots += dtype_[i][0] == DType::I8 ? 1 : 0;
         }
+        if (kv_i8_) log::info("sycl: int8 KV cache for ", int8_slots, " of ", kv_.size(), " slots");
         for (const graph::ConvSlot& c : graph_.conv_slots())
             fixed_state_.push_back(make_state(static_cast<size_t>((c.kernel - 1) * c.channels) * sizeof(float)));
         conv_states_ = fixed_state_.size();
@@ -318,6 +343,19 @@ private:
         return any;
     }
 
+    // An int8 KV slot needs every reader of its k / v to be an Attention reading them directly (it applies the scales).
+    bool attention_reads_only(size_t node, const std::vector<std::vector<std::pair<size_t, size_t>>>& consumers) const {
+        for (const auto& out : graph_.outputs()) {
+            if (static_cast<size_t>(out.value.node) == node) return false;
+        }
+        const auto& nodes = graph_.nodes();
+        for (const auto& [c, k] : consumers[node]) {
+            const int index = nodes[c].inputs[k].index;
+            if (nodes[c].kind != OpKind::Attention || static_cast<int>(k) != index + 1) return false;
+        }
+        return !consumers[node].empty();
+    }
+
     void infer_dtypes() {
         const auto& nodes = graph_.nodes();
         std::vector<std::vector<std::pair<size_t, size_t>>> consumers(nodes.size());
@@ -352,8 +390,12 @@ private:
                     dtype_[i][0] = dt(n.inputs[0]);
                     break;
                 case OpKind::KvCache:
-                    dtype_[i][0] = dtype_[i][1] =
-                        precision_ == DType::F16 && f16_readers_only(i, consumers) ? DType::F16 : DType::F32;
+                    if (kv_i8_ && attention_reads_only(i, consumers)) {
+                        dtype_[i][0] = dtype_[i][1] = DType::I8;
+                    } else {
+                        dtype_[i][0] = dtype_[i][1] =
+                            precision_ == DType::F16 && f16_readers_only(i, consumers) ? DType::F16 : DType::F32;
+                    }
                     break;
                 case OpKind::TopK:
                     dtype_[i][1] = DType::I32;
@@ -413,7 +455,7 @@ private:
                     break;
                 case OpKind::Attention: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1), "f16 or f32");
+                    need(1, is_fp(1) || dt(n.inputs[1]) == DType::I8, "f16, f32 or i8");
                     need(2, dt(n.inputs[2]) == dt(n.inputs[1]), "the dtype of k");
                     const int64_t d = graph_.type(n.inputs[0]).shape.back();
                     XS_CHECK(d == 16 || d == 32 || d == 64 || d == 128 || d == 192 || d == 256 || d == 512, where(i),
@@ -620,17 +662,23 @@ private:
             if (tokens <= b.capacity) continue;
             const size_t esize = dtype_size(b.dtype);
             const int64_t cap = std::min(max_context_, std::max({tokens, 2 * b.capacity, int64_t{1024}}));
-            const size_t bytes = static_cast<size_t>(cap * b.row) * esize;
-            DeviceBuffer k(q_, bytes);
-            DeviceBuffer v(q_, bytes);
-            const size_t keep = static_cast<size_t>(cached_ * b.row) * esize;
-            if (keep > 0) {
-                q_.memcpy(k.get(), b.k.get(), keep);
-                q_.memcpy(v.get(), b.v.get(), keep);
+            const auto grow = [&](DeviceBuffer& buf, size_t per_token) {
+                DeviceBuffer bigger(q_, static_cast<size_t>(cap) * per_token);
+                if (cached_ > 0) q_.memcpy(bigger.get(), buf.get(), static_cast<size_t>(cached_) * per_token);
+                return bigger;
+            };
+            DeviceBuffer k = grow(b.k, static_cast<size_t>(b.row) * esize);
+            DeviceBuffer v = grow(b.v, static_cast<size_t>(b.row) * esize);
+            DeviceBuffer ks, vs;
+            if (b.dtype == DType::I8) {
+                ks = grow(b.k_scale, static_cast<size_t>(b.heads) * sizeof(float));
+                vs = grow(b.v_scale, static_cast<size_t>(b.heads) * sizeof(float));
             }
             q_.wait();
             b.k = std::move(k);
             b.v = std::move(v);
+            b.k_scale = std::move(ks);
+            b.v_scale = std::move(vs);
             b.capacity = cap;
         }
     }
@@ -1045,7 +1093,15 @@ private:
                 KvBuffers& b = kv_[static_cast<size_t>(slot)];
                 const int64_t count = step.tokens * b.row;
                 const size_t offset = static_cast<size_t>((step.kv_len - step.tokens) * b.row);
-                if (b.dtype == DType::F16) {
+                if (b.dtype == DType::I8) {
+                    const int64_t rows = step.tokens * b.heads;
+                    const int64_t first = (step.kv_len - step.tokens) * b.heads;
+                    const int64_t width = b.row / b.heads;
+                    sycl_be::quantize_kv_i8(q_, in_f32(0), reinterpret_cast<int8_t*>(b.k.get()) + offset,
+                                            reinterpret_cast<float*>(b.k_scale.get()) + first, rows, width);
+                    sycl_be::quantize_kv_i8(q_, in_f32(1), reinterpret_cast<int8_t*>(b.v.get()) + offset,
+                                            reinterpret_cast<float*>(b.v_scale.get()) + first, rows, width);
+                } else if (b.dtype == DType::F16) {
                     auto* k = reinterpret_cast<half*>(b.k.get()) + offset;
                     auto* v = reinterpret_cast<half*>(b.v.get()) + offset;
                     sycl_be::to_half(q_, in_f32(0), k, count);
@@ -1070,7 +1126,20 @@ private:
                 s.softcap = a.softcap;
                 s.window = a.sliding_window;
                 s.causal = a.causal;
-                if (in_dt(1) == DType::F16) {
+                if (in_dt(1) == DType::I8) {
+                    const int slot = std::get<graph::KvCacheAttrs>(graph_.node(n.inputs[1]).attrs).slot;
+                    const KvBuffers& b = kv_[static_cast<size_t>(slot)];
+                    sycl_be::KvI8 kv;
+                    kv.k = reinterpret_cast<const int8_t*>(b.k.get());
+                    kv.v = reinterpret_cast<const int8_t*>(b.v.get());
+                    kv.k_scale = reinterpret_cast<const float*>(b.k_scale.get());
+                    kv.v_scale = reinterpret_cast<const float*>(b.v_scale.get());
+                    if (precision_ == DType::F16) {
+                        sycl_be::attention_i8<half>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_path_);
+                    } else {
+                        sycl_be::attention_i8<float>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_path_);
+                    }
+                } else if (in_dt(1) == DType::F16) {
                     sycl_be::attention(q_, *this, in_f32(0), reinterpret_cast<const half*>(in_ptr(1)),
                                        reinterpret_cast<const half*>(in_ptr(2)), out, s, attention_path_);
                 } else {
@@ -1182,6 +1251,7 @@ private:
     sycl::queue q_;
     const sycl_be::AttentionPath attention_path_;
     const DType precision_;
+    const bool kv_i8_;  // KV slots that only attention reads are int8 (SessionOptions::kv_dtype)
     const int64_t max_context_;
     const bool profiling_;
     const bool sync_;  // XS_SYCL_SYNC=1: wait after every op and name the op a device error comes from
@@ -1203,6 +1273,7 @@ private:
     std::map<std::pair<int64_t, int64_t>, Plan> plans_;
     DeviceBuffer arena_;
     DeviceBuffer scratch_;
+    GrowingScratch kv_scratch_{q_};  // the int8 KV cache dequantized for prefill attention
     int64_t cached_ = 0;
     std::map<std::string, double> decode_ms_, prefill_ms_;
     int64_t decode_steps_ = 0;
@@ -1233,6 +1304,8 @@ public:
         XS_CHECK(options.precision == DType::F16 || options.precision == DType::F32,
                  "sycl session precision must be f16 or f32, got ", dtype_name(options.precision));
         XS_CHECK(options.max_context > 0, "sycl max_context must be positive, got ", options.max_context);
+        XS_CHECK(!options.kv_dtype || *options.kv_dtype == DType::I8, "sycl KV cache dtype must be i8 when set, got ",
+                 dtype_name(*options.kv_dtype));
         auto attention_path = sycl_be::AttentionPath::Auto;
         for (const auto& [key, value] : options.extra) {
             if (key != "attention") fail("sycl does not know backend option '", key, "' (known: attention)");

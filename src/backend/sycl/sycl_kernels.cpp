@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 #include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 
@@ -221,9 +222,12 @@ void gated_delta_t(sycl::queue& q, const float* qp, const float* kp, const float
 
 constexpr int kAttnSubGroups = 16;
 
+// KV int8_t reads an int8 cache with per-(key, head) scales k_scale / v_scale; other KV types ignore them.
 template <typename KV, int DPL>
-void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v, float* out, const AttentionShape& s,
-                      int64_t split, float* part) {
+void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v, const float* k_scale,
+                      const float* v_scale, float* out, const AttentionShape& s, int64_t split, float* part) {
+    constexpr bool kI8 = std::is_same_v<KV, int8_t>;
+    constexpr bool kPacked = kI8 && DPL % 4 == 0;
     constexpr int64_t D = static_cast<int64_t>(DPL) * kSubGroup;
     const int64_t hq_n = s.q_heads;
     const int64_t hkv_n = s.kv_heads;
@@ -256,34 +260,60 @@ void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v,
             const int64_t lo = first + sp * chunk;
             const int64_t last = std::min<int64_t>(visible_last, lo + chunk - 1);
 
+            // The lane's e-th dim. Packed int8: 4 consecutive bytes per lane, one 32-bit load (64 bytes a sub-group).
+            const auto dim = [lane](int e) -> int64_t {
+                if constexpr (kPacked) {
+                    return (e / 4) * (4 * kSubGroup) + lane * 4 + e % 4;
+                } else {
+                    return lane + kSubGroup * e;
+                }
+            };
+            // dot / accumulate over the lane's dims of one key / value row.
+            const auto load = [&](const KV* row, float* x) {
+                if constexpr (kPacked) {
+                    for (int g = 0; g < DPL / 4; ++g) {
+                        const sycl::vec<int8_t, 4> c =
+                            *reinterpret_cast<const sycl::vec<int8_t, 4>*>(row + g * 4 * kSubGroup + lane * 4);
+                        for (int i = 0; i < 4; ++i)
+                            x[g * 4 + i] = static_cast<float>(c[i]);
+                    }
+                } else {
+                    for (int e = 0; e < DPL; ++e)
+                        x[e] = static_cast<float>(row[lane + kSubGroup * e]);
+                }
+            };
             float qv[DPL];
             const float* qr = qp + (t * hq_n + hq) * D;
             for (int e = 0; e < DPL; ++e)
-                qv[e] = qr[lane + kSubGroup * e];
+                qv[e] = qr[dim(e)];
             float o[DPL];
             for (int e = 0; e < DPL; ++e)
                 o[e] = 0.0f;
             float m = -std::numeric_limits<float>::infinity();
             float l = 0.0f;
             for (int64_t j = lo + sgid; j <= last; j += kAttnSubGroups) {
-                const KV* kr = k + (j * hkv_n + kh) * D;
+                float x[DPL];
+                load(k + (j * hkv_n + kh) * D, x);
                 float dot = 0.0f;
                 for (int e = 0; e < DPL; ++e)
-                    dot += qv[e] * static_cast<float>(kr[lane + kSubGroup * e]);
+                    dot += qv[e] * x[e];
                 float sc = sycl::reduce_over_group(sg, dot, sycl::plus<float>()) * scale;
+                if constexpr (kI8) sc *= k_scale[j * hkv_n + kh];
                 if (softcap > 0.0f) sc = softcap * sycl::tanh(sc / softcap);
                 const float m_new = sycl::fmax(m, sc);
                 const float corr = sycl::exp(m - m_new);
                 const float p = sycl::exp(sc - m_new);
                 l = l * corr + p;
-                const KV* vr = v + (j * hkv_n + kh) * D;
+                float pv = p;
+                if constexpr (kI8) pv *= v_scale[j * hkv_n + kh];
+                load(v + (j * hkv_n + kh) * D, x);
                 for (int e = 0; e < DPL; ++e)
-                    o[e] = o[e] * corr + p * static_cast<float>(vr[lane + kSubGroup * e]);
+                    o[e] = o[e] * corr + pv * x[e];
                 m = m_new;
             }
             const int64_t base = static_cast<int64_t>(sgid) * (D + 2);
             for (int e = 0; e < DPL; ++e)
-                slm[base + lane + kSubGroup * e] = o[e];
+                slm[base + dim(e)] = o[e];
             if (lane == 0) {
                 slm[base + D] = m;
                 slm[base + D + 1] = l;
@@ -315,6 +345,20 @@ void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v,
             }
         });
     });
+}
+
+template <typename KV>
+void attention_rows_dispatch(sycl::queue& q, const float* qp, const KV* k, const KV* v, const float* ks,
+                             const float* vs, float* out, const AttentionShape& s, int64_t split, float* part) {
+    switch (s.head_dim / kSubGroup) {
+        case 1: return attention_rows_t<KV, 1>(q, qp, k, v, ks, vs, out, s, split, part);
+        case 2: return attention_rows_t<KV, 2>(q, qp, k, v, ks, vs, out, s, split, part);
+        case 4: return attention_rows_t<KV, 4>(q, qp, k, v, ks, vs, out, s, split, part);
+        case 8: return attention_rows_t<KV, 8>(q, qp, k, v, ks, vs, out, s, split, part);
+        case 16: return attention_rows_t<KV, 16>(q, qp, k, v, ks, vs, out, s, split, part);
+        case 32: return attention_rows_t<KV, 32>(q, qp, k, v, ks, vs, out, s, split, part);
+        default: return attention_rows_t<KV, 12>(q, qp, k, v, ks, vs, out, s, split, part);  // head_dim 192
+    }
 }
 
 // Each sub-group computes kGemvRows output rows for all m <= M x rows; lanes stride K in chunks of 8.
@@ -769,16 +813,46 @@ void gated_delta(sycl::queue& q, const float* qp, const float* kp, const float* 
 template <typename KV>
 void attention_rows(sycl::queue& q, const float* qp, const KV* k, const KV* v, float* out, const AttentionShape& s,
                     int64_t split, float* part) {
-    switch (s.head_dim / kSubGroup) {
-        case 1: return attention_rows_t<KV, 1>(q, qp, k, v, out, s, split, part);
-        case 2: return attention_rows_t<KV, 2>(q, qp, k, v, out, s, split, part);
-        case 4: return attention_rows_t<KV, 4>(q, qp, k, v, out, s, split, part);
-        case 8: return attention_rows_t<KV, 8>(q, qp, k, v, out, s, split, part);
-        case 16: return attention_rows_t<KV, 16>(q, qp, k, v, out, s, split, part);
-        case 32: return attention_rows_t<KV, 32>(q, qp, k, v, out, s, split, part);
-        default: return attention_rows_t<KV, 12>(q, qp, k, v, out, s, split, part);  // head_dim 192
-    }
+    attention_rows_dispatch(q, qp, k, v, nullptr, nullptr, out, s, split, part);
 }
+
+void attention_rows_i8(sycl::queue& q, const float* qp, const KvI8& kv, float* out, const AttentionShape& s,
+                       int64_t split, float* part) {
+    attention_rows_dispatch(q, qp, kv.k, kv.v, kv.k_scale, kv.v_scale, out, s, split, part);
+}
+
+void quantize_kv_i8(sycl::queue& q, const float* x, int8_t* codes, float* scales, int64_t rows, int64_t width) {
+    constexpr int kRowsPerWg = 8;
+    const int64_t wgs = ceil_div(rows, kRowsPerWg);
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(wgs * kRowsPerWg * kSubGroup), kRowsPerWg * kSubGroup),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t r = static_cast<int64_t>(it.get_group(0)) * kRowsPerWg + sg.get_group_linear_id();
+        if (r >= rows) return;
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const float* xr = x + r * width;
+        float amax = 0.0f;
+        for (int64_t i = lane; i < width; i += kSubGroup)
+            amax = sycl::fmax(amax, sycl::fabs(xr[i]));
+        amax = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int8_t* cr = codes + r * width;
+        for (int64_t i = lane; i < width; i += kSubGroup)
+            cr[i] = static_cast<int8_t>(sycl::clamp(sycl::rint(xr[i] * inv), -127.0f, 127.0f));
+        if (lane == 0) scales[r] = amax / 127.0f;
+    });
+}
+
+template <typename CT>
+void dequantize_kv_i8(sycl::queue& q, const int8_t* codes, const float* scales, CT* out, int64_t rows, int64_t width) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(rows * width)), [=](sycl::id<1> idx) {
+        const int64_t i = static_cast<int64_t>(idx[0]);
+        out[i] = static_cast<CT>(static_cast<float>(codes[i]) * scales[i / width]);
+    });
+}
+
+template void dequantize_kv_i8<half>(sycl::queue&, const int8_t*, const float*, half*, int64_t, int64_t);
+template void dequantize_kv_i8<float>(sycl::queue&, const int8_t*, const float*, float*, int64_t, int64_t);
 
 void attention_combine(sycl::queue& q, const float* part, float* out, int64_t rows, int64_t split, int64_t head_dim) {
     const int64_t d_n = head_dim;

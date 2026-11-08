@@ -49,4 +49,10 @@ Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<dou
 // Float values of rows [first, first + count) of a Q8 / Q4 view, row-major into `out` (input_scales applied).
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out);
 
+// The int8 KV cache rounding of one row (one token's head): code = rint(x * 127 / max|x|) and scale = max|x| / 127,
+// so the value is code * scale. Writes `codes` and returns the scale (0 for an all-zero row). Backends match it.
+float quantize_kv_row_i8(const float* x, int64_t width, int8_t* codes);
+// Replaces each row of x [rows, width] by its int8 KV value (code * scale).
+void round_trip_kv_i8(float* x, int64_t rows, int64_t width);
+
 }  // namespace xs::quant

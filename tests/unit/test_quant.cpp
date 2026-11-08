@@ -92,6 +92,38 @@ TEST_SUITE("quant") {
         CHECK(std::abs(codes[9] - 64) <= 1);
     }
 
+    TEST_CASE("int8 KV rows: within half a step, the largest magnitude is +-127, zero rows stay zero") {
+        std::mt19937 gen(7);
+        std::uniform_real_distribution<float> dist(-3.0f, 3.0f);
+        const int64_t rows = 6, width = 64;
+        std::vector<float> x(static_cast<size_t>(rows * width));
+        for (float& v : x)
+            v = dist(gen);
+        std::fill(x.begin() + 2 * width, x.begin() + 3 * width, 0.0f);  // row 2: all zero
+        x[4 * width + 5] = -50.0f;                                         // row 4: one outlier
+        for (int64_t r = 0; r < rows; ++r) {
+            CAPTURE(r);
+            const float* row = x.data() + r * width;
+            std::vector<int8_t> codes(static_cast<size_t>(width));
+            const float scale = quant::quantize_kv_row_i8(row, width, codes.data());
+            float amax = 0.0f;
+            for (int64_t i = 0; i < width; ++i)
+                amax = std::max(amax, std::abs(row[i]));
+            CHECK(scale == amax / 127.0f);
+            int largest = 0;
+            for (int64_t i = 0; i < width; ++i) {
+                largest = std::max(largest, std::abs(static_cast<int>(codes[static_cast<size_t>(i)])));
+                CHECK(std::abs(codes[static_cast<size_t>(i)] * scale - row[i]) <= 0.5f * scale * (1 + 1e-5f) + 1e-12f);
+            }
+            CHECK(largest == (r == 2 ? 0 : 127));
+        }
+        std::vector<float> y = x;
+        quant::round_trip_kv_i8(y.data(), rows, width);
+        CHECK(std::all_of(y.begin() + 2 * width, y.begin() + 3 * width, [](float v) { return v == 0.0f; }));
+        CHECK(y[4 * width + 5] == -50.0f);
+        CHECK(y != x);
+    }
+
     TEST_CASE("all-zero groups are exact; a constant q4 group is exactly its bias") {
         const std::vector<float> zeros(64, 0.0f);
         for (const DType format : {DType::Q8, DType::Q4}) {

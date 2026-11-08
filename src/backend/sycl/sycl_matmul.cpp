@@ -81,21 +81,36 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantW
     });
 }
 
+namespace {
+
+bool rows_path(const AttentionShape& s, AttentionPath path) {
+    return path == AttentionPath::Rows || (path == AttentionPath::Auto && s.tokens <= kAttentionRowsMax);
+}
+
+// The rows path: enough work-groups to fill the GPU, each with at least kMinSplitKeys keys. `run(split, part)`
+// launches the per-row kernel.
+template <typename Run>
+void attention_by_rows(sycl::queue& q, Scratch& scratch, float* out, const AttentionShape& s, const Run& run) {
+    const int64_t rows = s.tokens * s.q_heads;
+    const int64_t keys = s.causal && s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
+    const int64_t split = std::clamp<int64_t>(std::min(kTargetWorkGroups / rows, keys / kMinSplitKeys), 1, 64);
+    if (split == 1) {
+        run(int64_t{1}, static_cast<float*>(nullptr));
+        return;
+    }
+    auto* part = static_cast<float*>(scratch.get(static_cast<size_t>(rows * split * (s.head_dim + 2)) * sizeof(float)));
+    run(split, part);
+    attention_combine(q, part, out, rows, split, s.head_dim);
+}
+
+}  // namespace
+
 template <typename KV>
 void attention(sycl::queue& q, Scratch& scratch, const float* qp, const KV* k, const KV* v, float* out,
                const AttentionShape& s, AttentionPath path) {
-    if (path == AttentionPath::Rows || (path == AttentionPath::Auto && s.tokens <= kAttentionRowsMax)) {
-        // Enough work-groups to fill the GPU, each with at least kMinSplitKeys keys.
-        const int64_t rows = s.tokens * s.q_heads;
-        const int64_t keys = s.causal && s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
-        const int64_t split = std::clamp<int64_t>(std::min(kTargetWorkGroups / rows, keys / kMinSplitKeys), 1, 64);
-        if (split == 1) {
-            attention_rows(q, qp, k, v, out, s, 1, static_cast<float*>(nullptr));
-            return;
-        }
-        auto* part = static_cast<float*>(scratch.get(static_cast<size_t>(rows * split * (s.head_dim + 2)) * sizeof(float)));
-        attention_rows(q, qp, k, v, out, s, split, part);
-        attention_combine(q, part, out, rows, split, s.head_dim);
+    if (rows_path(s, path)) {
+        attention_by_rows(q, scratch, out, s,
+                          [&](int64_t split, float* part) { attention_rows(q, qp, k, v, out, s, split, part); });
         return;
     }
     const int64_t group = s.q_heads / s.kv_heads;
@@ -142,11 +157,38 @@ void attention(sycl::queue& q, Scratch& scratch, const float* qp, const KV* k, c
     }
 }
 
+template <typename CT>
+void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvI8& kv, float* out,
+                  const AttentionShape& s, AttentionPath path) {
+    if (rows_path(s, path)) {
+        attention_by_rows(q, scratch, out, s,
+                          [&](int64_t split, float* part) { attention_rows_i8(q, qp, kv, out, s, split, part); });
+        return;
+    }
+    // Keys before `first` are outside every query's window: drop them, which shifts all positions alike.
+    const int64_t past = s.kv_len - s.tokens;
+    const int64_t first = s.causal && s.window > 0 ? std::max<int64_t>(0, past - s.window + 1) : 0;
+    const int64_t rows = (s.kv_len - first) * s.kv_heads;
+    const size_t half_bytes = align_up(static_cast<size_t>(rows * s.head_dim) * sizeof(CT));
+    auto* k = static_cast<CT*>(kv_scratch.get(2 * half_bytes));
+    auto* v = reinterpret_cast<CT*>(reinterpret_cast<char*>(k) + half_bytes);
+    const int64_t skip = first * s.kv_heads;
+    dequantize_kv_i8(q, kv.k + skip * s.head_dim, kv.k_scale + skip, k, rows, s.head_dim);
+    dequantize_kv_i8(q, kv.v + skip * s.head_dim, kv.v_scale + skip, v, rows, s.head_dim);
+    AttentionShape visible = s;
+    visible.kv_len = s.kv_len - first;
+    attention(q, scratch, qp, k, v, out, visible, AttentionPath::Gemm);
+}
+
 template void matmul<half>(sycl::queue&, Scratch&, const float*, const half*, float*, int64_t, int64_t, int64_t);
 template void matmul<float>(sycl::queue&, Scratch&, const float*, const float*, float*, int64_t, int64_t, int64_t);
 template void attention<half>(sycl::queue&, Scratch&, const float*, const half*, const half*, float*,
                               const AttentionShape&, AttentionPath);
 template void attention<float>(sycl::queue&, Scratch&, const float*, const float*, const float*, float*,
                                const AttentionShape&, AttentionPath);
+template void attention_i8<half>(sycl::queue&, Scratch&, Scratch&, const float*, const KvI8&, float*,
+                                 const AttentionShape&, AttentionPath);
+template void attention_i8<float>(sycl::queue&, Scratch&, Scratch&, const float*, const KvI8&, float*,
+                                  const AttentionShape&, AttentionPath);
 
 }  // namespace xs::sycl_be

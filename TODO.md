@@ -123,7 +123,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Engine thread + request queue + per-request token channel; cancel on disconnect
 - [ ] Paged KV: block allocator, pools per attention kind (sliding / global), sliding-window block release,
       KV-shared layers read their source pool
-- [ ] int8 KV option (`--kv-dtype i8`)
+- [x] int8 KV option (`--kv-dtype i8`): int8 codes + an f32 scale per (token, KV head), opt-in (docs/decisions/0010)
 - [ ] Chunked prefill that yields to decode at chunk boundaries
 - [ ] Continuous batching (after batch 1 is solid)
 - [ ] Prefix cache: hash-chained full blocks, refcounts, LRU; validity rule for sliding layers (DESIGN.md 9.4)
@@ -178,7 +178,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ## Phase 5: Performance on both backends, then the backend decision
 
-- [ ] int8 KV vs f16 KV (speed and accuracy)
+- [x] int8 KV vs f16 KV (speed and accuracy): decode +2 to 9 % at 16k to 32k, prefill -1 to 8 %, logits about
+      q8-close, MMLU-Pro unchanged on Qwen3.5 and within noise on Gemma 4 (docs/decisions/0010)
+- [ ] int8 KV: a larger eval on Gemma 4 (more questions, long-context tasks); per-channel key scales if it loses
 - [ ] K=V stored once on Gemma 4 global layers (where the backend allows)
 - [ ] Fusions found by profiling (residual + norm, router + top-k, PLE tail for E-series later)
 - [ ] Adaptive k tuning; tree drafts vs chain drafts

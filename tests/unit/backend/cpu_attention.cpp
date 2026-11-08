@@ -3,6 +3,7 @@
 
 #include "backend/cpu_ref/cpu_backend.h"
 #include "backend_test_util.h"
+#include "quant/quant.h"
 #include "reference_ops.h"
 #include "util/error.h"
 
@@ -48,16 +49,27 @@ test::ref::AttentionSpec spec_of(const AttentionAttrs& a) {
     return {a.scale, a.sliding_window, a.softcap, 0};
 }
 
-// Runs `steps` token counts through one session; checks every step against the reference over the full history.
-// Returns the last step's output and reference inputs for planted-bug checks.
+// Each row (token, head) of x [T, H, D] as its int8 KV value.
+HostTensor kv_i8_values(const HostTensor& x) {
+    HostTensor r = x.clone();
+    quant::round_trip_kv_i8(r.data<float>(), r.numel() / r.shape().back(), r.shape().back());
+    return r;
+}
+
+// Runs `steps` token counts through one session; checks every step against the reference over the full history
+// (with an int8 KV cache, the history of int8 KV values). Returns the last step's output and reference inputs for
+// planted-bug checks, plus the unrounded history.
 struct LastStep {
     HostTensor out;
     Tensor64 q, k_all, v_all;
+    Tensor64 k_exact, v_exact;
 };
 
-LastStep check_steps(const AttentionCase& c, const std::vector<int64_t>& steps, uint32_t seed) {
+LastStep check_steps(const AttentionCase& c, const std::vector<int64_t>& steps, uint32_t seed, bool kv_i8 = false) {
     const auto backend = make_cpu_ref_backend();
-    const auto session = backend->compile(attention_graph(c), test::MemoryWeights{}, {});
+    SessionOptions options;
+    if (kv_i8) options.kv_dtype = DType::I8;
+    const auto session = backend->compile(attention_graph(c), test::MemoryWeights{}, options);
     test::TensorRng rng(seed);
     Tensor64 k_hist, v_hist;
     LastStep last;
@@ -66,15 +78,20 @@ LastStep check_steps(const AttentionCase& c, const std::vector<int64_t>& steps, 
         const HostTensor q = rng.uniform(DType::F32, {t, c.q_heads, c.head_dim}, 2.0f);
         const HostTensor k = rng.uniform(DType::F32, {t, c.kv_heads, c.head_dim}, 2.0f);
         const HostTensor v = rng.uniform(DType::F32, {t, c.kv_heads, c.head_dim});
-        append_rows(k_hist, to_f64(k));
-        append_rows(v_hist, to_f64(v));
+        append_rows(k_hist, to_f64(kv_i8 ? kv_i8_values(k) : k));
+        append_rows(v_hist, to_f64(kv_i8 ? kv_i8_values(v) : v));
+        append_rows(last.k_exact, to_f64(k));
+        append_rows(last.v_exact, to_f64(v));
         TensorMap out;
         session->run({{"q", q}, {"k", k}, {"v", v}}, out);
         CHECK(session->num_cached() == k_hist.shape[0]);
         CHECK(test::all_close(out.at("k_all"), k_hist, 0, 0));
         CHECK(test::all_close(out.at("out"), test::ref::attention(to_f64(q), k_hist, v_hist, spec_of(c.attrs)), kAtol,
                               kRtol));
-        last = {out.at("out"), to_f64(q), k_hist, v_hist};
+        last.out = out.at("out");
+        last.q = to_f64(q);
+        last.k_all = k_hist;
+        last.v_all = v_hist;
     }
     return last;
 }
@@ -115,5 +132,20 @@ TEST_SUITE("cpu-ref attention") {
         unscaled.scale = 1.0;
         CHECK_FALSE(
             test::all_close(last.out, test::ref::attention(last.q, last.k_all, last.v_all, unscaled), kAtol, kRtol));
+    }
+
+    TEST_CASE("int8 KV cache: the cache holds int8 KV values; attention over them, not over the inputs") {
+        for (const AttentionCase& c : {AttentionCase{8, 2, 64, {0.125f, 0, 0.0f}}, AttentionCase{4, 1, 256, {0.0625f, 3, 0.0f}}}) {
+            CAPTURE(c.head_dim);
+            const LastStep last = check_steps(c, {6, 1, 2}, 18, true);
+            CHECK_FALSE(test::all_close(last.out, test::ref::attention(last.q, last.k_exact, last.v_exact,
+                                                                       spec_of(c.attrs)),
+                                        kAtol, kRtol));
+        }
+        SessionOptions f16_kv;
+        f16_kv.kv_dtype = DType::F16;
+        CHECK_THROWS_WITH_AS(make_cpu_ref_backend()->compile(attention_graph({2, 2, 16, {0.25f, 0, 0.0f}}),
+                                                             test::MemoryWeights{}, f16_kv),
+                             doctest::Contains("KV cache dtype"), Error);
     }
 }

@@ -5,6 +5,7 @@
 //   XS_PARITY_BACKEND   cpu-ref (default) | sycl
 //   XS_PARITY_DEVICE    backend device, e.g. GPU
 //   XS_PARITY_PRECISION f32 (default) | f16
+//   XS_PARITY_KV_DTYPE  auto (default) | i8 (the int8 KV cache)
 //   XS_PARITY_FIXTURES  default: <source>/tests/fixtures/generated/<model_type of the model>
 
 #include <doctest/doctest.h>
@@ -53,6 +54,7 @@ TEST_CASE("model matches Hugging Face logits and greedy output" * doctest::skip(
     options.device = env_or("XS_PARITY_DEVICE", "");
     options.precision = f32 ? xs::DType::F32 : xs::DType::F16;
     options.max_context = 4096;
+    if (env_or("XS_PARITY_KV_DTYPE", "auto") == "i8") options.kv_dtype = xs::DType::I8;
     auto session = xs::make_backend(backend_name)->compile(model->graph(), model->weights(), options);
 
     // Prompt logits straight from the session.

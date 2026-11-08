@@ -179,7 +179,7 @@ removes a whole class of races and keeps per-step overhead predictable.
 xpu-serve convert <dir> --out DIR [--quant q4|q8] [--group 32|64|128] [--q8 name,...]
                   [--keep REGEX ...] [--revision REV] [--with-drafter <hf-id | dir>]
 xpu-serve serve   <pack | name> [--backend openvino|sycl] [--device GPU.0] [--host 127.0.0.1] [--port 8080]
-                  [--ctx 65536] [--max-seqs 4] [--kv-dtype f16|i8]
+                  [--ctx 65536] [--max-seqs 4] [--kv-dtype auto|i8]
                   [--spec auto|off|pld|mtp|dflash] [--spec-k N]
 xpu-serve run     <pack | name>     # serve + chat in the terminal
 xpu-serve bench   <pack | name> [--ctx 1k,32k,64k] [--gen 256] [--spec ...]

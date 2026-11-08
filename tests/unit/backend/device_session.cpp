@@ -152,6 +152,9 @@ TEST_SUITE("device session" * doctest::skip(!dev::enabled())) {
         SessionOptions bf16 = dev::options();
         bf16.precision = DType::BF16;
         CHECK_THROWS_WITH_AS(f.session(bf16), doctest::Contains("precision must be f16 or f32"), Error);
+        SessionOptions f16_kv = dev::options();
+        f16_kv.kv_dtype = DType::F16;
+        CHECK_THROWS_WITH_AS(f.session(f16_kv), doctest::Contains("KV cache dtype must be i8"), Error);
         SessionOptions no_device = dev::options();
         no_device.device = "GPU.7";
         CHECK_THROWS_WITH_AS(f.session(no_device), doctest::Contains("GPU.7"), Error);
