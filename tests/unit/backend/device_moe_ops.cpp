@@ -29,8 +29,15 @@ TEST_SUITE("device moe ops" * doctest::skip(!dev::enabled())) {
     TEST_CASE("expert matmul with shared and per-slot inputs") {
         xs::test::moe::expert_matmul_shared_and_per_slot(device_env());
     }
+    TEST_CASE("quantized expert banks (q8, q4): few pairs and pairs grouped by expert") {
+        xs::test::moe::expert_matmul_quantized(device_env());
+    }
     TEST_CASE("moe block: softmax router, renormalized top-k") {
         xs::test::moe::moe_block(device_env(), xs::blocks::Router::Softmax, false);
+    }
+    TEST_CASE("moe block: q4 fused gate_up and down banks, 5 and 40 tokens") {
+        xs::test::moe::moe_block(device_env(), xs::blocks::Router::Softmax, true, true, 5);
+        xs::test::moe::moe_block(device_env(), xs::blocks::Router::Softmax, true, true, 40);
     }
     TEST_CASE("moe block: sigmoid router, routed scale, gated shared expert") {
         xs::test::moe::moe_block(device_env(), xs::blocks::Router::Sigmoid, true);

@@ -47,7 +47,7 @@ HostTensor weight_to_f32(const std::string& name, const TensorView& view) {
             break;
         case DType::Q8:
         case DType::Q4:
-            quant::dequantize_rows(view, 0, view.shape[0], out.data<float>());
+            quant::dequantize_rows(view, 0, quant::matrix_rows(view.shape), out.data<float>());
             break;
         default:
             fail("cpu-ref: weight '", name, "' has dtype ", dtype_name(view.dtype), "; supported: f32, f16, bf16, q8, q4");

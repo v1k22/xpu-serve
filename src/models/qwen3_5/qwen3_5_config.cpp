@@ -9,9 +9,7 @@ Config parse_config(const nlohmann::json& config_json) {
     const nlohmann::json& t = nested ? config_json.at("text_config") : config_json;
     const std::string where = nested ? "config.json text_config" : "config.json";
 
-    if (t.contains("num_experts") || t.contains("num_local_experts")) {
-        fail(where, ": mixture-of-experts layers (Qwen3.5 MoE) are not supported yet");
-    }
+    if (t.contains("num_local_experts")) fail(where, ": num_local_experts is not a Qwen3.5 MoE key");
     if (cfg::get_bool_or(t, "attention_bias", false, where)) fail(where, ": attention_bias is not supported");
     const std::string act = cfg::get_string(t, "hidden_act", where);
     if (act != "silu") fail(where, ": hidden_act '", act, "' is not supported");
@@ -22,7 +20,18 @@ Config parse_config(const nlohmann::json& config_json) {
     Config c;
     c.vocab_size = cfg::get_int(t, "vocab_size", where);
     c.hidden_size = cfg::get_int(t, "hidden_size", where);
-    c.intermediate_size = cfg::get_int(t, "intermediate_size", where);
+    if (t.contains("num_experts")) {
+        c.num_experts = cfg::get_int(t, "num_experts", where);
+        c.experts_per_token = cfg::get_int(t, "num_experts_per_tok", where);
+        c.moe_intermediate_size = cfg::get_int(t, "moe_intermediate_size", where);
+        c.shared_expert_intermediate_size = cfg::get_int_or(t, "shared_expert_intermediate_size", 0, where);
+        c.norm_topk_prob = cfg::get_bool_or(t, "norm_topk_prob", true, where);
+        XS_CHECK(c.experts_per_token >= 1 && c.experts_per_token <= c.num_experts, where, ": num_experts_per_tok ",
+                 c.experts_per_token, " of ", c.num_experts, " experts");
+        if (cfg::get_int_or(t, "decoder_sparse_step", 1, where) != 1) fail(where, ": decoder_sparse_step is not supported");
+    } else {
+        c.intermediate_size = cfg::get_int(t, "intermediate_size", where);
+    }
     c.num_layers = cfg::get_int(t, "num_hidden_layers", where);
     c.rms_norm_eps = cfg::get_float(t, "rms_norm_eps", where);
     c.max_position = cfg::get_int(t, "max_position_embeddings", where);

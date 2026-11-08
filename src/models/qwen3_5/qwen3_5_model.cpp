@@ -108,8 +108,40 @@ private:
                                                                                            : full_attention(i, x, pos);
         h = g.add(h, mixed);
         const Value y = norm(h, L + "post_attention_layernorm.weight");
+        if (cfg_.num_experts > 0) return g.add(h, moe(i, y));
         return g.add(h, blocks::gated_mlp(g, y, proj(L + "mlp.gate_proj.weight"), proj(L + "mlp.up_proj.weight"),
                                           proj(L + "mlp.down_proj.weight"), blocks::Act::Silu));
+    }
+
+    // Qwen3_5MoeSparseMoeBlock.
+    Value moe(int64_t i, Value y) {
+        const std::string L = "layers." + std::to_string(i) + ".mlp.";
+        blocks::MoeSpec spec;
+        spec.experts = cfg_.num_experts;
+        spec.top_k = cfg_.experts_per_token;
+        spec.router = blocks::Router::Softmax;
+        spec.normalize = cfg_.norm_topk_prob;
+        blocks::MoeParts parts;
+        parts.router = weight(L + "gate.weight");
+        if (!weights_->contains(w(L + "experts.gate_up_proj"))) {
+            fail("qwen3_5: ", w(L + "experts.gate_up_proj"), " is missing; per-expert tensors (experts.<e>.gate_proj) "
+                 "are not supported yet, only the fused expert banks the released checkpoints ship");
+        }
+        parts.gate_up = weight(L + "experts.gate_up_proj");
+        parts.down = weight(L + "experts.down_proj");
+        const int64_t e = cfg_.num_experts, h = cfg_.hidden_size, inter = cfg_.moe_intermediate_size;
+        XS_CHECK(graph_.type(parts.gate_up).shape == (Dims{e, 2 * inter, h}) &&
+                     graph_.type(parts.down).shape == (Dims{e, h, inter}),
+                 "qwen3_5: layer ", i, " expert banks have shapes ", dims_to_string(graph_.type(parts.gate_up).shape),
+                 " and ", dims_to_string(graph_.type(parts.down).shape), ", expected [", e, ", ", 2 * inter, ", ", h,
+                 "] and [", e, ", ", h, ", ", inter, "]");
+        if (cfg_.shared_expert_intermediate_size > 0) {
+            parts.shared_gate = proj(L + "shared_expert.gate_proj.weight");
+            parts.shared_up = proj(L + "shared_expert.up_proj.weight");
+            parts.shared_down = proj(L + "shared_expert.down_proj.weight");
+            parts.shared_expert_gate = weight(L + "shared_expert_gate.weight");
+        }
+        return blocks::moe(graph_, y, spec, parts);
     }
 
     // Qwen3_5GatedDeltaNet.

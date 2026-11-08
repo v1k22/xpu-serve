@@ -443,11 +443,15 @@ private:
                              "columns, got ", k);
                     break;
                 }
-                case OpKind::ExpertMatMul:
+                case OpKind::ExpertMatMul: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1), "f16 or f32");
+                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8 or q4");
                     need(2, is_int(2), "i32 or i64");
+                    const int64_t k = graph_.type(n.inputs[1]).shape[2];
+                    XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized expert bank needs a multiple of 32 "
+                             "columns, got ", k);
                     break;
+                }
                 case OpKind::Rope:
                     need(0, is_f32(0), "f32");
                     need(1, is_int(1), "i32 or i64");
@@ -541,8 +545,9 @@ private:
 
     // A pack's quantized weight: codes, scales and (Q4) biases as stored.
     void upload_quantized(size_t node, const TensorView& view) {
-        const int64_t rows = view.shape[0];
-        const size_t scale_bytes = static_cast<size_t>(rows * (view.shape[1] / view.quant.group)) * sizeof(uint16_t);
+        const int64_t cols = view.shape.back();
+        const int64_t rows = numel(view.shape) / cols;  // an expert bank [E, N, K] is E * N rows
+        const size_t scale_bytes = static_cast<size_t>(rows * (cols / view.quant.group)) * sizeof(uint16_t);
         const auto copy = [&](const void* src, size_t bytes) {
             leaves_.emplace_back(q_, std::max<size_t>(bytes, 1));
             q_.memcpy(leaves_.back().get(), src, bytes).wait();
@@ -556,7 +561,7 @@ private:
         if (w.q4) w.biases = reinterpret_cast<const half*>(copy(view.quant.biases, scale_bytes));
         if (view.quant.input_scales != nullptr) {
             w.input_scales = reinterpret_cast<const float*>(
-                copy(view.quant.input_scales, static_cast<size_t>(view.shape[1]) * sizeof(float)));
+                copy(view.quant.input_scales, static_cast<size_t>(cols) * sizeof(float)));
         }
         leaf_ptr_[node] = const_cast<char*>(reinterpret_cast<const char*>(w.codes));
         leaf_quant_[node] = w;
@@ -1173,6 +1178,21 @@ private:
                 const Dims& ws = in_shape(1);
                 const Dims& is = in_shape(2);
                 const bool per_slot = in_shape(0).size() == 3;
+                if (is_quantized(in_dt(1))) {
+                    const sycl_be::QuantWeight& w = leaf_quant_[static_cast<size_t>(n.inputs[1].node)];
+                    const int64_t pairs = is[0] * is[1];
+                    auto* grouping = pairs > sycl_be::kExpertPairsDirect
+                                         ? static_cast<int32_t*>(get(sycl_be::expert_grouping_bytes(pairs, ws[0])))
+                                         : nullptr;
+                    if (in_dt(2) == DType::I32) {
+                        sycl_be::expert_matmul_quant(q_, in_f32(0), per_slot, w, reinterpret_cast<const int32_t*>(in_ptr(2)),
+                                                     out, is[0], is[1], ws[0], ws[1], ws[2], grouping);
+                    } else {
+                        sycl_be::expert_matmul_quant(q_, in_f32(0), per_slot, w, reinterpret_cast<const int64_t*>(in_ptr(2)),
+                                                     out, is[0], is[1], ws[0], ws[1], ws[2], grouping);
+                    }
+                    return;
+                }
                 const auto run = [&](const auto* w) {
                     if (in_dt(2) == DType::I32) {
                         sycl_be::expert_matmul(q_, in_f32(0), per_slot, w, reinterpret_cast<const int32_t*>(in_ptr(2)),

@@ -12,7 +12,7 @@ namespace xs::quant {
 namespace {
 
 void row_to_f32(const TensorView& w, int64_t row, float* out) {
-    const int64_t cols = w.shape[1];
+    const int64_t cols = w.shape.back();
     const size_t offset = static_cast<size_t>(row * cols);
     switch (w.dtype) {
         case DType::F32: {
@@ -49,7 +49,7 @@ void parallel_rows(int64_t rows, Fn fn) {
 TensorView Quantized::view() const {
     TensorView v;
     v.dtype = format;
-    v.shape = {rows, cols};
+    v.shape = shape.empty() ? Dims{rows, cols} : shape;
     v.data = codes.data();
     v.quant.group = group;
     v.quant.scales = scales.data();
@@ -67,12 +67,13 @@ std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t
 }
 
 Quantized quantize(const TensorView& w, DType format, int64_t group) {
-    XS_CHECK(w.shape.size() == 2, "quantize needs a 2-D matrix, got ", dims_to_string(w.shape));
-    const int64_t rows = w.shape[0];
-    const int64_t cols = w.shape[1];
+    XS_CHECK(w.shape.size() >= 2, "quantize needs a tensor of at least 2 dims, got ", dims_to_string(w.shape));
+    const int64_t rows = matrix_rows(w.shape);
+    const int64_t cols = w.shape.back();
     if (const std::string why = unsupported_reason(format, rows, cols, group); !why.empty()) fail("quantize: ", why);
     Quantized q;
     q.format = format;
+    q.shape = w.shape;
     q.rows = rows;
     q.cols = cols;
     q.group = group;
@@ -255,6 +256,7 @@ Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<dou
     }
     Quantized q;
     q.format = DType::Q4;
+    q.shape = w.shape;
     q.rows = rows;
     q.cols = cols;
     q.group = group;
@@ -291,9 +293,9 @@ void round_trip_kv_i8(float* x, int64_t rows, int64_t width) {
 }
 
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
-    XS_CHECK(is_quantized(v.dtype) && v.shape.size() == 2, "dequantize needs a q8 / q4 matrix, got ",
+    XS_CHECK(is_quantized(v.dtype) && v.shape.size() >= 2, "dequantize needs a q8 / q4 tensor, got ",
              dtype_name(v.dtype), " ", dims_to_string(v.shape));
-    const int64_t cols = v.shape[1];
+    const int64_t cols = v.shape.back();
     const int64_t group = v.quant.group;
     const int64_t groups = cols / group;
     const auto* scales = static_cast<const uint16_t*>(v.quant.scales);

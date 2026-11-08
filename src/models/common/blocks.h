@@ -51,6 +51,7 @@ struct MoeSpec {
 struct MoeParts {
     Value router;                     // [E, hidden]
     Value gate, up, down;             // [E, I, hidden], [E, I, hidden], [E, hidden, I]
+    Value gate_up;                    // instead of gate and up: [E, 2 I, hidden], gate rows first (one expert matmul)
     Linear shared_gate, shared_up, shared_down;  // a shared expert every token uses; empty: none
     Value shared_expert_gate;         // [1, hidden]: the shared output times sigmoid(x . w); invalid: no gate
 };

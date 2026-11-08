@@ -201,7 +201,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Gemma 4 dense (12B, 31B) and E-series (E2B, E4B: PLE, KV-shared tail)
 - [x] Qwen3.5 dense (text): Gated DeltaNet via CausalConv + GatedDelta graph ops, OpenVINO PagedGatedDeltaNet,
       byte-level BPE + NFC tokenizer, chat template parity, `qwen3_5` output parser; HF parity on CPU and B60
-- [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; MoE variant; vision tower; MTP head
+- [x] Qwen3.5 MoE (`qwen3_5_moe`): HF parity on a tiny random checkpoint (cpu-ref exact, SYCL f16 / f32); q8 / q4
+      expert banks in packs (routers stay unquantized); SYCL expert kernels: one GEMV per (token, expert) for few
+      pairs, pairs grouped by expert on the device for prefill
+- [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; vision tower; MTP head; per-expert
+      checkpoint layout (`experts.<e>.gate_proj`)
 - [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
 - [ ] Llama 3
 - [ ] Import MLX-affine packs; import GGUF (Q4_0 / Q8_0 / K-quants)

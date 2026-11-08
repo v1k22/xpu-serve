@@ -22,7 +22,7 @@ import os
 
 import numpy as np
 import torch
-from transformers import AutoModelForImageTextToText, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
 CHAT_PROMPTS = {
     "chat_short": [{"role": "user", "content": "What is the capital of France? Answer in one word."}],
@@ -66,12 +66,14 @@ def main():
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     with open(os.path.join(args.model_dir, "config.json")) as f:
-        model_type = json.load(f)["model_type"]
+        config = json.load(f)
+    model_type = config["model_type"]
     args.out = args.out or os.path.join("tests", "fixtures", "generated", model_type)
     os.makedirs(args.out, exist_ok=True)
 
     tok = AutoTokenizer.from_pretrained(args.model_dir)
-    model = AutoModelForImageTextToText.from_pretrained(args.model_dir, dtype=torch.float32, attn_implementation="eager")
+    auto = AutoModelForImageTextToText if "vision_config" in config else AutoModelForCausalLM  # text-only: tiny models
+    model = auto.from_pretrained(args.model_dir, dtype=torch.float32, attn_implementation="eager")
     model.eval()
     if model_type.startswith("gemma4"):
         hidden = model.config.text_config.hidden_size

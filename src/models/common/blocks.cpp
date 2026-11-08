@@ -27,7 +27,14 @@ Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p) {
     auto [weights, idx] = g.topk(probs, s.top_k);  // [T, k]
     if (s.normalize) weights = g.div(weights, g.reshape(g.reduce_sum(weights, 1), {kT, 1}));
     if (s.routed_scale != 1.0f) weights = g.scale(weights, s.routed_scale);
-    const Value h = g.mul(activation(g, s.act, g.expert_matmul(x, p.gate, idx)), g.expert_matmul(x, p.up, idx));
+    Value h;
+    if (p.gate_up.valid()) {
+        const int64_t inter = g.type(p.gate_up).shape[1] / 2;
+        const Value both = g.expert_matmul(x, p.gate_up, idx);  // [T, k, 2 I]
+        h = g.mul(activation(g, s.act, g.slice(both, 2, 0, inter)), g.slice(both, 2, inter, 2 * inter));
+    } else {
+        h = g.mul(activation(g, s.act, g.expert_matmul(x, p.gate, idx)), g.expert_matmul(x, p.up, idx));
+    }
     const Value y = g.expert_matmul(h, p.down, idx);  // [T, k, hidden]
     Value out = g.reduce_sum(g.mul(y, g.reshape(weights, {kT, s.top_k, 1})), 1);
     if (p.shared_gate) {

@@ -92,6 +92,30 @@ TEST_SUITE("quant") {
         CHECK(std::abs(codes[9] - 64) <= 1);
     }
 
+    TEST_CASE("a 3-D expert bank quantizes as its [E * N, K] matrix and keeps its shape") {
+        std::mt19937 gen(9);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float> w(3 * 8 * 64);
+        for (float& v : w)
+            v = dist(gen);
+        for (const DType format : {DType::Q8, DType::Q4}) {
+            CAPTURE(dtype_name(format));
+            TensorView bank;
+            bank.dtype = DType::F32;
+            bank.shape = {3, 8, 64};
+            bank.data = w.data();
+            const quant::Quantized q3 = quant::quantize(bank, format, 32);
+            const quant::Quantized q2 = quant::quantize(f32_view(w, 24, 64), format, 32);
+            CHECK(q3.rows == 24);
+            CHECK(q3.cols == 64);
+            CHECK(q3.view().shape == Dims{3, 8, 64});
+            CHECK(q3.codes == q2.codes);
+            CHECK(q3.scales == q2.scales);
+            CHECK(q3.biases == q2.biases);
+            CHECK(quant::component_shape(bank.shape, 2) == Dims{3, 8, 2});
+        }
+    }
+
     TEST_CASE("int8 KV rows: within half a step, the largest magnitude is +-127, zero rows stay zero") {
         std::mt19937 gen(7);
         std::uniform_real_distribution<float> dist(-3.0f, 3.0f);

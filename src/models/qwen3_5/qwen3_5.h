@@ -5,8 +5,9 @@
 //
 // A hybrid decoder: most layers are Gated DeltaNet linear attention (a causal depthwise conv over q, k, v, then the
 // gated delta rule with a fixed-size state per sequence), every `full_attention_interval`-th layer is gated full
-// attention (sigmoid output gate, q/k norms, partial rotary). Norms are zero-centered (x * (1 + w)). Served: the dense
-// text decoder. Mixture-of-experts variants are refused by name; the vision tower and the MTP head are not loaded.
+// attention (sigmoid output gate, q/k norms, partial rotary). Norms are zero-centered (x * (1 + w)). Served: the text
+// decoder, dense ("qwen3_5") or mixture of experts in every layer ("qwen3_5_moe": softmax router, top-k renormalized,
+// fused gate_up expert banks, a sigmoid-gated shared expert). The vision tower and the MTP head are not loaded.
 
 #include <filesystem>
 #include <memory>
@@ -23,7 +24,13 @@ enum class LayerKind { Linear, Full };
 struct Config {
     int64_t vocab_size = 0;
     int64_t hidden_size = 0;
-    int64_t intermediate_size = 0;
+    int64_t intermediate_size = 0;  // dense MLP (0 for MoE)
+    // Mixture of experts (num_experts > 0).
+    int64_t num_experts = 0;
+    int64_t experts_per_token = 0;
+    int64_t moe_intermediate_size = 0;
+    int64_t shared_expert_intermediate_size = 0;  // 0: no shared expert
+    bool norm_topk_prob = true;
     int64_t num_layers = 0;
     double rms_norm_eps = 1e-6;
     int64_t max_position = 0;

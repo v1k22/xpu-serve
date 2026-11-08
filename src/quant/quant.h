@@ -10,12 +10,26 @@
 
 namespace xs::quant {
 
-// A quantized [rows, cols] matrix. Q8: int8 codes [rows, cols]; Q4: uint8 [rows, cols / 2] with the even column in
-// the low nibble. f16 scales and (Q4) biases [rows, cols / group].
+// A quantized tensor of shape [..., cols] is a matrix of rows = numel / cols (an expert bank [E, N, K] is E * N rows
+// of K). Q8: int8 codes [rows, cols]; Q4: uint8 [rows, cols / 2] with the even column in the low nibble. f16 scales
+// and (Q4) biases [rows, cols / group]. Stored components keep the leading dims (component_shape).
+inline int64_t matrix_rows(const Dims& shape) {
+    int64_t rows = 1;
+    for (size_t d = 0; d + 1 < shape.size(); ++d)
+        rows *= shape[d];
+    return rows;
+}
+// `shape` with its last dim replaced: the shape of a stored component (codes, scales, biases).
+inline Dims component_shape(Dims shape, int64_t last) {
+    shape.back() = last;
+    return shape;
+}
+
 struct Quantized {
     DType format = DType::Q4;
-    int64_t rows = 0;
-    int64_t cols = 0;
+    Dims shape;        // logical shape, at least 2-D
+    int64_t rows = 0;  // matrix_rows(shape)
+    int64_t cols = 0;  // shape.back()
     int64_t group = 0;
     std::vector<uint8_t> codes;
     std::vector<uint16_t> scales;
@@ -29,7 +43,7 @@ struct Quantized {
 // Why a [rows, cols] matrix cannot be stored as `format` with this group size, or empty when it can.
 std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t group);
 
-// Round to nearest per group of `group` columns of `w` (2-D, f32 / f16 / bf16). Q8 is symmetric (scale = max|w| / 127,
+// Round to nearest per group of `group` columns of `w` (at least 2-D, f32 / f16 / bf16). Q8 is symmetric (scale = max|w| / 127,
 // codes in [-127, 127]); Q4 is asymmetric (bias = min, scale = (max - min) / 15, codes in [0, 15]). Codes are chosen
 // against the f16-rounded scale and bias, so dequantization reproduces exactly the values the rounding picked.
 Quantized quantize(const TensorView& w, DType format, int64_t group);

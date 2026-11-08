@@ -508,6 +508,184 @@ void gemv_quant_q(sycl::queue& q, const float* x, const QuantWeight& w, float* y
     }
 }
 
+// acc[r][m] += dequant(row rows[r] of w) . xs[m] over this lane's chunks (gemv_quant_t's chunking; each row's codes
+// and scales load once for all M inputs).
+template <bool Q4, int M>
+inline void quant_rows_dot(const QuantWeight& w, const int64_t (&rows)[kQRows], const float* const (&xs)[M], int lane,
+                           int64_t k, float (&acc)[kQRows][M]) {
+    constexpr int kChunk = Q4 ? 32 : 16;
+    const int64_t groups = k / w.group;
+    const int64_t row_bytes = Q4 ? k / 2 : k;
+    for (int64_t k0 = static_cast<int64_t>(lane) * kChunk; k0 < k; k0 += kSubGroup * kChunk) {
+        const int64_t g = k0 / w.group;
+        sycl::vec<uint8_t, 16> c[kQRows];
+        float s[kQRows];
+        float b[kQRows];
+        for (int r = 0; r < kQRows; ++r) {
+            c[r] = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(w.codes + rows[r] * row_bytes + (Q4 ? k0 / 2 : k0));
+            s[r] = static_cast<float>(w.scales[rows[r] * groups + g]);
+            b[r] = Q4 ? static_cast<float>(w.biases[rows[r] * groups + g]) : 0.0f;
+        }
+        for (int mm = 0; mm < M; ++mm) {
+            float xv[kChunk];
+            const auto* xp = reinterpret_cast<const sycl::vec<float, 4>*>(xs[mm] + k0);
+            for (int i = 0; i < kChunk / 4; ++i) {
+                const sycl::vec<float, 4> v = xp[i];
+                xv[4 * i] = v[0];
+                xv[4 * i + 1] = v[1];
+                xv[4 * i + 2] = v[2];
+                xv[4 * i + 3] = v[3];
+            }
+            if (w.input_scales != nullptr) {
+                for (int i = 0; i < kChunk; ++i)
+                    xv[i] *= w.input_scales[k0 + i];
+            }
+            float xsum = 0.0f;
+            if constexpr (Q4) {
+                for (int i = 0; i < kChunk; ++i)
+                    xsum += xv[i];
+            }
+            for (int r = 0; r < kQRows; ++r) {
+                float dot = 0.0f;
+                if constexpr (Q4) {
+                    for (int i = 0; i < 16; ++i) {
+                        dot += static_cast<float>(c[r][i] & 0x0F) * xv[2 * i];
+                        dot += static_cast<float>(c[r][i] >> 4) * xv[2 * i + 1];
+                    }
+                    acc[r][mm] += s[r] * dot + b[r] * xsum;
+                } else {
+                    for (int i = 0; i < 16; ++i)
+                        dot += static_cast<float>(static_cast<int8_t>(c[r][i])) * xv[i];
+                    acc[r][mm] += s[r] * dot;
+                }
+            }
+        }
+    }
+}
+
+template <typename I>
+inline int64_t expert_of(const I* idx, int64_t pair, int64_t experts) {
+    const int64_t e = static_cast<int64_t>(idx[pair]);
+    return e < 0 || e >= experts ? 0 : e;
+}
+
+// One work-group per (pair, block of kQSgPerWg * kQRows rows).
+template <bool Q4, typename I>
+void expert_quant_pairs_t(sycl::queue& q, const float* x, bool per_slot, QuantWeight w, const I* idx, float* out,
+                          int64_t pairs, int64_t slots, int64_t experts, int64_t n, int64_t k) {
+    constexpr int64_t kRowsPerWg = kQSgPerWg * kQRows;
+    const int64_t blocks = ceil_div(n, kRowsPerWg);
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(pairs * blocks * kQSgPerWg * kSubGroup),
+                                           kQSgPerWg * kSubGroup),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const int64_t p = static_cast<int64_t>(it.get_group(0)) / blocks;
+        const int64_t block = static_cast<int64_t>(it.get_group(0)) % blocks;
+        const int64_t row0 = (block * kQSgPerWg + sg.get_group_linear_id()) * kQRows;
+        const int64_t base = expert_of(idx, p, experts) * n;
+        int64_t rows[kQRows];
+        for (int r = 0; r < kQRows; ++r)
+            rows[r] = base + std::min<int64_t>(row0 + r, n - 1);
+        const float* const xs[1] = {x + (per_slot ? p : p / slots) * k};
+        float acc[kQRows][1] = {};
+        quant_rows_dot<Q4, 1>(w, rows, xs, lane, k, acc);
+        for (int r = 0; r < kQRows; ++r) {
+            const float sum = sycl::reduce_over_group(sg, acc[r][0], sycl::plus<float>());
+            if (lane == 0 && row0 + r < n) out[p * n + row0 + r] = sum;
+        }
+    });
+}
+
+// grouping (int32): counts [E], offsets [E + 1], cursor [E], active [E], n_active [1], order [pairs].
+struct ExpertGrouping {
+    int32_t* counts;
+    int32_t* offsets;
+    int32_t* cursor;
+    int32_t* active;
+    int32_t* n_active;
+    int32_t* order;
+    ExpertGrouping(int32_t* g, int64_t experts)
+        : counts(g),
+          offsets(g + experts),
+          cursor(g + 2 * experts + 1),
+          active(g + 3 * experts + 1),
+          n_active(g + 4 * experts + 1),
+          order(g + 4 * experts + 2) {}
+};
+
+// Counting sort of the pairs by expert. The order inside an expert is not deterministic, which does not matter: each
+// pair's output row is computed the same way wherever it lands.
+template <typename I>
+void group_by_expert(sycl::queue& q, const I* idx, int64_t pairs, int64_t experts, ExpertGrouping g) {
+    q.memset(g.counts, 0, static_cast<size_t>(experts) * sizeof(int32_t));
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(pairs)), [=](sycl::id<1> i) {
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space>(g.counts[expert_of(idx, static_cast<int64_t>(i[0]), experts)])
+            .fetch_add(1);
+    });
+    syclex::single_task(q, [=]() {
+        int32_t sum = 0;
+        int32_t active = 0;
+        for (int64_t e = 0; e < experts; ++e) {
+            g.offsets[e] = sum;
+            g.cursor[e] = sum;
+            if (g.counts[e] > 0) g.active[active++] = static_cast<int32_t>(e);
+            sum += g.counts[e];
+        }
+        g.offsets[experts] = sum;
+        *g.n_active = active;
+    });
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(pairs)), [=](sycl::id<1> i) {
+        const auto p = static_cast<int64_t>(i[0]);
+        const int32_t pos = sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                             sycl::access::address_space::global_space>(g.cursor[expert_of(idx, p, experts)])
+                                .fetch_add(1);
+        g.order[pos] = static_cast<int32_t>(p);
+    });
+}
+
+// One work-group per (active expert, row block); it walks the expert's pairs kGemvMaxRows at a time.
+template <bool Q4>
+void expert_quant_grouped_t(sycl::queue& q, const float* x, bool per_slot, QuantWeight w, float* out, int64_t slots,
+                            int64_t n, int64_t k, ExpertGrouping g, int64_t max_active) {
+    constexpr int M = static_cast<int>(kGemvMaxRows);
+    constexpr int64_t kRowsPerWg = kQSgPerWg * kQRows;
+    const int64_t blocks = ceil_div(n, kRowsPerWg);
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(max_active * blocks * kQSgPerWg * kSubGroup),
+                                           kQSgPerWg * kSubGroup),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+        const int64_t a = static_cast<int64_t>(it.get_group(0)) / blocks;
+        if (a >= *g.n_active) return;  // uniform across the work-group
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const int64_t block = static_cast<int64_t>(it.get_group(0)) % blocks;
+        const int64_t row0 = (block * kQSgPerWg + sg.get_group_linear_id()) * kQRows;
+        const int64_t e = g.active[a];
+        const int64_t begin = g.offsets[e];
+        const int64_t end = g.offsets[e + 1];
+        int64_t rows[kQRows];
+        for (int r = 0; r < kQRows; ++r)
+            rows[r] = e * n + std::min<int64_t>(row0 + r, n - 1);
+        for (int64_t c = begin; c < end; c += M) {
+            int64_t ps[M];
+            const float* xs[M];
+            for (int mm = 0; mm < M; ++mm) {
+                ps[mm] = g.order[std::min<int64_t>(c + mm, end - 1)];
+                xs[mm] = x + (per_slot ? ps[mm] : ps[mm] / slots) * k;
+            }
+            float acc[kQRows][M] = {};
+            quant_rows_dot<Q4, M>(w, rows, xs, lane, k, acc);
+            for (int r = 0; r < kQRows; ++r) {
+                for (int mm = 0; mm < M; ++mm) {
+                    const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
+                    if (lane == 0 && c + mm < end && row0 + r < n) out[ps[mm] * n + row0 + r] = sum;
+                }
+            }
+        }
+    });
+}
+
 // Dequantized value of column c of row r.
 inline float dequant_at(const QuantWeight& w, int64_t r, int64_t c, int64_t k) {
     const int64_t sg = r * (k / w.group) + c / w.group;
@@ -850,6 +1028,37 @@ void dequantize_kv_i8(sycl::queue& q, const int8_t* codes, const float* scales, 
         out[i] = static_cast<CT>(static_cast<float>(codes[i]) * scales[i / width]);
     });
 }
+
+size_t expert_grouping_bytes(int64_t pairs, int64_t experts) {
+    return static_cast<size_t>(4 * experts + 2 + pairs) * sizeof(int32_t);
+}
+
+template <typename I>
+void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const QuantWeight& w, const I* idx, float* out,
+                         int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping) {
+    const int64_t pairs = tokens * slots;
+    if (pairs <= kExpertPairsDirect || grouping == nullptr) {
+        if (w.q4) {
+            expert_quant_pairs_t<true>(q, x, per_slot, w, idx, out, pairs, slots, experts, n, k);
+        } else {
+            expert_quant_pairs_t<false>(q, x, per_slot, w, idx, out, pairs, slots, experts, n, k);
+        }
+        return;
+    }
+    const ExpertGrouping g(grouping, experts);
+    group_by_expert(q, idx, pairs, experts, g);
+    const int64_t max_active = std::min(pairs, experts);
+    if (w.q4) {
+        expert_quant_grouped_t<true>(q, x, per_slot, w, out, slots, n, k, g, max_active);
+    } else {
+        expert_quant_grouped_t<false>(q, x, per_slot, w, out, slots, n, k, g, max_active);
+    }
+}
+
+template void expert_matmul_quant<int32_t>(sycl::queue&, const float*, bool, const QuantWeight&, const int32_t*, float*,
+                                           int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*);
+template void expert_matmul_quant<int64_t>(sycl::queue&, const float*, bool, const QuantWeight&, const int64_t*, float*,
+                                           int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*);
 
 template void dequantize_kv_i8<half>(sycl::queue&, const int8_t*, const float*, half*, int64_t, int64_t);
 template void dequantize_kv_i8<float>(sycl::queue&, const int8_t*, const float*, float*, int64_t, int64_t);

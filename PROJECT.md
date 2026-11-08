@@ -21,9 +21,9 @@ How that works:
   conversion step yet; a `convert` command for quantized packs is planned (DESIGN.md section 6).
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
-Status (see TODO.md): Gemma 4 E2B/E4B (text and images) and Qwen3.5 (dense, text; a hybrid of Gated DeltaNet
-linear attention and full attention), served end to end on the SYCL backend (Arc Pro B60), matching Hugging
-Face fp32 logits and greedy output. One sequence at a time, no quantization yet.
+Status (see TODO.md): Gemma 4 E2B/E4B (text and images) and Qwen3.5 (text; a hybrid of Gated DeltaNet linear
+attention and full attention, dense or mixture of experts), served end to end on the SYCL backend (Arc Pro B60),
+matching Hugging Face fp32 logits and greedy output; q8 / q4 packs from `convert`. One sequence at a time.
 
 ## 2. Build, run, test
 
@@ -46,8 +46,9 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
   `src/cli/main.cpp` is the source of truth.
 - Run one test case: `build/tests/xs_tests -tc='model matches*'`. Environment for the tests that need files:
   `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref` or `sycl`),
-  `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`; `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for
-  tokenizer parity).
+  `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`, `XS_PARITY_KV_DTYPE`; `XS_QWEN35_DIR` (a Qwen3.5
+  checkpoint, for tokenizer parity). `tests/parity/model/make_tiny.py` writes a tiny random checkpoint of an
+  architecture (real layer pattern and tensor names) to run `hf_reference.py` and the parity test on in seconds.
 - `XS_SYCL_PROFILE=1` logs the SYCL backend's per-op time per step (each op runs alone); `XS_SYCL_SYNC=1` waits after
   every op and names the op a device error comes from (`XS_SYCL_TRACE=1` also prints each op before it runs).
 - The GPU suites ("device ops", "device attention", "device session", "device vs cpu-ref", ...) run when
@@ -80,7 +81,7 @@ area).
 | `util/` | xs_core | `error.h` (`xs::Error`, `fail(...)`, `XS_CHECK`, `str_cat`), `log`, `timer.h`, `mmap_file`, `half` (f16/bf16 conversions), `base64` |
 | `tensor/` | xs_core | `DType` (incl. `Q8` / `Q4` pack weights), `TensorView` (non-owning, e.g. into an mmap; `quant` points at a pack weight's scales and biases), `HostTensor` (owning), `TensorMap` (name -> HostTensor) |
 | `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped; a pack's quantized weights appear as one Q8 / Q4 view each); `safetensors_writer` (streamed writing) |
-| `quant/` | xs_core | round-to-nearest quantization into the pack formats (DESIGN.md 6.3) and dequantization |
+| `quant/` | xs_core | round-to-nearest quantization into the pack formats (DESIGN.md 6.3) and dequantization; a tensor `[..., K]` is a matrix of `numel / K` rows (expert banks `[E, N, K]` included) |
 | `convert/` | xs_core | `convert_model`: checkpoint -> pack; the model's own graph decides which weights to quantize |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
@@ -103,7 +104,7 @@ area).
 | `src/models/gemma4/gemma4_model.cpp` | Gemma 4 text model: graph builder + per-step host inputs |
 | `src/models/gemma4/gemma4_config.cpp` | Gemma 4 `config.json` parsing; refuses unsupported variants by name |
 | `src/models/gemma4/gemma4_vision.cpp` | Gemma 4 vision: image processor (resize, patches, pooling map) and vision tower graph |
-| `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention |
+| `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention; dense MLP or `blocks::moe` (`qwen3_5_moe`: fused gate_up expert banks, gated shared expert) |
 | `src/backend/backend.h` | `Backend::compile(graph, weights, options) -> Session`; `Session::run/reset/truncate` |
 | `src/backend/cpu_ref/ops.cpp` | f32/f64 reference kernels, one per op: the accuracy oracle |
 | `src/backend/sycl/sycl_backend.cpp` | SYCL session: device dtypes, fusions, per-T memory plan (one arena), op dispatch, KV and state buffers |
@@ -263,8 +264,8 @@ Parse and validate it in `src/server/openai_request.cpp` (a bad value is a 400 n
 
 ## 10. Known limitations
 
-- Two model families: Gemma 4 E2B/E4B (text and images) and Qwen3.5 dense (text; its vision tower and MTP head
-  are not loaded). No audio or video. Images only as base64 data: URLs.
+- Two model families: Gemma 4 E2B/E4B (text and images) and Qwen3.5 dense and MoE (text; its vision tower and MTP
+  head are not loaded; MoE checkpoints must use fused expert banks, as the released ones do). No audio or video. Images only as base64 data: URLs.
 - Linear-attention models re-prefill when a new prompt does not extend the cached sequence (no state snapshots).
 - Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)
   and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 before its GEMM.

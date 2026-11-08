@@ -146,6 +146,15 @@ struct QuantWeight {
 };
 // y [M, N] = x [M, K] @ dequant(w)^T for M <= kGemvMaxRows; K a multiple of 32.
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k);
+// ExpertMatMul over a quantized expert bank (rows = E * N of K columns): out [T, S, N], x [T, K] or (per_slot)
+// [T, S, K], expert ids outside [0, E) read expert 0. Up to kExpertPairsDirect (token, slot) pairs run one GEMV each;
+// more are grouped by expert on the device in `grouping` (expert_grouping_bytes) so an expert's rows are read once
+// per kGemvMaxRows of its pairs.
+inline constexpr int64_t kExpertPairsDirect = 32;
+size_t expert_grouping_bytes(int64_t pairs, int64_t experts);
+template <typename I>
+void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const QuantWeight& w, const I* idx, float* out,
+                         int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping);
 // out [N, K] = dequant(w) as f16 or f32, for the GEMM path.
 template <typename T>
 void dequantize(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k);

@@ -13,6 +13,7 @@
 
 #include "backend_test_util.h"
 #include "models/common/blocks.h"
+#include "quant/quant.h"
 #include "reference_ops.h"
 #include "util/error.h"
 
@@ -104,17 +105,82 @@ inline void expert_matmul_shared_and_per_slot(const Env& env) {
     }
 }
 
+// Q8 / Q4 expert banks against the dequantized bank: few (token, slot) pairs (one GEMV each on SYCL) and many (grouped
+// by expert), shared and per-slot inputs, experts repeated across tokens, N not a multiple of the row blocks.
+struct BankShape {
+    int64_t experts, n, k, slots;
+};
+
+inline void expert_matmul_quantized(const Env& env) {
+    TensorRng rng(36);
+    for (const BankShape s : {BankShape{6, 40, 128, 3}, BankShape{8, 128, 64, 2}}) {
+    const int64_t experts = s.experts, n = s.n, k = s.k, slots = s.slots;
+    CAPTURE(experts);
+    CAPTURE(k);
+    const HostTensor dense = rng.uniform(DType::F32, {experts, n, k}, 1.0f / std::sqrt(static_cast<float>(k)));
+    for (const DType format : {DType::Q8, DType::Q4}) {
+        for (const int64_t group : {32, 64}) {
+            if (k % group != 0) continue;
+            CAPTURE(dtype_name(format));
+            CAPTURE(group);
+            MemoryWeights w;
+            w.add_quantized("w", quant::quantize(dense.view(), format, group));
+            for (const int64_t tokens : {1, 5, 13, 40}) {  // 3, 15, 39 and 120 pairs
+                CAPTURE(tokens);
+                std::vector<int32_t> idx;
+                for (int64_t i = 0; i < tokens * slots; ++i)
+                    idx.push_back(static_cast<int32_t>((i * 5 + 2 + i / 7) % experts));
+                const HostTensor ids = ids_i32({tokens, slots}, idx);
+                const HostTensor x2 = rng.uniform(DType::F32, {tokens, k});
+                const HostTensor x3 = rng.uniform(DType::F32, {tokens, slots, k});
+                Graph g;
+                const Value i = g.input("idx", DType::I32, {kT, slots});
+                g.output("shared", g.expert_matmul(g.input("x2", DType::F32, {kT, k}), g.weight(w, "w"), i));
+                g.output("per_slot", g.expert_matmul(g.input("x3", DType::F32, {kT, slots, k}), g.weight(w, "w"), i));
+                const TensorMap out = run(env, g, w, {{"idx", ids}, {"x2", x2}, {"x3", x3}});
+                const std::vector<int64_t> idx64(idx.begin(), idx.end());
+                CHECK(all_close(out.at("shared"), ref::expert_matmul(to_f64(x2), to_f64(w.tensor("w")), idx64, slots),
+                                env.mm_atol, env.mm_rtol));
+                CHECK(all_close(out.at("per_slot"),
+                                ref::expert_matmul(to_f64(x3), to_f64(w.tensor("w")), idx64, slots), env.mm_atol,
+                                env.mm_rtol));
+            }
+        }
+    }
+    }
+}
+
 // The MoE block against an fp64 composition of the same math. Router weights are scaled so the chosen experts are
 // clearly ahead of the rest (a near tie could pick differently at f16).
-inline void moe_block(const Env& env, blocks::Router router, bool shared) {
+// `quantized`: q4 banks with gate and up fused into one [E, 2 I, hidden] bank (Qwen3.5 MoE's layout); `tokens` past
+// 16 takes the grouped path for quantized banks on SYCL.
+inline void moe_block(const Env& env, blocks::Router router, bool shared, bool quantized = false, int64_t tokens = 7) {
     TensorRng rng(router == blocks::Router::Softmax ? 34 : 35);
-    const int64_t experts = 8, top_k = 2, hidden = 64, inter = 48, tokens = 7;
+    const int64_t experts = 8, top_k = 2, hidden = 64, inter = quantized ? 64 : 48;
     MemoryWeights w;
     const float s_in = 1.0f / std::sqrt(static_cast<float>(hidden));
-    w.add("router", rng.uniform(DType::F32, {experts, hidden}, 6.0f * s_in));
-    w.add("gate", rng.uniform(DType::BF16, {experts, inter, hidden}, s_in));
-    w.add("up", rng.uniform(DType::BF16, {experts, inter, hidden}, s_in));
-    w.add("down", rng.uniform(DType::BF16, {experts, hidden, inter}, 1.0f / std::sqrt(static_cast<float>(inter))));
+    w.add("router", rng.uniform(DType::F32, {experts, hidden}, (quantized ? 24.0f : 6.0f) * s_in));
+    if (quantized) {
+        const HostTensor gate_up = rng.uniform(DType::F32, {experts, 2 * inter, hidden}, s_in);
+        const HostTensor down = rng.uniform(DType::F32, {experts, hidden, inter}, 1.0f / std::sqrt(static_cast<float>(inter)));
+        w.add_quantized("gate_up", quant::quantize(gate_up.view(), DType::Q4, 32));
+        w.add_quantized("down", quant::quantize(down.view(), DType::Q4, 32));
+        // gate and up as separate dense banks, for the reference below.
+        HostTensor gate(DType::F32, {experts, inter, hidden}), up(DType::F32, {experts, inter, hidden});
+        const float* both = w.tensor("gate_up").data<float>();
+        for (int64_t e = 0; e < experts; ++e) {
+            std::copy(both + (e * 2 * inter) * hidden, both + (e * 2 * inter + inter) * hidden,
+                      gate.data<float>() + e * inter * hidden);
+            std::copy(both + (e * 2 * inter + inter) * hidden, both + (e * 2 * inter + 2 * inter) * hidden,
+                      up.data<float>() + e * inter * hidden);
+        }
+        w.add("gate", std::move(gate));
+        w.add("up", std::move(up));
+    } else {
+        w.add("gate", rng.uniform(DType::BF16, {experts, inter, hidden}, s_in));
+        w.add("up", rng.uniform(DType::BF16, {experts, inter, hidden}, s_in));
+        w.add("down", rng.uniform(DType::BF16, {experts, hidden, inter}, 1.0f / std::sqrt(static_cast<float>(inter))));
+    }
     w.add("s_gate", rng.uniform(DType::BF16, {inter, hidden}, s_in));
     w.add("s_up", rng.uniform(DType::BF16, {inter, hidden}, s_in));
     w.add("s_down", rng.uniform(DType::BF16, {hidden, inter}, 1.0f / std::sqrt(static_cast<float>(inter))));
@@ -129,8 +195,12 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared) {
     spec.routed_scale = router == blocks::Router::Sigmoid ? 2.5f : 1.0f;
     blocks::MoeParts parts;
     parts.router = g.weight(w, "router");
-    parts.gate = g.weight(w, "gate");
-    parts.up = g.weight(w, "up");
+    if (quantized) {
+        parts.gate_up = g.weight(w, "gate_up");
+    } else {
+        parts.gate = g.weight(w, "gate");
+        parts.up = g.weight(w, "up");
+    }
     parts.down = g.weight(w, "down");
     if (shared) {
         parts.shared_gate = blocks::matmul_by(g, g.weight(w, "s_gate"));

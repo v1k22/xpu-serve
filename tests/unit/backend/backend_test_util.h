@@ -31,10 +31,11 @@ class MemoryWeights final : public WeightStore {
     // A Q8 / Q4 weight, as a pack holds it. tensor(name) is its dequantized f32 value (what a backend must compute
     // with).
     void add_quantized(const std::string& name, quant::Quantized q) {
-        HostTensor dense(DType::F32, {q.rows, q.cols});
+        HostTensor dense(DType::F32, q.view().shape);
+        const int64_t rows = q.rows;
         quantized_[name] = std::move(q);
         views_[name] = quantized_[name].view();
-        quant::dequantize_rows(views_[name], 0, dense.dim(0), dense.data<float>());
+        quant::dequantize_rows(views_[name], 0, rows, dense.data<float>());
         tensors_[name] = std::move(dense);
     }
     const TensorView* find(const std::string& name) const override {

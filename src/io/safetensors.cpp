@@ -117,14 +117,21 @@ void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) 
         if (dtype == DType::F32) fail("pack: tensor '", name, "' has unknown format '", format, "'");
         const int64_t group = entry.at("group").get<int64_t>();
         const Dims shape = entry.at("shape").get<Dims>();
-        XS_CHECK(shape.size() == 2 && group > 0 && shape[1] % group == 0 && (dtype == DType::Q8 || shape[1] % 2 == 0),
+        XS_CHECK(shape.size() >= 2 && group > 0 && shape.back() % group == 0 &&
+                     (dtype == DType::Q8 || shape.back() % 2 == 0),
                  "pack: tensor '", name, "' has shape ", dims_to_string(shape), " and group ", group);
-        const Dims groups{shape[0], shape[1] / group};
+        // Components keep the leading dims; the last is columns, column pairs (q4 codes) or groups.
+        const auto with_last = [&](int64_t last) {
+            Dims d = shape;
+            d.back() = last;
+            return d;
+        };
+        const Dims groups = with_last(shape.back() / group);
         TensorView v;
         v.dtype = dtype;
         v.shape = shape;
         v.data = component(name, dtype == DType::Q4 ? DType::U8 : DType::I8,
-                           dtype == DType::Q4 ? Dims{shape[0], shape[1] / 2} : shape).data;
+                           dtype == DType::Q4 ? with_last(shape.back() / 2) : shape).data;
         v.quant.group = group;
         v.quant.scales = component(name + ".scales", DType::F16, groups).data;
         index_.erase(name + ".scales");
@@ -133,7 +140,8 @@ void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) 
             index_.erase(name + ".biases");
         }
         if (entry.value("input_scales", false)) {
-            v.quant.input_scales = static_cast<const float*>(component(name + ".input_scales", DType::F32, {shape[1]}).data);
+            v.quant.input_scales =
+                static_cast<const float*>(component(name + ".input_scales", DType::F32, {shape.back()}).data);
             index_.erase(name + ".input_scales");
         }
         index_[name] = &(quant_views_[name] = v);

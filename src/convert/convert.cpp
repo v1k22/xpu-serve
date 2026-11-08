@@ -30,18 +30,37 @@ using graph::OpKind;
 
 constexpr uint64_t kShardBytes = uint64_t{4} << 30;
 
-// Q8 / Q4 when `format` fits the tensor (a float matrix of at least min_elements); explains a refusal in the log.
+// Q8 / Q4 when `format` fits the tensor (a float tensor of at least 2 dims and min_elements, quant.h's matrix view);
+// explains a refusal in the log.
 std::optional<DType> fitting(const std::string& name, const TensorView& v, DType format, const ConvertOptions& o) {
-    if (!is_float(v.dtype) || v.shape.size() != 2 || v.numel() < o.min_elements) return std::nullopt;
-    if (const std::string why = quant::unsupported_reason(format, v.shape[0], v.shape[1], o.group); !why.empty()) {
+    if (!is_float(v.dtype) || v.shape.size() < 2 || v.numel() < o.min_elements) return std::nullopt;
+    if (const std::string why = quant::unsupported_reason(format, quant::matrix_rows(v.shape), v.shape.back(), o.group);
+        !why.empty()) {
         log::info("convert: keeping '", name, "' as ", dtype_name(v.dtype), ": ", why);
         return std::nullopt;
     }
     return format;
 }
 
-// The format each weight of `g` gets: what the graph does with it decides. A weight read only as a matmul weight takes
-// `matmul_format`; one that is also (or only) a gather table takes q8; anything else is copied.
+// Weights of the matmuls whose output decides a TopK (through Softmax / Sigmoid): mixture-of-experts routers. They stay
+// unquantized: a rounded router picks different experts for some tokens, a much larger error than rounding a weight.
+std::set<std::string> router_weights(const graph::Graph& g) {
+    std::set<std::string> out;
+    for (const auto& n : g.nodes()) {
+        if (n.kind != OpKind::TopK) continue;
+        graph::Value v = n.inputs[0];
+        while (g.node(v).kind == OpKind::Softmax || g.node(v).kind == OpKind::Sigmoid) v = g.node(v).inputs[0];
+        const auto& mm = g.node(v);
+        if (mm.kind == OpKind::MatMul && g.node(mm.inputs[1]).kind == OpKind::Weight) {
+            out.insert(std::get<graph::WeightAttrs>(g.node(mm.inputs[1]).attrs).name);
+        }
+    }
+    return out;
+}
+
+// The format each weight of `g` gets: what the graph does with it decides. A weight read only as a matmul weight (or
+// an expert bank) takes `matmul_format`; one that is also (or only) a gather table takes q8; routers and anything else
+// are copied.
 void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_format, const ConvertOptions& o,
                 std::map<std::string, DType>& plan) {
     const auto& nodes = g.nodes();
@@ -52,14 +71,19 @@ void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_
     }
     for (const auto& out : g.outputs())
         readers[static_cast<size_t>(out.value.node)].emplace_back(OpKind::Input, 0);  // a graph output: keep
+    const std::set<std::string> routers = router_weights(g);
     for (size_t i = 0; i < nodes.size(); ++i) {
         if (nodes[i].kind != OpKind::Weight || readers[i].empty()) continue;
         const std::string& name = std::get<graph::WeightAttrs>(nodes[i].attrs).name;
+        if (routers.count(name) != 0) {
+            log::info("convert: keeping router '", name, "' unquantized");
+            continue;
+        }
         bool matmul = false;
         bool table = false;
         bool other = false;
         for (const auto& [kind, k] : readers[i]) {
-            if (kind == OpKind::MatMul && k == 1) {
+            if ((kind == OpKind::MatMul || kind == OpKind::ExpertMatMul) && k == 1) {
                 matmul = true;
             } else if (kind == OpKind::Gather && k == 0) {
                 table = true;
@@ -101,13 +125,14 @@ OutUnit copy_unit(const std::string& name, const TensorView& v) {
 // `act_ms` (AWQ calibration statistics) set: the q4 weight is quantized with quantize_awq and gets input_scales.
 OutUnit quant_unit(const std::string& name, const TensorView& v, DType format, int64_t group,
                    const std::vector<double>* act_ms, ConvertReport* report) {
-    const Dims groups{v.shape[0], v.shape[1] / group};
+    const int64_t cols = v.shape.back();
+    const Dims groups = quant::component_shape(v.shape, cols / group);
     OutUnit u;
     u.tensors.push_back(OutTensor{name, format == DType::Q4 ? DType::U8 : DType::I8,
-                                  format == DType::Q4 ? Dims{v.shape[0], v.shape[1] / 2} : v.shape});
+                                  format == DType::Q4 ? quant::component_shape(v.shape, cols / 2) : v.shape});
     u.tensors.push_back(OutTensor{name + ".scales", DType::F16, groups});
     if (format == DType::Q4) u.tensors.push_back(OutTensor{name + ".biases", DType::F16, groups});
-    if (act_ms != nullptr) u.tensors.push_back(OutTensor{name + ".input_scales", DType::F32, {v.shape[1]}});
+    if (act_ms != nullptr) u.tensors.push_back(OutTensor{name + ".input_scales", DType::F32, {cols}});
     u.write = [v, format, group, act_ms, report, name](std::ostream& out) {
         quant::Quantized q;
         if (act_ms != nullptr) {

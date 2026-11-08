@@ -31,6 +31,7 @@ struct TinyQwen {
     int64_t vocab = 256, hidden = 128, ffn = 256, heads = 4, kv_heads = 2, head_dim = 64;
     int64_t lin_k_heads = 2, lin_v_heads = 4, lin_dim = 32, conv = 4;
     std::vector<std::string> layers{"linear_attention", "linear_attention", "linear_attention", "full_attention"};
+    int64_t experts = 0, top_k = 2, moe_ffn = 64, shared_ffn = 96;  // experts > 0: Qwen3.5 MoE (fused banks)
 };
 
 // Writes config.json and model.safetensors (bf16, random) for `m` into `dir`.
@@ -44,6 +45,14 @@ void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t seed) {
         {"linear_key_head_dim", m.lin_dim}, {"linear_value_head_dim", m.lin_dim}, {"linear_conv_kernel_dim", m.conv},
         {"hidden_act", "silu"}, {"tie_word_embeddings", true}, {"eos_token_id", 1}, {"layer_types", m.layers},
         {"rope_parameters", {{"rope_type", "default"}, {"rope_theta", 1e7}, {"partial_rotary_factor", 0.25}}}};
+    if (m.experts > 0) {
+        config["model_type"] = "qwen3_5_moe_text";
+        config.erase("intermediate_size");
+        config["num_experts"] = m.experts;
+        config["num_experts_per_tok"] = m.top_k;
+        config["moe_intermediate_size"] = m.moe_ffn;
+        config["shared_expert_intermediate_size"] = m.shared_ffn;
+    }
     std::ofstream(dir / "config.json") << config.dump(1);
     std::ofstream(dir / "tokenizer_config.json") << R"({"eos_token": "<|end|>"})";
 
@@ -57,9 +66,19 @@ void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t seed) {
         const std::string L = "layers." + std::to_string(i) + ".";
         add(L + "input_layernorm.weight", {m.hidden});
         add(L + "post_attention_layernorm.weight", {m.hidden});
-        add(L + "mlp.gate_proj.weight", {m.ffn, m.hidden});
-        add(L + "mlp.up_proj.weight", {m.ffn, m.hidden});
-        add(L + "mlp.down_proj.weight", {m.hidden, m.ffn});
+        if (m.experts > 0) {
+            add(L + "mlp.gate.weight", {m.experts, m.hidden});
+            add(L + "mlp.experts.gate_up_proj", {m.experts, 2 * m.moe_ffn, m.hidden});
+            add(L + "mlp.experts.down_proj", {m.experts, m.hidden, m.moe_ffn});
+            add(L + "mlp.shared_expert.gate_proj.weight", {m.shared_ffn, m.hidden});
+            add(L + "mlp.shared_expert.up_proj.weight", {m.shared_ffn, m.hidden});
+            add(L + "mlp.shared_expert.down_proj.weight", {m.hidden, m.shared_ffn});
+            add(L + "mlp.shared_expert_gate.weight", {1, m.hidden});
+        } else {
+            add(L + "mlp.gate_proj.weight", {m.ffn, m.hidden});
+            add(L + "mlp.up_proj.weight", {m.ffn, m.hidden});
+            add(L + "mlp.down_proj.weight", {m.hidden, m.ffn});
+        }
         if (m.layers[i] == "linear_attention") {
             const std::string A = L + "linear_attn.";
             add(A + "in_proj_qkv.weight", {conv_width, m.hidden});
@@ -85,8 +104,11 @@ void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t seed) {
     data.reserve(specs.size());  // the units below keep references into it
     std::vector<OutUnit> units;
     for (const auto& [name, shape] : specs) {
-        // 1/sqrt(fan-in) for matrices keeps activations O(1); small values for norms (zero-centered) and the rest.
-        const float range = shape.size() >= 2 ? 1.0f / std::sqrt(static_cast<float>(shape.back())) : 0.1f;
+        // 1/sqrt(fan-in) for matrices keeps activations O(1); small values for norms (zero-centered) and the rest. The
+        // router is larger, so each token's top-k experts win clearly (a near tie may route differently at f16).
+        const bool router = name.size() > 15 && name.compare(name.size() - 15, 15, "mlp.gate.weight") == 0;
+        const float range = shape.size() >= 2 ? (router ? 8.0f : 1.0f) / std::sqrt(static_cast<float>(shape.back()))
+                                              : 0.1f;
         std::uniform_real_distribution<float> dist(-range, range);
         std::vector<uint16_t> values(static_cast<size_t>(numel(shape)));
         for (uint16_t& v : values)
@@ -103,7 +125,9 @@ void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t seed) {
     write_safetensors(dir / "model.safetensors", units);
 }
 
+// Logits of the last prompt token, from a fresh state.
 std::vector<float> last_logits(Session& session, const Model& model, const std::vector<int32_t>& ids) {
+    session.reset();
     TensorMap inputs, outputs;
     model.prepare_inputs(ids, 0, {}, inputs);
     session.run(inputs, outputs);
@@ -196,6 +220,63 @@ TEST_SUITE("convert") {
                 const double agree = cosine(device_logits, logits);
                 MESSAGE(dtype_name(format), " pack on the GPU vs cpu-ref: cosine ", agree);
                 CHECK(agree > 0.9999);
+            }
+        }
+    }
+
+    TEST_CASE("q4 / q8 packs of a tiny Qwen3.5 MoE: expert banks quantized whole, GPU agrees with cpu-ref") {
+        const TempDir work("xs_convert_moe_test");
+        const fs::path src = work.path / "tiny-qwen-moe";
+        TinyQwen spec;
+        spec.experts = 8;
+        write_tiny_qwen(src, spec, 5);
+        const auto original = load_model(src);
+        const auto oracle = make_cpu_ref_backend();
+        SessionOptions so;
+        so.precision = DType::F32;
+        // 10 tokens x top-2 = 20 (token, expert) pairs: the direct path; 40 tokens = 80 pairs: grouped by expert.
+        std::vector<std::vector<int32_t>> prompts{{3, 17, 42, 99, 5, 250, 7, 8, 64, 128}, {}};
+        for (int32_t i = 0; i < 40; ++i)
+            prompts[1].push_back((i * 37 + 11) % 256);
+        for (const DType format : {DType::Q8, DType::Q4}) {
+            CAPTURE(dtype_name(format));
+            const fs::path out = work.path / (format == DType::Q4 ? "moe-q4" : "moe-q8");
+            ConvertOptions o;
+            o.source = src;
+            o.output = out;
+            o.format = format;
+            o.group = 32;
+            o.min_elements = 0;
+            convert_model(o);
+            const auto pack = load_model(out);
+            const std::string bank = "model.layers.0.mlp.experts.gate_up_proj";
+            const TensorView& up = pack->weights().get(bank);
+            CHECK(up.dtype == format);
+            CHECK(up.shape == Dims{8, 128, 128});
+            CHECK(pack->weights().get("model.layers.2.mlp.experts.down_proj").shape == Dims{8, 128, 64});
+            // The bank holds what the quantizer chose for its E * N rows.
+            const quant::Quantized q = quant::quantize(original->weights().get(bank), format, 32);
+            std::vector<float> expected(8 * 128 * 128), got(8 * 128 * 128);
+            quant::dequantize_rows(q.view(), 0, 8 * 128, expected.data());
+            quant::dequantize_rows(up, 0, 8 * 128, got.data());
+            CHECK(got == expected);
+
+            // No closeness bound against the bf16 original here: in a random MoE any rounding upstream flips some
+            // near-tied top-k choices, which moves the logits far more than the rounding itself. The GPU must agree
+            // with cpu-ref on the same pack; at f32, so f16 noise cannot flip a tie either.
+            const auto cpu = oracle->compile(pack->graph(), pack->weights(), so);
+            for (const auto& ids : prompts) {
+                CAPTURE(ids.size());
+                const std::vector<float> logits = last_logits(*cpu, *pack, ids);
+                if (dev::enabled()) {
+                    SessionOptions gpu = dev::options();
+                    gpu.precision = DType::F32;
+                    const std::vector<float> device_logits =
+                        last_logits(*dev::backend().compile(pack->graph(), pack->weights(), gpu), *pack, ids);
+                    const double agree = cosine(device_logits, logits);
+                    MESSAGE(dtype_name(format), " MoE pack on the GPU vs cpu-ref (", ids.size(), " tokens): ", agree);
+                    CHECK(agree > 0.99999);
+                }
             }
         }
     }
