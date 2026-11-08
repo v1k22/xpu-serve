@@ -27,8 +27,9 @@ def main():
     ap.add_argument("--both", required=True)
     ap.add_argument("--split")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--errors", default="err", choices=["err", "err_rtn"])
     args = ap.parse_args()
-    table = load(args.sweep)
+    table = load(args.sweep, key=args.errors)
     de = lambda li, bank, a, b: table[NAME.format(li, bank)][b][0].sum() - table[NAME.format(li, bank)][a][0].sum()
     both = {r["layer"]: r for r in map(json.loads, open(args.both))}
     split = {r["layer"]: r for r in map(json.loads, open(args.split))} if args.split else {}
