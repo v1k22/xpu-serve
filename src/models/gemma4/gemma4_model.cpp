@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "models/common/blocks.h"
 #include "models/config_util.h"
 #include "models/gemma4/gemma4.h"
 #include "quant/quant.h"
@@ -33,12 +34,7 @@ HostTensor rope_inv_freq(const RopeConfig& rope, int64_t head_dim) {
                              ? static_cast<int64_t>(std::floor(rope.partial_rotary_factor * static_cast<double>(head_dim) / 2.0))
                              : pairs;
     XS_CHECK(rotated >= 0 && rotated <= pairs, "gemma4: rotary pairs ", rotated, " out of range for head_dim ", head_dim);
-    HostTensor t(DType::F32, {pairs});
-    float* f = t.data<float>();
-    for (int64_t i = 0; i < rotated; ++i) {
-        f[i] = static_cast<float>(1.0 / std::pow(rope.theta, static_cast<double>(2 * i) / static_cast<double>(head_dim)));
-    }
-    return t;
+    return blocks::rope_inv_freq(rope.theta, head_dim, rotated, pairs);
 }
 
 // Checkpoints of Gemma4ForConditionalGeneration keep the decoder under "model.language_model.", text-only ones
@@ -227,9 +223,8 @@ private:
         h = g.add(h, g.rms_norm(attn, weight(L + "post_attention_layernorm.weight"), eps()));
 
         const Value x = g.rms_norm(h, weight(L + "pre_feedforward_layernorm.weight"), eps());
-        Value mlp = g.mul(g.gelu_tanh(g.matmul(x, weight(L + "mlp.gate_proj.weight"))),
-                          g.matmul(x, weight(L + "mlp.up_proj.weight")));
-        mlp = g.matmul(mlp, weight(L + "mlp.down_proj.weight"));
+        const Value mlp = blocks::gated_mlp(g, x, proj(L + "mlp.gate_proj.weight"), proj(L + "mlp.up_proj.weight"),
+                                            proj(L + "mlp.down_proj.weight"), blocks::Act::GeluTanh);
         h = g.add(h, g.rms_norm(mlp, weight(L + "post_feedforward_layernorm.weight"), eps()));
 
         if (per_layer.valid()) {
@@ -242,37 +237,40 @@ private:
         return g.mul(h, weight(L + "layer_scalar"));
     }
 
+    // A projection whose weight node is made when a block uses it (KV-shared layers never load k / v).
+    blocks::Linear proj(const std::string& suffix) {
+        return [this, suffix](Value x) { return graph_.matmul(x, weight(suffix)); };
+    }
+
     Value attention(int64_t i, Value x, Value pos) {
-        Graph& g = graph_;
-        Graph::Scope s(g, "attn");
+        Graph::Scope s(graph_, "attn");
         const std::string L = "layers." + std::to_string(i) + ".self_attn.";
         const AttnKind kind = cfg_.layer_kinds[static_cast<size_t>(i)];
-        const int64_t hd = cfg_.layer_head_dim(i);
+        blocks::AttentionSpec spec;
+        spec.heads = cfg_.num_heads;
+        spec.kv_heads = cfg_.num_kv_heads;
+        spec.head_dim = cfg_.layer_head_dim(i);
+        spec.attrs.scale = 1.0f;  // q_norm / k_norm carry the scale
+        spec.attrs.sliding_window = kind == AttnKind::Sliding ? cfg_.sliding_window : 0;
+        spec.kv_window = spec.attrs.sliding_window;
+        spec.kv_label = "layers." + std::to_string(i);
+        blocks::AttentionParts parts;
+        parts.q = proj(L + "q_proj.weight");
+        parts.k = proj(L + "k_proj.weight");
+        parts.v = proj(L + "v_proj.weight");
+        parts.o = proj(L + "o_proj.weight");
+        parts.q_norm = [this, L](Value q) { return graph_.rms_norm(q, weight(L + "q_norm.weight"), eps()); };
+        parts.k_norm = [this, L](Value k) { return graph_.rms_norm(k, weight(L + "k_norm.weight"), eps()); };
+        parts.v_norm = [this](Value v) { return graph_.rms_norm(v, eps()); };
         const Value inv_freq = kind == AttnKind::Full ? inv_freq_full_ : inv_freq_sliding_;
-
-        Value q = g.reshape(g.matmul(x, weight(L + "q_proj.weight")), {kT, cfg_.num_heads, hd});
-        q = g.rope(g.rms_norm(q, weight(L + "q_norm.weight"), eps()), pos, inv_freq);
-
-        std::pair<Value, Value> kv;
+        const std::pair<Value, Value>* shared = nullptr;
         if (cfg_.is_kv_shared(i)) {
-            kv = layer_kv_[static_cast<size_t>(cfg_.kv_source_layer(i))];
-            XS_CHECK(kv.first.valid(), "gemma4: layer ", i, " shares the KV of a layer that has none");
-        } else {
-            Value k = g.reshape(g.matmul(x, weight(L + "k_proj.weight")), {kT, cfg_.num_kv_heads, hd});
-            k = g.rope(g.rms_norm(k, weight(L + "k_norm.weight"), eps()), pos, inv_freq);
-            Value v = g.reshape(g.matmul(x, weight(L + "v_proj.weight")), {kT, cfg_.num_kv_heads, hd});
-            v = g.rms_norm(v, eps());
-            const int64_t window = kind == AttnKind::Sliding ? cfg_.sliding_window : 0;
-            const int slot = g.add_kv_slot(cfg_.num_kv_heads, hd, window, "layers." + std::to_string(i));
-            kv = g.kv_cache(slot, k, v);
-            layer_kv_[static_cast<size_t>(i)] = kv;
+            shared = &layer_kv_[static_cast<size_t>(cfg_.kv_source_layer(i))];
+            XS_CHECK(shared->first.valid(), "gemma4: layer ", i, " shares the KV of a layer that has none");
         }
-
-        graph::AttentionAttrs attrs;
-        attrs.scale = 1.0f;  // q_norm / k_norm carry the scale
-        attrs.sliding_window = kind == AttnKind::Sliding ? cfg_.sliding_window : 0;
-        const Value o = g.attention(q, kv.first, kv.second, attrs);
-        return g.matmul(g.reshape(o, {kT, cfg_.num_heads * hd}), weight(L + "o_proj.weight"));
+        const blocks::AttentionOut r = blocks::attention(graph_, spec, parts, x, pos, inv_freq, shared);
+        if (shared == nullptr) layer_kv_[static_cast<size_t>(i)] = r.kv;
+        return r.out;
     }
 
     Config cfg_;

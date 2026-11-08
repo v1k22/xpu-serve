@@ -9,6 +9,7 @@
 #include <fstream>
 
 #include "models/config_util.h"
+#include "models/common/blocks.h"
 #include "models/gemma4/gemma4.h"
 #include "util/error.h"
 #include "util/half.h"
@@ -182,13 +183,8 @@ private:
         }
 
         // Axial RoPE: the head dim splits into an x half and a y half, each rotated with head_dim / 4 frequencies.
-        const int64_t pairs = vc_.head_dim / 4;
-        HostTensor inv_freq(DType::F32, {pairs});
-        for (int64_t i = 0; i < pairs; ++i) {
-            inv_freq.data<float>()[i] = static_cast<float>(
-                1.0 / std::pow(vc_.rope_theta, static_cast<double>(2 * i) / static_cast<double>(vc_.head_dim / 2)));
-        }
-        const Value freq = g.constant(std::move(inv_freq));
+        const Value freq =
+            g.constant(blocks::rope_inv_freq(vc_.rope_theta, vc_.head_dim / 2, vc_.head_dim / 4, vc_.head_dim / 4));
 
         for (int64_t i = 0; i < vc_.num_layers; ++i) h = encoder_layer(i, h, patch_pos, freq);
 
@@ -208,22 +204,31 @@ private:
         Graph::Scope s(g, "vision.layers." + std::to_string(i));
         const int64_t hd = vc_.head_dim;
 
+        const auto lin = [this](const std::string& name) {
+            return blocks::Linear([this, name](Value v) { return linear(v, name); });
+        };
         Value x = g.rms_norm(h, weight(L + "input_layernorm.weight"), eps());
-        Value q = g.reshape(linear(x, L + "self_attn.q_proj"), {kT, vc_.num_heads, hd});
-        q = g.rope(g.rms_norm(q, weight(L + "self_attn.q_norm.weight"), eps()), patch_pos, freq);
-        Value k = g.reshape(linear(x, L + "self_attn.k_proj"), {kT, vc_.num_kv_heads, hd});
-        k = g.rope(g.rms_norm(k, weight(L + "self_attn.k_norm.weight"), eps()), patch_pos, freq);
-        const Value v = g.rms_norm(g.reshape(linear(x, L + "self_attn.v_proj"), {kT, vc_.num_kv_heads, hd}), eps());
-        graph::AttentionAttrs attrs;
-        attrs.causal = false;
-        attrs.scale = 1.0f;  // q_norm / k_norm carry the scale
-        const Value o = g.attention(q, k, v, attrs);
-        x = linear(g.reshape(o, {kT, vc_.num_heads * hd}), L + "self_attn.o_proj");
+        blocks::AttentionSpec spec;
+        spec.heads = vc_.num_heads;
+        spec.kv_heads = vc_.num_kv_heads;
+        spec.head_dim = hd;
+        spec.attrs.causal = false;
+        spec.attrs.scale = 1.0f;  // q_norm / k_norm carry the scale
+        spec.kv_cache = false;    // an encoder: every patch sees every patch of this image
+        blocks::AttentionParts parts;
+        parts.q = lin(L + "self_attn.q_proj");
+        parts.k = lin(L + "self_attn.k_proj");
+        parts.v = lin(L + "self_attn.v_proj");
+        parts.o = lin(L + "self_attn.o_proj");
+        parts.q_norm = [this, L](Value q) { return graph_.rms_norm(q, weight(L + "self_attn.q_norm.weight"), eps()); };
+        parts.k_norm = [this, L](Value k) { return graph_.rms_norm(k, weight(L + "self_attn.k_norm.weight"), eps()); };
+        parts.v_norm = [this](Value v) { return graph_.rms_norm(v, eps()); };
+        x = blocks::attention(g, spec, parts, x, patch_pos, freq).out;
         h = g.add(h, g.rms_norm(x, weight(L + "post_attention_layernorm.weight"), eps()));
 
         x = g.rms_norm(h, weight(L + "pre_feedforward_layernorm.weight"), eps());
-        x = g.mul(g.gelu_tanh(linear(x, L + "mlp.gate_proj")), linear(x, L + "mlp.up_proj"));
-        x = linear(x, L + "mlp.down_proj");
+        x = blocks::gated_mlp(g, x, lin(L + "mlp.gate_proj"), lin(L + "mlp.up_proj"), lin(L + "mlp.down_proj"),
+                              blocks::Act::GeluTanh);
         return g.add(h, g.rms_norm(x, weight(L + "post_feedforward_layernorm.weight"), eps()));
     }
 

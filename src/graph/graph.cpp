@@ -417,6 +417,53 @@ void Graph::validate() const {
     }
 }
 
+namespace {
+
+// The attributes of a node as text, and a checksum of a constant's bytes, so two dumps are equal only when the
+// graphs compute the same thing.
+std::string attrs_to_string(const Attrs& a) {
+    std::ostringstream os;
+    os.precision(9);
+    std::visit(
+        [&](const auto& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, ConstantAttrs>) {
+                uint64_t h = 1469598103934665603ull;
+                const auto* p = static_cast<const unsigned char*>(v.value.raw());
+                for (size_t i = 0; i < v.value.nbytes(); ++i) h = (h ^ p[i]) * 1099511628211ull;
+                os << "fnv=" << std::hex << h;
+            } else if constexpr (std::is_same_v<T, ScaleAttrs>) {
+                os << "factor=" << v.factor;
+            } else if constexpr (std::is_same_v<T, SoftcapAttrs>) {
+                os << "cap=" << v.cap;
+            } else if constexpr (std::is_same_v<T, ClampAttrs>) {
+                os << "lo=" << v.lo << " hi=" << v.hi;
+            } else if constexpr (std::is_same_v<T, RmsNormAttrs>) {
+                os << "eps=" << v.eps;
+            } else if constexpr (std::is_same_v<T, ReshapeAttrs>) {
+                os << "shape=" << shape_to_string(v.shape);
+            } else if constexpr (std::is_same_v<T, SliceAttrs>) {
+                os << "axis=" << v.axis << " begin=" << v.begin << " end=" << dim_to_string(v.end == kSliceEnd ? -3 : v.end);
+            } else if constexpr (std::is_same_v<T, TransposeAttrs>) {
+                os << "perm=";
+                for (const int p : v.perm) os << p << ',';
+            } else if constexpr (std::is_same_v<T, KvCacheAttrs>) {
+                os << "slot=" << v.slot;
+            } else if constexpr (std::is_same_v<T, RopeAttrs>) {
+                os << "rotary_dim=" << v.rotary_dim;
+            } else if constexpr (std::is_same_v<T, StateAttrs>) {
+                os << "slot=" << v.slot << " l2norm_eps=" << v.qk_l2norm_eps;
+            } else if constexpr (std::is_same_v<T, AttentionAttrs>) {
+                os << "scale=" << v.scale << " window=" << v.sliding_window << " softcap=" << v.softcap
+                   << " causal=" << v.causal;
+            }
+        },
+        a);
+    return os.str();
+}
+
+}  // namespace
+
 std::string Graph::dump() const {
     std::ostringstream os;
     for (size_t i = 0; i < nodes_.size(); ++i) {
@@ -426,12 +473,19 @@ std::string Graph::dump() const {
             os << (j ? ", " : "") << '%' << n.inputs[j].node;
             if (n.inputs[j].index) os << ':' << n.inputs[j].index;
         }
-        os << ") ->";
+        os << ')';
+        if (const std::string a = attrs_to_string(n.attrs); !a.empty()) os << " {" << a << '}';
+        os << " ->";
         for (const auto& t : n.outputs) os << ' ' << dtype_name(t.dtype) << shape_to_string(t.shape);
         if (!n.label.empty()) os << "  # " << n.label;
         os << '\n';
     }
     for (const auto& o : outputs_) os << "output " << o.name << " = %" << o.value.node << '\n';
+    for (const auto& s : kv_slots_)
+        os << "kv_slot " << s.label << " heads=" << s.num_kv_heads << " dim=" << s.head_dim << " window=" << s.sliding_window << '\n';
+    for (const auto& s : conv_slots_) os << "conv_slot " << s.label << " channels=" << s.channels << " kernel=" << s.kernel << '\n';
+    for (const auto& s : recurrent_slots_)
+        os << "recurrent_slot " << s.label << " heads=" << s.heads << " dims=" << s.key_dim << 'x' << s.value_dim << '\n';
     return os.str();
 }
 

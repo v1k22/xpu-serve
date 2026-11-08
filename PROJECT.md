@@ -84,7 +84,7 @@ area).
 | `convert/` | xs_core | `convert_model`: checkpoint -> pack; the model's own graph decides which weights to quantize |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
-| `models/` | xs_core | `model.h` (the `Model` interface), `registry.cpp` (model_type -> code), `config_util` (checked JSON readers), one folder per architecture |
+| `models/` | xs_core | `model.h` (the `Model` interface), `registry.cpp` (model_type -> code), `config_util` (checked JSON readers), `common/blocks` (the shared building blocks: gated MLPs, RMSNorm variants, RoPE frequencies, attention), one folder per architecture |
 | `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop), `Sampler`, request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses) |
 | `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `sycl/` |
 | `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
@@ -205,6 +205,8 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
    - `<arch>_model.cpp`: a class implementing `Model`. Build the graph once in the constructor with `graph::Graph`
      (inputs, weights by safetensors name, ops, `output("logits", ...)`), wrap layers in `Graph::Scope` for readable
      node names, and fill every graph input in `prepare_inputs`. The last-token logits output must be named `logits`.
+     Build layers from `models/common/blocks.h` (`attention`, `gated_mlp`, `rms_norm_one_plus`, `gated_rms_norm`,
+     `rope_inv_freq`): the model maps its weight names onto a block's projections and norms; the math lives once.
 3. Register the `model_type` in `src/models/registry.cpp` (`load_model` and `supported_model_types`).
 4. If the model needs an op the IR does not have, add the op first (8.2).
 5. Tests: a config test (`tests/unit/model/<arch>_config.cpp`) and a parity test against Hugging Face fp32 modeled

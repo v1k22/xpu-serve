@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstring>
 
+#include "models/common/blocks.h"
 #include "models/config_util.h"
 #include "models/qwen3_5/qwen3_5.h"
 #include "util/error.h"
@@ -70,9 +71,11 @@ private:
 
     // Qwen3_5RMSNorm is zero-centered: x * rsqrt(mean(x^2) + eps) * (1 + w).
     Value norm(Value x, const std::string& suffix) {
-        HostTensor scale = to_f32(w(suffix), weights_->get(w(suffix)));
-        for (int64_t i = 0; i < scale.numel(); ++i) scale.data<float>()[i] += 1.0f;
-        return graph_.rms_norm(x, graph_.constant(std::move(scale)), eps());
+        return blocks::rms_norm_one_plus(graph_, x, *weights_, w(suffix), eps());
+    }
+    // A projection whose weight node is made when the block uses it.
+    blocks::Linear proj(const std::string& suffix) {
+        return [this, suffix](Value x) { return graph_.matmul(x, weight(suffix)); };
     }
 
     void build_graph() {
@@ -82,12 +85,8 @@ private:
         const Value embed = weight("embed_tokens.weight");
         Value h = g.gather(embed, ids);
 
-        HostTensor inv_freq(DType::F32, {cfg_.rotary_dim / 2});
-        for (int64_t i = 0; i < cfg_.rotary_dim / 2; ++i) {
-            inv_freq.data<float>()[i] = static_cast<float>(
-                1.0 / std::pow(cfg_.rope_theta, static_cast<double>(2 * i) / static_cast<double>(cfg_.rotary_dim)));
-        }
-        inv_freq_ = g.constant(std::move(inv_freq));
+        inv_freq_ = g.constant(
+            blocks::rope_inv_freq(cfg_.rope_theta, cfg_.rotary_dim, cfg_.rotary_dim / 2, cfg_.rotary_dim / 2));
 
         for (int64_t i = 0; i < cfg_.num_layers; ++i) h = decoder_layer(i, h, pos);
 
@@ -109,8 +108,8 @@ private:
                                                                                            : full_attention(i, x, pos);
         h = g.add(h, mixed);
         const Value y = norm(h, L + "post_attention_layernorm.weight");
-        Value mlp = g.mul(g.silu(g.matmul(y, weight(L + "mlp.gate_proj.weight"))), g.matmul(y, weight(L + "mlp.up_proj.weight")));
-        return g.add(h, g.matmul(mlp, weight(L + "mlp.down_proj.weight")));
+        return g.add(h, blocks::gated_mlp(g, y, proj(L + "mlp.gate_proj.weight"), proj(L + "mlp.up_proj.weight"),
+                                          proj(L + "mlp.down_proj.weight"), blocks::Act::Silu));
     }
 
     // Qwen3_5GatedDeltaNet.
@@ -146,38 +145,30 @@ private:
 
         // Qwen3_5RMSNormGated: rms_norm(o) * w * silu(z), per value head.
         const Value z = g.reshape(g.matmul(x, weight(L + "in_proj_z.weight")), {kT, hv, dv});
-        o = g.mul(g.rms_norm(o, weight(L + "norm.weight"), eps()), g.silu(z));
+        o = blocks::gated_rms_norm(g, o, weight(L + "norm.weight"), z, eps());
         return g.matmul(g.reshape(o, {kT, value_width}), weight(L + "out_proj.weight"));
     }
 
     // Qwen3_5Attention: q_proj yields [query | gate] per head; the output is gated by sigmoid(gate).
     Value full_attention(int64_t i, Value x, Value pos) {
-        Graph& g = graph_;
-        Graph::Scope s(g, "self_attn");
+        Graph::Scope s(graph_, "self_attn");
         const std::string L = "layers." + std::to_string(i) + ".self_attn.";
-        const int64_t hd = cfg_.head_dim, hq = cfg_.num_heads, hkv = cfg_.num_kv_heads;
-
-        Value q = g.matmul(x, weight(L + "q_proj.weight"));
-        Value gate;
-        if (cfg_.attn_output_gate) {
-            const Value both = g.reshape(q, {kT, hq, 2 * hd});
-            q = g.slice(both, 2, 0, hd);
-            gate = g.reshape(g.slice(both, 2, hd, 2 * hd), {kT, hq * hd});
-        } else {
-            q = g.reshape(q, {kT, hq, hd});
-        }
-        q = g.rope(norm(q, L + "q_norm.weight"), pos, inv_freq_, cfg_.rotary_dim);
-        Value k = g.reshape(g.matmul(x, weight(L + "k_proj.weight")), {kT, hkv, hd});
-        k = g.rope(norm(k, L + "k_norm.weight"), pos, inv_freq_, cfg_.rotary_dim);
-        const Value v = g.reshape(g.matmul(x, weight(L + "v_proj.weight")), {kT, hkv, hd});
-
-        const int slot = g.add_kv_slot(hkv, hd, 0, "layers." + std::to_string(i));
-        const auto [k_all, v_all] = g.kv_cache(slot, k, v);
-        graph::AttentionAttrs attrs;
-        attrs.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(hd)));
-        Value o = g.reshape(g.attention(q, k_all, v_all, attrs), {kT, hq * hd});
-        if (gate.valid()) o = g.mul(o, g.sigmoid(gate));
-        return g.matmul(o, weight(L + "o_proj.weight"));
+        blocks::AttentionSpec spec;
+        spec.heads = cfg_.num_heads;
+        spec.kv_heads = cfg_.num_kv_heads;
+        spec.head_dim = cfg_.head_dim;
+        spec.attrs.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg_.head_dim)));
+        spec.rotary_dim = cfg_.rotary_dim;
+        spec.output_gate = cfg_.attn_output_gate;
+        spec.kv_label = "layers." + std::to_string(i);
+        blocks::AttentionParts parts;
+        parts.q = proj(L + "q_proj.weight");
+        parts.k = proj(L + "k_proj.weight");
+        parts.v = proj(L + "v_proj.weight");
+        parts.o = proj(L + "o_proj.weight");
+        parts.q_norm = [this, L](Value q) { return norm(q, L + "q_norm.weight"); };
+        parts.k_norm = [this, L](Value k) { return norm(k, L + "k_norm.weight"); };
+        return blocks::attention(graph_, spec, parts, x, pos, inv_freq_).out;
     }
 
     Config cfg_;
