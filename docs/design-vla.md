@@ -482,12 +482,18 @@ f16, Intel Panther Lake (Arc B390 iGPU), steady state after warm-up (`xpu-serve 
 | f16 GEMM inputs written by their producers; norm + shift and gated-residual fusions; no attention unpack with one KV head | 380.3 ms | | 227.1 ms | 1.1e-3 / 5.7e-4 |
 | Attention operands in f16 (projections and RoPE write f16; the attention GEMMs run on the matrix engines instead of in f32) | 343.1 ms | | 213.7 ms | 5.4e-4 / 5.8e-4 |
 | GeGLU gate / up in f16; bias folded into GELU and into residual adds; SigLIP attention batched across cameras | 326.3 ms | 253.5 ms | 202.8 ms | 1.8e-3 / 7.5e-4 |
+| Fused flash attention on the matrix engines (head_dim up to 128: SigLIP); Concat as one copy kernel | 311.9 ms | 244.8 ms | 196.8 ms | parity gates green |
 
-Where the time goes now (per-op profile, ops run one at a time): the prefix MLP GEMMs (~90 ms at 30 to 40 TFLOPS),
-the expert's GEMMs (~83 ms, near their bandwidth floor of ~56 ms), attention (~60 ms across SigLIP, the prefix and
-the expert, mostly GEMM-path overhead) and the remaining elementwise passes. Next steps in order of expected gain: a
-fused attention kernel for the three shapes, the expert's K / V written in place instead of concatenated per step,
-gate and up projections in one GEMM, then record / replay of the whole program.
+Where the time goes now (per-op profile, ops run one at a time, which overstates small ops): the prefix MLP GEMMs
+(~85 ms: gate / up near 50 TFLOPS, down near 30), the expert's GEMMs (~80 ms; they re-read ~620 MB of f16 weights
+per flow step, a memory floor near 60 ms), attention (~45 ms: SigLIP 7 ms in the fused kernel, the prefix and the
+expert on oneMKL GEMMs) and the remaining elementwise passes.
+
+The fused attention kernel keeps scores in registers and reads K and V tiles with 2D block loads. At head_dim 256
+(the prefix and the expert) a sub-group's accumulators for 8 query rows fill its registers, so each K / V tile it
+loads feeds one matrix instruction: load-bound, it only matched oneMKL end to end, and those shapes stay on GEMMs.
+Next steps: a device-timestamp profile, the down projection's GEMM, the expert's K / V in place, gate and up in one
+GEMM, record / replay of the program; int8 weights for the expert as an opt-in setting (lossy) would halve its floor.
 
 Missing cameras cost nothing: the program for a camera subset contains only those cameras, and its result equals
 LeRobot's padded, masked cameras (the 1-camera parity case checks it).

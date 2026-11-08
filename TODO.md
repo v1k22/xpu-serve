@@ -251,8 +251,17 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
 - [x] Policy kind: `models/policy.h`, `model_kind`, `load_policy`; `src/policy/` runtime (programs per camera subset
       and flow steps, warm-up, timings); `xpu-serve bench <policy-dir>`
 - [x] π0.5 (`lerobot/pi05_base`): parity with LeRobot f32 (cpu-ref 5e-6, Arc B390 f16 1e-3), 1 / 2 / 3 cameras
-- [ ] π0.5 latency: fused attention for the three shapes, in-place expert K/V, SigLIP attention across cameras, gate
-      and up in one GEMM, bias adds folded into consumers, record / replay of the program
+- [x] π0.5 latency, first pass: f16 operands, fusions, SigLIP batched across cameras, fused flash attention (XMX) up
+      to head_dim 128, Concat as one kernel (Arc B390, 3 cameras: 428.5 -> 311.9 ms; docs/design-vla.md §6)
+- [ ] π0.5 latency, next: device-timestamp profile (the per-op sync profile overstates small ops), the prefix down
+      projection's GEMM (~30 TFLOPS against ~50 for gate / up), in-place expert K/V, gate and up in one GEMM,
+      record / replay of the program
+- [ ] π0.5 int8 weights (opt-in, lossy): the action expert re-reads ~620 MB of f16 weights per flow step (~60 ms of
+      a 3-camera call at the memory floor); int8 halves it. Needs a GEMM that dequantizes in registers (50 rows)
+- [ ] Flash attention at head_dim 256 (Gemma): 8 rows per sub-group fill the registers, so every K/V tile feeds one
+      DPAS and oneMKL's GEMMs match it; needs K/V or P shared across sub-groups through local memory
+- [ ] Low precision on Panther Lake: the B390 compiles fp8 (E4M3 / E5M2) DPAS but returns wrong results; int8 DPAS is
+      exact at ~122 TOPS (2x f16). A w8a8 path is the low-precision option there (lossy, opt-in)
 - [ ] Normalization statistics (quantiles, mean/std) and resize-with-pad for other image sizes
 - [ ] Policy service and API: `/v1/policy/info`, `/v1/policy/act` (JSON + msgpack), latest-wins queue, `/ready` after
       warm-up; then the openpi-compatible WebSocket; RTC (previous chunk + delay)
