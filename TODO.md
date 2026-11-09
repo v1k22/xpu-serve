@@ -141,13 +141,20 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ## Phase 3: Speculative decoding
 
-- [ ] `engine/spec/`: drafter interface, verify step (k+1 positions), greedy acceptance, rejection sampling, KV rollback
+- [x] `engine/spec/` + `Engine::spec_round`: verify of k+1 positions, greedy acceptance, rejection sampling, rollback
+      of KV and of conv / recurrent state (`Session::truncate` inside a step of `rewind_tokens`), sessions of several
+      programs sharing weights and slots, `KvRead` (docs/design-spec-decode.md)
+- [x] Qwen3.5-family MTP head (`mtp.*`, dense and MoE) as the drafter; `convert` quantizes it
 - [ ] Prompt lookup (n-gram) drafter
-- [ ] Gemma 4 MTP assistant (`google/gemma-4-26B-A4B-it-assistant`): convert with `--with-drafter`, shared target KV,
-      centroid LM head (`models/gemma4/drafter.cpp`)
+- [x] Gemma 4 assistants (E2B and 26B-A4B, `--drafter <dir>`): query-only layers over the target's KV, centroid
+      LM head; drafts equal transformers' after every parity prompt (E2B)
+- [ ] Pack an assistant with its target (`convert --with-drafter` → `drafters/mtp/`), the assistant at q8
 - [ ] DFlash drafter (chain): hidden-state capture outputs from chosen target layers; drafter program
 - [ ] Adaptive k from measured acceptance and per-k step cost (MoE verify cost)
-- [ ] Spec equivalence tests: greedy spec on vs off (near-tie rule, DESIGN.md 10.4); sampling distribution test
+- [x] Spec equivalence tests: greedy spec on vs off on a stateful tiny model with a partly wrong drafter; the real
+      models' greedy output; rejection sampling's distribution
+- [ ] Verify cost at 2 to 5 rows (Qwen3.8: 48 / 52 / 62 ms at T = 2 / 3 / 4 vs 45 at T = 1) and MoE verify reading
+      each expert once; fewer host round trips per round (E2B is bound by them)
 - [ ] Spec stats in logs and `/metrics`
 - [ ] Bench at 32k / 64k on B390 and B60 vs the GenAI baseline with the same drafter
 - **Done when:** equivalence tests pass and decode tok/s at 32k/64k beats the GenAI baseline with the same drafter.
@@ -236,7 +243,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Qwen3.5 MoE (`qwen3_5_moe`): HF parity on a tiny random checkpoint (cpu-ref exact, SYCL f16 / f32); q8 / q4
       expert banks in packs (routers stay unquantized); SYCL expert kernels: one GEMV per (token, expert) for few
       pairs, pairs grouped by expert on the device for prefill
-- [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; vision tower; MTP head; per-expert
+- [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; vision tower; per-expert
       checkpoint layout (`experts.<e>.gate_proj`)
 - [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
 - [ ] Llama 3
@@ -262,11 +269,11 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 
 | # | Model | Hugging Face ID | Notes |
 |---|---|---|---|
-| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | Dense `qwen3_5`. **Runs** (text): tiny-checkpoint HF parity with its ratios (cosine 1, greedy exact on cpu-ref and SYCL); q4 g32 pack 19.2 GB (16.2 GiB on device) on one Arc Pro B60: decode 22 tok/s, prefill 831 tok/s at 512 tokens and 945 at 4,096 (1,058 with --prefill-chunk 4096; 630 / 763 before the 2026-11-09 prefill work), MMLU-Pro 76 % (25 q; 3 answers hit the 4,096-token cap); q4 g64: 23.8 tok/s. Arc B390: decode 6.8 tok/s, prefill 460 tok/s at 512 tokens (307 before), 270 to 385 at 4,096 (noisy, run to run). q4 (RTN) vs HF fp32 last-token cosine 0.67 to 0.99, as Qwen3.5-4B's q4 (0.87 to 0.99). Against OpenVINO 2026.4.1 GenAI (optimum-intel int4: asymmetric, group 128, int8 head; `llm_bench`, no MTP, prefix cache off), our q4 at the same group size decodes 24.9 vs 23.4 tok/s on the B60 (24.1 vs 23.0 at 4k) and 7.6 vs 7.65 on the B390; OpenVINO prefills 1.5x faster on the B60 at 512 tokens (1,255 vs 831 tok/s; with its int8 activations: 1,086 with f16 activations, as ours) and 1.3x at 4,096 (1,251 vs 945), 1.6x on the B390 at 512. To do: prefill (below), AWQ, vision, MTP |
-| 2 | Qwen3.6-35B-A3B (preferred) | `Qwen/Qwen3.6-35B-A3B` | MoE (3B active). **Runs** (text): tiny-model HF parity; q4 g64 pack 18.9 GiB on one Arc Pro B60, decode ~58 tok/s, prefill ~1,250 tok/s, MMLU-Pro 84 % (25 q). To do: Panther Lake, AWQ, vision, MTP |
+| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | Dense `qwen3_5`. **Runs** (text): tiny-checkpoint HF parity with its ratios (cosine 1, greedy exact on cpu-ref and SYCL); q4 g32 pack 19.2 GB (16.2 GiB on device) on one Arc Pro B60: decode 22 tok/s, prefill 831 tok/s at 512 tokens and 945 at 4,096 (1,058 with --prefill-chunk 4096; 630 / 763 before the 2026-11-09 prefill work), MMLU-Pro 76 % (25 q; 3 answers hit the 4,096-token cap); q4 g64: 23.8 tok/s; with its MTP head (`--spec mtp --spec-k 2`): 39.6 tok/s over six chat prompts (2.47 tokens per verify). Arc B390: decode 6.8 tok/s, prefill 460 tok/s at 512 tokens (307 before), 270 to 385 at 4,096 (noisy, run to run). q4 (RTN) vs HF fp32 last-token cosine 0.67 to 0.99, as Qwen3.5-4B's q4 (0.87 to 0.99). Against OpenVINO 2026.4.1 GenAI (optimum-intel int4: asymmetric, group 128, int8 head; `llm_bench`, no MTP, prefix cache off), our q4 at the same group size decodes 24.9 vs 23.4 tok/s on the B60 (24.1 vs 23.0 at 4k) and 7.6 vs 7.65 on the B390; OpenVINO prefills 1.5x faster on the B60 at 512 tokens (1,255 vs 831 tok/s; with its int8 activations: 1,086 with f16 activations, as ours) and 1.3x at 4,096 (1,251 vs 945), 1.6x on the B390 at 512. To do: prefill (below), AWQ, vision |
+| 2 | Qwen3.6-35B-A3B (preferred) | `Qwen/Qwen3.6-35B-A3B` | MoE (3B active). **Runs** (text): tiny-model HF parity; q4 g64 pack 18.9 GiB on one Arc Pro B60, decode ~58 tok/s, prefill ~1,250 tok/s, MMLU-Pro 84 % (25 q); with its MTP head: 85.6 tok/s at k = 2 (59.9 without). To do: Panther Lake, AWQ, vision |
 | | Qwen3.5-35B-A3B (older) | `Qwen/Qwen3.5-35B-A3B` | MoE; the Qwen3.5 Gated DeltaNet hybrid |
 | 3 | Gemma 4 31B | `google/gemma-4-31B-it` | vision tower uses `standardize` |
-| 4 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` | MoE (4B active) |
+| 4 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` | MoE (4B active). **Runs** (text): tiny-checkpoint HF parity of its layout (experts beside the MLP with per-expert scales, K = V global layers with 2 KV heads; cosine 1 on cpu-ref and SYCL f32); q4 g32 pack 17.3 GB on one Arc Pro B60: decode 65.6 tok/s, 84.2 with its assistant at k = 2. q4 vs HF fp32 last-token cosine 0.95 to 0.9997. To do: images (bidirectional attention over image tokens), AWQ |
 | 5 | Nemotron 3.5 Lightning (30B-A3B) | `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16` | MoE (3B active) |
 | | Nemotron 3.5 Super (120B-A12B, larger) | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16` | MoE + vision; int4 and two GPUs |
 | 6 | Muse Glimmer 30B | `meta-models/Muse-Glimmer-30B` | |

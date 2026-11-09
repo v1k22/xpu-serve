@@ -11,24 +11,26 @@ live here, and the math runs on Intel GPUs through our SYCL backend (our own ker
 
 **Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8) and a robot policy (π0.5), from the original
 checkpoint or a q8 / q4 pack written by `xpu-serve convert`, one request at a time, on Intel GPUs through the SYCL
-backend. [CLAUDE.md](CLAUDE.md) maps the code.
+backend; speculative decoding with each model's drafter (Qwen's MTP head, Gemma 4's assistant checkpoints). [CLAUDE.md](CLAUDE.md) maps the code.
 
 ## Supported models
 
 | Model | Kind | Weights | Speed | Measured on |
 |---|---|---|---|---|
-| Gemma 4 E2B / E4B | language, images | f16, q8, q4 | 61.5 / 92 tok/s decode (f16 / q8) | Arc Pro B60 |
+| Gemma 4 E2B / E4B | language, images | f16, q8, q4 | 61.5 / 92 tok/s decode (f16 / q8); q4: 127, 165 with its assistant | Arc Pro B60 |
+| Gemma 4 26B-A4B | language, MoE | q4 | 66 tok/s decode, 84 with its assistant | Arc Pro B60 |
 | Qwen3.5 4B | language | f16, q8, q4 | 42 / 71 tok/s decode (f16 / q8) | Arc Pro B60 |
-| Qwen3.6-35B-A3B | language, MoE | q4 | 59 tok/s decode, 1,550 tok/s prefill | Arc Pro B60 |
-| Qwen3.8-27B | language | q4 | 22 tok/s decode, 830 tok/s prefill; 6.8 / 460 on Arc B390 | Arc Pro B60, Arc B390 |
+| Qwen3.6-35B-A3B | language, MoE | q4 | 60 tok/s decode, 86 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
+| Qwen3.8-27B | language | q4 | 22 tok/s decode, 40 with MTP; 830 tok/s prefill; 6.8 / 460 on Arc B390 | Arc Pro B60, Arc B390 |
 | π0.5 | robot policy | f16, q8 | 239 / 225 ms per call (f16 / q8) | Arc B390, 3 cameras |
 
 | Model | Checkpoint (`model_type`) | Checked against |
 |---|---|---|
-| Gemma 4 E2B / E4B | `google/gemma-4-E2B-it` (`gemma4`) | Hugging Face fp32 logits, greedy text, image features |
+| Gemma 4 E2B / E4B | `google/gemma-4-E2B-it` (`gemma4`) | Hugging Face fp32 logits, greedy text, image features; its assistant's drafts |
+| Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` (`gemma4`) | tiny-checkpoint parity of its layout (experts beside the MLP, K = V global layers) |
 | Qwen3.5 4B | `Qwen/Qwen3.5-4B` (`qwen3_5`) | Hugging Face fp32 logits, greedy text |
 | Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B` (`qwen3_5_moe`) | tiny-checkpoint parity; MMLU-Pro (25 questions): 84 % |
-| Qwen3.8-27B | `Qwen/Qwen3.8-27B` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE); MMLU-Pro (25 questions): 76 % |
+| Qwen3.8-27B | `Qwen/Qwen3.8-27B` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE, its MTP head); MMLU-Pro (25 questions): 76 % |
 | π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 2e-3 (GPU f16) |
 
 Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card; π0.5 maps camera images, the
@@ -63,6 +65,18 @@ build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU     # chat in the
 build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --image photo.jpg --prompt "What is in this picture?"
 build/src/xpu-serve serve ~/models/gemma-4-E2B-it --device GPU     # http://127.0.0.1:8080/v1
 build/src/xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1024 --gen-tokens 128
+```
+
+Speculative decoding (`--spec mtp` on `run`, `serve` and `bench`) drafts with the model's own drafter and verifies
+the drafts in one step; greedy output stays the model's own and sampling keeps its distribution (rejection
+sampling). Qwen3.5-family checkpoints carry an MTP head; a Gemma 4 model takes its assistant checkpoint with
+`--drafter`. `--spec-k` sets the drafts per round (2 is the best on the models measured,
+[docs/design-spec-decode.md](docs/design-spec-decode.md)); `bench --prompts file` measures over real prompts, since
+acceptance depends on the text:
+
+```bash
+build/src/xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 2
+build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 --drafter ~/models/gemma-4-E2B-it-assistant
 ```
 
 The server speaks the OpenAI API (`/v1/chat/completions` with streaming, tool calls and images, `/v1/completions`,

@@ -137,33 +137,41 @@ checkpoint of its layout (`make_tiny.py --arch gemma4_moe`).
   the three chained drafts after each prompt.
 - Real models: greedy output with speculation equals output without (`run`, then the bench prompts).
 
-## 6. Expected speed (Arc Pro B60, batch 1)
+## 6. Measured speed (Arc Pro B60, batch 1)
 
-A round costs k drafter steps plus one verify of k + 1 tokens plus about 2 ms (the per-token states, the logits of
-k + 1 rows to the host). Measured today, a step of T tokens at the start of a sequence (the verify's kernels):
+Greedy decode over the six prompts of section 2 (chat template, thinking off, up to 256 new tokens each, stopping at
+the end of the turn), `xpu-serve bench <pack> --prompts <file> --spec off|mtp --spec-k k`; decode tok/s counts the
+tokens after the first. q4 packs (g32, round to nearest; the MTP heads quantized like the target); the Gemma
+assistants run from their bf16 checkpoints.
 
-| Pack | T = 1 (decode) | T = 2 | T = 3 | T = 4 | T = 5 | T = 8 |
+| Model | spec off | k = 1 | k = 2 | k = 3 | k = 4 | best |
 |---|---|---|---|---|---|---|
-| Qwen3.8-27B q4 | 44.8 ms | 60.2 | 54.9 | 61.8 | 68.6 | 104 |
-| Qwen3.6-35B-A3B q4 | 16.2 | 20.2 | 21.0 | 23.3 | 38.4 | 48.8 |
-| Gemma 4 E2B q4 | 7.1 | 7.1 | 7.1 | 9.9 | 8.1 | 10.6 |
+| Qwen3.8-27B | 22.2 | 35.0 (1.85) | **39.6** (2.47) | 37.5 (2.92) | 35.8 (3.21) | 1.78x |
+| Qwen3.6-35B-A3B | 59.9 | 80.6 (1.84) | **85.6** (2.44) | 83.5 (2.82) | 64.9 (3.06) | 1.43x |
+| Gemma 4 E2B + assistant | 127.3 | **164.5** (1.65) | 144.5 (2.02) | 147.2 (2.27) | 132.4 (2.40) | 1.29x |
+| Gemma 4 26B-A4B + assistant | 65.6 | 81.7 (1.81) | **84.2** (2.41) | 79.2 (2.86) | 61.0 (3.20) | 1.28x |
 
-| Model | drafter step | best k | estimated decode with MTP | today | speed-up |
-|---|---|---|---|---|---|
-| Qwen3.8-27B | ~2.3 ms (layer 0.6, `lm_head` 1.6) | 2 to 3 | ~40 tok/s | 22.3 | ~1.8x |
-| Qwen3.6-35B-A3B | ~1.0 ms | 3 | ~100 tok/s | ~60 | ~1.7x |
-| Gemma 4 E2B | ~0.3 ms | 2 | ~240 tok/s | ~140 | ~1.7x (projected from its 7.1 ms decode step) |
-| Gemma 4 26B-A4B | ~0.5 ms | 3 | (after enablement) | | |
+tok/s, with tokens per verify in parentheses; they follow the references of section 2. Greedy output with k = 2
+equals plain decoding prompt by prompt on Qwen3.8, Qwen3.6 and E2B (6 of 6 each) and on 5 of 6 for 26B-A4B: its story
+diverges after 673 of 902 bytes ("It wasn't painting a perfect circle" / "It wasn't a perfect circle"), the kind of
+near tie a wider verify (another kernel path at f16) can flip (DESIGN.md 10.4; the margin was not measured).
 
-The verify is where the headroom is: a Qwen3.8 verify of 4 tokens reads the same weights as a decode step but costs
-1.38 times as much, because the quantized GEMV for 2 to 5 rows streams the weight less efficiently than for 1. Making
-it cost what one row costs takes Qwen3.8 at k = 3 to about 51 tok/s (2.3x). The Qwen3.6 jump at 5 tokens is its expert
-path switching from one GEMV per (token, expert) to grouping.
+Where the time goes, and what would move it:
 
-## 7. Order of work
+- A verify of T tokens costs more than a decode step. Qwen3.8 at T = 1 / 2 / 3 / 4: 44.8 / 48.2 / 52.4 / 61.9 ms (the
+  q4 GEMV re-tuned for 2 and 3 rows took T = 2 from 60.2 ms). A verify as cheap as a decode step would take Qwen3.8
+  at k = 3 to about 50 tok/s.
+- MoE targets (Qwen3.6, 26B-A4B): a verify of k + 1 tokens reads the union of their experts, so it grows faster with
+  k than a dense model's; past 4 (token, expert) pairs per expert bank the expert path also changes kernels. Best k
+  is 2.
+- Drafter steps: Qwen3.8's MTP step is about 2.5 ms (its lm_head over 248k tokens alone 1.8 ms). The E2B target's
+  step is short (about 7 ms), so its rounds are bound by per-program host overhead (several programs per round, each
+  waiting for its outputs); k = 1 is best there.
+- Adaptive k (DESIGN.md 10.1) is not done: `--spec-k` is fixed, 2 is the best default on these four.
 
-1. Backend: programs with shared weights and slots, `rollback`, `KvRead` (+ op tests).
-2. Qwen3.8-27B: MTP head, verify program, the engine loop, flags; equivalence and bench.
-3. Qwen3.6-35B-A3B: the MoE head, and expert grouping at verify width (each expert read once per verify).
-4. Gemma 4 E2B with its assistant.
-5. Gemma 4 26B-A4B: model enablement, then its assistant.
+## 7. Next
+
+- Verify cost at 2 to 5 rows (a DPAS path for the quantized matmuls at few rows); MoE verify that reads each expert
+  once per verify.
+- Fewer host round trips per round (the drafter's chained steps without waiting for each output).
+- Adaptive k; packing a Gemma assistant with its target (`convert --with-drafter`); the assistant at q8.
