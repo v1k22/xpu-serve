@@ -24,8 +24,9 @@ How that works:
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
 Status (see TODO.md): Gemma 4 E2B/E4B (text and images) and the Qwen3.5 family (Qwen3.5, Qwen3.6, Qwen3.8; text; a
-hybrid of Gated DeltaNet linear attention and full attention, dense or mixture of experts), served end to end on the SYCL backend (Arc Pro B60),
-matching Hugging Face fp32 logits and greedy output; q8 / q4 packs from `convert`. One sequence at a time.
+hybrid of Gated DeltaNet linear attention and full attention, dense or mixture of experts), served end to end on the
+SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs from `convert`. One
+sequence at a time.
 
 ## 2. Build, run, test
 

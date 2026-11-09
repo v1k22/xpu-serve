@@ -164,7 +164,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       decoded from its bits (no int-to-float conversion), two rows per sub-group at M = 1; quantized matmuls that
       read the same x run as one launch (gate + up, q + k + v); float GEMVs under 512 rows split K
 - [ ] Prefill without the f16 copy of each weight (a large-M GEMM that dequantizes in registers; on Qwen3.8-27B q4
-      writing the copies is about 150 ms of an 815 ms 512-token prefill on the B60)
+      writing the copies is about 150 ms of an 815 ms 512-token prefill on the B60). The bar: OpenVINO GenAI prefills
+      Qwen3.8-27B int4 at 1,250 tok/s on the B60 (ours 634 at 512 tokens, 763 at 4k)
 - [x] MoE expert matmuls over q8 / q4 banks: one GEMV per (token, expert) up to 32 pairs (decode), pairs grouped by
       expert up to 256, grouped oneMKL GEMMs on dequantized banks beyond (prefill)
 - [ ] MoE prefill without the f16 copy of each expert bank (a GEMM that dequantizes in registers); the expert union
@@ -242,7 +243,7 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 
 | # | Model | Hugging Face ID | Notes |
 |---|---|---|---|
-| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | Dense `qwen3_5`. **Runs** (text): tiny-checkpoint HF parity with its ratios (cosine 1, greedy exact on cpu-ref and SYCL); q4 g32 pack 19.2 GB (16.2 GiB on device) on one Arc Pro B60: decode 21.9 tok/s, prefill 630 tok/s (512 tokens), MMLU-Pro 76 % (25 q; 3 answers hit the 4,096-token cap); q4 g64: 23.8 tok/s. Arc B390: decode 6.7 tok/s, prefill 307 / 370 tok/s (512 / 4,096). q4 (RTN) vs HF fp32 last-token cosine 0.67 to 0.99, as Qwen3.5-4B's q4 (0.87 to 0.99). To do: AWQ, vision, MTP |
+| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | Dense `qwen3_5`. **Runs** (text): tiny-checkpoint HF parity with its ratios (cosine 1, greedy exact on cpu-ref and SYCL); q4 g32 pack 19.2 GB (16.2 GiB on device) on one Arc Pro B60: decode 21.9 tok/s, prefill 630 tok/s (512 tokens), MMLU-Pro 76 % (25 q; 3 answers hit the 4,096-token cap); q4 g64: 23.8 tok/s. Arc B390: decode 6.7 tok/s, prefill 307 / 370 tok/s (512 / 4,096). q4 (RTN) vs HF fp32 last-token cosine 0.67 to 0.99, as Qwen3.5-4B's q4 (0.87 to 0.99). Against OpenVINO 2026.4.1 GenAI (optimum-intel int4: asymmetric, group 128, int8 head; `llm_bench`, no MTP, prefix cache off), our q4 at the same group size decodes 24.9 vs 23.4 tok/s on the B60 (24.1 vs 23.0 at 4k) and 7.6 vs 7.65 on the B390; OpenVINO prefills 2.0x faster on the B60 (1,255 vs 634 tok/s at 512 tokens) and 2.4x on the B390. To do: prefill (below), AWQ, vision, MTP |
 | 2 | Qwen3.6-35B-A3B (preferred) | `Qwen/Qwen3.6-35B-A3B` | MoE (3B active). **Runs** (text): tiny-model HF parity; q4 g64 pack 18.9 GiB on one Arc Pro B60, decode ~58 tok/s, prefill ~1,250 tok/s, MMLU-Pro 84 % (25 q). To do: Panther Lake, AWQ, vision, MTP |
 | | Qwen3.5-35B-A3B (older) | `Qwen/Qwen3.5-35B-A3B` | MoE; the Qwen3.5 Gated DeltaNet hybrid |
 | 3 | Gemma 4 31B | `google/gemma-4-31B-it` | vision tower uses `standardize` |
