@@ -259,8 +259,10 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
       conversion kernels gone, -2 ms), the expert's K / V concats read in place by the attention GEMMs (about even:
       the copies were cached, the GEMMs doubled). q8 action expert 231 -> 225 ms, f16 244 -> 239 ms
 - [ ] π0.5 latency, next: the prefix down projection's GEMM (~30 TFLOPS against ~50 for gate / up; oneMKL split-K
-      is slower), gate and up in one GEMM with the activation, the expert's gated residual in quant_gemm's epilogue,
-      record / replay of the program (small kernels cost ~2 us each; ~400 per flow step)
+      is slower) and the expert's q8 matmuls at 50 rows (~5.4 of each 7.3 ms flow step). Tried and dropped: gate and
+      up in one quant_gemm with the activation, and the gated residual in its epilogue (720 kernels fewer per call,
+      within noise: the Arc B390 pipelines small kernels, under 1 us each unprofiled; XS_SYCL_PROFILE's barriers make
+      them look 10x dearer)
 - [x] Generic weight quantization by a graph rule (`convert --scope bandwidth|all`): weights of matmuls with a
       step-dependent row count or at most 64 rows per call; policies convert too. π0.5 q8 (the rule picks the action
       expert): 245 -> 231 ms at 3 cameras on Arc B390, actions cosine 0.99999; q4 misses the 0.999 gate
