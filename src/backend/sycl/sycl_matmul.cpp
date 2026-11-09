@@ -90,13 +90,10 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantW
         return;
     }
     if (!f32 && use_quant_gemm && m <= kQuantGemmMaxRows) {
-        const int64_t split = quant_gemm_split(n, k, compute_units);
-        const size_t x_bytes = align_up(static_cast<size_t>(m * k) * sizeof(half));
-        auto* base = static_cast<char*>(scratch.get(x_bytes + static_cast<size_t>(split * m * n) * sizeof(float)));
-        auto* xh = reinterpret_cast<half*>(base);
+        auto* xh = static_cast<half*>(scratch.get(static_cast<size_t>(m * k) * sizeof(half)));
         if (quant_gemm_fits(m, n, k, w, xh)) {
             to_half(q, x, xh, m * k);
-            quant_gemm(q, xh, w, y, split > 1 ? reinterpret_cast<float*>(base + x_bytes) : nullptr, m, n, k, split);
+            quant_gemm(q, xh, w, y, m, n, k, quant_gemm_slices(n, k, compute_units));
             return;
         }
     }

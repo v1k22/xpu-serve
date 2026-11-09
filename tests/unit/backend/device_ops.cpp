@@ -2,6 +2,8 @@
 // XS_DEVICE_TEST_DEVICE at its precision.
 #include <doctest/doctest.h>
 
+#include <utility>
+
 #include "device_test_support.h"
 #include "reference_ops.h"
 #include "util/error.h"
@@ -56,8 +58,9 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
 
     TEST_CASE("matmul and gather on q8 / q4 pack weights against fp64 of the dequantized values") {
         test::TensorRng rng(41);
-        const int64_t n = 96;
-        const int64_t k = 512;
+        // K = 2048 lets quant_gemm split K between up to 8 sub-groups of a work-group
+        for (const auto& [n, k] : {std::pair<int64_t, int64_t>{96, 512}, std::pair<int64_t, int64_t>{64, 2048}}) {
+        CAPTURE(k);
         for (const DType format : {DType::Q8, DType::Q4}) {
             for (const int64_t group : {32, 128}) {
                 CAPTURE(dtype_name(format));
@@ -84,10 +87,11 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
                 }
                 Graph g;
                 g.output("out", g.gather(g.weight(w, "w"), g.input("ids", DType::I32, {kT})));
-                const HostTensor ids = HostTensor::from_vector(DType::I32, {4}, std::vector<int32_t>{5, 0, 95, 17});
+                const HostTensor ids = HostTensor::from_vector(DType::I32, {4}, std::vector<int32_t>{5, 0, 63, 17});
                 const Tensor64 expected = test::ref::gather(to_f64(w.tensor("w")), test::to_ints(ids));
                 CHECK(dev::close("gather_quant", run_out(g, w, {{"ids", ids}}), expected, {1e-6, 1e-6}));
             }
+        }
         }
     }
 

@@ -8,8 +8,9 @@
 // operand from registers: element access on A and B tiles loses the device.) A sub-group owns 32 output features: a
 // transposed 2D block load gives each lane 32 (q8) or 64 (q4) codes of its feature, and per 16 columns of K every
 // 8-row tile of x (one 2D block load, rows past M read as zero) multiplies both B registers.
-// When N gives too few sub-groups to keep the memory busy, K is split between work-groups and a second kernel adds
-// the partial sums.
+// A work-group owns 32 output features and splits K between its sub-groups, which add their accumulators in local
+// memory at the end: enough sub-groups to keep the memory busy without writing partial sums out (at 50 rows a split
+// between work-groups spent as long on them as on the weight).
 
 #include "backend/sycl/sycl_kernels.h"
 #include "util/error.h"
@@ -68,8 +69,6 @@ namespace {
 constexpr int kSg = 16;
 constexpr int kTm = 8;    // rows of x per tile
 constexpr int kTk = 16;   // K per DPAS
-constexpr int kNt = 2;    // 16-feature columns per sub-group (each lane: kNt output features)
-constexpr int kSgs = 4;   // sub-groups per work-group
 
 int64_t ceil_div(int64_t a, int64_t b) {
     return (a + b - 1) / b;
@@ -79,15 +78,42 @@ inline int pack_half2(half lo, half hi) {
     return static_cast<int>(sycl::bit_cast<uint32_t>(sycl::vec<half, 2>(lo, hi)));
 }
 
-template <bool Q4, int MT, typename Y>
+typedef _Float16 h2_v __attribute__((ext_vector_type(2)));
+
+// q8 codes to f16 two at a time: a code c < 1024 OR'ed under the exponent of 1024 (0x6400) is exactly the f16
+// 1024 + c, so one packed subtract recovers it and one packed multiply scales it: a few 32-bit operations per pair
+// instead of a conversion, a multiply and a repack per value. `pair` holds the codes in bits 0-9 and 16-25.
+inline int dequant_pair(uint32_t pair, _Float16 offset, h2_v scale) {
+    const h2_v c = __builtin_bit_cast(h2_v, pair | 0x64006400u) - h2_v{offset, offset};
+    return __builtin_bit_cast(int, c * scale);
+}
+
+
+template <bool Q4, int MT, bool AWQ, typename Y>
 struct QuantGemmKernel {
-    static constexpr int kFeatures = kNt * kSg;  // per sub-group
+    // 16-feature columns per work-group (each lane: kNt output features); 8 row tiles take one, or the accumulators
+    // spill
+    static constexpr int kNt = MT >= 8 ? 1 : 2;
+    static constexpr int kFeatures = kNt * kSg;
+    // Per step, one transposed 2D block load per 16 features brings each lane 8 dwords of its feature's codes:
+    // kStep columns of K (32 at q8, 64 at q4), kSlices DPAS B operands.
+    static constexpr int kStep = Q4 ? 64 : 32;
+    static constexpr int kSlices = kStep / kTk;
+
+    // What one step reads from memory: the codes, and each slice's scale (and bias). A scale is a scattered load (16
+    // lanes, 16 rows), so a slice in the same group as the previous one reuses it. (Requesting the next step's ahead
+    // measured no faster and spilled registers at 7 and 8 row tiles.)
+    struct Step {
+        uint8_v codes[kNt];
+        half scale[kNt][kSlices];
+        half bias[kNt][kSlices];
+    };
 
     const half* x;
     QuantWeight w;
-    Y* y;         // split == 1
-    float* part;  // split > 1: [split, M, N]
-    int64_t m, n, k, k_chunk, split;
+    Y* y;
+    sycl::local_accessor<float, 1> slm;  // every slice's accumulators: [slice][mt][nt][8 rows][16 lanes]
+    int64_t m, n, k, k_slice;
     int group_shift;  // log2(w.group): no 64-bit division in the loop (it is emulated, and slow)
 
     auto get(syclex::properties_tag) const {
@@ -97,58 +123,77 @@ struct QuantGemmKernel {
     void operator()(sycl::nd_item<1> it) const {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = static_cast<int>(sg.get_local_linear_id());
-        const auto wg = static_cast<int64_t>(it.get_group(0));
-        const int64_t sp = wg % split;
-        const int64_t n0 = ((wg / split) * kSgs + static_cast<int64_t>(sg.get_group_linear_id())) * kFeatures;
-        if (n0 >= n) return;
-        const int64_t k_lo = sp * k_chunk;
-        const int64_t k_hi = std::min(k, k_lo + k_chunk);
+        const int slice = static_cast<int>(sg.get_group_linear_id());  // this sub-group's share of K
+        const int slices = static_cast<int>(sg.get_group_linear_range());
+        const int64_t n0 = static_cast<int64_t>(it.get_group(0)) * kFeatures;
+        const int64_t k_lo = std::min(k, slice * k_slice);
+        const int64_t k_hi = std::min(k, k_lo + k_slice);
         const int64_t groups = k / w.group;
         const int64_t row_bytes = Q4 ? k / 2 : k;
         const int x_width = static_cast<int>(k * 2) - 1;  // x as a [M, K] f16 surface
         const int x_height = static_cast<int>(m) - 1;
         const auto x_base = reinterpret_cast<long>(x);
+        const int c_width = static_cast<int>(row_bytes) - 1;  // the codes as an [N, row_bytes] surface
+        const int c_height = static_cast<int>(n) - 1;
+        const auto c_base = reinterpret_cast<long>(w.codes);
+        const half* scales[kNt];
+        const half* biases[kNt];
+        for (int nt = 0; nt < kNt; ++nt) {
+            const int64_t row = n0 + nt * kSg + lane;
+            scales[nt] = w.scales + row * groups;
+            biases[nt] = Q4 ? w.biases + row * groups : nullptr;
+        }
+        const auto fetch = [&](int64_t kk, Step& st) {
+            for (int nt = 0; nt < kNt; ++nt) {
+                const int2_v at = {static_cast<int>((Q4 ? kk / 2 : kk) / 4), static_cast<int>(n0 + nt * kSg)};
+                st.codes[nt] = __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(c_base, c_width, c_height,
+                                                                                      c_width, at);
+            }
+            for (int ks = 0; ks < kSlices; ++ks) {
+                const int g = (static_cast<int>(kk) + ks * kTk) >> group_shift;
+                const bool same = ks > 0 && g == ((static_cast<int>(kk) + (ks - 1) * kTk) >> group_shift);
+                for (int nt = 0; nt < kNt; ++nt) {
+                    st.scale[nt][ks] = same ? st.scale[nt][ks - 1] : scales[nt][g];
+                    if constexpr (Q4) st.bias[nt][ks] = same ? st.bias[nt][ks - 1] : biases[nt][g];
+                }
+            }
+        };
 
         float8_v acc[MT][kNt];
         for (int mt = 0; mt < MT; ++mt) {
             for (int nt = 0; nt < kNt; ++nt) acc[mt][nt] = 0.0f;
         }
-        // Per step, one transposed 2D block load per 16 features brings each lane 8 dwords of its feature's codes:
-        // kStep columns of K (32 at q8, 64 at q4), kStep / 16 DPAS B operands.
-        constexpr int kStep = Q4 ? 64 : 32;
-        const int c_width = static_cast<int>(row_bytes) - 1;  // the codes as an [N, row_bytes] surface
-        const int c_height = static_cast<int>(n) - 1;
-        const auto c_base = reinterpret_cast<long>(w.codes);
         for (int64_t kk = k_lo; kk < k_hi; kk += kStep) {
-            int8_v b[kNt][kStep / kTk];
+            Step cur;
+            fetch(kk, cur);
+            int8_v b[kNt][kSlices];
             for (int nt = 0; nt < kNt; ++nt) {
-                const int64_t row = n0 + nt * kSg + lane;
-                const half* row_scales = w.scales + row * groups;
-                const half* row_biases = Q4 ? w.biases + row * groups : nullptr;
-                const int2_v at = {static_cast<int>((Q4 ? kk / 2 : kk) / 4), static_cast<int>(n0 + nt * kSg)};
-                const uint8_v c = __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(c_base, c_width, c_height,
-                                                                                         c_width, at);
-                for (int ks = 0; ks < kStep / kTk; ++ks) {
-                    const int g = (static_cast<int>(kk) + ks * kTk) >> group_shift;
-                    const half s = row_scales[g];
+                const uint8_v c = cur.codes[nt];
+                for (int ks = 0; ks < kSlices; ++ks) {
                     if constexpr (Q4) {
-                        const half bias = row_biases[g];
-                        // 16 columns = 8 bytes = dwords 2 ks, 2 ks + 1; even column in the low nibble
+                        // 16 columns = 8 bytes = dwords 2 ks, 2 ks + 1; even column in the low nibble. (The packed
+                        // trick below measured 2-3x slower here: the compiler's code for it spilled.)
+                        const half sh = cur.scale[nt][ks];
+                        const half bias = cur.bias[nt][ks];
                         for (int d = 0; d < 2; ++d) {
                             const uint32_t word = c[2 * ks + d];
                             for (int i = 0; i < 4; ++i) {
                                 const uint32_t byte = (word >> (8 * i)) & 0xFF;
-                                b[nt][ks][4 * d + i] = pack_half2(sycl::fma(static_cast<half>(byte & 0x0F), s, bias),
-                                                                  sycl::fma(static_cast<half>(byte >> 4), s, bias));
+                                b[nt][ks][4 * d + i] = pack_half2(sycl::fma(static_cast<half>(byte & 0x0F), sh, bias),
+                                                                  sycl::fma(static_cast<half>(byte >> 4), sh, bias));
                             }
                         }
                     } else {
-                        // 16 columns = 16 bytes = dwords 4 ks .. 4 ks + 3
-                        const sycl::vec<uint32_t, 4> words(c[4 * ks], c[4 * ks + 1], c[4 * ks + 2], c[4 * ks + 3]);
-                        const sycl::vec<half, 16> v = sycl::bit_cast<sycl::vec<int8_t, 16>>(words).template convert<half>() * s;
-                        for (int i = 0; i < 8; ++i) b[nt][ks][i] = pack_half2(v[2 * i], v[2 * i + 1]);
+                        // 16 columns = 16 bytes = dwords 4 ks .. 4 ks + 3; codes biased to unsigned (c + 128)
+                        const _Float16 sf = sycl::bit_cast<_Float16>(cur.scale[nt][ks]);
+                        const h2_v s2{sf, sf};
+                        for (int d = 0; d < 4; ++d) {
+                            const uint32_t w8 = c[4 * ks + d] ^ 0x80808080u;
+                            b[nt][ks][2 * d] = dequant_pair((w8 & 0xFFu) | ((w8 & 0xFF00u) << 8), 1152, s2);
+                            b[nt][ks][2 * d + 1] = dequant_pair(((w8 >> 16) & 0xFFu) | ((w8 >> 8) & 0xFF0000u), 1152, s2);
+                        }
                     }
-                    if (w.input_scales != nullptr) {
+                    if constexpr (AWQ) {
                         for (int i = 0; i < 8; ++i) {
                             const int64_t col = kk + ks * kTk + 2 * i;
                             const auto p = sycl::bit_cast<sycl::vec<half, 2>>(static_cast<uint32_t>(b[nt][ks][i]));
@@ -158,7 +203,7 @@ struct QuantGemmKernel {
                     }
                 }
             }
-            for (int ks = 0; ks < kStep / kTk; ++ks) {
+            for (int ks = 0; ks < kSlices; ++ks) {
                 for (int mt = 0; mt < MT; ++mt) {
                     const int2_v coord = {static_cast<int>(kk + ks * kTk), mt * kTm};
                     const ushort8_v a =
@@ -170,59 +215,61 @@ struct QuantGemmKernel {
                 }
             }
         }
-        // acc[mt][nt] element r, lane l: y row mt * 8 + r, feature n0 + nt * 16 + l.
+        // The slices add up in local memory, each one finishing the row tiles mt = slice, slice + slices, ...
+        constexpr int kTileFloats = kTm * kSg;
         for (int mt = 0; mt < MT; ++mt) {
-            for (int r = 0; r < kTm; ++r) {
-                const int64_t row = mt * kTm + r;
-                if (row >= m) break;
-                for (int nt = 0; nt < kNt; ++nt) {
-                    const int64_t col = n0 + nt * kSg + lane;
-                    if (split > 1) {
-                        part[(sp * m + row) * n + col] = acc[mt][nt][r];
-                    } else {
-                        y[row * n + col] = static_cast<Y>(acc[mt][nt][r]);
-                    }
+            for (int nt = 0; nt < kNt; ++nt) {
+                float* t = &slm[((slice * MT + mt) * kNt + nt) * kTileFloats];
+                for (int r = 0; r < kTm; ++r) t[r * kSg + lane] = acc[mt][nt][r];
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        for (int mt = slice; mt < MT; mt += slices) {
+            for (int nt = 0; nt < kNt; ++nt) {
+                float8_v sum = 0.0f;
+                for (int s = 0; s < slices; ++s) {
+                    const float* t = &slm[((s * MT + mt) * kNt + nt) * kTileFloats];
+                    for (int r = 0; r < kTm; ++r) sum[r] += t[r * kSg + lane];
+                }
+                // element r, lane l: y row mt * 8 + r, feature n0 + nt * 16 + l
+                for (int r = 0; r < kTm; ++r) {
+                    const int64_t row = mt * kTm + r;
+                    if (row >= m) break;
+                    y[row * n + n0 + nt * kSg + lane] = static_cast<Y>(sum[r]);
                 }
             }
         }
     }
 };
 
-template <bool Q4, int MT, typename Y>
-void quant_gemm_t(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, float* part, int64_t m, int64_t n,
-                  int64_t k, int64_t split) {
-    using K = QuantGemmKernel<Q4, MT, Y>;
-    const int64_t k_chunk = ceil_div(ceil_div(k, split), 64) * 64;  // whole steps (32 or 64 columns)
-    const int64_t blocks = ceil_div(n, K::kFeatures);
-    const auto wgs = static_cast<size_t>(ceil_div(blocks, kSgs) * split);
+template <bool Q4, int MT, bool AWQ, typename Y>
+void quant_gemm_t(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
+                  int64_t slices) {
+    using K = QuantGemmKernel<Q4, MT, AWQ, Y>;
+    const int64_t k_slice = ceil_div(ceil_div(k, slices), 64) * 64;  // whole steps (32 or 64 columns)
+    const auto wgs = static_cast<size_t>(n / K::kFeatures);
     int shift = 0;
     while ((int64_t{1} << shift) < w.group) ++shift;
-    syclex::nd_launch(q, sycl::nd_range<1>(wgs * kSgs * kSg, kSgs * kSg),
-                      K{x, w, y, part, m, n, k, k_chunk, split, shift});
-}
-
-template <typename Y>
-void reduce_split(sycl::queue& q, const float* part, Y* y, int64_t mn, int64_t split) {
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(mn)), [=](sycl::id<1> idx) {
-        const auto i = static_cast<int64_t>(idx[0]);
-        float s = 0.0f;
-        for (int64_t p = 0; p < split; ++p) s += part[p * mn + i];
-        y[i] = static_cast<Y>(s);
+    const auto slm_floats = static_cast<size_t>(slices * MT * K::kNt * kTm * kSg);
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_floats), h);
+        const auto local = static_cast<size_t>(slices) * kSg;
+        syclex::nd_launch(h, sycl::nd_range<1>(wgs * local, local), K{x, w, y, slm, m, n, k, k_slice, shift});
     });
 }
 
-template <bool Q4, typename Y>
-void quant_gemm_q(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, float* part, int64_t m, int64_t n,
-                  int64_t k, int64_t split) {
+template <bool Q4, bool AWQ, typename Y>
+void quant_gemm_q(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
+                  int64_t slices) {
     const int64_t mt = ceil_div(m, kTm);
     if (mt <= 2) {
-        quant_gemm_t<Q4, 2, Y>(q, x, w, y, part, m, n, k, split);
+        quant_gemm_t<Q4, 2, AWQ, Y>(q, x, w, y, m, n, k, slices);
     } else if (mt <= 4) {
-        quant_gemm_t<Q4, 4, Y>(q, x, w, y, part, m, n, k, split);
+        quant_gemm_t<Q4, 4, AWQ, Y>(q, x, w, y, m, n, k, slices);
     } else if (mt <= 7) {
-        quant_gemm_t<Q4, 7, Y>(q, x, w, y, part, m, n, k, split);
+        quant_gemm_t<Q4, 7, AWQ, Y>(q, x, w, y, m, n, k, slices);
     } else {
-        quant_gemm_t<Q4, 8, Y>(q, x, w, y, part, m, n, k, split);
+        quant_gemm_t<Q4, 8, AWQ, Y>(q, x, w, y, m, n, k, slices);
     }
 }
 
@@ -233,31 +280,34 @@ bool quant_gemm_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w, cons
     // 2D block loads of x: a 64-byte aligned base, rows of at least 64 bytes and a multiple of 16
     // and of the codes ([N, K] bytes at q8, [N, K / 2] at q4): rows of at least 64 bytes
     const bool pow2_group = w.group >= kTk && (w.group & (w.group - 1)) == 0;
-    return m > 0 && m <= kQuantGemmMaxRows && n % (kNt * kSg) == 0 && k % 128 == 0 && pow2_group &&
+    return m > 0 && m <= kQuantGemmMaxRows && n % (2 * kSg) == 0 && k % 128 == 0 && pow2_group &&
            aligned(x, 64) && aligned(w.codes, 64) && k * 2 < (int64_t{1} << 24) && n < (int64_t{1} << 24);
 }
 
-int64_t quant_gemm_split(int64_t n, int64_t k, int64_t compute_units) {
-    // about 4 sub-groups per execution unit streaming the weight; at least 256 of K per split
-    const int64_t sub_groups = n / (kNt * kSg);
-    const int64_t want = ceil_div(compute_units * 4, std::max<int64_t>(sub_groups, 1));
-    return std::clamp<int64_t>(std::min(want, k / 256), 1, 16);
+int64_t quant_gemm_slices(int64_t n, int64_t k, int64_t compute_units) {
+    // about 4 sub-groups per execution unit streaming the weight, each slice at least 128 columns of K
+    const int64_t blocks = n / (2 * kSg);
+    int64_t slices = 1;
+    while (slices < kQuantGemmMaxSlices && blocks * slices < compute_units * 4 && k / (slices * 2) >= 128) slices *= 2;
+    return slices;
 }
 
 template <typename Y>
-void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, float* part, int64_t m, int64_t n,
-                int64_t k, int64_t split) {
+void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
+                int64_t slices) {
+    const bool awq = w.input_scales != nullptr;
     if (w.q4) {
-        quant_gemm_q<true, Y>(q, x, w, y, part, m, n, k, split);
+        awq ? quant_gemm_q<true, true, Y>(q, x, w, y, m, n, k, slices)
+            : quant_gemm_q<true, false, Y>(q, x, w, y, m, n, k, slices);
     } else {
-        quant_gemm_q<false, Y>(q, x, w, y, part, m, n, k, split);
+        awq ? quant_gemm_q<false, true, Y>(q, x, w, y, m, n, k, slices)
+            : quant_gemm_q<false, false, Y>(q, x, w, y, m, n, k, slices);
     }
-    if (split > 1) reduce_split(q, part, y, m * n, split);
 }
 
-template void quant_gemm<float>(sycl::queue&, const half*, const QuantWeight&, float*, float*, int64_t, int64_t,
-                                int64_t, int64_t);
-template void quant_gemm<half>(sycl::queue&, const half*, const QuantWeight&, half*, float*, int64_t, int64_t,
-                               int64_t, int64_t);
+template void quant_gemm<float>(sycl::queue&, const half*, const QuantWeight&, float*, int64_t, int64_t, int64_t,
+                                int64_t);
+template void quant_gemm<half>(sycl::queue&, const half*, const QuantWeight&, half*, int64_t, int64_t, int64_t,
+                               int64_t);
 
 }  // namespace xs::sycl_be

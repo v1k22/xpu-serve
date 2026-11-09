@@ -262,9 +262,13 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
       expert): 245 -> 231 ms at 3 cameras on Arc B390, actions cosine 0.99999; q4 misses the 0.999 gate
 - [x] SYCL quant_gemm: quantized matmuls of 9 to 64 rows read the q8 / q4 weight once and dequantize in registers
       (DPAS and 2D block load builtins), 2.5 to 4x the dequantize + GEMM path
-- [ ] quant_gemm at 50 rows: x tiles are re-read per 32 output features, so it runs near 4-5 TFLOPS instead of at the
-      weight's bandwidth (q8 should be about 2x f16 there); share x tiles across features (local memory or larger
-      sub-group tiles)
+- [x] quant_gemm, second pass (Arc B390, M = 9 to 64): K split between the sub-groups of a work-group (partial sums
+      added in local memory instead of written out), scales loaded once per group, q8 codes to f16 two at a time,
+      one 16-feature column at 8 row tiles (no spills): q4 1.1-2.7x, q8 at 64 rows 1.4x, q8 at 9 rows 1.1x. Staging
+      x in local memory and prefetching codes a step ahead measured no faster (x tiles were not the limit)
+- [ ] quant_gemm at 50 rows, q8 still near f16 speed (75 us for a 4096 x 1024 weight, 56 GB/s): without dequantizing
+      it runs at 47 us at 9 rows (the memory's speed), so the rest is the DPAS / x side at 7 row tiles (~40% of the
+      DPAS rate); the packed q4 dequantization spilled (2-3x slower) and needs registers freed first
 - [ ] q4 for policies: AWQ-style calibration on policy activations (or q4 with q8 for the most sensitive matmuls)
 - [ ] Flash attention at head_dim 256 (Gemma): 8 rows per sub-group fill the registers, so every K/V tile feeds one
       DPAS and oneMKL's GEMMs match it; needs K/V or P shared across sub-groups through local memory
