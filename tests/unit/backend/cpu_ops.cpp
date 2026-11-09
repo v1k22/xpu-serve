@@ -141,6 +141,19 @@ TEST_SUITE("cpu-ref ops") {
         }
     }
 
+    TEST_CASE("gather picks rows of an i32 table as i32") {
+        std::vector<int32_t> table(6 * 3);
+        for (size_t i = 0; i < table.size(); ++i) table[i] = static_cast<int32_t>(1000003 * i % 262147);
+        Graph g;
+        g.output("out", g.gather(g.constant(test::make_tensor(DType::I32, {6, 3}, table)), g.input("ids", DType::I32, {kT})));
+        const HostTensor out = run_single_output(
+            g, test::MemoryWeights{}, {{"ids", test::make_tensor(DType::I32, {3}, std::vector<int32_t>{5, 0, 2})}});
+        REQUIRE(out.dtype() == DType::I32);
+        const int32_t* r = out.data<int32_t>();
+        CHECK(std::vector<int32_t>(r, r + 9) == std::vector<int32_t>{table[15], table[16], table[17], table[0], table[1],
+                                                                     table[2], table[6], table[7], table[8]});
+    }
+
     TEST_CASE("gather refuses an id outside the table") {
         test::MemoryWeights w;
         w.add("embed", HostTensor(DType::F32, {4, 2}));

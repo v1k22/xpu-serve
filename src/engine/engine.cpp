@@ -1,6 +1,7 @@
 #include "engine/engine.h"
 
 #include <algorithm>
+#include <deque>
 #include <numeric>
 
 #include "engine/sampler.h"
@@ -35,6 +36,18 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, s
       options_(options) {
     XS_CHECK(options_.max_context > 1 && options_.prefill_chunk > 0, "invalid engine options");
     XS_CHECK(vision_session_ == nullptr || model_->vision() != nullptr, "a vision session for a model without vision");
+    XS_CHECK(options_.spec_k >= 0, "spec_k must not be negative, got ", options_.spec_k);
+    if (options_.spec_k > 0) {
+        const Speculation* spec = model_->speculation();
+        XS_CHECK(spec != nullptr, "model ", model_->info().id, " has no drafter for speculative decoding");
+        drafter_ = std::make_unique<spec::DraftRunner>(*spec, *session_);
+    }
+}
+
+void Engine::reset_sequence() {
+    session_->reset();
+    cached_.clear();
+    if (drafter_) drafter_->reset();
 }
 
 void Engine::set_prefill_chunk(int64_t tokens) {
@@ -42,22 +55,72 @@ void Engine::set_prefill_chunk(int64_t tokens) {
     options_.prefill_chunk = tokens;
 }
 
-std::vector<float> Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
-                                   std::span<const float* const> embeddings) {
+void Engine::run_target(size_t program, std::span<const int32_t> tokens, std::span<const PositionKey> keys,
+                        std::span<const float* const> embeddings) {
     XS_CHECK(!tokens.empty() && keys.size() == tokens.size(), "forward without tokens");
     const auto start = static_cast<int64_t>(cached_.size());
     XS_CHECK(start + static_cast<int64_t>(tokens.size()) <= options_.max_context, "sequence of ",
              start + static_cast<int64_t>(tokens.size()), " tokens exceeds the context limit of ", options_.max_context);
     inputs_.clear();
     model_->prepare_inputs(tokens, start, embeddings, inputs_);
-    session_->run(inputs_, outputs_);
+    session_->run(program, inputs_, outputs_);
     cached_.insert(cached_.end(), keys.begin(), keys.end());
     XS_CHECK(session_->num_cached() == static_cast<int64_t>(cached_.size()), "backend holds ", session_->num_cached(),
              " cached tokens, engine expected ", cached_.size());
+}
+
+std::vector<float> Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
+                                   std::span<const float* const> embeddings) {
+    const auto start = static_cast<int64_t>(cached_.size());
+    run_target(drafter_ ? spec::kPrefill : spec::kStep, tokens, keys, embeddings);
+    if (drafter_) {
+        drafter_->add(outputs_.at("hidden"), static_cast<int64_t>(tokens.size()), start, tokens);
+        drafter_->flush();
+    }
     const HostTensor& logits = outputs_.at("logits");
     XS_CHECK(logits.dtype() == DType::F32 && logits.numel() == model_->info().vocab_size, "logits output is ",
              dtype_name(logits.dtype()), dims_to_string(logits.shape()));
     return {logits.data<float>(), logits.data<float>() + logits.numel()};
+}
+
+std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
+                                        std::span<const int32_t> generated, GenerateStats& stats) {
+    std::vector<int32_t> fed{token};
+    if (k > 0) {
+        const std::vector<int32_t> drafts = drafter_->propose(token, k);
+        fed.insert(fed.end(), drafts.begin(), drafts.end());
+    }
+    std::vector<PositionKey> keys(fed.size());
+    std::transform(fed.begin(), fed.end(), keys.begin(), text_key);
+    const auto start = static_cast<int64_t>(cached_.size());
+    run_target(spec::kVerify, fed, keys, {});
+    HostTensor& logits = outputs_.at("logits");
+    const int64_t vocab = model_->info().vocab_size;
+    XS_CHECK(logits.dtype() == DType::F32 && logits.numel() == static_cast<int64_t>(fed.size()) * vocab,
+             "verify logits output is ", dtype_name(logits.dtype()), dims_to_string(logits.shape()));
+
+    // Row i of the verify is the target's distribution after fed[i]: it accepts the draft fed[i + 1] or replaces it.
+    std::vector<int32_t> history(generated.begin(), generated.end());
+    std::vector<int32_t> out;
+    for (size_t i = 0; i < fed.size(); ++i) {
+        const std::span<float> row(logits.data<float>() + static_cast<int64_t>(i) * vocab, static_cast<size_t>(vocab));
+        const bool last = i + 1 == fed.size();
+        const int32_t t = last ? sampler.sample(row, prompt, history) : sampler.verify(row, prompt, history, fed[i + 1]);
+        out.push_back(t);
+        history.push_back(t);
+        if (!last && t != fed[i + 1]) break;
+    }
+    const auto accepted = static_cast<int64_t>(out.size()) - 1;
+    const int64_t keep = start + accepted + 1;  // the token and the accepted drafts
+    if (keep < static_cast<int64_t>(cached_.size())) {
+        session_->truncate(keep);
+        cached_.resize(static_cast<size_t>(keep));
+    }
+    drafter_->add(outputs_.at("hidden"), accepted + 1, start, fed);
+    ++stats.spec_rounds;
+    stats.spec_drafted += k;
+    stats.spec_accepted += static_cast<int>(accepted);
+    return out;
 }
 
 int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
@@ -66,19 +129,18 @@ int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
     // At least the last prompt token must run, because its logits pick the first new token.
     const int64_t keep = std::min<int64_t>(common, static_cast<int64_t>(prompt_keys.size()) - 1);
     if (keep <= 0) {
-        session_->reset();
-        cached_.clear();
+        reset_sequence();
         return 0;
     }
     if (keep < static_cast<int64_t>(cached_.size())) {
         if (model_->graph().has_fixed_state()) {
             // Conv and recurrent state cannot be cut back into the sequence; start over.
-            session_->reset();
-            cached_.clear();
+            reset_sequence();
             return 0;
         }
         session_->truncate(keep);
         cached_.resize(static_cast<size_t>(keep));
+        if (drafter_) drafter_->truncate(keep);
     }
     return keep;
 }
@@ -181,8 +243,9 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
         const int64_t room = options_.max_context - static_cast<int64_t>(n);
         const int64_t max_new = std::min<int64_t>(request.max_new_tokens, room);
         result.finish = FinishReason::Length;
+        std::deque<int32_t> ready;  // tokens a speculative round produced, not emitted yet
+        int32_t token = max_new > 0 ? sampler.sample(logits, prompt, result.tokens) : 0;
         while (static_cast<int64_t>(result.tokens.size()) < max_new) {
-            const int32_t token = sampler.sample(logits, prompt, result.tokens);
             if (std::find(request.stop_token_ids.begin(), request.stop_token_ids.end(), token) !=
                 request.stop_token_ids.end()) {
                 result.finish = FinishReason::Stop;
@@ -196,16 +259,27 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
                 result.finish = FinishReason::Cancelled;
                 break;
             }
-            if (static_cast<int64_t>(result.tokens.size()) >= max_new) break;
-            const int32_t next[] = {token};
-            const PositionKey next_key[] = {text_key(token)};
-            logits = forward(next, next_key, {});
+            const auto emitted = static_cast<int64_t>(result.tokens.size());
+            if (emitted >= max_new) break;
+            if (ready.empty() && drafter_) {
+                // Drafts past the last token wanted, or past the context, are never verified.
+                const int64_t fits = options_.max_context - static_cast<int64_t>(cached_.size()) - 1;
+                const auto k = static_cast<int>(std::min<int64_t>({options_.spec_k, max_new - emitted - 1, fits}));
+                const std::vector<int32_t> round = spec_round(token, k, sampler, prompt, result.tokens, result.stats);
+                ready.assign(round.begin(), round.end());
+            } else if (ready.empty()) {
+                const int32_t next[] = {token};
+                const PositionKey next_key[] = {text_key(token)};
+                logits = forward(next, next_key, {});
+                ready.push_back(sampler.sample(logits, prompt, result.tokens));
+            }
+            token = ready.front();
+            ready.pop_front();
         }
         result.stats.generated_tokens = static_cast<int>(result.tokens.size());
     } catch (const std::exception& e) {
         // The KV state may be partially written; start the next request from scratch.
-        session_->reset();
-        cached_.clear();
+        reset_sequence();
         result.finish = FinishReason::Error;
         result.error = e.what();
         log::error("generation failed: ", e.what());

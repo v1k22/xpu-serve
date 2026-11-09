@@ -200,12 +200,104 @@ sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::Attent
     return p;
 }
 
-class SyclSession final : public Session, private sycl_be::Scratch {
+// What the programs of one session share (backend.h): the queue, the weights uploaded so far (by name and device
+// dtype), the state slots (by label) with their token counts, and the step memory (programs run one at a time).
+struct SharedKv {
+    graph::KvSlot spec;
+    KvBuffers buf;
+    int64_t len = 0;
+    bool typed = false;  // a writing program has set buf.dtype
+};
+struct SharedFixed {  // a conv or recurrent slot
+    bool conv = false;
+    std::string label;
+    StateBuffers state;
+    int64_t tokens = 0;
+    // The last step, when it had at most rewind_tokens tokens (base >= 0): the state before it is the other buffer
+    // (state.buf[1 - state.cur]) and its op's per-token inputs are kept here, replayed by truncate for a count inside
+    // the step (conv: x; recurrent: k, v, g, beta).
+    int64_t base = -1;
+    std::vector<DeviceBuffer> inputs;
+    std::vector<int64_t> input_row;  // floats per token of each kept input
+    int64_t channels = 0, kernel = 0;                                     // conv
+    int64_t k_heads = 0, v_heads = 0, key_dim = 0, value_dim = 0;         // recurrent
+    float eps = 0.0f;
+};
+struct SharedLeaf {
+    char* ptr = nullptr;
+    sycl_be::QuantWeight quant;
+};
+
+class SyclShared final : public sycl_be::Scratch {
 public:
-    SyclSession(const graph::Graph& graph, const WeightStore& weights, const SessionOptions& options, sycl::queue q,
+    SyclShared(sycl::queue queue, int64_t max_context, int64_t rewind_tokens)
+        : q(std::move(queue)), max_context(max_context), rewind_tokens(rewind_tokens) {}
+    ~SyclShared() override {
+        try {
+            q.wait();
+        } catch (...) {
+        }
+        if (host_ != nullptr) sycl::free(host_, q);
+    }
+
+    void* get(size_t bytes) override {
+        if (bytes > scratch_.bytes()) {
+            q.wait();
+            scratch_ = DeviceBuffer(q, align_up(bytes + bytes / 4));
+        }
+        return scratch_.get();
+    }
+    void* get_host(size_t bytes) override {
+        if (bytes > host_bytes_) {
+            q.wait();
+            if (host_ != nullptr) sycl::free(host_, q);
+            host_bytes_ = align_up(bytes);
+            host_ = sycl::malloc_host(host_bytes_, q);
+            XS_CHECK(host_ != nullptr, "sycl: out of pinned host memory allocating ", host_bytes_, " bytes");
+        }
+        return host_;
+    }
+
+    void ensure_arena(size_t bytes) {
+        if (bytes <= arena.bytes()) return;
+        q.wait();
+        arena = DeviceBuffer(q, align_up(bytes + bytes / 8));
+    }
+
+    void reset() {
+        for (SharedKv& k : kv) k.len = 0;
+        for (SharedFixed& f : fixed) {
+            q.memset(f.state.buf[f.state.cur].get(), 0, f.state.bytes);
+            f.tokens = 0;
+            f.base = -1;
+        }
+        q.wait();
+    }
+
+    sycl::queue q;
+    const int64_t max_context;
+    const int64_t rewind_tokens;
+    std::vector<SharedKv> kv;
+    std::vector<SharedFixed> fixed;
+    std::map<std::pair<std::string, DType>, SharedLeaf> weights;  // uploaded weights by name and device dtype
+    std::vector<DeviceBuffer> weight_buffers;
+    DeviceBuffer arena;
+    GrowingScratch kv_scratch{q};  // the int8 KV cache dequantized for prefill attention
+
+private:
+    DeviceBuffer scratch_;
+    void* host_ = nullptr;
+    size_t host_bytes_ = 0;
+};
+
+// One program (graph) of a session: its plans, fusions and launches over the shared state.
+class SyclProgram final : private sycl_be::Scratch {
+public:
+    SyclProgram(const graph::Graph& graph, const WeightStore& weights, const SessionOptions& options, SyclShared& shared,
                 const sycl_be::AttentionPlan& attention, const sycl_be::QuantMatmulPlan& quant)
         : graph_(graph),
-          q_(std::move(q)),
+          shared_(shared),
+          q_(shared.q),
           attention_(attention),
           quant_(quant),
           precision_(options.precision),
@@ -218,7 +310,8 @@ public:
         // anything but Attention reads one; otherwise L only reaches Attention (and outputs), resolved per run.
         const auto has_l = [](const Dims& d) { return std::find(d.begin(), d.end(), kL) != d.end(); };
         for (const Node& n : graph_.nodes()) {
-            if (n.kind != OpKind::KvCache) {
+            reads_kv_ |= n.kind == OpKind::KvRead;
+            if (n.kind != OpKind::KvCache && n.kind != OpKind::KvRead) {
                 for (const auto& t : n.outputs)
                     l_dependent_ |= has_l(t.shape);
             }
@@ -227,51 +320,48 @@ public:
                     l_dependent_ |= has_l(graph_.type(in).shape);
             }
         }
+        for (const graph::KvSlot& k : graph_.kv_slots()) kv_slot_.push_back(shared_kv(k));
+        for (const graph::ConvSlot& c : graph_.conv_slots()) {
+            fixed_slot_.push_back(shared_fixed(true, c.label, static_cast<size_t>((c.kernel - 1) * c.channels)));
+        }
+        conv_states_ = fixed_slot_.size();
+        for (const graph::RecurrentSlot& r : graph_.recurrent_slots()) {
+            fixed_slot_.push_back(
+                shared_fixed(false, r.label, static_cast<size_t>(r.heads * r.key_dim * r.value_dim)));
+        }
         infer_dtypes();
         check_ops();
         plan_fusions();
         plan_half_values();
         upload_leaves(weights);
         finish_mm_parts();
-        for (const graph::KvSlot& s : graph_.kv_slots()) {
-            KvBuffers b;
-            b.heads = s.num_kv_heads;
-            b.row = s.num_kv_heads * s.head_dim;
-            kv_.push_back(std::move(b));
-        }
         size_t int8_slots = 0;
         for (size_t i = 0; i < graph_.nodes().size(); ++i) {
             const Node& n = graph_.nodes()[i];
             if (n.kind != OpKind::KvCache) continue;
-            kv_[static_cast<size_t>(std::get<graph::KvCacheAttrs>(n.attrs).slot)].dtype = dtype_[i][0];
+            SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(std::get<graph::KvCacheAttrs>(n.attrs).slot)]];
+            XS_CHECK(!slot.typed || slot.buf.dtype == dtype_[i][0], "sycl: kv slot '", slot.spec.label,
+                     "' is written in two dtypes by two programs");
+            slot.buf.dtype = dtype_[i][0];
+            slot.typed = true;
             int8_slots += dtype_[i][0] == DType::I8 ? 1 : 0;
         }
-        if (kv_i8_) log::info("sycl: int8 KV cache for ", int8_slots, " of ", kv_.size(), " slots");
-        for (const graph::ConvSlot& c : graph_.conv_slots())
-            fixed_state_.push_back(make_state(static_cast<size_t>((c.kernel - 1) * c.channels) * sizeof(float)));
-        conv_states_ = fixed_state_.size();
-        for (const graph::RecurrentSlot& r : graph_.recurrent_slots())
-            fixed_state_.push_back(make_state(static_cast<size_t>(r.heads * r.key_dim * r.value_dim) * sizeof(float)));
-        zero_fixed_state();
+        if (kv_i8_ && !reads_kv_) log::info("sycl: int8 KV cache for ", int8_slots, " of ", kv_slot_.size(), " slots");
     }
 
-    ~SyclSession() override {
-        try {
-            q_.wait();
-        } catch (...) {
-        }
-        if (host_ != nullptr) sycl::free(host_, q_);
+    ~SyclProgram() override {
         if (profiling_) report_profile();
     }
 
-    void run(const TensorMap& inputs, TensorMap& outputs) override {
+    void run(const TensorMap& inputs, TensorMap& outputs) {
         const Step step = check_inputs(inputs);
         XS_CHECK(step.kv_len <= max_context_, "sycl: ", step.kv_len, " tokens exceed max_context ", max_context_);
         std::vector<HostTensor> keep_alive;  // host sources of pending copies
+        rewinding_ = step.tokens <= shared_.rewind_tokens;
         try {
-            ensure_kv_capacity(step.kv_len);
+            if (!reads_kv_) ensure_kv_capacity(step.kv_len);
             const Plan& plan = plan_for(step);
-            ensure_arena(plan.arena_bytes);
+            shared_.ensure_arena(plan.arena_bytes);
             for (const Value& v : graph_.inputs()) {
                 const HostTensor& t = inputs.at(input_name(v));
                 const HostTensor& src = keep_alive.emplace_back(
@@ -282,7 +372,7 @@ public:
                 if (trace_) {
                     const Loc& l = plan.locs[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
                     std::fprintf(stderr, "sycl: input %s %zu bytes at arena offset %lld of %zu (store %d)\n",
-                                 input_name(v).c_str(), src.nbytes(), static_cast<long long>(l.offset), arena_.bytes(),
+                                 input_name(v).c_str(), src.nbytes(), static_cast<long long>(l.offset), shared_.arena.bytes(),
                                  static_cast<int>(l.store));
                     q_.wait_and_throw();
                 }
@@ -335,9 +425,15 @@ public:
             }
             throw;
         }
-        if (graph_.stateful()) cached_ = step.kv_len;  // a graph without slots is stateless
-        for (StateBuffers& s : fixed_state_)
-            s.cur = 1 - s.cur;
+        if (!reads_kv_) {
+            for (size_t k : kv_slot_) shared_.kv[k].len = step.kv_len;
+        }
+        for (size_t f : fixed_slot_) {
+            SharedFixed& st = shared_.fixed[f];
+            st.state.cur = 1 - st.state.cur;
+            st.base = rewinding_ ? st.tokens : -1;  // rewinding_: the step's inputs went to st.inputs
+            st.tokens += step.tokens;
+        }
         if (!marks_.empty()) {
             // Device time between consecutive barriers is the op's: no host round trip in the measurement.
             auto& ms = step.tokens == 1 ? decode_ms_ : prefill_ms_;
@@ -354,38 +450,121 @@ public:
         }
     }
 
-    int64_t num_cached() const override { return cached_; }
+    // Tokens in the slots this program writes (they agree after every run and truncate).
+    int64_t cached() const {
+        if (!kv_slot_.empty() && !reads_kv_) return shared_.kv[kv_slot_[0]].len;
+        if (!fixed_slot_.empty()) return shared_.fixed[fixed_slot_[0]].tokens;
+        return 0;
+    }
 
-    void reset() override { truncate(0); }
-
-    void truncate(int64_t n) override {
-        XS_CHECK(n >= 0 && n <= cached_, "cannot truncate to ", n, " tokens; ", cached_, " are cached");
-        if (n == cached_) return;
-        XS_CHECK(n == 0 || !graph_.has_fixed_state(), "cannot truncate to ", n,
-                 " tokens: conv and recurrent state summarize the whole sequence");
-        if (n == 0) zero_fixed_state();
-        cached_ = n;
+    void truncate(int64_t n) {
+        const int64_t have = cached();
+        XS_CHECK(n >= 0 && n <= have, "cannot truncate to ", n, " tokens; ", have, " are cached");
+        for (size_t i : fixed_slot_) {  // checked first: a refusal changes nothing
+            const SharedFixed& f = shared_.fixed[i];
+            XS_CHECK(n == f.tokens || n == 0 || (f.base >= 0 && n >= f.base), "cannot truncate to ", n,
+                     " tokens: conv and recurrent state summarize the whole sequence (only a count inside a last step ",
+                     "of up to rewind_tokens tokens is kept)");
+        }
+        if (!reads_kv_) {
+            for (size_t k : kv_slot_) shared_.kv[k].len = n;
+        }
+        for (size_t f : fixed_slot_) rewind(shared_.fixed[f], n);
+        q_.wait_and_throw();
     }
 
 private:
-    // sycl_be::Scratch
-    void* get(size_t bytes) override {
-        if (bytes > scratch_.bytes()) {
-            q_.wait();
-            scratch_ = DeviceBuffer(q_, align_up(bytes + bytes / 4));
+    // Brings a conv or recurrent slot to `n` tokens: kept, zeroed, or replayed from the state before the last step
+    // (the other buffer) through the kept inputs, into the current buffer.
+    void rewind(SharedFixed& f, int64_t n) {
+        StateBuffers& st = f.state;
+        if (n == f.tokens) return;
+        if (n == 0) {
+            q_.memset(st.buf[st.cur].get(), 0, st.bytes);
+            f.tokens = 0;
+            f.base = -1;
+            return;
         }
-        return scratch_.get();
-    }
-    void* get_host(size_t bytes) override {
-        if (bytes > host_bytes_) {
-            q_.wait();
-            if (host_ != nullptr) sycl::free(host_, q_);
-            host_bytes_ = align_up(bytes);
-            host_ = sycl::malloc_host(host_bytes_, q_);
-            XS_CHECK(host_ != nullptr, "sycl: out of pinned host memory allocating ", host_bytes_, " bytes");
+        const int64_t m = n - f.base;  // truncate checked base <= n
+        const auto* before = reinterpret_cast<const float*>(st.buf[1 - st.cur].get());
+        auto* now = reinterpret_cast<float*>(st.buf[st.cur].get());
+        const auto in = [&](size_t i) { return reinterpret_cast<const float*>(f.inputs[i].get()); };
+        if (m == 0) {
+            q_.memcpy(now, before, st.bytes);
+        } else if (f.conv) {
+            // the window is the last kernel - 1 rows of [before; x[0, m)]
+            const int64_t past = f.kernel - 1;
+            const int64_t from_before = std::max<int64_t>(0, past - m);
+            const auto row = static_cast<size_t>(f.channels) * sizeof(float);
+            if (from_before > 0) q_.memcpy(now, before + (past - from_before) * f.channels, from_before * row);
+            if (past - from_before > 0) {
+                q_.memcpy(now + from_before * f.channels, in(0) + (m - (past - from_before)) * f.channels,
+                          (past - from_before) * row);
+            }
+        } else {
+            auto* out = static_cast<float*>(get(static_cast<size_t>(m * f.v_heads * f.value_dim) * sizeof(float)));
+            sycl_be::gated_delta(q_, in(0), in(0), in(1), in(2), in(3), before, now, out, m, f.k_heads, f.v_heads,
+                                 f.key_dim, f.value_dim, f.eps);
         }
-        return host_;
+        f.tokens = n;
     }
+
+    // Keeps a short step's per-token inputs of a conv or recurrent op for rewind (SharedFixed).
+    void keep_inputs(SharedFixed& f, std::initializer_list<std::pair<const float*, int64_t>> inputs, int64_t tokens) {
+        if (f.inputs.size() != inputs.size()) {
+            f.inputs.clear();
+            f.input_row.clear();
+            for (const auto& [ptr, row] : inputs) {
+                f.inputs.emplace_back(q_, static_cast<size_t>(shared_.rewind_tokens * row) * sizeof(float));
+                f.input_row.push_back(row);
+            }
+        }
+        size_t i = 0;
+        for (const auto& [ptr, row] : inputs) {
+            q_.memcpy(f.inputs[i++].get(), ptr, static_cast<size_t>(tokens * row) * sizeof(float));
+        }
+    }
+
+    size_t shared_kv(const graph::KvSlot& spec) {
+        for (size_t i = 0; i < shared_.kv.size(); ++i) {
+            const graph::KvSlot& s = shared_.kv[i].spec;
+            if (s.label != spec.label) continue;
+            XS_CHECK(s.num_kv_heads == spec.num_kv_heads && s.head_dim == spec.head_dim, "sycl: kv slot '",
+                     spec.label, "' is declared with two shapes");
+            return i;
+        }
+        SharedKv k;
+        k.spec = spec;
+        k.buf.heads = spec.num_kv_heads;
+        k.buf.row = spec.num_kv_heads * spec.head_dim;
+        shared_.kv.push_back(std::move(k));
+        return shared_.kv.size() - 1;
+    }
+
+    size_t shared_fixed(bool conv, const std::string& label, size_t elements) {
+        const size_t bytes = elements * sizeof(float);
+        for (size_t i = 0; i < shared_.fixed.size(); ++i) {
+            const SharedFixed& f = shared_.fixed[i];
+            if (f.conv != conv || f.label != label) continue;
+            XS_CHECK(f.state.bytes == bytes, "sycl: state slot '", label, "' is declared with two sizes");
+            return i;
+        }
+        SharedFixed f;
+        f.conv = conv;
+        f.label = label;
+        f.state = make_state(bytes);
+        q_.memset(f.state.buf[0].get(), 0, bytes);
+        q_.wait();
+        shared_.fixed.push_back(std::move(f));
+        return shared_.fixed.size() - 1;
+    }
+
+    KvBuffers& kv_buffers(int64_t slot) const { return shared_.kv[kv_slot_[static_cast<size_t>(slot)]].buf; }
+    StateBuffers& fixed_state(size_t index) { return shared_.fixed[fixed_slot_[index]].state; }
+
+    // sycl_be::Scratch: the session's
+    void* get(size_t bytes) override { return shared_.get(bytes); }
+    void* get_host(size_t bytes) override { return shared_.get_host(bytes); }
 
     std::string where(size_t i) const {
         const Node& n = graph_.nodes()[i];
@@ -478,8 +657,19 @@ private:
                             precision_ == DType::F16 && f16_readers_only(i, consumers) ? DType::F16 : DType::F32;
                     }
                     break;
+                case OpKind::KvRead: {  // in the dtype its writer stores (a program compiled before this one)
+                    const SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(
+                        std::get<graph::KvCacheAttrs>(n.attrs).slot)]];
+                    XS_CHECK(slot.typed, "sycl: kv slot '", slot.spec.label, "' is read before a program writes it; ",
+                             "compile the writer first");
+                    dtype_[i][0] = dtype_[i][1] = slot.buf.dtype;
+                    break;
+                }
                 case OpKind::TopK:
                     dtype_[i][1] = DType::I32;
+                    break;
+                case OpKind::Gather:
+                    if (dt(n.inputs[0]) == DType::I32) dtype_[i][0] = DType::I32;
                     break;
                 case OpKind::Concat:
                     dtype_[i][0] = dt(n.inputs[0]);
@@ -516,7 +706,7 @@ private:
                     need(0, !is_quantized(dt(n.inputs[0])), "an unquantized tensor");
                     break;
                 case OpKind::Gather:
-                    need(0, is_fp(0) || is_packed(0), "f16, f32, q8 or q4");
+                    need(0, is_fp(0) || is_packed(0) || dt(n.inputs[0]) == DType::I32, "f16, f32, q8, q4 or i32");
                     need(1, is_int(1), "i32 or i64");
                     break;
                 case OpKind::MatMul: {
@@ -941,9 +1131,9 @@ private:
         const int64_t rows = numel(view.shape) / cols;  // an expert bank [E, N, K] is E * N rows
         const size_t scale_bytes = static_cast<size_t>(rows * (cols / view.quant.group)) * sizeof(uint16_t);
         const auto copy = [&](const void* src, size_t bytes) {
-            leaves_.emplace_back(q_, std::max<size_t>(bytes, 1));
-            q_.memcpy(leaves_.back().get(), src, bytes).wait();
-            return leaves_.back().get();
+            shared_.weight_buffers.emplace_back(q_, std::max<size_t>(bytes, 1));
+            q_.memcpy(shared_.weight_buffers.back().get(), src, bytes).wait();
+            return shared_.weight_buffers.back().get();
         };
         sycl_be::QuantWeight w;
         w.q4 = view.dtype == DType::Q4;
@@ -1005,38 +1195,41 @@ private:
         const auto& nodes = graph_.nodes();
         leaf_ptr_.assign(nodes.size(), nullptr);
         leaf_quant_.assign(nodes.size(), sycl_be::QuantWeight{});
-        std::map<std::pair<std::string, DType>, size_t> uploaded;  // first node of each weight and device dtype
+        // Weights are the session's (a weight two programs read in one device dtype is uploaded once); constants the
+        // program's.
+        size_t uploaded = 0;
         size_t bytes = 0;
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
             if (n.kind == OpKind::Weight) {
                 const std::string& name = std::get<graph::WeightAttrs>(n.attrs).name;
                 const auto key = std::make_pair(name, dtype_[i][0]);
-                if (const auto it = uploaded.find(key); it != uploaded.end()) {
-                    leaf_ptr_[i] = leaf_ptr_[it->second];
-                    leaf_quant_[i] = leaf_quant_[it->second];
+                if (const auto it = shared_.weights.find(key); it != shared_.weights.end()) {
+                    leaf_ptr_[i] = it->second.ptr;
+                    leaf_quant_[i] = it->second.quant;
                     continue;
                 }
                 const TensorView& view = weights.get(name);
                 XS_CHECK(view.shape == n.outputs[0].shape, "weight '", name, "' has shape ", dims_to_string(view.shape),
                          " but the graph was built for ", dims_to_string(n.outputs[0].shape));
-                uploaded[key] = i;
-                const size_t before = leaves_.size();
+                const size_t before = shared_.weight_buffers.size();
                 if (is_quantized(view.dtype)) {
                     upload_quantized(i, view);
                 } else {
-                    leaves_.push_back(upload(name, view.data, view.dtype, view.shape, dtype_[i][0]));
-                    leaf_ptr_[i] = leaves_.back().get();
+                    shared_.weight_buffers.push_back(upload(name, view.data, view.dtype, view.shape, dtype_[i][0]));
+                    leaf_ptr_[i] = shared_.weight_buffers.back().get();
                 }
-                for (size_t b = before; b < leaves_.size(); ++b)
-                    bytes += leaves_[b].bytes();
+                shared_.weights[key] = SharedLeaf{leaf_ptr_[i], leaf_quant_[i]};
+                ++uploaded;
+                for (size_t b = before; b < shared_.weight_buffers.size(); ++b)
+                    bytes += shared_.weight_buffers[b].bytes();
             } else if (n.kind == OpKind::Constant) {
                 const HostTensor& value = std::get<graph::ConstantAttrs>(n.attrs).value;
                 leaves_.push_back(upload(n.label, value.raw(), value.dtype(), value.shape(), dtype_[i][0]));
                 leaf_ptr_[i] = leaves_.back().get();
             }
         }
-        log::info("sycl: ", uploaded.size(), " weights, ", bytes >> 20, " MiB on ",
+        if (uploaded > 0) log::info("sycl: ", uploaded, " weights, ", bytes >> 20, " MiB on ",
                   q_.get_device().get_info<sycl::info::device::name>());
     }
 
@@ -1048,20 +1241,16 @@ private:
         return s;
     }
 
-    void zero_fixed_state() {
-        for (StateBuffers& s : fixed_state_)
-            q_.memset(s.buf[s.cur].get(), 0, s.bytes);
-        q_.wait();
-    }
-
     void ensure_kv_capacity(int64_t tokens) {
-        for (KvBuffers& b : kv_) {
+        for (size_t slot : kv_slot_) {
+            KvBuffers& b = shared_.kv[slot].buf;
+            const int64_t len = shared_.kv[slot].len;
             if (tokens <= b.capacity) continue;
             const size_t esize = dtype_size(b.dtype);
             const int64_t cap = std::min(max_context_, std::max({tokens, 2 * b.capacity, int64_t{1024}}));
             const auto grow = [&](DeviceBuffer& buf, size_t per_token) {
                 DeviceBuffer bigger(q_, static_cast<size_t>(cap) * per_token);
-                if (cached_ > 0) q_.memcpy(bigger.get(), buf.get(), static_cast<size_t>(cached_) * per_token);
+                if (len > 0) q_.memcpy(bigger.get(), buf.get(), static_cast<size_t>(len) * per_token);
                 return bigger;
             };
             DeviceBuffer k = grow(b.k, static_cast<size_t>(b.row) * esize);
@@ -1078,12 +1267,6 @@ private:
             b.v_scale = std::move(vs);
             b.capacity = cap;
         }
-    }
-
-    void ensure_arena(size_t bytes) {
-        if (bytes <= arena_.bytes()) return;
-        q_.wait();
-        arena_ = DeviceBuffer(q_, align_up(bytes + bytes / 8));
     }
 
     Dims resolve(const Dims& dims, const Step& step) const {
@@ -1128,7 +1311,8 @@ private:
                 have_tokens = true;
             }
         }
-        step.kv_len = cached_ + step.tokens;
+        // A program reading KV slots sees their length; one writing state extends it by T.
+        step.kv_len = reads_kv_ ? shared_.kv[kv_slot_[0]].len : cached() + step.tokens;
         for (const Value& v : graph_inputs) {
             const HostTensor& t = inputs.at(input_name(v));
             if (t.shape() != resolve(graph_.type(v).shape, step)) {
@@ -1198,7 +1382,8 @@ private:
             block_of[i].assign(outs, -1);
             for (size_t j = 0; j < outs; ++j) {
                 // KvCache outputs keep a symbolic L unless the plan is per L (see l_dependent_).
-                p.shapes[i][j] = n.kind == OpKind::KvCache && !l_dependent_ ? resolve(n.outputs[j].shape, Step{step.tokens, kL})
+                p.shapes[i][j] = (n.kind == OpKind::KvCache || n.kind == OpKind::KvRead) && !l_dependent_
+                                     ? resolve(n.outputs[j].shape, Step{step.tokens, kL})
                                                                             : resolve(n.outputs[j].shape, step);
             }
             const auto new_block = [&](size_t j) {
@@ -1277,10 +1462,12 @@ private:
                     }
                     break;
                 }
-                case OpKind::KvCache: {
+                case OpKind::KvCache:
+                case OpKind::KvRead: {
                     const int slot = std::get<graph::KvCacheAttrs>(n.attrs).slot;
                     p.locs[i][0] = Loc{Store::KvK, slot, 0};
                     p.locs[i][1] = Loc{Store::KvV, slot, 0};
+                    if (n.kind == OpKind::KvRead) p.alias[i] = 1;  // nothing to run: it names the slot's memory
                     break;
                 }
                 default:
@@ -1342,13 +1529,13 @@ private:
         const Loc& l = p.locs[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
         switch (l.store) {
             case Store::Arena:
-                return arena_.get() + l.offset;
+                return shared_.arena.get() + l.offset;
             case Store::Leaf:
                 return leaf_ptr_[static_cast<size_t>(l.index)] + l.offset;
             case Store::KvK:
-                return kv_[static_cast<size_t>(l.index)].k.get() + l.offset;
+                return kv_buffers(l.index).k.get() + l.offset;
             case Store::KvV:
-                return kv_[static_cast<size_t>(l.index)].v.get() + l.offset;
+                return kv_buffers(l.index).v.get() + l.offset;
         }
         return nullptr;
     }
@@ -1364,7 +1551,7 @@ private:
         char* out_raw = ptr(p, Value{static_cast<int32_t>(i), 0});
         auto* out = reinterpret_cast<float*>(out_raw);
         const Dims& out_shape = p.shapes[i][0];
-        const int64_t out_n = n.kind == OpKind::KvCache ? 0 : numel(out_shape);  // KvCache outputs may keep kL
+        const int64_t out_n = n.kind == OpKind::KvCache || n.kind == OpKind::KvRead ? 0 : numel(out_shape);  // may keep kL
         using sycl_be::UnaryOp;
         // Kernels that may write f16 (plan_half_values) get the output as float* or half*.
         const auto with_out = [&](auto&& fn) {
@@ -1397,6 +1584,7 @@ private:
             case OpKind::Weight:
             case OpKind::Constant:
             case OpKind::Reshape:
+            case OpKind::KvRead:  // its outputs are the slot's buffers (build_plan)
                 return;
             case OpKind::Gather: {
                 const int64_t width = in_shape(0)[1];
@@ -1407,6 +1595,16 @@ private:
                         sycl_be::gather_quant(q_, t, reinterpret_cast<const int32_t*>(in_ptr(1)), out, count, width);
                     } else {
                         sycl_be::gather_quant(q_, t, reinterpret_cast<const int64_t*>(in_ptr(1)), out, count, width);
+                    }
+                    return;
+                }
+                if (in_dt(0) == DType::I32) {
+                    const auto* table = reinterpret_cast<const uint32_t*>(in_ptr(0));
+                    auto* rows = reinterpret_cast<uint32_t*>(out);
+                    if (in_dt(1) == DType::I32) {
+                        sycl_be::gather_bits(q_, table, reinterpret_cast<const int32_t*>(in_ptr(1)), rows, count, width);
+                    } else {
+                        sycl_be::gather_bits(q_, table, reinterpret_cast<const int64_t*>(in_ptr(1)), rows, count, width);
                     }
                     return;
                 }
@@ -1644,7 +1842,7 @@ private:
             }
             case OpKind::KvCache: {
                 const int slot = std::get<graph::KvCacheAttrs>(n.attrs).slot;
-                KvBuffers& b = kv_[static_cast<size_t>(slot)];
+                KvBuffers& b = kv_buffers(slot);
                 const int64_t count = step.tokens * b.row;
                 const size_t offset = static_cast<size_t>((step.kv_len - step.tokens) * b.row);
                 if (b.dtype == DType::I8) {
@@ -1683,16 +1881,16 @@ private:
                 if (n.inputs.size() == 4) s.key_bias = in_f32(3);
                 if (in_dt(1) == DType::I8) {
                     const int slot = std::get<graph::KvCacheAttrs>(graph_.node(n.inputs[1]).attrs).slot;
-                    const KvBuffers& b = kv_[static_cast<size_t>(slot)];
+                    const KvBuffers& b = kv_buffers(slot);
                     sycl_be::KvI8 kv;
                     kv.k = reinterpret_cast<const int8_t*>(b.k.get());
                     kv.v = reinterpret_cast<const int8_t*>(b.v.get());
                     kv.k_scale = reinterpret_cast<const float*>(b.k_scale.get());
                     kv.v_scale = reinterpret_cast<const float*>(b.v_scale.get());
                     if (precision_ == DType::F16) {
-                        sycl_be::attention_i8<half>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_);
+                        sycl_be::attention_i8<half>(q_, *this, shared_.kv_scratch, in_f32(0), kv, out, s, attention_);
                     } else {
-                        sycl_be::attention_i8<float>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_);
+                        sycl_be::attention_i8<float>(q_, *this, shared_.kv_scratch, in_f32(0), kv, out, s, attention_);
                     }
                 } else {
                     // Keys and values in place, in two parts when the concats were fused away (attn_split_).
@@ -1830,23 +2028,40 @@ private:
                 return;
             }
             case OpKind::CausalConv: {
-                const int slot = std::get<graph::StateAttrs>(n.attrs).slot;
-                StateBuffers& st = fixed_state_[static_cast<size_t>(slot)];
+                const auto slot = static_cast<size_t>(std::get<graph::StateAttrs>(n.attrs).slot);
+                SharedFixed& f = shared_.fixed[fixed_slot_[slot]];
+                StateBuffers& st = f.state;
                 const Dims& x = in_shape(0);
                 sycl_be::causal_conv(q_, in_f32(0), in_f32(1), reinterpret_cast<const float*>(st.buf[st.cur].get()),
                                      reinterpret_cast<float*>(st.buf[1 - st.cur].get()), out, x[0], x[1],
                                      in_shape(1)[1], conv_silu_[i] != 0);
+                if (rewinding_) {
+                    f.channels = x[1];
+                    f.kernel = in_shape(1)[1];
+                    keep_inputs(f, {{in_f32(0), x[1]}}, x[0]);
+                }
                 return;
             }
             case OpKind::GatedDelta: {
                 const auto& a = std::get<graph::StateAttrs>(n.attrs);
-                StateBuffers& st = fixed_state_[conv_states_ + static_cast<size_t>(a.slot)];
+                SharedFixed& f = shared_.fixed[fixed_slot_[conv_states_ + static_cast<size_t>(a.slot)]];
+                StateBuffers& st = f.state;
                 const Dims& qs = in_shape(0);
                 const Dims& vs = in_shape(2);
                 sycl_be::gated_delta(q_, in_f32(0), in_f32(1), in_f32(2), in_f32(3), in_f32(4),
                                      reinterpret_cast<const float*>(st.buf[st.cur].get()),
                                      reinterpret_cast<float*>(st.buf[1 - st.cur].get()), out, qs[0], qs[1], vs[1],
                                      qs[2], vs[2], a.qk_l2norm_eps);
+                if (rewinding_) {
+                    f.k_heads = qs[1];
+                    f.v_heads = vs[1];
+                    f.key_dim = qs[2];
+                    f.value_dim = vs[2];
+                    f.eps = a.qk_l2norm_eps;
+                    keep_inputs(f, {{in_f32(1), qs[1] * qs[2]}, {in_f32(2), vs[1] * vs[2]}, {in_f32(3), vs[1]},
+                                    {in_f32(4), vs[1]}},
+                                qs[0]);
+                }
                 return;
             }
         }
@@ -1895,7 +2110,8 @@ private:
     }
 
     const graph::Graph graph_;
-    sycl::queue q_;
+    SyclShared& shared_;
+    sycl::queue& q_;
     const sycl_be::AttentionPlan attention_;
     const sycl_be::QuantMatmulPlan quant_;  // how quantized matmuls run on this device (sycl_be::quant_path)
     const DType precision_;
@@ -1920,25 +2136,49 @@ private:
     std::vector<int32_t> mm_add_;            // Add run as a GEMM adding into the residual (the MatMul folded in), or -1
     std::vector<std::vector<int32_t>> mm_parts_;  // MatMul whose siblings run in its GEMV: all of them, itself first
     std::vector<int32_t> mm_leader_;         // MatMul run in a sibling's GEMV (mm_parts_): that sibling, or -1
-    std::vector<DeviceBuffer> leaves_;
+    std::vector<DeviceBuffer> leaves_;  // constants (weights are the session's: SyclShared)
     std::vector<char*> leaf_ptr_;  // by node index, weights and constants
     std::vector<sycl_be::QuantWeight> leaf_quant_;  // by node index, quantized weights
-    std::vector<KvBuffers> kv_;
-    std::vector<StateBuffers> fixed_state_;  // conv slots, then recurrent slots
+    std::vector<size_t> kv_slot_;     // the shared KV slot of each of the graph's
+    std::vector<size_t> fixed_slot_;  // the shared slot of each conv slot, then each recurrent slot
     size_t conv_states_ = 0;
+    bool reads_kv_ = false;   // the program reads its KV slots (KvRead) instead of appending
+    bool rewinding_ = false;  // the running step keeps its conv and recurrent inputs (SharedFixed)
     std::map<std::pair<int64_t, int64_t>, Plan> plans_;
-    DeviceBuffer arena_;
-    DeviceBuffer scratch_;
-    void* host_ = nullptr;  // get_host()
-    size_t host_bytes_ = 0;
-    GrowingScratch kv_scratch_{q_};  // the int8 KV cache dequantized for prefill attention
-    int64_t cached_ = 0;
     std::map<std::string, double> decode_ms_, prefill_ms_;
     std::vector<std::pair<std::string, sycl::event>> marks_;  // a profiled run's barriers: (op, event)
     std::set<int64_t> profiled_shapes_;      // step token counts seen (their first run is not profiled)
     std::map<int64_t, int64_t> profiled_runs_;
     int64_t decode_steps_ = 0;
     int64_t prefill_steps_ = 0;
+};
+
+// A session: the shared state and its programs (backend.h).
+class SyclSession final : public Session {
+public:
+    explicit SyclSession(std::unique_ptr<SyclShared> shared) : shared_(std::move(shared)) {}
+
+    SyclShared& shared() { return *shared_; }
+    void add(std::unique_ptr<SyclProgram> program) { programs_.push_back(std::move(program)); }
+
+    void run(size_t program, const TensorMap& inputs, TensorMap& outputs) override {
+        at(program).run(inputs, outputs);
+    }
+    int64_t num_cached(size_t program) const override {
+        XS_CHECK(program < programs_.size(), "sycl: no program ", program);
+        return programs_[program]->cached();
+    }
+    void reset() override { shared_->reset(); }
+    void truncate(size_t program, int64_t n) override { at(program).truncate(n); }
+
+private:
+    SyclProgram& at(size_t program) {
+        XS_CHECK(program < programs_.size(), "sycl: no program ", program, " (", programs_.size(), " compiled)");
+        return *programs_[program];
+    }
+
+    std::unique_ptr<SyclShared> shared_;  // outlives the programs, which refer to it
+    std::vector<std::unique_ptr<SyclProgram>> programs_;
 };
 
 class SyclBackend final : public Backend {
@@ -1960,9 +2200,11 @@ public:
         return out;
     }
 
-    std::unique_ptr<Session> compile(const graph::Graph& graph, const WeightStore& weights,
+    std::unique_ptr<Session> compile(std::span<const graph::Graph* const> programs, const WeightStore& weights,
                                      const SessionOptions& options) override {
-        graph.validate();
+        XS_CHECK(!programs.empty(), "sycl: compile without a program");
+        for (const graph::Graph* graph : programs) graph->validate();
+        XS_CHECK(options.rewind_tokens >= 0, "sycl rewind_tokens must not be negative");
         XS_CHECK(options.precision == DType::F16 || options.precision == DType::F32,
                  "sycl session precision must be f16 or f32, got ", dtype_name(options.precision));
         XS_CHECK(options.max_context > 0, "sycl max_context must be positive, got ", options.max_context);
@@ -2001,8 +2243,13 @@ public:
         }
         attention.xmx = sycl_be::xmx_device(devices_[index]);
         attention.compute_units = devices_[index].get_info<sycl::info::device::max_compute_units>();
-        return std::make_unique<SyclSession>(graph, weights, options, it->second, attention,
-                                             quant_plan(devices_[index], attention, options.precision));
+        auto session = std::make_unique<SyclSession>(
+            std::make_unique<SyclShared>(it->second, options.max_context, options.rewind_tokens));
+        const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision);
+        for (const graph::Graph* graph : programs) {
+            session->add(std::make_unique<SyclProgram>(*graph, weights, options, session->shared(), attention, quant));
+        }
+        return session;
     }
 
 private:

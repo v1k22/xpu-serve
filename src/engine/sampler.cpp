@@ -48,8 +48,29 @@ void Sampler::apply_penalties(std::span<float> logits, std::span<const int32_t> 
 
 int32_t Sampler::sample(std::span<float> logits, std::span<const int32_t> prompt, std::span<const int32_t> generated) {
     apply_penalties(logits, prompt, generated);
-    if (params_.temperature <= 0.0f || params_.top_k == 1) return argmax(logits);
+    if (greedy()) return argmax(logits);
+    distribution(logits);
+    std::discrete_distribution<size_t> pick(weights_.begin(), weights_.end());
+    return order_[pick(rng_)];
+}
 
+int32_t Sampler::verify(std::span<float> logits, std::span<const int32_t> prompt, std::span<const int32_t> generated,
+                        int32_t draft) {
+    apply_penalties(logits, prompt, generated);
+    if (greedy()) return argmax(logits);
+    distribution(logits);
+    const double total = std::accumulate(weights_.begin(), weights_.end(), 0.0);
+    const auto it = std::find(order_.begin(), order_.end(), draft);
+    if (it != order_.end()) {
+        double& w = weights_[static_cast<size_t>(it - order_.begin())];
+        if (std::uniform_real_distribution<double>(0.0, 1.0)(rng_) * total < w) return draft;
+        w = 0.0;  // the residual max(p - q, 0) of a point-mass draft: p without the draft
+    }
+    std::discrete_distribution<size_t> pick(weights_.begin(), weights_.end());
+    return order_[pick(rng_)];
+}
+
+void Sampler::distribution(std::span<const float> logits) {
     // Candidates sorted by logit, cut by top-k first (cheap partial sort), then top-p / min-p on the softmax.
     const size_t vocab = logits.size();
     const size_t k = params_.top_k > 0 ? std::min(vocab, static_cast<size_t>(params_.top_k)) : vocab;
@@ -60,29 +81,30 @@ int32_t Sampler::sample(std::span<float> logits, std::span<const int32_t> prompt
     order_.resize(k);
 
     const float max_logit = logits[static_cast<size_t>(order_[0])];
-    std::vector<double> probs(k);
+    weights_.resize(k);
     double total = 0.0;
     for (size_t i = 0; i < k; ++i) {
-        probs[i] = std::exp((static_cast<double>(logits[static_cast<size_t>(order_[i])]) - max_logit) / params_.temperature);
-        total += probs[i];
+        weights_[i] =
+            std::exp((static_cast<double>(logits[static_cast<size_t>(order_[i])]) - max_logit) / params_.temperature);
+        total += weights_[i];
     }
     size_t keep = k;
     if (params_.min_p > 0.0f) {
-        const double floor = params_.min_p * probs[0];  // probs[0] is the max
-        while (keep > 1 && probs[keep - 1] < floor) --keep;
+        const double floor = params_.min_p * weights_[0];  // weights_[0] is the max
+        while (keep > 1 && weights_[keep - 1] < floor) --keep;
     }
     if (params_.top_p < 1.0f) {
         double cumulative = 0.0;
         for (size_t i = 0; i < keep; ++i) {
-            cumulative += probs[i] / total;
+            cumulative += weights_[i] / total;
             if (cumulative >= params_.top_p) {
                 keep = i + 1;
                 break;
             }
         }
     }
-    std::discrete_distribution<size_t> pick(probs.begin(), probs.begin() + static_cast<std::ptrdiff_t>(keep));
-    return order_[pick(rng_)];
+    order_.resize(keep);
+    weights_.resize(keep);
 }
 
 }  // namespace xs

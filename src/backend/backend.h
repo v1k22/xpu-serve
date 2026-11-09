@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,25 +32,37 @@ struct SessionOptions {
     // KV cache storage: empty = the backend's choice for `precision`; I8 = int8 codes with one f32 scale per (token,
     // KV head), rounded as quant::quantize_kv_row_i8.
     std::optional<DType> kv_dtype;
+    // Steps of up to this many tokens can be cut back to any point inside them (truncate), conv and recurrent state
+    // included: the verify step of speculative decoding (k + 1 tokens). 0: only whole sequences.
+    int64_t rewind_tokens = 0;
     std::map<std::string, std::string> extra;  // backend-specific options, refused by name when unknown
 };
 
+// The programs of a session run over one sequence. They share the weights (by name) and the state slots: a KV, conv
+// or recurrent slot that two programs declare with the same label is one state. Each slot counts the tokens it holds;
+// a program extends the slots it writes (KvCache, CausalConv, GatedDelta), which always hold the same count, and may
+// read KV slots another program writes (KvRead, without appending; such a program writes no KV slot itself).
 class Session {
 public:
     virtual ~Session() = default;
 
-    // Runs one step. `inputs` holds every graph input by name (shapes resolve kT). Fills `outputs` with every graph
-    // output by name as freshly allocated host tensors (f32 for float outputs). Advances the state by T tokens; a
-    // failed step leaves it as it was. A graph without state slots is stateless (num_cached() stays 0).
-    virtual void run(const TensorMap& inputs, TensorMap& outputs) = 0;
+    // Runs one step of program `program` (its index in compile's list). `inputs` holds every graph input by name
+    // (shapes resolve kT). Fills `outputs` with every graph output by name as freshly allocated host tensors (f32 for
+    // float outputs). Advances the slots the program writes by T tokens; a failed step leaves the state as it was. A
+    // program without slots is stateless.
+    virtual void run(size_t program, const TensorMap& inputs, TensorMap& outputs) = 0;
+    void run(const TensorMap& inputs, TensorMap& outputs) { run(0, inputs, outputs); }
 
-    // Tokens currently in the KV state (L of the last run, 0 after reset).
-    virtual int64_t num_cached() const = 0;
-    // Drops all KV state.
+    // Tokens in the slots `program` writes (L of its last run, 0 after reset or for a program writing none).
+    virtual int64_t num_cached(size_t program) const = 0;
+    int64_t num_cached() const { return num_cached(0); }
+    // Drops the state of every slot.
     virtual void reset() = 0;
-    // Keeps the first `n` cached tokens (n <= num_cached()). A graph with conv or recurrent state
-    // (Graph::has_fixed_state) can only keep 0 or num_cached() tokens; anything else throws.
-    virtual void truncate(int64_t n) = 0;
+    // Keeps the first `n` tokens of the slots `program` writes (n <= num_cached(program)). Conv and recurrent state
+    // (Graph::has_fixed_state) summarize the sequence: it keeps 0 tokens, all of them, or, after a step of at most
+    // SessionOptions::rewind_tokens tokens, any count from before that step on; anything else throws.
+    virtual void truncate(size_t program, int64_t n) = 0;
+    void truncate(int64_t n) { truncate(0, n); }
 };
 
 class Backend {
@@ -57,9 +70,15 @@ public:
     virtual ~Backend() = default;
     virtual std::string_view name() const = 0;
     virtual std::vector<DeviceInfo> devices() const = 0;
-    // Compiles `graph` with the weights it references. Throws xs::Error naming anything it cannot do.
-    virtual std::unique_ptr<Session> compile(const graph::Graph& graph, const WeightStore& weights,
+    // Compiles programs over one sequence (Session) with the weights they reference. Throws xs::Error naming anything
+    // it cannot do, including two programs declaring one slot label with different shapes.
+    virtual std::unique_ptr<Session> compile(std::span<const graph::Graph* const> programs, const WeightStore& weights,
                                              const SessionOptions& options) = 0;
+    std::unique_ptr<Session> compile(const graph::Graph& graph, const WeightStore& weights,
+                                     const SessionOptions& options) {
+        const graph::Graph* programs[] = {&graph};
+        return compile(programs, weights, options);
+    }
 };
 
 // Backends compiled into this binary, in order of preference, e.g. {"sycl", "cpu-ref"}.

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe --tokenizer-from <Qwen3.5 dir> --out <dir>
+    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe --tokenizer-from <dir> --out <dir>
 
 The model keeps the real layer pattern and tensor names (Qwen3.5 MoE: three Gated DeltaNet layers then one full
-attention layer, fused gate_up expert banks, a gated shared expert) at a width a CPU runs in seconds. The tokenizer
+attention layer, fused gate_up expert banks, a gated shared expert; an MTP head) at a width a CPU runs in seconds. The tokenizer
 files are copied from a real checkpoint, so the vocabulary is the real one. Router weights are scaled up so each
 token's top-k experts win by a clear margin: a near tie could route differently at f16 and fail parity for a reason
 that is not a bug. Then run hf_reference.py on the output.
@@ -60,7 +60,62 @@ def qwen3_5(vocab_size):
     return Qwen3_5ForCausalLM(config)
 
 
-ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe}
+def gemma4_moe(vocab_size):
+    """Gemma 4 26B-A4B's layout: five sliding layers then a full one, experts beside every layer's MLP (a router with
+    per-expert scales), global layers with fewer KV heads whose values are the key projection, softcapped logits.
+    The sliding window is shorter than the longest prompt, so the masks are exercised."""
+    from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+
+    config = Gemma4TextConfig(
+        vocab_size=vocab_size, hidden_size=64, intermediate_size=48, num_hidden_layers=6, num_attention_heads=4,
+        num_key_value_heads=2, num_global_key_value_heads=1, head_dim=32, global_head_dim=64, sliding_window=16,
+        layer_types=["sliding_attention"] * 5 + ["full_attention"], hidden_size_per_layer_input=0,
+        enable_moe_block=True, num_experts=8, top_k_experts=2, moe_intermediate_size=32, attention_k_eq_v=True,
+        final_logit_softcapping=30.0, max_position_embeddings=4096, tie_word_embeddings=True, rms_norm_eps=1e-6,
+        initializer_range=0.05,
+        rope_parameters={"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25,
+                                            "rope_theta": 1000000.0},
+                         "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}},
+    )
+    model = Gemma4ForCausalLM(config)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("router.proj.weight"):
+                p.normal_(0.0, 40.0)  # decisive routing: a near tie could route differently at f16
+            elif name.endswith("router.per_expert_scale") or name.endswith("router.scale"):
+                p.uniform_(0.5, 1.5)
+            elif p.dim() == 1 and "norm" in name:
+                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
+    return model
+
+
+ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe}
+
+
+def mtp_head(model):
+    """A random MTP head as the released checkpoints carry it (mtp.*: fc over [embedding | hidden], the two pre-fc
+    norms, one full-attention decoder layer of the target's kind, the final norm), built from the target's classes."""
+    import torch.nn as nn
+
+    cfg = model.config
+    layer_cls, norm_cls = type(model.model.layers[0]), type(model.model.norm)
+    hidden = cfg.hidden_size
+    head = nn.ModuleDict({
+        "layers": nn.ModuleList([layer_cls(cfg, cfg.layer_types.index("full_attention"))]),
+        "fc": nn.Linear(2 * hidden, hidden, bias=False),
+        "pre_fc_norm_embedding": norm_cls(hidden, eps=cfg.rms_norm_eps),
+        "pre_fc_norm_hidden": norm_cls(hidden, eps=cfg.rms_norm_eps),
+        "norm": norm_cls(hidden, eps=cfg.rms_norm_eps),
+    })
+    with torch.no_grad():
+        for name, p in head.named_parameters():
+            if p.dim() == 1:
+                p.normal_(0.0, 0.2)  # zero-centered norms: (1 + w) away from 1, so a skipped norm shows
+            elif name.endswith("mlp.gate.weight"):
+                p.normal_(0.0, 2.0)  # decisive routing, as for the target's routers
+            else:
+                p.normal_(0.0, cfg.initializer_range)
+    return {"mtp." + k: v.contiguous() for k, v in head.state_dict().items()}
 
 
 def fuse_experts(path):
@@ -94,8 +149,14 @@ def main():
     model = ARCHS[args.arch](len(tok))
     model.config.eos_token_id = tok.eos_token_id
     model.generation_config.eos_token_id = tok.eos_token_id
+    qwen = args.arch.startswith("qwen")
+    if qwen:
+        model.config.mtp_num_hidden_layers = 1
     model.save_pretrained(args.out, safe_serialization=True)
-    fuse_experts(os.path.join(args.out, "model.safetensors"))
+    weights = os.path.join(args.out, "model.safetensors")
+    if qwen:
+        save_file({**load_file(weights), **mtp_head(model)}, weights, metadata={"format": "pt"})
+    fuse_experts(weights)
     for f in TOKENIZER_FILES:
         src = os.path.join(args.tokenizer_from, f)
         if os.path.exists(src):

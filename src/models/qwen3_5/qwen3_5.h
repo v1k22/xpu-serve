@@ -7,7 +7,8 @@
 // gated delta rule with a fixed-size state per sequence), every `full_attention_interval`-th layer is gated full
 // attention (sigmoid output gate, q/k norms, partial rotary). Norms are zero-centered (x * (1 + w)). Served: the text
 // decoder, dense ("qwen3_5") or mixture of experts in every layer ("qwen3_5_moe": softmax router, top-k renormalized,
-// fused gate_up expert banks, a sigmoid-gated shared expert). The vision tower and the MTP head are not loaded.
+// fused gate_up expert banks, a sigmoid-gated shared expert), and its MTP head (mtp.*) as the drafter for speculative
+// decoding. The vision tower is not loaded.
 
 #include <filesystem>
 #include <memory>
@@ -48,6 +49,7 @@ struct Config {
     int64_t linear_key_dim = 0;
     int64_t linear_value_dim = 0;
     int64_t conv_kernel = 0;
+    int64_t mtp_layers = 0;  // decoder layers of the MTP head (mtp.layers.<i>); 0: no head
 };
 
 // Parses config.json (the text_config object of a multimodal config, or the root of a text-only one).

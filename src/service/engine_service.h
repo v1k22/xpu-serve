@@ -20,6 +20,7 @@ struct ServiceOptions {
     EngineOptions engine;
     std::string model_id;  // empty = the model directory name
     bool vision = true;    // load the vision encoder when the checkpoint has one
+    std::filesystem::path drafter;  // a drafter checkpoint for speculative decoding (a Gemma 4 assistant)
 };
 
 // The real InferenceService: loads model, tokenizer and chat template from a model directory, compiles the step

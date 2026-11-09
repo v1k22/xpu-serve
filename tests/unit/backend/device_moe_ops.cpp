@@ -43,4 +43,8 @@ TEST_SUITE("device moe ops" * doctest::skip(!dev::enabled())) {
     TEST_CASE("moe block: sigmoid router, routed scale, gated shared expert") {
         xs::test::moe::moe_block(device_env(), xs::blocks::Router::Sigmoid, true);
     }
+    TEST_CASE("moe block, Gemma 4 routing: its own router input, per-expert scales, GeGLU experts") {
+        xs::test::moe::moe_block(device_env(), xs::blocks::Router::Softmax, false, false, 7, true);
+        xs::test::moe::moe_block(device_env(), xs::blocks::Router::Softmax, false, true, 40, true);
+    }
 }

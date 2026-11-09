@@ -24,7 +24,8 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     Timer timer;
     s->tokenizer_ = tok::Tokenizer::load(model_dir);
     s->template_ = chat::ChatTemplate::load(model_dir);
-    auto model = load_model(model_dir, LoadOptions{options.vision});
+    const bool speculate = options.engine.spec_k > 0;
+    auto model = load_model(model_dir, LoadOptions{options.vision, speculate, options.drafter});
     const ModelInfo& info = model->info();
     log::info("model ", info.id, " (", info.arch, "): graph of ", model->graph().nodes().size(), " nodes, ",
               model->graph().kv_slots().size(), " KV slots", model->vision() ? "; vision encoder" : "");
@@ -38,9 +39,23 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     SessionOptions session_options = options.session;
     session_options.max_context = engine_options.max_context;
 
+    // Speculating, the session also runs the model's prefill, verify and draft programs (spec::Program order) and
+    // cuts a verify back to its accepted tokens.
+    std::vector<const graph::Graph*> programs{&model->graph()};
+    if (speculate) {
+        const Speculation* spec = model->speculation();
+        if (spec == nullptr) {
+            fail("model ", info.id, " has no drafter: speculative decoding needs one (an MTP head in the checkpoint, or "
+                 "--drafter <an assistant checkpoint>)");
+        }
+        programs.insert(programs.end(), {&spec->prefill_graph(), &spec->verify_graph(), &spec->draft_graph()});
+        session_options.rewind_tokens = options.engine.spec_k + 1;
+        log::info("speculative decoding: ", options.engine.spec_k, " drafts per round, drafter graph of ",
+                  spec->draft_graph().nodes().size(), " nodes");
+    }
     auto backend = make_backend(options.backend);
     Timer compile_timer;
-    auto session = backend->compile(model->graph(), model->weights(), session_options);
+    auto session = backend->compile(programs, model->weights(), session_options);
     log::info("compiled on ", options.backend, " ", session_options.device.empty() ? "(default device)" : session_options.device,
               " in ", static_cast<int>(compile_timer.elapsed_ms()), " ms");
     std::unique_ptr<Session> vision_session;

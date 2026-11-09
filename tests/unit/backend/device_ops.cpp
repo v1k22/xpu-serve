@@ -322,6 +322,19 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
+    TEST_CASE("gather picks rows of an i32 table as i32, bit for bit") {
+        std::vector<int32_t> table(300 * 5);
+        for (size_t i = 0; i < table.size(); ++i) table[i] = static_cast<int32_t>(1000003 * i % 262147);  // denormal bits
+        const std::vector<int32_t> ids = {299, 0, 17, 17, 128};
+        Graph g;
+        g.output("out", g.gather(g.constant(test::make_tensor(DType::I32, {300, 5}, table)), g.input("ids", DType::I32, {kT})));
+        const HostTensor out = run_out(g, test::MemoryWeights{}, {{"ids", test::make_tensor(DType::I32, {5}, ids)}});
+        REQUIRE(out.dtype() == DType::I32);
+        std::vector<int32_t> want;
+        for (const int32_t id : ids) want.insert(want.end(), table.begin() + id * 5, table.begin() + id * 5 + 5);
+        CHECK(std::vector<int32_t>(out.data<int32_t>(), out.data<int32_t>() + out.numel()) == want);
+    }
+
     TEST_CASE("slice with static ranges and the symbolic last-n form; reshape resolves T") {
         test::TensorRng rng(6);
         const HostTensor x = rng.uniform(DType::F32, {5, 4, 8});

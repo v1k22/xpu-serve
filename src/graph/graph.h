@@ -42,7 +42,7 @@ enum class OpKind : uint8_t {
     Input,      // graph input fed by the caller every run
     Weight,     // named tensor from the WeightStore
     Constant,   // small tensor embedded in the graph
-    Gather,     // (table [V, D], ids [N] int) -> [N, D]; rows of table
+    Gather,     // (table [V, D], ids [...] int) -> [..., D]; rows of table (an i32 table gives i32 rows)
     MatMul,     // (x [..., K], w [N, K]) -> [..., N] = x @ w^T
     Add,        // (a, b) numpy broadcasting
     Mul,        // (a, b) numpy broadcasting
@@ -72,6 +72,8 @@ enum class OpKind : uint8_t {
     ExpertMatMul, // (x [T, K] or [T, S, K], w [E, N, K], idx [T, S] int) -> [T, S, N]: out[t, s] = x[t] (or
                   // x[t, s]) @ w[idx[t, s]]^T; every idx in [0, E). The expert matmuls of a mixture of experts
     Concat,     // (x0, x1, ...) joined along AxisAttrs::axis (static there); the other dims and the dtype agree
+    KvRead,     // () -> (k_all [L, Hkv, D], v_all [L, Hkv, D]): a KV slot another program of the session writes, read
+                // without appending; L is that slot's length (a graph either appends to its KV slots or only reads)
 };
 
 // CausalConv: with x' = [the slot's K-1 previous inputs (zeros at the start), x], out[t, c] = sum_j w[c, j] x'[t + j, c];
@@ -139,8 +141,8 @@ struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op'
     int slot = -1;
     float qk_l2norm_eps = 0.0f;  // GatedDelta only; 0 = no l2norm of q and k
 };
-// Causal (the default): k and v are KvCache outputs [L, Hkv, D]. Query i of the step sits at absolute position
-// p_i = L - T + i; key j sits at position j. Key j is visible to query i iff j <= p_i and (sliding_window == 0 or
+// Causal (the default): k and v are KvCache or KvRead outputs [L, Hkv, D]. Query i of the step sits at absolute
+// position p_i = L - T + i (after a KvRead, the slot's last T positions); key j sits at position j. Key j is visible to query i iff j <= p_i and (sliding_window == 0 or
 // p_i - j < sliding_window).
 // Not causal (encoders, policy prefixes): every key is visible to every query; q may have a static length and k, v
 // any length N (e.g. kT for self-attention over the step's own tokens); sliding_window must be 0. The optional
@@ -170,9 +172,10 @@ struct Node {
     std::string label;  // scope path for debugging and backend node names, e.g. "layers.3.attn.q_proj"
 };
 
-// Per-sequence state owned by the backend session. Each slot is used by exactly one node per graph. A graph without
-// slots is stateless: every run stands alone (encoders). KV slots grow with the sequence and can be cut back to a
-// prefix; conv and recurrent slots have a fixed size and summarize the whole sequence, so they cannot.
+// Per-sequence state owned by the backend session, shared by label between the programs of a session (backend.h).
+// Each slot is used by exactly one node per graph. A graph without slots is stateless: every run stands alone
+// (encoders). KV slots grow with the sequence and can be cut back to a prefix; conv and recurrent slots have a fixed
+// size and summarize the whole sequence, so they cannot (except within a short last step: SessionOptions).
 struct KvSlot {
     int64_t num_kv_heads = 0;
     int64_t head_dim = 0;
@@ -225,6 +228,7 @@ public:
     Value rope(Value x, Value positions, Value inv_freq, int64_t rotary_dim = 0);
     int add_kv_slot(int64_t num_kv_heads, int64_t head_dim, int64_t sliding_window, std::string label);
     std::pair<Value, Value> kv_cache(int slot, Value k, Value v);
+    std::pair<Value, Value> kv_read(int slot);
     Value attention(Value q, Value k_all, Value v_all, const AttentionAttrs& attrs);
     // Non-causal attention whose key j's scores get key_bias[j] added (AttentionAttrs::causal must be false).
     Value attention(Value q, Value k, Value v, Value key_bias, const AttentionAttrs& attrs);

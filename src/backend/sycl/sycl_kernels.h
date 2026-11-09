@@ -83,6 +83,9 @@ void concat(sycl::queue& q, const ConcatParts& parts, void* out, int64_t outer);
 
 template <typename T, typename I>
 void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n, int64_t width);
+// Rows of a table of 32-bit integers, copied as they are.
+template <typename I>
+void gather_bits(sycl::queue& q, const uint32_t* table, const I* ids, uint32_t* out, int64_t n, int64_t width);
 
 // x [T, H, D]; positions [T] or [T, sections]; inv_freq [rotary / (2 sections)].
 template <typename I, typename Y>

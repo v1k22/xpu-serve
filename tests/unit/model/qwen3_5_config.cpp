@@ -17,7 +17,7 @@ json qwen38_config() {
               {"num_key_value_heads", 4}, {"head_dim", 256}, {"attn_output_gate", true}, {"linear_num_key_heads", 16},
               {"linear_num_value_heads", 48}, {"linear_key_head_dim", 128}, {"linear_value_head_dim", 128},
               {"linear_conv_kernel_dim", 4}, {"hidden_act", "silu"}, {"output_gate_type", "swish"},
-              {"tie_word_embeddings", false},
+              {"tie_word_embeddings", false}, {"mtp_num_hidden_layers", 1}, {"mtp_use_dedicated_embeddings", false},
               {"rope_parameters",
                {{"mrope_interleaved", true}, {"mrope_section", {11, 11, 10}}, {"partial_rotary_factor", 0.25},
                 {"rope_theta", 10000000}, {"rope_type", "default"}}}};
@@ -39,6 +39,7 @@ TEST_CASE("qwen3_5 config: the Qwen3.8-27B layout") {
     CHECK(c.rope_theta == doctest::Approx(1e7));
     CHECK(c.attn_output_gate);
     CHECK(c.linear_value_heads == 3 * c.linear_key_heads);
+    CHECK(c.mtp_layers == 1);
 }
 
 TEST_CASE("qwen3_5 config: refuses what it does not implement, by name") {
@@ -47,7 +48,7 @@ TEST_CASE("qwen3_5 config: refuses what it does not implement, by name") {
         json value;
     };
     for (const Case& k : {Case{"output_gate_type", "sigmoid"}, Case{"hidden_act", "gelu"}, Case{"attention_bias", true},
-                          Case{"linear_num_value_heads", 40}}) {
+                          Case{"linear_num_value_heads", 40}, Case{"mtp_use_dedicated_embeddings", true}}) {
         CAPTURE(k.key);
         json config = qwen38_config();
         config["text_config"][k.key] = k.value;

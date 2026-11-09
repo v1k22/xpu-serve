@@ -77,6 +77,20 @@ inline void topk_rows(const Env& env) {
     CHECK(to_ints(out.at("indices")) == ref_indices);
     CHECK(to_ints(out.at("indices"))[0] == 3);
     CHECK(to_ints(out.at("indices"))[1] == 11);
+
+    // Few wide rows (a drafter's 32 of 2048 centroids), ties included.
+    HostTensor wide = rng.uniform(DType::F32, {2, 2048});
+    wide.data<float>()[100] = wide.data<float>()[1900] = wide.data<float>()[700] = 3.0f;
+    Graph gw;
+    const auto [wv, wi] = gw.topk(gw.input("x", DType::F32, {kT, 2048}), 32);
+    gw.output("values", wv);
+    gw.output("indices", wi);
+    const TensorMap wout = run(env, gw, MemoryWeights{}, {{"x", wide}});
+    const auto [wref_values, wref_indices] = ref::topk(to_f64(wide), 32);
+    CHECK(all_close(wout.at("values"), wref_values, 0, 0));
+    const std::vector<int64_t> wide_idx = to_ints(wout.at("indices"));
+    CHECK(wide_idx == wref_indices);
+    CHECK(std::vector<int64_t>(wide_idx.begin(), wide_idx.begin() + 3) == std::vector<int64_t>{100, 700, 1900});
 }
 
 inline void expert_matmul_shared_and_per_slot(const Env& env) {
@@ -155,7 +169,10 @@ inline void expert_matmul_quantized(const Env& env) {
 // clearly ahead of the rest (a near tie could pick differently at f16).
 // `quantized`: q4 banks with gate and up fused into one [E, 2 I, hidden] bank (Qwen3.5 MoE's layout); `tokens` past
 // 16 takes the grouped path for quantized banks on SYCL.
-inline void moe_block(const Env& env, blocks::Router router, bool shared, bool quantized = false, int64_t tokens = 7) {
+// gemma: Gemma 4's routing: the router reads its own input, each expert's weight is scaled after normalizing, and
+// the experts use GeGLU.
+inline void moe_block(const Env& env, blocks::Router router, bool shared, bool quantized = false, int64_t tokens = 7,
+                      bool gemma = false) {
     TensorRng rng(router == blocks::Router::Softmax ? 34 : 35);
     const int64_t experts = 8, top_k = 2, hidden = 64, inter = quantized ? 64 : 48;
     MemoryWeights w;
@@ -186,9 +203,13 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
     w.add("s_up", rng.uniform(DType::BF16, {inter, hidden}, s_in));
     w.add("s_down", rng.uniform(DType::BF16, {hidden, inter}, 1.0f / std::sqrt(static_cast<float>(inter))));
     w.add("s_gg", rng.uniform(DType::F32, {1, hidden}, s_in));
+    HostTensor scale = rng.uniform(DType::F32, {experts}, 0.5f);
+    for (int64_t e = 0; e < experts; ++e) scale.data<float>()[e] += 1.0f;
+    w.add("expert_scale", std::move(scale));
     // Tokens whose k-th and (k+1)-th router logits are within 0.05 are drawn again: both routers rank by logit, and a
     // near tie could pick differently at f16 without a bug.
     HostTensor x = rng.uniform(DType::F32, {tokens, hidden});
+    HostTensor rx = gemma ? rng.uniform(DType::F32, {tokens, hidden}) : x;
     const Tensor64 router_w = to_f64(w.tensor("router"));
     for (int64_t t = 0; t < tokens; ++t) {
         for (int attempt = 0;; ++attempt) {
@@ -196,11 +217,12 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
             std::vector<double> row(static_cast<size_t>(experts), 0.0);
             for (int64_t e = 0; e < experts; ++e)
                 for (int64_t c = 0; c < hidden; ++c)
-                    row[static_cast<size_t>(e)] += router_w[e * hidden + c] * x.data<float>()[t * hidden + c];
+                    row[static_cast<size_t>(e)] += router_w[e * hidden + c] * rx.data<float>()[t * hidden + c];
             std::sort(row.rbegin(), row.rend());
             if (row[static_cast<size_t>(top_k - 1)] - row[static_cast<size_t>(top_k)] > 0.05) break;
             const HostTensor redraw = rng.uniform(DType::F32, {1, hidden});
-            std::copy(redraw.data<float>(), redraw.data<float>() + hidden, x.data<float>() + t * hidden);
+            std::copy(redraw.data<float>(), redraw.data<float>() + hidden, rx.data<float>() + t * hidden);
+            if (!gemma) x = rx;
         }
     }
 
@@ -210,8 +232,13 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
     spec.top_k = top_k;
     spec.router = router;
     spec.routed_scale = router == blocks::Router::Sigmoid ? 2.5f : 1.0f;
+    spec.act = gemma ? blocks::Act::GeluTanh : blocks::Act::Silu;
     blocks::MoeParts parts;
     parts.router = g.weight(w, "router");
+    if (gemma) {
+        parts.router_x = g.input("rx", DType::F32, {kT, hidden});
+        parts.expert_scale = g.weight(w, "expert_scale");
+    }
     if (quantized) {
         parts.gate_up = g.weight(w, "gate_up");
     } else {
@@ -226,17 +253,21 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
         parts.shared_expert_gate = g.weight(w, "s_gg");
     }
     g.output("out", blocks::moe(g, g.input("x", DType::F32, {kT, hidden}), spec, parts));
-    const HostTensor out = run(env, g, w, {{"x", x}}).at("out");
+    TensorMap inputs{{"x", x}};
+    if (gemma) inputs["rx"] = rx;
+    const HostTensor out = run(env, g, w, inputs).at("out");
 
     // fp64: router, top-k, renormalize, scale, experts, weighted sum, shared expert.
     const Tensor64 x64 = to_f64(x);
-    const Tensor64 logits = ref::matmul(x64, router_w);
+    const Tensor64 logits = ref::matmul(to_f64(rx), router_w);
     const Tensor64 probs = router == blocks::Router::Softmax
                                ? ref::softmax(logits)
                                : ref::map(logits, [](double v) { return 1.0 / (1.0 + std::exp(-v)); });
     const auto [weights, idx] = ref::topk(probs, top_k);
     const auto silu = [](double v) { return v / (1.0 + std::exp(-v)); };
-    const Tensor64 gate = ref::map(ref::expert_matmul(x64, to_f64(w.tensor("gate")), idx, top_k), silu);
+    const auto gelu = [](double v) { return 0.5 * v * (1.0 + std::tanh(0.7978845608028654 * (v + 0.044715 * v * v * v))); };
+    const Tensor64 gate = gemma ? ref::map(ref::expert_matmul(x64, to_f64(w.tensor("gate")), idx, top_k), gelu)
+                                : ref::map(ref::expert_matmul(x64, to_f64(w.tensor("gate")), idx, top_k), silu);
     const Tensor64 up = ref::expert_matmul(x64, to_f64(w.tensor("up")), idx, top_k);
     const Tensor64 h = ref::broadcast(gate, up, [](double a, double b) { return a * b; });
     const Tensor64 y = ref::expert_matmul(h, to_f64(w.tensor("down")), idx, top_k);
@@ -246,7 +277,8 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
         for (int64_t j = 0; j < top_k; ++j)
             norm += weights[t * top_k + j];
         for (int64_t j = 0; j < top_k; ++j) {
-            const double wj = weights[t * top_k + j] / norm * spec.routed_scale;
+            const double per = gemma ? w.tensor("expert_scale").data<float>()[idx[static_cast<size_t>(t * top_k + j)]] : 1.0;
+            const double wj = weights[t * top_k + j] / norm * spec.routed_scale * per;
             for (int64_t c = 0; c < hidden; ++c)
                 expected[t * hidden + c] += wj * y[(t * top_k + j) * hidden + c];
         }

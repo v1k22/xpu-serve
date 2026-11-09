@@ -141,15 +141,19 @@ void attend_one(const float* q, const HostTensor& k_all, const HostTensor& v_all
 }  // namespace
 
 HostTensor gather(const HostTensor& table, const HostTensor& ids) {
-    check_f32(table, "gather table");
+    XS_CHECK(table.dtype() == DType::F32 || table.dtype() == DType::I32, "gather table must be f32 or i32, got ",
+             dtype_name(table.dtype()));
     const int64_t rows = table.dim(0);
     const int64_t width = table.dim(1);
-    HostTensor out(DType::F32, {ids.numel(), width});
+    Dims shape = ids.shape();
+    shape.push_back(width);
+    HostTensor out(table.dtype(), std::move(shape));
+    const size_t row_bytes = static_cast<size_t>(width) * 4;  // f32 or i32
     for (int64_t i = 0; i < ids.numel(); ++i) {
         const int64_t id = int_at(ids, i);
         XS_CHECK(id >= 0 && id < rows, "gather id ", id, " at index ", i, " is outside the table of ", rows, " rows");
-        std::memcpy(out.data<float>() + i * width, table.data<float>() + id * width,
-                    static_cast<size_t>(width) * sizeof(float));
+        std::memcpy(static_cast<std::byte*>(out.raw()) + i * row_bytes,
+                    static_cast<const std::byte*>(table.raw()) + id * row_bytes, row_bytes);
     }
     return out;
 }

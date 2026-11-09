@@ -4,9 +4,11 @@
 // modeling_gemma4.py (Gemma4TextModel and its layers; Gemma4VisionModel, Gemma4MultimodalEmbedder) and
 // image_processing_gemma4.py (Gemma4ImageProcessor).
 //
-// Served: the dense E-series text layout (E2B, E4B): sliding + full attention, per-layer embeddings (PLE) and a
-// KV-shared tail; and the vision tower of those checkpoints. Mixture-of-experts layers and K=V attention (26B-A4B,
-// 31B) are refused by name; their standardized vision towers load as text-only with a warning. Audio is not served.
+// Served: the E-series text layout (E2B, E4B): sliding + full attention, per-layer embeddings (PLE) and a KV-shared
+// tail; the mixture-of-experts layout (26B-A4B: experts beside each MLP, K = V global attention), text only; the
+// vision tower of the E-series checkpoints; and an assistant checkpoint as the drafter of speculative decoding
+// (LoadOptions::drafter). Standardized vision towers (26B-A4B, 31B) load as text-only with a warning. Audio is not
+// served.
 
 #include <filesystem>
 #include <memory>
@@ -37,7 +39,9 @@ struct Config {
     int64_t intermediate_size = 0;
     int64_t num_layers = 0;
     int64_t num_heads = 0;
-    int64_t num_kv_heads = 0;
+    int64_t num_kv_heads = 0;         // sliding layers
+    int64_t num_global_kv_heads = 0;  // full-attention layers
+    bool k_eq_v = false;              // full-attention layers' values are their key projection (attention_k_eq_v)
     int64_t head_dim = 0;         // sliding layers
     int64_t global_head_dim = 0;  // full-attention layers
     int64_t sliding_window = 0;
@@ -47,6 +51,12 @@ struct Config {
     bool double_wide_mlp = false;
     double rms_norm_eps = 1e-6;
     double final_logit_softcap = 0.0;
+    // Mixture of experts beside every layer's MLP (enable_moe_block; num_experts > 0): a softmax router over the
+    // normed residual with per-expert weight scales, GeGLU experts on their own norm, summed with the MLP.
+    int64_t num_experts = 0;
+    int64_t top_k_experts = 0;
+    int64_t moe_intermediate_size = 0;
+    bool bidirectional_vision = false;  // image tokens attend both ways (use_bidirectional_attention "vision")
     int64_t max_position = 0;
     std::vector<AttnKind> layer_kinds;
     RopeConfig rope_sliding;
@@ -55,6 +65,7 @@ struct Config {
     int64_t first_kv_shared_layer() const { return num_layers - num_kv_shared_layers; }
     bool is_kv_shared(int64_t layer) const { return num_kv_shared_layers > 0 && layer >= first_kv_shared_layer(); }
     int64_t layer_head_dim(int64_t layer) const;
+    int64_t layer_kv_heads(int64_t layer) const;
     int64_t layer_intermediate_size(int64_t layer) const;
     // The earlier layer whose KV a shared layer reads: the last non-shared layer of the same kind.
     int64_t kv_source_layer(int64_t layer) const;
@@ -62,6 +73,22 @@ struct Config {
 
 // Parses config.json (the text_config object of a multimodal config, or the root of a text-only one).
 Config parse_config(const nlohmann::json& config_json);
+
+// A Gemma 4 assistant (model_type "gemma4_assistant", google/gemma-4-*-assistant): the drafter of speculative
+// decoding. Reference: transformers models/gemma4_assistant (Gemma4AssistantForCausalLM) and generation's
+// SinglePositionMultiTokenCandidateGenerator. Its decoder's layers all read the target's KV (the last layer of each
+// attention kind that computes its own); its input is pre_projection(cat(the target's scaled embedding of the last
+// token, the target's last hidden state)); post_projection maps its output back to the target's width for the next
+// chained draft; its logits come from its own tied embedding, over the vocabulary or (ordered embeddings) over the
+// tokens of the top centroids.
+struct AssistantConfig {
+    Config text;  // its decoder
+    int64_t backbone_hidden_size = 0;  // the target's hidden size
+    bool ordered_embeddings = false;
+    int64_t num_centroids = 0;
+    int64_t centroid_top_k = 0;
+};
+AssistantConfig parse_assistant_config(const nlohmann::json& config_json);
 
 struct VisionConfig {
     int64_t hidden_size = 0;

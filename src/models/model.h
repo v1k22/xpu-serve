@@ -48,6 +48,31 @@ public:
     virtual int32_t soft_token() const = 0;
 };
 
+// Speculative decoding with a model's own drafter (an MTP head in the checkpoint, or an assistant checkpoint): the
+// programs it adds to the step graph and how the drafter is fed. The engine compiles them into the step graph's
+// session after it, in the order prefill, verify, draft (engine/spec/programs.h); they share its weights by name and
+// its state slots by label. "hidden" is whatever the drafter takes from the target (the same width in every program).
+class Speculation {
+public:
+    virtual ~Speculation() = default;
+    // The target with "logits" of the last row and "hidden" of every row: a prefill chunk.
+    virtual const graph::Graph& prefill_graph() const = 0;
+    // The target with "logits" and "hidden" of every row: verifying a pending token and its drafts.
+    virtual const graph::Graph& verify_graph() const = 0;
+    // One drafter step over pairs (the target's hidden row of position i, the token at i + 1): "logits" [1, n] and
+    // "hidden" [1, width] of the last pair (the hidden the next chained step takes), where the logits are over the
+    // vocabulary or, when the graph has an I32 "candidates" output [n], over the tokens it lists.
+    virtual const graph::Graph& draft_graph() const = 0;
+    // Inputs of draft_graph. depth 0: the pairs at positions start_pos, start_pos + 1, ... (`hidden` holds one row
+    // per token). depth d > 0: one chained step, the d-th draft after the pair at start_pos, from the token drafted
+    // before it and the drafter's own "hidden".
+    virtual void prepare_draft(std::span<const int32_t> tokens, std::span<const float> hidden, int64_t start_pos,
+                               int depth, TensorMap& inputs) const = 0;
+    // The drafter keeps its own KV over the sequence: every pair goes through it once, in order (catching up on
+    // the pairs a verify accepted). Otherwise a round starts from the last pair alone.
+    virtual bool drafter_keeps_state() const = 0;
+};
+
 class Model {
 public:
     virtual ~Model() = default;
@@ -64,10 +89,14 @@ public:
     // Weights the model reads on the host one row at a time (embedding tables kept out of device memory, like Gemma
     // 4's per-layer embeddings). They never appear in a graph, so convert asks for them here; they may be Q8 / Q4.
     virtual std::vector<std::string> host_tables() const { return {}; }
+    // Null unless the model was loaded with LoadOptions::speculation and has a drafter.
+    virtual const Speculation* speculation() const { return nullptr; }
 };
 
 struct LoadOptions {
-    bool vision = true;  // load the vision encoder when the checkpoint has one
+    bool vision = true;        // load the vision encoder when the checkpoint has one
+    bool speculation = false;  // build the speculative decoding programs when the model has a drafter
+    std::filesystem::path drafter;  // a drafter checkpoint beside the model (a Gemma 4 assistant), for speculation
 };
 
 // Reads <dir>/config.json and dispatches on model_type. Throws xs::Error naming unsupported architectures.

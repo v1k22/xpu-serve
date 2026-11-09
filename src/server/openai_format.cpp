@@ -49,10 +49,16 @@ json usage_json(const GenerateStats& stats) {
 }
 
 json timings_json(const GenerateStats& stats) {
-    return {{"prefill_ms", stats.prefill_ms},
-            {"prefill_tokens_per_second", stats.prefill_tok_per_s()},
-            {"decode_ms", stats.decode_ms},
-            {"decode_tokens_per_second", stats.decode_tok_per_s()}};
+    json t = {{"prefill_ms", stats.prefill_ms},
+              {"prefill_tokens_per_second", stats.prefill_tok_per_s()},
+              {"decode_ms", stats.decode_ms},
+              {"decode_tokens_per_second", stats.decode_tok_per_s()}};
+    if (stats.spec_rounds > 0) {
+        t["spec_rounds"] = stats.spec_rounds;
+        t["spec_drafted_tokens"] = stats.spec_drafted;
+        t["spec_accepted_tokens"] = stats.spec_accepted;
+    }
+    return t;
 }
 
 json chat_completion_json(const ResponseMeta& meta, const chat::ParsedDelta& message, std::string_view finish_reason,

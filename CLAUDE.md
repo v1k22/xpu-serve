@@ -23,10 +23,11 @@ How that works:
   conversion step yet; a `convert` command for quantized packs is planned (DESIGN.md section 6).
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
-Status (see TODO.md): Gemma 4 E2B/E4B (text and images) and the Qwen3.5 family (Qwen3.5, Qwen3.6, Qwen3.8; text; a
-hybrid of Gated DeltaNet linear attention and full attention, dense or mixture of experts), served end to end on the
-SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs from `convert`. One
-sequence at a time.
+Status (see TODO.md): Gemma 4 E2B/E4B (text and images), Gemma 4 26B-A4B (text) and the Qwen3.5 family (Qwen3.5,
+Qwen3.6, Qwen3.8; text; a hybrid of Gated DeltaNet linear attention and full attention, dense or mixture of experts),
+served end to end on the SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs
+from `convert`; speculative decoding with the model's drafter (`--spec mtp`: Qwen's MTP head, a Gemma 4 assistant
+with `--drafter`, docs/design-spec-decode.md). One sequence at a time.
 
 ## 2. Build, run, test
 
@@ -85,13 +86,13 @@ area).
 |---|---|---|
 | `util/` | xs_core | `error.h` (`xs::Error`, `fail(...)`, `XS_CHECK`, `str_cat`), `log`, `timer.h`, `mmap_file`, `half` (f16/bf16 conversions), `base64` |
 | `tensor/` | xs_core | `DType` (incl. `Q8` / `Q4` pack weights), `TensorView` (non-owning, e.g. into an mmap; `quant` points at a pack weight's scales and biases), `HostTensor` (owning), `TensorMap` (name -> HostTensor) |
-| `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped; a pack's quantized weights appear as one Q8 / Q4 view each); `safetensors_writer` (streamed writing) |
+| `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped; a pack's quantized weights appear as one Q8 / Q4 view each); `safetensors_writer` (streamed writing); `joined_weights` (a drafter checkpoint's weights under a prefix beside the target's) |
 | `quant/` | xs_core | round-to-nearest quantization into the pack formats (DESIGN.md 6.3) and dequantization; a tensor `[..., K]` is a matrix of `numel / K` rows (expert banks `[E, N, K]` included) |
 | `convert/` | xs_core | `convert_model`: checkpoint (language model or policy) -> pack; the model's own graph decides which weights to quantize (`plan_graph_formats`: bandwidth-bound matmuls, or all with `--scope all`) |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
 | `models/` | xs_core | `model.h` (the `Model` interface: language models), `policy.h` (the `Policy` interface: robot policies, one static program per call shape: camera subset, step count, padded prompt length), `registry.cpp` (model_type / LeRobot type -> code, `model_kind`), `config_util` (checked JSON readers), `common/blocks` (the shared building blocks: gated MLPs, mixture of experts, RMSNorm variants, RoPE frequencies, attention), one folder per architecture (`pi05/`: π0.5) |
-| `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop), `Sampler`, request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses) |
+| `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop, speculative rounds: draft, verify, accept, roll back), `Sampler` (and rejection sampling of a draft), request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses), `spec/draft_runner` (the drafter side of speculative decoding: feeds the model's drafter the target's hidden states, proposes chains; the session's program order) |
 | `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `sycl/` |
 | `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
 | `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls), `plain` |
@@ -107,18 +108,19 @@ area).
 | `src/graph/graph.h` | **The op contract.** Every op's semantics are written next to `OpKind`; every backend must implement exactly that |
 | `src/models/model.h` | What a model provides: `info()`, `graph()`, `weights()`, `prepare_inputs()`, and optionally `vision()` (a `VisionEncoder`: preprocessing, encoder graph, prompt layout of an image) |
 | `src/models/registry.cpp` | Dispatch on `config.json` `model_type`; the list of supported types |
-| `src/models/gemma4/gemma4_model.cpp` | Gemma 4 text model: graph builder + per-step host inputs |
+| `src/models/gemma4/gemma4_model.cpp` | Gemma 4 text model: graph builder + per-step host inputs; experts beside the MLP and K = V global layers (26B-A4B); an assistant checkpoint as the drafter (query-only layers over the target's KV through `kv_read`, the centroid head) |
 | `src/models/gemma4/gemma4_config.cpp` | Gemma 4 `config.json` parsing; refuses unsupported variants by name |
 | `src/models/gemma4/gemma4_vision.cpp` | Gemma 4 vision: image processor (resize, patches, pooling map) and vision tower graph |
-| `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention; dense MLP or `blocks::moe` (`qwen3_5_moe`: fused gate_up expert banks, gated shared expert) |
-| `src/backend/backend.h` | `Backend::compile(graph, weights, options) -> Session`; `Session::run/reset/truncate` |
+| `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention; dense MLP or `blocks::moe` (`qwen3_5_moe`: fused gate_up expert banks, gated shared expert); the MTP head (`mtp.*`) as the drafter, built from the same layer builders |
+| `src/backend/backend.h` | `Backend::compile(graphs, weights, options) -> Session` (programs sharing weights by name and state slots by label); `Session::run(program)/reset/truncate` (inside a step of up to `rewind_tokens` tokens too) |
 | `src/backend/cpu_ref/ops.cpp` | f32/f64 reference kernels, one per op: the accuracy oracle |
 | `src/backend/sycl/sycl_backend.cpp` | SYCL session: device dtypes, fusions, per-T memory plan (one arena), op dispatch, KV and state buffers |
 | `src/backend/sycl/sycl_kernels.cpp` | SYCL kernels: elementwise, norms, RoPE, gather, copies, causal conv, gated delta, decode attention, GEMV |
 | `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond; quantized: `quant_path` picks the GEMV, quant_gemm, quant_gemm_tiled or dequantize + oneMKL per device and shape) and Attention (per-row kernel with split-K, the fused kernel, or GEMMs) |
 | `src/backend/sycl/sycl_flash_attention.cpp` | Fused attention on the matrix engines (joint_matrix; head_dim up to 128) |
 | `src/backend/sycl/sycl_quant_gemm.cpp` | Quantized matmuls past the GEMV on the matrix engines (DPAS and 2D block load builtins): quant_gemm (9 to 64 rows, the weight read once) and quant_gemm_tiled (many rows: each weight tile dequantized once per work-group of 512 rows into local memory, no f16 copy of the weight) |
-| `src/engine/engine.cpp` | Generation loop for one sequence; encodes images and splices their rows into prefill chunks |
+| `src/engine/engine.cpp` | Generation loop for one sequence; encodes images and splices their rows into prefill chunks; speculative rounds (`spec_round`) |
+| `src/models/model.h` (`Speculation`) | What a model with a drafter adds: prefill and verify programs with a `hidden` output, the draft program, how drafts are fed |
 | `src/service/engine_service.cpp` | Wiring from a model directory to a ready service |
 | `src/server/completion_handlers.cpp` | `/v1/chat/completions` and `/v1/completions` |
 | `src/cli/main.cpp` | Commands, flags and their defaults |
@@ -160,7 +162,8 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 - MatMul weights use the Hugging Face layout `[out, in]`: `matmul(x, w) = x @ w^T`.
 - Ops: Input, Weight, Constant, Gather, MatMul, Add, Mul, Div, Scale, Tanh, GeluTanh, Softcap, Sigmoid, Silu, Softplus,
   Clamp, RmsNorm, Softmax, TopK, ReduceSum, Reshape, Slice, Transpose, Rope (1-D or axial, optionally partial), KvCache,
-  Attention (causal with optional window, or non-causal), CausalConv and GatedDelta (stateful, for linear attention),
+  KvRead (another program's KV slot, read only), Attention (causal with optional window, or non-causal), CausalConv and
+  GatedDelta (stateful, for linear attention),
   ExpertMatMul (each token's chosen experts from a stacked `[E, N, K]` bank, for mixture of experts). The exact semantics
   are the comments in `graph.h`.
 - KV: `add_kv_slot(...)` declares per-sequence state; `kv_cache(slot, k, v)` appends this step's K/V and returns the
@@ -168,8 +171,12 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 - Graph inputs are filled per step by `Model::prepare_inputs` (token ids, positions, and model-specific host inputs
   such as Gemma 4's per-layer embedding rows, and the image rows that replace soft-token embeddings).
 - Conv and recurrent slots (`add_conv_slot`, `add_recurrent_slot`) hold fixed-size per-sequence state for
-  `causal_conv` and `gated_delta`. They summarize the whole sequence, so a session cannot cut them back to a prefix:
-  the engine reuses a cached prefix for such models only when the new prompt extends it, else it starts over.
+  `causal_conv` and `gated_delta`. They summarize the whole sequence, so a session cannot cut them back to a prefix,
+  except inside a last step of up to `SessionOptions::rewind_tokens` tokens (a speculative verify; the backend keeps
+  that step's inputs and replays the kept ones). The engine reuses a cached prefix for such models only when the new
+  prompt extends it, else it starts over.
+- A session can hold several programs (the target's step, prefill and verify graphs and a drafter): they share
+  weights by name and state slots by label; a program that only reads a KV slot (`kv_read`) attends to another's.
 - A graph without slots is stateless (every run stands alone): that is how vision encoders run, one image per run,
   compiled as a second session next to the text one.
 
@@ -191,12 +198,14 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/backend/cpu_*.cpp` | each op on cpu-ref (`cpu_encoder_ops.cpp`: the encoder ops and stateless sessions), KV sessions, attention masks | fp64 references in `reference_ops.h`, with planted-bug controls |
 | `tests/unit/backend/device_*.cpp` | each op on the GPU backend (`device_encoder_ops.cpp` likewise), sessions, agreement with cpu-ref (also with an int8 KV cache on both), decode timing | the same references; skip unless `XS_DEVICE_TEST_DEVICE` is set |
 | `tests/unit/backend/*_moe_ops.cpp` | Div, Softmax, TopK (ties to the lower index), ReduceSum, ExpertMatMul and the `moe` block (softmax and sigmoid routers, shared expert), on cpu-ref and the GPU | fp64 references and an fp64 composition of the block (`moe_ops_cases.h`) |
+| `tests/unit/backend/*_programs.cpp` | sessions of several programs: KV slots shared by label, KvRead, truncate inside a short step (conv, gated delta, KV) equals never running the dropped tokens | the same session without them (`session_cases.h`) |
+| `tests/unit/engine/` | speculative decoding emits exactly the greedy tokens (a stateful tiny model, a partly wrong drafter, prefix reuse, stops); rejection sampling draws the target's distribution | plain greedy decoding; exact distributions |
 | `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on cpu-ref and the GPU | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |
 | `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`; tables from `gen_unicode_tables.py`) |
 | `tests/unit/chat/` | template rendering, Gemma 4 and Qwen3.5 output parsing | `apply_chat_template` outputs in `tests/fixtures/chat/` |
 | `tests/unit/server/` | request parsing, response format, stop strings, HTTP end to end | a fake `InferenceService` (`fake_service.h`) |
 | `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp` | config parsing and refusals | |
-| `tests/unit/model/model_parity.cpp` | whole model: last-token logits and greedy continuations | Hugging Face fp32, from `tests/parity/model/hf_reference.py` |
+| `tests/unit/model/model_parity.cpp` | whole model: last-token logits and greedy continuations; its drafter (MTP head, or an assistant with `XS_TEST_DRAFTER_DIR`): logits and chained drafts after each prompt | Hugging Face fp32, from `tests/parity/model/hf_reference.py` (`--assistant` for a Gemma 4 assistant) |
 | `tests/unit/model/policy_parity.cpp` | a robot policy end to end: prompt ids and the action chunk, all cameras and one camera (`XS_TEST_POLICY_DIR`, `XS_POLICY_FIXTURES`) | LeRobot fp32 with fixed noise, from `tests/parity/policy/lerobot_reference.py` |
 | `tests/unit/backend/*_policy_ops.cpp` | LayerNorm, Concat, attention with a key bias over static queries (head dims 72, 256) | fp64 references (`policy_ops_cases.h`) |
 | `tests/unit/model/gemma4_vision_parity.cpp` | image input: pixels, vision features, expanded prompt, logits, greedy (whole and chunked prefill), prefix reuse by image | Hugging Face fp32, from `tests/parity/model/hf_vision_reference.py` |
@@ -274,8 +283,11 @@ Parse and validate it in `src/server/openai_request.cpp` (a bad value is a 400 n
 
 ## 10. Known limitations
 
-- Two model families: Gemma 4 E2B/E4B (text and images) and Qwen3.5 dense and MoE (text; its vision tower and MTP
-  head are not loaded; MoE checkpoints must use fused expert banks, as the released ones do). No audio or video. Images only as base64 data: URLs.
+- Two model families: Gemma 4 E2B/E4B (text and images) and 26B-A4B (text), and Qwen3.5 dense and MoE (text; its
+  vision tower is not loaded; MoE checkpoints must use fused expert banks, as the released ones do). No audio or video.
+  Images only as base64 data: URLs.
+- Speculative decoding drafts with greedy chains (rejection sampling keeps sampled output exact); the MTP heads and
+  assistants are the only drafters.
 - Linear-attention models re-prefill when a new prompt does not extend the cached sequence (no state snapshots).
 - Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)
   and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 for oneMKL's GEMM, except

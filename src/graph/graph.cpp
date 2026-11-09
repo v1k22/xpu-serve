@@ -49,6 +49,7 @@ std::string_view op_name(OpKind kind) {
         case OpKind::Transpose: return "Transpose";
         case OpKind::Rope: return "Rope";
         case OpKind::KvCache: return "KvCache";
+        case OpKind::KvRead: return "KvRead";
         case OpKind::Attention: return "Attention";
         case OpKind::CausalConv: return "CausalConv";
         case OpKind::GatedDelta: return "GatedDelta";
@@ -157,9 +158,14 @@ Value Graph::gather(Value table, Value ids) {
     const TensorType& tt = type(table);
     const TensorType& it = type(ids);
     XS_CHECK(tt.shape.size() == 2, "gather table must be 2-D, got ", shape_to_string(tt.shape), " at ", where(table));
-    XS_CHECK(it.shape.size() == 1 && is_int(it.dtype), "gather ids must be a 1-D integer tensor, got ",
-             dtype_name(it.dtype), shape_to_string(it.shape));
-    return add_node(OpKind::Gather, {table, ids}, {}, {TensorType{DType::F32, {it.shape[0], tt.shape[1]}}}, "gather");
+    XS_CHECK(!it.shape.empty() && is_int(it.dtype), "gather ids must be an integer tensor, got ", dtype_name(it.dtype),
+             shape_to_string(it.shape));
+    XS_CHECK(!is_int(tt.dtype) || tt.dtype == DType::I32, "an integer gather table must be i32, got ",
+             dtype_name(tt.dtype), " at ", where(table));
+    const DType out = tt.dtype == DType::I32 ? DType::I32 : DType::F32;
+    Dims shape = it.shape;
+    shape.push_back(tt.shape[1]);
+    return add_node(OpKind::Gather, {table, ids}, {}, {TensorType{out, std::move(shape)}}, "gather");
 }
 
 Value Graph::matmul(Value x, Value w) {
@@ -406,6 +412,14 @@ std::pair<Value, Value> Graph::kv_cache(int slot, Value k, Value v) {
     return {Value{out.node, 0}, Value{out.node, 1}};
 }
 
+std::pair<Value, Value> Graph::kv_read(int slot) {
+    XS_CHECK(slot >= 0 && static_cast<size_t>(slot) < kv_slots_.size(), "unknown kv slot ", slot);
+    const KvSlot& s = kv_slots_[static_cast<size_t>(slot)];
+    const TensorType all{DType::F32, {kL, s.num_kv_heads, s.head_dim}};
+    const Value out = add_node(OpKind::KvRead, {}, KvCacheAttrs{slot}, {all, all}, "kv_read");
+    return {Value{out.node, 0}, Value{out.node, 1}};
+}
+
 Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& attrs) {
     const Dims& qs = type(q).shape;
     const Dims& ks = type(k_all).shape;
@@ -496,15 +510,22 @@ void Graph::validate() const {
     std::vector<int> appended(kv_slots_.size(), 0);
     std::vector<int> convs(conv_slots_.size(), 0);
     std::vector<int> recurrents(recurrent_slots_.size(), 0);
+    int reads = 0;
     for (const Node& n : nodes_) {
-        if (n.kind == OpKind::KvCache) ++appended[static_cast<size_t>(std::get<KvCacheAttrs>(n.attrs).slot)];
+        if (n.kind == OpKind::KvCache || n.kind == OpKind::KvRead) {
+            ++appended[static_cast<size_t>(std::get<KvCacheAttrs>(n.attrs).slot)];
+        }
+        reads += n.kind == OpKind::KvRead ? 1 : 0;
         if (n.kind == OpKind::CausalConv) ++convs[static_cast<size_t>(std::get<StateAttrs>(n.attrs).slot)];
         if (n.kind == OpKind::GatedDelta) ++recurrents[static_cast<size_t>(std::get<StateAttrs>(n.attrs).slot)];
     }
     for (size_t s = 0; s < appended.size(); ++s) {
-        XS_CHECK(appended[s] == 1, "kv slot ", s, " (", kv_slots_[s].label, ") is appended ", appended[s],
+        XS_CHECK(appended[s] == 1, "kv slot ", s, " (", kv_slots_[s].label, ") is used ", appended[s],
                  " times; expected exactly once per graph");
     }
+    XS_CHECK(reads == 0 || static_cast<size_t>(reads) == kv_slots_.size(),
+             "a graph either appends to its kv slots or only reads them (kL is one or the other); ", reads, " of ",
+             kv_slots_.size(), " are read");
     for (size_t s = 0; s < convs.size(); ++s) {
         XS_CHECK(convs[s] == 1, "conv slot ", s, " (", conv_slots_[s].label, ") is used ", convs[s], " times");
     }

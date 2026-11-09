@@ -50,6 +50,8 @@ struct MoeSpec {
 
 struct MoeParts {
     Value router;                     // [E, hidden]
+    Value router_x;                   // the router's input when it is not x (invalid: x)
+    Value expert_scale;               // [E]: each expert's routing weight times its entry, after normalizing; or invalid
     Value gate, up, down;             // [E, I, hidden], [E, I, hidden], [E, hidden, I]
     Value gate_up;                    // instead of gate and up: [E, 2 I, hidden], gate rows first (one expert matmul)
     Linear shared_gate, shared_up, shared_down;  // a shared expert every token uses; empty: none
@@ -89,7 +91,7 @@ struct AttentionSpec {
 };
 
 struct AttentionParts {
-    Linear q, k, v, o;
+    Linear q, k, v, o;  // v empty: the values are the key projection's output, before k_norm and RoPE (K = V)
     HeadNorm q_norm, k_norm, v_norm;
 };
 

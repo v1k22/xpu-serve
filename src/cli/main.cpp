@@ -62,6 +62,9 @@ void add_engine_options(Args& a) {
         .value("ctx", "context length in tokens (prompt + output)", "8192")
         .value("prefill-chunk", "tokens per prefill step", "1024")
         .value("backend-opt", "backend options as key=value[,key=value]")
+        .value("spec", "speculative decoding: off | mtp (the model's drafter: its MTP head, or --drafter)", "off")
+        .value("spec-k", "speculative decoding: drafts per round", "3")
+        .value("drafter", "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, e.g. gemma-4-E2B-it-assistant)")
         .value("log-level", "debug | info | warn | error", "info")
         .flag("no-vision", "do not load the model's vision encoder (text only)")
         .flag("help", "show this help");
@@ -88,6 +91,15 @@ ServiceOptions service_options(const Args& a) {
     o.vision = !a.has("no-vision");
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");
+    const std::string& spec = a.get("spec");
+    if (spec == "mtp") {
+        o.engine.spec_k = a.get_int("spec-k");
+        if (o.engine.spec_k < 1) fail("--spec-k must be at least 1, got ", o.engine.spec_k);
+    } else if (spec != "off") {
+        fail("--spec must be off or mtp, got '", spec, "'");
+    }
+    o.drafter = a.get("drafter");
+    if (!o.drafter.empty() && spec != "mtp") fail("--drafter drafts for --spec mtp");
     const std::string& opts = a.get("backend-opt");
     for (size_t pos = 0; pos < opts.size();) {
         const size_t comma = std::min(opts.find(',', pos), opts.size());
@@ -280,9 +292,11 @@ std::string run_turn(EngineService& service, std::string_view prompt_text, const
         images = str_cat(s.images_encoded, s.images_encoded == 1 ? " image" : " images", " encoded in ",
                          static_cast<int>(s.encode_ms), " ms | ");
     }
-    std::fprintf(stderr, "[%s%d prompt tokens (%d cached), prefill %.1f tok/s | %d tokens, decode %.1f tok/s | %s]\n",
+    char spec[48] = "";
+    if (s.spec_rounds > 0) std::snprintf(spec, sizeof spec, " (%.2f per verify)", s.tokens_per_round());
+    std::fprintf(stderr, "[%s%d prompt tokens (%d cached), prefill %.1f tok/s | %d tokens, decode %.1f tok/s%s | %s]\n",
                  images.c_str(), s.prompt_tokens, s.cached_tokens, s.prefill_tok_per_s(), s.generated_tokens,
-                 s.decode_tok_per_s(), finish_reason_name(r.finish));
+                 s.decode_tok_per_s(), spec, finish_reason_name(r.finish));
     return raw;
 }
 
@@ -411,11 +425,58 @@ int bench_policy(const Args& a, const std::string& dir) {
     return 0;
 }
 
+// Greedy decode speed over real prompts (what speculative decoding is measured on: its acceptance depends on the text).
+int bench_prompts(EngineService& service, const std::string& path, int n_gen, int runs) {
+    std::ifstream in(path);
+    XS_CHECK(in.good(), "cannot read '", path, "'");
+    std::vector<std::vector<int32_t>> prompts;
+    for (std::string line; std::getline(in, line);) {
+        if (line.empty()) continue;
+        const nlohmann::json messages = nlohmann::json::array({{{"role", "user"}, {"content", line}}});
+        const std::string text = service.chat_template().render(messages, nlohmann::json::array(), true,
+                                                                nlohmann::json{{"enable_thinking", false}});
+        prompts.push_back(service.tokenizer().encode(text));
+    }
+    XS_CHECK(!prompts.empty(), "'", path, "' holds no prompt");
+    for (int run = 0; run < runs; ++run) {
+        GenerateStats total;
+        for (const auto& prompt : prompts) {
+            GenerateRequest req;
+            req.prompt = prompt;
+            req.sampling.temperature = 0.0f;
+            req.max_new_tokens = n_gen;
+            req.stop_token_ids = service.model().stop_token_ids;
+            const GenerateResult r = service.generate(req, {});
+            if (r.finish == FinishReason::Error) fail("generation failed: ", r.error);
+            const GenerateStats& s = r.stats;
+            total.prompt_tokens += s.prompt_tokens - s.cached_tokens;
+            total.prefill_ms += s.prefill_ms;
+            total.generated_tokens += s.generated_tokens - 1;  // decode speed counts the tokens after the first
+            total.decode_ms += s.decode_ms;
+            total.spec_rounds += s.spec_rounds;
+            total.spec_drafted += s.spec_drafted;
+            total.spec_accepted += s.spec_accepted;
+        }
+        std::printf("run %d: %zu prompts, %d prompt tok, prefill %.1f tok/s | %d tok after the first, decode %.1f tok/s",
+                    run, prompts.size(), total.prompt_tokens, total.prefill_tok_per_s(), total.generated_tokens,
+                    total.decode_ms > 0 ? total.generated_tokens * 1000.0 / total.decode_ms : 0.0);
+        if (total.spec_rounds > 0) {
+            std::printf(" | %.2f tok per verify, %d of %d drafts accepted", total.tokens_per_round(),
+                        total.spec_accepted, total.spec_drafted);
+        }
+        std::printf("\n");
+    }
+    return 0;
+}
+
 int cmd_bench(const std::vector<std::string>& argv) {
     Args a;
     add_engine_options(a);
     a.value("prompt-tokens", "prompt length (language models)", "512")
         .value("gen-tokens", "tokens to generate (language models)", "128")
+        .value("prompts", "language models: a file of prompts, one per line, each a user message through the chat "
+               "template (thinking off) generating up to --gen-tokens until the end of the turn; instead of "
+               "--prompt-tokens")
         .value("runs", "timed runs", "3")
         .value("cameras", "policies: cameras present, the first N (default: all)", "0")
         .value("steps", "policies: flow steps (default: the checkpoint's)", "0")
@@ -427,8 +488,9 @@ int cmd_bench(const std::vector<std::string>& argv) {
     const std::string dir = model_dir_arg(a, "bench");
     if (model_kind(dir) == ModelKind::Policy) return bench_policy(a, dir);
     auto service = EngineService::create(dir, service_options(a));
-    const int n_prompt = a.get_int("prompt-tokens");
     const int n_gen = a.get_int("gen-tokens");
+    if (!a.get("prompts").empty()) return bench_prompts(*service, a.get("prompts"), n_gen, a.get_int("runs"));
+    const int n_prompt = a.get_int("prompt-tokens");
     std::string text;
     while (static_cast<int>(service->tokenizer().encode(text).size()) < n_prompt + 16) {
         text += "The quick brown fox jumps over the lazy dog while the engine measures how fast it reads and writes. ";
@@ -443,9 +505,11 @@ int cmd_bench(const std::vector<std::string>& argv) {
         req.max_new_tokens = n_gen;
         const GenerateResult r = service->generate(req, {});
         if (r.finish == FinishReason::Error) fail("generation failed: ", r.error);
-        std::printf("run %d: prompt %d tok, prefill %.1f ms (%.1f tok/s) | generated %d tok, decode %.1f tok/s\n", run,
+        std::printf("run %d: prompt %d tok, prefill %.1f ms (%.1f tok/s) | generated %d tok, decode %.1f tok/s", run,
                     r.stats.prompt_tokens, r.stats.prefill_ms, r.stats.prefill_tok_per_s(), r.stats.generated_tokens,
                     r.stats.decode_tok_per_s());
+        if (r.stats.spec_rounds > 0) std::printf(" (%.2f per verify)", r.stats.tokens_per_round());
+        std::printf("\n");
     }
     return 0;
 }

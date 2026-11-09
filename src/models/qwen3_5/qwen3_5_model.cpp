@@ -36,22 +36,63 @@ HostTensor to_f32(const std::string& name, const TensorView& t) {
     return out;
 }
 
-class Qwen35Model final : public Model {
+// The programs of a Qwen3.5 checkpoint, built from one set of layer builders: the step graph, and with speculation the
+// prefill and verify programs (the same decoder, other outputs) and the MTP head (vLLM's Qwen3.5 MTP: one decoder
+// layer of the target's kind over fc(cat(norm(embed(t_{i+1})), norm(h_i))), then the target's lm_head).
+class Qwen35Model final : public Model, public Speculation {
 public:
-    Qwen35Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> weights)
+    Qwen35Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> weights, bool speculation)
         : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)), prefix_(probe_prefix(*weights_)) {
-        build_graph();
+        build_target(step_, Head::LastLogits);
+        if (!speculation) return;
+        if (cfg_.mtp_layers == 0 || !weights_->contains("mtp.fc.weight")) {
+            log::warn("qwen3_5: the checkpoint has no MTP head (mtp.*); speculative decoding is unavailable");
+            return;
+        }
+        if (cfg_.mtp_layers != 1) fail("qwen3_5: an MTP head of ", cfg_.mtp_layers, " layers is not supported (1 is)");
+        build_target(prefill_, Head::LastLogitsAllHidden);
+        build_target(verify_, Head::AllLogitsAllHidden);
+        build_mtp(draft_);
+        has_mtp_ = true;
     }
 
     const ModelInfo& info() const override { return info_; }
-    const graph::Graph& graph() const override { return graph_; }
+    const graph::Graph& graph() const override { return step_; }
     const WeightStore& weights() const override { return *weights_; }
+    const Speculation* speculation() const override { return has_mtp_ ? this : nullptr; }
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
                         TensorMap& inputs) const override {
+        XS_CHECK(embeddings.empty(), "qwen3_5: image input is not supported yet");
+        token_inputs(tokens, start_pos, inputs);
+    }
+
+    const graph::Graph& prefill_graph() const override { return prefill_; }
+    const graph::Graph& verify_graph() const override { return verify_; }
+    const graph::Graph& draft_graph() const override { return draft_; }
+    bool drafter_keeps_state() const override { return true; }
+
+    // The pair (h_i, token i + 1) runs at position i, a chained draft one position after the previous one.
+    void prepare_draft(std::span<const int32_t> tokens, std::span<const float> hidden, int64_t start_pos, int depth,
+                       TensorMap& inputs) const override {
+        const auto n = static_cast<int64_t>(tokens.size());
+        XS_CHECK(static_cast<int64_t>(hidden.size()) == n * cfg_.hidden_size, "qwen3_5: ", n, " MTP tokens need ",
+                 n * cfg_.hidden_size, " hidden values, got ", hidden.size());
+        token_inputs(tokens, start_pos + depth, inputs);
+        inputs["hidden"] = HostTensor::from_vector(DType::F32, {n, cfg_.hidden_size},
+                                                   std::vector<float>(hidden.begin(), hidden.end()));
+    }
+
+private:
+    enum class Head {
+        LastLogits,           // the step graph
+        LastLogitsAllHidden,  // prefill with speculation
+        AllLogitsAllHidden,   // verify
+    };
+
+    void token_inputs(std::span<const int32_t> tokens, int64_t start_pos, TensorMap& inputs) const {
         const auto n = static_cast<int64_t>(tokens.size());
         XS_CHECK(n > 0, "qwen3_5: a step needs at least one token");
-        XS_CHECK(embeddings.empty(), "qwen3_5: image input is not supported yet");
         HostTensor ids(DType::I32, {n});
         HostTensor pos(DType::I32, {n});
         for (int64_t i = 0; i < n; ++i) {
@@ -64,127 +105,148 @@ public:
         inputs["positions"] = std::move(pos);
     }
 
-private:
-    std::string w(const std::string& suffix) const { return prefix_ + suffix; }
-    Value weight(const std::string& suffix) { return graph_.weight(*weights_, w(suffix)); }
+    Value weight(Graph& g, const std::string& name) const { return g.weight(*weights_, name); }
     float eps() const { return static_cast<float>(cfg_.rms_norm_eps); }
 
     // Qwen3_5RMSNorm is zero-centered: x * rsqrt(mean(x^2) + eps) * (1 + w).
-    Value norm(Value x, const std::string& suffix) {
-        return blocks::rms_norm_one_plus(graph_, x, *weights_, w(suffix), eps());
+    Value norm(Graph& g, Value x, const std::string& name) const {
+        return blocks::rms_norm_one_plus(g, x, *weights_, name, eps());
     }
     // A projection whose weight node is made when the block uses it.
-    blocks::Linear proj(const std::string& suffix) {
-        return [this, suffix](Value x) { return graph_.matmul(x, weight(suffix)); };
+    blocks::Linear proj(Graph& g, const std::string& name) const {
+        return [this, &g, name](Value x) { return g.matmul(x, weight(g, name)); };
+    }
+    Value lm_head(Graph& g) const {
+        return weight(g, weights_->contains("lm_head.weight") ? "lm_head.weight" : prefix_ + "embed_tokens.weight");
+    }
+    Value inv_freq(Graph& g) const {
+        return g.constant(
+            blocks::rope_inv_freq(cfg_.rope_theta, cfg_.rotary_dim, cfg_.rotary_dim / 2, cfg_.rotary_dim / 2));
     }
 
-    void build_graph() {
-        Graph& g = graph_;
+    void build_target(Graph& g, Head head) const {
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
-        const Value embed = weight("embed_tokens.weight");
-        Value h = g.gather(embed, ids);
+        Value h = g.gather(weight(g, prefix_ + "embed_tokens.weight"), ids);
+        const Value freq = inv_freq(g);
+        for (int64_t i = 0; i < cfg_.num_layers; ++i) {
+            const std::string layer = "layers." + std::to_string(i);
+            h = decoder_layer(g, prefix_ + layer + ".", layer, cfg_.layer_kinds[static_cast<size_t>(i)], h, pos, freq);
+        }
 
-        inv_freq_ = g.constant(
-            blocks::rope_inv_freq(cfg_.rope_theta, cfg_.rotary_dim, cfg_.rotary_dim / 2, cfg_.rotary_dim / 2));
-
-        for (int64_t i = 0; i < cfg_.num_layers; ++i) h = decoder_layer(i, h, pos);
-
-        Graph::Scope head(g, "head");
-        const Value last = norm(g.slice(h, 0, -1), "norm.weight");
-        const Value lm_head = weights_->contains("lm_head.weight") ? g.weight(*weights_, "lm_head.weight") : embed;
-        g.output("logits", g.matmul(last, lm_head));
+        Graph::Scope scope(g, "head");
+        if (head == Head::LastLogits) {
+            g.output("logits", g.matmul(norm(g, g.slice(h, 0, -1), prefix_ + "norm.weight"), lm_head(g)));
+        } else {
+            const Value hidden = norm(g, h, prefix_ + "norm.weight");
+            g.output("logits", g.matmul(head == Head::AllLogitsAllHidden ? hidden : g.slice(hidden, 0, -1), lm_head(g)));
+            g.output("hidden", hidden);
+        }
         g.validate();
-        log::debug("qwen3_5: step graph has ", g.nodes().size(), " nodes, ", g.kv_slots().size(), " kv, ",
+        log::debug("qwen3_5: graph has ", g.nodes().size(), " nodes, ", g.kv_slots().size(), " kv, ",
                    g.conv_slots().size(), " conv and ", g.recurrent_slots().size(), " recurrent slots");
     }
 
-    Value decoder_layer(int64_t i, Value h, Value pos) {
-        Graph& g = graph_;
-        const std::string L = "layers." + std::to_string(i) + ".";
-        Graph::Scope s(g, "layers." + std::to_string(i));
-        const Value x = norm(h, L + "input_layernorm.weight");
-        const Value mixed = cfg_.layer_kinds[static_cast<size_t>(i)] == LayerKind::Linear ? linear_attention(i, x)
-                                                                                           : full_attention(i, x, pos);
+    void build_mtp(Graph& g) const {
+        const Value ids = g.input("token_ids", DType::I32, {kT});
+        const Value pos = g.input("positions", DType::I32, {kT});
+        const Value hidden = g.input("hidden", DType::F32, {kT, cfg_.hidden_size});
+        Graph::Scope scope(g, "mtp");
+        const Value e = norm(g, g.gather(weight(g, prefix_ + "embed_tokens.weight"), ids),
+                             "mtp.pre_fc_norm_embedding.weight");
+        const Value x = g.matmul(g.concat({e, norm(g, hidden, "mtp.pre_fc_norm_hidden.weight")}, 1),
+                                 weight(g, "mtp.fc.weight"));
+        const Value h = decoder_layer(g, "mtp.layers.0.", "mtp.layers.0", LayerKind::Full, x, pos, inv_freq(g));
+        const Value last = norm(g, g.slice(h, 0, -1), "mtp.norm.weight");
+        g.output("logits", g.matmul(last, lm_head(g)));
+        g.output("hidden", last);
+        g.validate();
+    }
+
+    // One decoder layer from the weights under `L` (".../layers.<i>."); `label` names its state slots.
+    Value decoder_layer(Graph& g, const std::string& L, const std::string& label, LayerKind kind, Value h, Value pos,
+                        Value freq) const {
+        Graph::Scope s(g, label);
+        const Value x = norm(g, h, L + "input_layernorm.weight");
+        const Value mixed = kind == LayerKind::Linear ? linear_attention(g, L, label, x)
+                                                      : full_attention(g, L, label, x, pos, freq);
         h = g.add(h, mixed);
-        const Value y = norm(h, L + "post_attention_layernorm.weight");
-        if (cfg_.num_experts > 0) return g.add(h, moe(i, y));
-        return g.add(h, blocks::gated_mlp(g, y, proj(L + "mlp.gate_proj.weight"), proj(L + "mlp.up_proj.weight"),
-                                          proj(L + "mlp.down_proj.weight"), blocks::Act::Silu));
+        const Value y = norm(g, h, L + "post_attention_layernorm.weight");
+        if (cfg_.num_experts > 0) return g.add(h, moe(g, L + "mlp.", y));
+        return g.add(h, blocks::gated_mlp(g, y, proj(g, L + "mlp.gate_proj.weight"), proj(g, L + "mlp.up_proj.weight"),
+                                          proj(g, L + "mlp.down_proj.weight"), blocks::Act::Silu));
     }
 
     // Qwen3_5MoeSparseMoeBlock.
-    Value moe(int64_t i, Value y) {
-        const std::string L = "layers." + std::to_string(i) + ".mlp.";
+    Value moe(Graph& g, const std::string& L, Value y) const {
         blocks::MoeSpec spec;
         spec.experts = cfg_.num_experts;
         spec.top_k = cfg_.experts_per_token;
         spec.router = blocks::Router::Softmax;
         spec.normalize = cfg_.norm_topk_prob;
         blocks::MoeParts parts;
-        parts.router = weight(L + "gate.weight");
-        if (!weights_->contains(w(L + "experts.gate_up_proj"))) {
-            fail("qwen3_5: ", w(L + "experts.gate_up_proj"), " is missing; per-expert tensors (experts.<e>.gate_proj) "
-                 "are not supported yet, only the fused expert banks the released checkpoints ship");
+        parts.router = weight(g, L + "gate.weight");
+        if (!weights_->contains(L + "experts.gate_up_proj")) {
+            fail("qwen3_5: ", L, "experts.gate_up_proj is missing; per-expert tensors (experts.<e>.gate_proj) are not ",
+                 "supported yet, only the fused expert banks the released checkpoints ship");
         }
-        parts.gate_up = weight(L + "experts.gate_up_proj");
-        parts.down = weight(L + "experts.down_proj");
+        parts.gate_up = weight(g, L + "experts.gate_up_proj");
+        parts.down = weight(g, L + "experts.down_proj");
         const int64_t e = cfg_.num_experts, h = cfg_.hidden_size, inter = cfg_.moe_intermediate_size;
-        XS_CHECK(graph_.type(parts.gate_up).shape == (Dims{e, 2 * inter, h}) &&
-                     graph_.type(parts.down).shape == (Dims{e, h, inter}),
-                 "qwen3_5: layer ", i, " expert banks have shapes ", dims_to_string(graph_.type(parts.gate_up).shape),
-                 " and ", dims_to_string(graph_.type(parts.down).shape), ", expected [", e, ", ", 2 * inter, ", ", h,
-                 "] and [", e, ", ", h, ", ", inter, "]");
+        XS_CHECK(g.type(parts.gate_up).shape == (Dims{e, 2 * inter, h}) && g.type(parts.down).shape == (Dims{e, h, inter}),
+                 "qwen3_5: ", L, " expert banks have shapes ", dims_to_string(g.type(parts.gate_up).shape), " and ",
+                 dims_to_string(g.type(parts.down).shape), ", expected [", e, ", ", 2 * inter, ", ", h, "] and [", e,
+                 ", ", h, ", ", inter, "]");
         if (cfg_.shared_expert_intermediate_size > 0) {
-            parts.shared_gate = proj(L + "shared_expert.gate_proj.weight");
-            parts.shared_up = proj(L + "shared_expert.up_proj.weight");
-            parts.shared_down = proj(L + "shared_expert.down_proj.weight");
-            parts.shared_expert_gate = weight(L + "shared_expert_gate.weight");
+            parts.shared_gate = proj(g, L + "shared_expert.gate_proj.weight");
+            parts.shared_up = proj(g, L + "shared_expert.up_proj.weight");
+            parts.shared_down = proj(g, L + "shared_expert.down_proj.weight");
+            parts.shared_expert_gate = weight(g, L + "shared_expert_gate.weight");
         }
-        return blocks::moe(graph_, y, spec, parts);
+        return blocks::moe(g, y, spec, parts);
     }
 
     // Qwen3_5GatedDeltaNet.
-    Value linear_attention(int64_t i, Value x) {
-        Graph& g = graph_;
+    Value linear_attention(Graph& g, const std::string& layer, const std::string& label, Value x) const {
         Graph::Scope s(g, "linear_attn");
-        const std::string L = "layers." + std::to_string(i) + ".linear_attn.";
+        const std::string L = layer + "linear_attn.";
         const int64_t hk = cfg_.linear_key_heads, hv = cfg_.linear_value_heads;
         const int64_t dk = cfg_.linear_key_dim, dv = cfg_.linear_value_dim;
         const int64_t key_width = hk * dk, value_width = hv * dv;
         const int64_t conv_width = 2 * key_width + value_width;
 
         // q, k and v share one projection and one causal conv (with SiLU), then split.
-        const Value conv_w = weight(L + "conv1d.weight");
-        XS_CHECK(g.type(conv_w).shape == (Dims{conv_width, 1, cfg_.conv_kernel}), "qwen3_5: ", w(L + "conv1d.weight"),
-                 " has shape ", dims_to_string(g.type(conv_w).shape));
-        const int conv_slot = g.add_conv_slot(conv_width, cfg_.conv_kernel, "layers." + std::to_string(i));
-        const Value qkv = g.silu(g.causal_conv(conv_slot, g.matmul(x, weight(L + "in_proj_qkv.weight")),
+        const Value conv_w = weight(g, L + "conv1d.weight");
+        XS_CHECK(g.type(conv_w).shape == (Dims{conv_width, 1, cfg_.conv_kernel}), "qwen3_5: ", L, "conv1d.weight has ",
+                 "shape ", dims_to_string(g.type(conv_w).shape));
+        const int conv_slot = g.add_conv_slot(conv_width, cfg_.conv_kernel, label);
+        const Value qkv = g.silu(g.causal_conv(conv_slot, g.matmul(x, weight(g, L + "in_proj_qkv.weight")),
                                                 g.reshape(conv_w, {conv_width, cfg_.conv_kernel})));
         const Value q = g.reshape(g.slice(qkv, 1, 0, key_width), {kT, hk, dk});
         const Value k = g.reshape(g.slice(qkv, 1, key_width, 2 * key_width), {kT, hk, dk});
         const Value v = g.reshape(g.slice(qkv, 1, 2 * key_width, conv_width), {kT, hv, dv});
 
         // beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias), the per-token log decay.
-        const Value beta = g.sigmoid(g.matmul(x, weight(L + "in_proj_b.weight")));
-        HostTensor neg_a = to_f32(w(L + "A_log"), weights_->get(w(L + "A_log")));
+        const Value beta = g.sigmoid(g.matmul(x, weight(g, L + "in_proj_b.weight")));
+        HostTensor neg_a = to_f32(L + "A_log", weights_->get(L + "A_log"));
         for (int64_t j = 0; j < neg_a.numel(); ++j) neg_a.data<float>()[j] = -std::exp(neg_a.data<float>()[j]);
-        const Value decay = g.mul(g.softplus(g.add(g.matmul(x, weight(L + "in_proj_a.weight")), weight(L + "dt_bias"))),
+        const Value decay = g.mul(g.softplus(g.add(g.matmul(x, weight(g, L + "in_proj_a.weight")), weight(g, L + "dt_bias"))),
                                   g.constant(std::move(neg_a)));
 
-        const int slot = g.add_recurrent_slot(hv, dk, dv, "layers." + std::to_string(i));
+        const int slot = g.add_recurrent_slot(hv, dk, dv, label);
         Value o = g.gated_delta(slot, q, k, v, decay, beta, 1e-6f);
 
         // Qwen3_5RMSNormGated: rms_norm(o) * w * silu(z), per value head.
-        const Value z = g.reshape(g.matmul(x, weight(L + "in_proj_z.weight")), {kT, hv, dv});
-        o = blocks::gated_rms_norm(g, o, weight(L + "norm.weight"), z, eps());
-        return g.matmul(g.reshape(o, {kT, value_width}), weight(L + "out_proj.weight"));
+        const Value z = g.reshape(g.matmul(x, weight(g, L + "in_proj_z.weight")), {kT, hv, dv});
+        o = blocks::gated_rms_norm(g, o, weight(g, L + "norm.weight"), z, eps());
+        return g.matmul(g.reshape(o, {kT, value_width}), weight(g, L + "out_proj.weight"));
     }
 
     // Qwen3_5Attention: q_proj yields [query | gate] per head; the output is gated by sigmoid(gate).
-    Value full_attention(int64_t i, Value x, Value pos) {
-        Graph::Scope s(graph_, "self_attn");
-        const std::string L = "layers." + std::to_string(i) + ".self_attn.";
+    Value full_attention(Graph& g, const std::string& layer, const std::string& label, Value x, Value pos,
+                         Value freq) const {
+        Graph::Scope s(g, "self_attn");
+        const std::string L = layer + "self_attn.";
         blocks::AttentionSpec spec;
         spec.heads = cfg_.num_heads;
         spec.kv_heads = cfg_.num_kv_heads;
@@ -192,23 +254,23 @@ private:
         spec.attrs.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(cfg_.head_dim)));
         spec.rotary_dim = cfg_.rotary_dim;
         spec.output_gate = cfg_.attn_output_gate;
-        spec.kv_label = "layers." + std::to_string(i);
+        spec.kv_label = label;
         blocks::AttentionParts parts;
-        parts.q = proj(L + "q_proj.weight");
-        parts.k = proj(L + "k_proj.weight");
-        parts.v = proj(L + "v_proj.weight");
-        parts.o = proj(L + "o_proj.weight");
-        parts.q_norm = [this, L](Value q) { return norm(q, L + "q_norm.weight"); };
-        parts.k_norm = [this, L](Value k) { return norm(k, L + "k_norm.weight"); };
-        return blocks::attention(graph_, spec, parts, x, pos, inv_freq_).out;
+        parts.q = proj(g, L + "q_proj.weight");
+        parts.k = proj(g, L + "k_proj.weight");
+        parts.v = proj(g, L + "v_proj.weight");
+        parts.o = proj(g, L + "o_proj.weight");
+        parts.q_norm = [this, &g, L](Value q) { return norm(g, q, L + "q_norm.weight"); };
+        parts.k_norm = [this, &g, L](Value k) { return norm(g, k, L + "k_norm.weight"); };
+        return blocks::attention(g, spec, parts, x, pos, freq).out;
     }
 
     Config cfg_;
     ModelInfo info_;
     std::unique_ptr<SafetensorsWeights> weights_;
     std::string prefix_;
-    graph::Graph graph_;
-    Value inv_freq_;
+    graph::Graph step_, prefill_, verify_, draft_;
+    bool has_mtp_ = false;
 };
 
 }  // namespace
@@ -253,7 +315,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     info.stop_token_ids = std::move(stops);
 
     auto weights = SafetensorsWeights::open_dir(dir);
-    return std::make_unique<Qwen35Model>(std::move(cfg), std::move(info), std::move(weights));
+    return std::make_unique<Qwen35Model>(std::move(cfg), std::move(info), std::move(weights), options.speculation);
 }
 
 }  // namespace xs::qwen3_5

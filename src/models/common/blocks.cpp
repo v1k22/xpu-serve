@@ -22,11 +22,15 @@ Value gated_mlp(Graph& g, Value x, const Linear& gate, const Linear& up, const L
 Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p) {
     Graph::Scope scope(g, "moe");
     XS_CHECK(s.top_k >= 1 && s.top_k <= s.experts, "moe: top_k ", s.top_k, " of ", s.experts, " experts");
-    const Value logits = g.matmul(x, p.router);  // [T, E]
+    const Value logits = g.matmul(p.router_x.valid() ? p.router_x : x, p.router);  // [T, E]
     const Value probs = s.router == Router::Softmax ? g.softmax(logits) : g.sigmoid(logits);
     auto [weights, idx] = g.topk(probs, s.top_k);  // [T, k]
     if (s.normalize) weights = g.div(weights, g.reshape(g.reduce_sum(weights, 1), {kT, 1}));
     if (s.routed_scale != 1.0f) weights = g.scale(weights, s.routed_scale);
+    if (p.expert_scale.valid()) {
+        const Value per = g.gather(g.reshape(p.expert_scale, {s.experts, 1}), idx);  // [T, k, 1]
+        weights = g.mul(weights, g.reshape(per, {kT, s.top_k}));
+    }
     Value h;
     if (p.gate_up.valid()) {
         const int64_t inter = g.type(p.gate_up).shape[1] / 2;
@@ -103,10 +107,11 @@ AttentionOut attention(Graph& g, const AttentionSpec& s, const AttentionParts& p
         XS_CHECK(shared_kv->first.valid(), "attention: the shared KV is empty");
         r.kv = *shared_kv;
     } else {
-        Value k = heads(p.k(x), s.kv_heads);
+        const Value k_proj = heads(p.k(x), s.kv_heads);
+        Value k = k_proj;
         if (p.k_norm) k = p.k_norm(k);
         k = position(k);
-        Value v = heads(p.v(x), s.kv_heads);
+        Value v = p.v ? heads(p.v(x), s.kv_heads) : k_proj;
         if (p.v_norm) v = p.v_norm(v);
         if (s.kv_cache) {
             r.kv = g.kv_cache(g.add_kv_slot(s.kv_heads, hd, s.kv_window, s.kv_label), k, v);

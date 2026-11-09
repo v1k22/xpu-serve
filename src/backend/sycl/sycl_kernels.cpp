@@ -638,11 +638,11 @@ constexpr int kQSgPerWg = 8;
 
 // Rows per sub-group and code bytes per lane by format and inputs, measured on the B60: two rows and 16 bytes
 // stream the weight at M = 1 (four with AWQ, which scales each x chunk once for all of them); as M grows, smaller
-// chunks keep the decoded codes and the accumulators in registers.
+// chunks keep the decoded codes and the accumulators in registers (q4: 8 bytes up to M = 3, four rows at M = 3).
 template <bool Q4, int M, bool AWQ = false>
 struct QuantGemvShape {
-    static constexpr int kRows = (Q4 && M == 2) || (AWQ && M == 1) ? 4 : 2;
-    static constexpr int kBytes = M <= 2 ? (Q4 && M == 2 ? 8 : 16) : (!Q4 && M <= 4 ? 8 : 4);
+    static constexpr int kRows = (Q4 && M == 3) || (AWQ && M == 1) ? 4 : 2;
+    static constexpr int kBytes = Q4 ? (M == 1 ? 16 : M <= 3 ? 8 : 4) : (M <= 2 ? 16 : M <= 4 ? 8 : 4);
 };
 
 inline float q4_unit(uint32_t word, int j) {  // 1 + (nibble j of word) / 16
@@ -1017,11 +1017,49 @@ void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t wid
     });
 }
 
+// Pick j of a row: the largest (value, then lowest index) strictly after pick j - 1 in that order. Few wide rows (a
+// drafter's centroids) take a work-group each, a pick per pair of group reductions; many narrow rows (MoE routers,
+// one per token) a work-item each.
+constexpr int64_t kTopkGroupWidth = 512;
+constexpr int kTopkGroup = 256;
+
 void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64_t rows, int64_t width, int64_t k) {
+    if (width >= kTopkGroupWidth && rows <= 64) {
+        syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows * kTopkGroup), kTopkGroup),
+                          [=](sycl::nd_item<1> it) {
+            const auto group = it.get_group();
+            const auto r = static_cast<int64_t>(it.get_group(0));
+            const auto lane = static_cast<int64_t>(it.get_local_id(0));
+            const float* xr = x + r * width;
+            float prev_v = std::numeric_limits<float>::infinity();
+            int64_t prev_i = -1;
+            for (int64_t j = 0; j < k; ++j) {
+                float best_v = -std::numeric_limits<float>::infinity();
+                int64_t best_i = width;
+                for (int64_t i = lane; i < width; i += kTopkGroup) {
+                    const float v = xr[i];
+                    const bool after_prev = v < prev_v || (v == prev_v && i > prev_i);
+                    if (after_prev && (best_i == width || v > best_v)) {
+                        best_v = v;
+                        best_i = i;
+                    }
+                }
+                const float v = sycl::reduce_over_group(group, best_v, sycl::maximum<float>());
+                const int64_t i = sycl::reduce_over_group(group, best_i < width && best_v == v ? best_i : width,
+                                                          sycl::minimum<int64_t>());
+                if (lane == 0) {
+                    values[r * k + j] = v;
+                    indices[r * k + j] = static_cast<int32_t>(i);
+                }
+                prev_v = v;
+                prev_i = i;
+            }
+        });
+        return;
+    }
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(rows)), [=](sycl::id<1> idx) {
         const int64_t r = static_cast<int64_t>(idx[0]);
         const float* xr = x + r * width;
-        // Pick j: the largest (value, then lowest index) strictly after pick j - 1 in that order.
         float prev_v = std::numeric_limits<float>::infinity();
         int64_t prev_i = -1;
         for (int64_t j = 0; j < k; ++j) {
@@ -1238,6 +1276,17 @@ void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n,
         out[r * width + c] = static_cast<float>(table[static_cast<int64_t>(ids[r]) * width + c]);
     });
 }
+
+template <typename I>
+void gather_bits(sycl::queue& q, const uint32_t* table, const I* ids, uint32_t* out, int64_t n, int64_t width) {
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(n), static_cast<size_t>(width)), [=](sycl::item<2> it) {
+        const int64_t r = static_cast<int64_t>(it[0]);
+        const int64_t c = static_cast<int64_t>(it[1]);
+        out[r * width + c] = table[static_cast<int64_t>(ids[r]) * width + c];
+    });
+}
+template void gather_bits(sycl::queue&, const uint32_t*, const int32_t*, uint32_t*, int64_t, int64_t);
+template void gather_bits(sycl::queue&, const uint32_t*, const int64_t*, uint32_t*, int64_t, int64_t);
 
 template <typename I, typename Y>
 void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_freq, Y* y, int64_t tokens,
