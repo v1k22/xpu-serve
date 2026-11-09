@@ -121,7 +121,8 @@ struct Loc {
 struct Plan {
     std::vector<std::vector<Dims>> shapes;
     std::vector<std::vector<Loc>> locs;
-    std::vector<uint8_t> alias;  // the node only names memory another value owns: nothing to run
+    std::vector<uint8_t> alias;     // the node only names memory another value owns: nothing to run
+    std::vector<uint8_t> in_place;  // a fused residual GEMM (mm_add_) writing into its residual's memory
     size_t arena_bytes = 0;
 };
 
@@ -578,6 +579,8 @@ private:
         add_mul_.assign(nodes.size(), -1);
         unary_bias_.assign(nodes.size(), -1);
         add3_.assign(nodes.size(), -1);
+        attn_split_.assign(nodes.size(), -1);
+        mm_add_.assign(nodes.size(), -1);
         reads_.resize(nodes.size());
         for (size_t i = 0; i < nodes.size(); ++i)
             reads_[i] = nodes[i].inputs;
@@ -684,11 +687,66 @@ private:
                 }
             }
         }
+        // Add(a, MatMul(x, w)) with an f16 weight on the GEMM path and the matmul read only here: one GEMM adding into
+        // the output (beta 1), which the plan puts in a's memory when nothing reads a afterwards: a residual stream's
+        // update without the add's three passes over [T, width]. reads_: a, x, w.
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const Node& n = nodes[i];
+            if (n.kind != OpKind::Add || fused_[i] != Fused::No || norm_bias_[i] >= 0 || add_mul_[i] >= 0 || add3_[i] >= 0)
+                continue;
+            const Dims& out = n.outputs[0].shape;
+            for (size_t k = 0; k < 2; ++k) {
+                const auto mm = static_cast<size_t>(n.inputs[1 - k].node);
+                const Node& m = nodes[mm];
+                if (m.kind != OpKind::MatMul || readers[mm] != 1 || fused_[mm] != Fused::No) continue;
+                if (dt(m.inputs[1]) != DType::F16 || graph_.type(n.inputs[k]).shape != out) continue;
+                const Dims& x = graph_.type(m.inputs[0]).shape;
+                if (std::any_of(x.begin(), x.end(), [](int64_t v) { return v == kT || v == kL; }) ||
+                    numel(x) / x.back() <= sycl_be::kGemvMaxRows)
+                    continue;
+                fused_[mm] = Fused::Skip;
+                mm_add_[i] = static_cast<int32_t>(mm);
+                reads_[i] = {n.inputs[k], m.inputs[0], m.inputs[1]};
+                reads_[mm].clear();
+                break;
+            }
+        }
+        // Attention(q, Concat(k1, k2), Concat(v1, v2)) on the GEMM path (head_dim past the fused kernel's, more
+        // queries than the per-row kernel takes): its GEMMs read the two parts in place, so the concat copies go (a
+        // policy's action expert attends to the prefix's keys and its own, every flow step). reads_: q, k1, v1,
+        // [bias], k2, v2.
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const Node& n = nodes[i];
+            if (n.kind != OpKind::Attention || fused_[i] != Fused::No) continue;
+            const auto kc = static_cast<size_t>(n.inputs[1].node);
+            const auto vc = static_cast<size_t>(n.inputs[2].node);
+            const auto two_parts = [&](size_t c) {
+                return nodes[c].kind == OpKind::Concat && nodes[c].inputs.size() == 2 && readers[c] == 1 &&
+                       fused_[c] == Fused::No && std::get<graph::AxisAttrs>(nodes[c].attrs).axis == 0;
+            };
+            if (kc == vc || !two_parts(kc) || !two_parts(vc)) continue;
+            const Dims& q = graph_.type(n.inputs[0]).shape;
+            const int64_t first = graph_.type(nodes[kc].inputs[0]).shape[0];
+            if (q.size() != 3 || q[0] == kT || first == kT || first != graph_.type(nodes[vc].inputs[0]).shape[0]) continue;
+            sycl_be::AttentionShape sh;
+            sh.tokens = q[0];
+            sh.head_dim = q[2];
+            if (sh.head_dim <= 128 || !sycl_be::attention_matrix_path(sh, attention_.path)) continue;
+            fused_[kc] = Fused::Skip;
+            fused_[vc] = Fused::Skip;
+            reads_[kc].clear();
+            reads_[vc].clear();
+            reads_[i] = {n.inputs[0], nodes[kc].inputs[0], nodes[vc].inputs[0]};
+            if (n.inputs.size() == 4) reads_[i].push_back(n.inputs[3]);
+            attn_split_[i] = static_cast<int8_t>(reads_[i].size());
+            reads_[i].push_back(nodes[kc].inputs[1]);
+            reads_[i].push_back(nodes[vc].inputs[1]);
+        }
     }
 
-    // Values that only GEMM-path matmuls (as x) and GEMM-path attention (as q, k, v) read are kept in f16, written so
-    // by the kernel that makes them: those GEMMs run on f16 operands anyway, so a conversion pass disappears and the
-    // traffic halves. Attention operands produced in f16 (projections, RoPE) round q, k and v to f16 before the
+    // Values that only GEMM-path matmuls and quant_gemm (as x) and GEMM-path attention (as q, k, v) read are kept in
+    // f16, written so by the kernel that makes them: those GEMMs run on f16 operands anyway, so a conversion pass
+    // disappears and the traffic halves. Attention operands produced in f16 (projections, RoPE) round q, k and v to f16 before the
     // scores, the convention of the f16 KV cache. Static shapes only (dynamic ones can take the f32-only GEMV and
     // per-row paths). A fixed point: start from every eligible value, drop any whose readers cannot take f16.
     void plan_half_values() {
@@ -713,6 +771,16 @@ private:
             const Dims& x = graph_.type(n.inputs[0]).shape;
             return static_shape(x) && numel(x) / x.back() > sycl_be::kGemvMaxRows;
         };
+        // the matmul runs quant_gemm (a quantized weight, 9 to 64 rows), which reads x in f16
+        const auto quant_matmul = [&](size_t m) {
+            const Node& n = nodes[m];
+            if (!quant_gemm_ || n.kind != OpKind::MatMul || !is_quantized(dt(n.inputs[1]))) return false;
+            const Dims& x = graph_.type(n.inputs[0]).shape;
+            const Dims& w = graph_.type(n.inputs[1]).shape;
+            if (!static_shape(x)) return false;
+            const int64_t rows = numel(x) / x.back();
+            return rows > sycl_be::kGemvMaxRows && rows <= sycl_be::kQuantGemmMaxRows && w[0] % 32 == 0 && w[1] % 128 == 0;
+        };
         const auto gemm_attention = [&](size_t a) {
             const Node& n = nodes[a];
             if (n.kind != OpKind::Attention || attention_.path == sycl_be::AttentionPath::Rows) return false;
@@ -731,7 +799,7 @@ private:
                                   k == OpKind::Mul || k == OpKind::GeluTanh || k == OpKind::Silu ||
                                   k == OpKind::Rope || k == OpKind::Reshape || k == OpKind::Slice ||
                                   k == OpKind::Transpose || k == OpKind::Concat || (k == OpKind::MatMul && gemm_matmul(i));
-            half[i] = producer && fused_[i] == Fused::No && dtype_[i][0] == DType::F32 && output[i] == 0 &&
+            half[i] = producer && fused_[i] == Fused::No && mm_add_[i] < 0 && dtype_[i][0] == DType::F32 && output[i] == 0 &&
                       nodes[i].outputs.size() == 1 && static_shape(nodes[i].outputs[0].shape) && !readers[i].empty();
         }
         for (bool changed = true; changed;) {
@@ -751,13 +819,20 @@ private:
                     const OpKind rk = nodes[r].kind;
                     bool accept = false;
                     if (rk == OpKind::MatMul) {
-                        accept = k == 0 && fused_[r] == Fused::No && gemm_matmul(r);
+                        accept = k == 0 && fused_[r] == Fused::No && (gemm_matmul(r) || quant_matmul(r));
+                    } else if (rk == OpKind::Attention && attn_split_[r] >= 0) {  // the four parts in one type
+                        const auto part = [&](size_t idx) { return half[static_cast<size_t>(reads_[r][idx].node)] != 0; };
+                        const auto s2 = static_cast<size_t>(attn_split_[r]);
+                        const bool kv = k == 1 || k == 2 || k == s2 || k == s2 + 1;
+                        accept = gemm_attention(r) && (k == 0 || (kv && part(1) && part(2) && part(s2) && part(s2 + 1)));
                     } else if (rk == OpKind::Attention) {
                         const auto kv = [&](size_t idx) { return half[static_cast<size_t>(nodes[r].inputs[idx].node)] != 0; };
                         accept = gemm_attention(r) && (k == 0 || ((k == 1 || k == 2) && kv(1) && kv(2)));
                     } else if (rk == OpKind::Reshape || rk == OpKind::Slice || rk == OpKind::Transpose ||
                                rk == OpKind::Concat) {
                         accept = half[r] != 0;
+                    } else if (rk == OpKind::Add && mm_add_[r] >= 0) {  // a fused residual GEMM: x in either type
+                        accept = k == 1;
                     } else if (rk == OpKind::Mul && act_mul_[r] >= 0) {  // a fused activation reads both in one type
                         accept = half[static_cast<size_t>(reads_[r][0].node)] != 0 &&
                                  half[static_cast<size_t>(reads_[r][1].node)] != 0;
@@ -1015,6 +1090,26 @@ private:
         p.shapes.resize(count);
         p.locs.resize(count);
         p.alias.assign(count, 0);
+        p.in_place.assign(count, 0);
+        // For residual GEMMs (mm_add_): the last reader of each value, and whether a view (reshape, slice) reads it
+        // (then its memory may be read later under another name).
+        std::vector<std::vector<size_t>> last_reader(count);
+        std::vector<std::vector<uint8_t>> viewed(count);
+        for (size_t i = 0; i < count; ++i) {
+            last_reader[i].assign(nodes[i].outputs.size(), 0);
+            viewed[i].assign(nodes[i].outputs.size(), 0);
+        }
+        for (size_t i = 0; i < count; ++i) {
+            for (const Value& in : reads_[i]) {
+                auto& last = last_reader[static_cast<size_t>(in.node)][static_cast<size_t>(in.index)];
+                last = std::max(last, i);
+                if (nodes[i].kind == OpKind::Reshape || nodes[i].kind == OpKind::Slice)
+                    viewed[static_cast<size_t>(in.node)][static_cast<size_t>(in.index)] = 1;
+            }
+        }
+        std::vector<uint8_t> graph_output(count, 0);
+        for (const auto& o : graph_.outputs())
+            graph_output[static_cast<size_t>(o.value.node)] = 1;
         std::vector<size_t> block_size;
         std::vector<size_t> block_def;
         std::vector<size_t> block_last;
@@ -1048,6 +1143,27 @@ private:
             };
             if (fused_[i] == Fused::Skip) {
                 p.alias[i] = 1;  // runs inside its consumer; no memory of its own
+                continue;
+            }
+            if (mm_add_[i] >= 0) {  // in the residual's memory when this is its last reader and it owns that memory
+                const Value& a = reads_[i][0];
+                const auto an = static_cast<size_t>(a.node);
+                const auto ai = static_cast<size_t>(a.index);
+                const OpKind ak = nodes[an].kind;
+                const bool own = p.alias[an] == 0 && p.locs[an][ai].store == Store::Arena && ak != OpKind::Input &&
+                                 block_of[an][ai] >= 0;
+                if (own && graph_output[an] == 0 && viewed[an][ai] == 0 && last_reader[an][ai] == i &&
+                    dtype_[an][ai] == DType::F32 && dtype_[i][0] == DType::F32 && p.shapes[an][ai] == p.shapes[i][0]) {
+                    p.locs[i][0] = p.locs[an][ai];
+                    block_of[i][0] = block_of[an][ai];
+                    p.in_place[i] = 1;
+                } else {
+                    new_block(0);
+                }
+                for (const Value& in : reads_[i]) {
+                    const int b = block_of[static_cast<size_t>(in.node)][static_cast<size_t>(in.index)];
+                    if (b >= 0) block_last[static_cast<size_t>(b)] = std::max(block_last[static_cast<size_t>(b)], i);
+                }
                 continue;
             }
             switch (n.kind) {
@@ -1229,7 +1345,11 @@ private:
                 const int64_t rows = in_shape(1)[0];
                 const int64_t k = in_shape(1)[1];
                 const int64_t m = numel(in_shape(0)) / k;
-                if (is_quantized(in_dt(1))) {
+                if (is_quantized(in_dt(1)) && in_dt(0) == DType::F16) {  // plan_half_values: quant_gemm's x in f16
+                    sycl_be::matmul_quant_half_x(q_, *this, reinterpret_cast<const half*>(in_ptr(0)),
+                                                 leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out, m, rows, k,
+                                                 quant_gemm_, attention_.compute_units);
+                } else if (is_quantized(in_dt(1))) {
                     sycl_be::matmul_quant(q_, *this, in_f32(0), leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out,
                                           m, rows, k, precision_ == DType::F32, quant_gemm_,
                                           attention_.compute_units);
@@ -1254,6 +1374,22 @@ private:
             case OpKind::Add:
             case OpKind::Mul:
             case OpKind::Div: {
+                if (mm_add_[i] >= 0) {  // out = a + x @ w^T: a GEMM adding into out, which holds a in place or a copy
+                    const Value a = reads_[i][0];
+                    const Value x = reads_[i][1];
+                    const Dims& ws = graph_.type(reads_[i][2]).shape;
+                    XS_CHECK(dt(a) == DType::F32 && dt(Value{static_cast<int32_t>(i), 0}) == DType::F32,
+                             "sycl: a residual GEMM in f16");
+                    const int64_t m = out_n / ws[0];
+                    if (p.in_place[i] == 0) q_.memcpy(out, ptr(p, a), static_cast<size_t>(out_n) * sizeof(float));
+                    const auto* w = reinterpret_cast<const half*>(ptr(p, reads_[i][2]));
+                    if (dt(x) == DType::F16) {
+                        sycl_be::matmul_accumulate(q_, *this, reinterpret_cast<const half*>(ptr(p, x)), w, out, m, ws[0], ws[1]);
+                    } else {
+                        sycl_be::matmul_accumulate(q_, *this, reinterpret_cast<const float*>(ptr(p, x)), w, out, m, ws[0], ws[1]);
+                    }
+                    return;
+                }
                 if (act_mul_[i] >= 0) {
                     const auto act = static_cast<UnaryOp>(act_mul_[i]);
                     with_out([&](auto* y) {
@@ -1448,12 +1584,23 @@ private:
                         sycl_be::attention_i8<float>(q_, *this, kv_scratch_, in_f32(0), kv, out, s, attention_);
                     }
                 } else {
+                    // Keys and values in place, in two parts when the concats were fused away (attn_split_).
+                    const int split = attn_split_[i];
+                    const Value kv_k = split >= 0 ? reads_[i][1] : n.inputs[1];
+                    const Value kv_v = split >= 0 ? reads_[i][2] : n.inputs[2];
+                    sycl_be::KvSecond second;
+                    if (split >= 0) {
+                        second.k = ptr(p, reads_[i][static_cast<size_t>(split)]);
+                        second.v = ptr(p, reads_[i][static_cast<size_t>(split) + 1]);
+                        second.first_len = graph_.type(kv_k).shape[0];
+                    }
                     const auto run = [&](const auto* qp) {
-                        if (in_dt(1) == DType::F16) {
-                            sycl_be::attention(q_, *this, qp, reinterpret_cast<const half*>(in_ptr(1)),
-                                               reinterpret_cast<const half*>(in_ptr(2)), out, s, attention_);
+                        if (dt(kv_k) == DType::F16) {
+                            sycl_be::attention(q_, *this, qp, reinterpret_cast<const half*>(ptr(p, kv_k)),
+                                               reinterpret_cast<const half*>(ptr(p, kv_v)), out, s, attention_, second);
                         } else {
-                            sycl_be::attention(q_, *this, qp, in_f32(1), in_f32(2), out, s, attention_);
+                            sycl_be::attention(q_, *this, qp, reinterpret_cast<const float*>(ptr(p, kv_k)),
+                                               reinterpret_cast<const float*>(ptr(p, kv_v)), out, s, attention_, second);
                         }
                     };
                     if (in_dt(0) == DType::F16) {
@@ -1658,6 +1805,8 @@ private:
     std::vector<int32_t> add_mul_;           // Add run as a + b * c with the Mul node folded in, or -1
     std::vector<int32_t> unary_bias_;        // activation run as act(x + bias) with the Add folded in, or -1
     std::vector<int32_t> add3_;              // Add run as a + (b + c) with the inner Add folded in, or -1
+    std::vector<int8_t> attn_split_;         // Attention over two-part keys and values: where k2 is in reads_, or -1
+    std::vector<int32_t> mm_add_;            // Add run as a GEMM adding into the residual (the MatMul folded in), or -1
     std::vector<DeviceBuffer> leaves_;
     std::vector<char*> leaf_ptr_;  // by node index, weights and constants
     std::vector<sycl_be::QuantWeight> leaf_quant_;  // by node index, quantized weights

@@ -56,6 +56,39 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
+    TEST_CASE("a residual add folded into the GEMM: in the residual's memory or on a copy, the same values") {
+        test::TensorRng rng(52);
+        const int64_t m = 24, k = 64, n = 48;
+        test::MemoryWeights w;
+        w.add("w", rng.uniform(DType::F16, {n, k}, 1.0f / std::sqrt(static_cast<float>(k))));
+        const HostTensor x = rng.uniform(DType::F32, {m, k});
+        const HostTensor a = rng.uniform(DType::F32, {m, n});
+        const HostTensor b = rng.uniform(DType::F32, {m, n});
+        const Tensor64 mm = test::ref::matmul(to_f64(x), to_f64(w.tensor("w")));
+        // form 0: the residual is an input (a copy); 1: computed and read only by the add (in place); 2: computed and
+        // read again after the add (a copy, or the later read would see the sum)
+        for (int form = 0; form < 3; ++form) {
+            CAPTURE(form);
+            Graph g;
+            Value h = g.input("a", DType::F32, {m, n});
+            if (form > 0) h = g.add(h, g.input("b", DType::F32, {m, n}));
+            g.output("out", g.add(h, g.matmul(g.input("x", DType::F32, {m, k}), g.weight(w, "w"))));
+            if (form == 2) g.output("again", g.mul(h, h));
+            TensorMap inputs = {{"x", x}, {"a", a}};
+            if (form > 0) inputs["b"] = b;
+            const TensorMap out = dev::run(g, w, inputs);
+            const auto plus = [](double p, double q) { return p + q; };
+            Tensor64 h64 = to_f64(a);
+            if (form > 0) h64 = test::ref::broadcast(h64, to_f64(b), plus);
+            CHECK(dev::close("residual gemm", out.at("out"), test::ref::broadcast(h64, mm, plus),
+                             dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+            if (form == 2) {
+                const Tensor64 sq = test::ref::broadcast(h64, h64, [](double p, double q) { return p * q; });
+                CHECK(dev::close("residual kept", out.at("again"), sq, {1e-5, 1e-5}));
+            }
+        }
+    }
+
     TEST_CASE("matmul and gather on q8 / q4 pack weights against fp64 of the dequantized values") {
         test::TensorRng rng(41);
         // K = 2048 lets quant_gemm split K between up to 8 sub-groups of a work-group

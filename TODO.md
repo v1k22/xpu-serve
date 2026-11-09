@@ -254,9 +254,13 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
 - [x] π0.5 latency, first pass: f16 operands, fusions, fused flash attention (XMX) up to head_dim 128 with SigLIP
       per camera, Concat as one kernel, a cheaper GELU, prompt padded to 32-token buckets (Arc B390, 3 cameras:
       428.5 -> 243.9 ms; design-vla.md §6)
-- [ ] π0.5 latency, next: the prefix down
-      projection's GEMM (~30 TFLOPS against ~50 for gate / up), in-place expert K/V, gate and up in one GEMM,
-      record / replay of the program
+- [x] π0.5 fusions (Arc B390, 3 cameras): residual adds folded into the prefix's GEMMs, written in the residual's
+      memory (beta 1; 35 passes over [928, 2048] gone, -4 ms), quant_gemm inputs kept in f16 by their producers (~900
+      conversion kernels gone, -2 ms), the expert's K / V concats read in place by the attention GEMMs (about even:
+      the copies were cached, the GEMMs doubled). q8 action expert 231 -> 225 ms, f16 244 -> 239 ms
+- [ ] π0.5 latency, next: the prefix down projection's GEMM (~30 TFLOPS against ~50 for gate / up; oneMKL split-K
+      is slower), gate and up in one GEMM with the activation, the expert's gated residual in quant_gemm's epilogue,
+      record / replay of the program (small kernels cost ~2 us each; ~400 per flow step)
 - [x] Generic weight quantization by a graph rule (`convert --scope bandwidth|all`): weights of matmuls with a
       step-dependent row count or at most 64 rows per call; policies convert too. π0.5 q8 (the rule picks the action
       expert): 245 -> 231 ms at 3 cameras on Arc B390, actions cosine 0.99999; q4 misses the 0.999 gate

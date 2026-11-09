@@ -84,7 +84,8 @@ inline void concat_axes(const Env& env) {
 // 16 heads, outside the per-row kernels) and the action expert's (50 queries over a padded prefix, MQA, head dim 256,
 // and the same at 128). Operands as graph inputs, and through a reshape (an f16 session stores those in f16, which the
 // fused matrix-engine kernel needs): 300 keys against 50 queries of an MQA head at 128 split the keys between
-// work-groups there.
+// work-groups there. Keys and values also as Concat(prefix part, the last 50), the expert's form, which the GEMM path
+// reads in place (two GEMMs per product) at head dim 256.
 inline void attention_key_bias(const Env& env) {
     TensorRng rng(43);
     struct Case {
@@ -111,26 +112,42 @@ inline void attention_key_bias(const Env& env) {
         spec.key_bias.clear();
         const Tensor64 unmasked = ref::attention(to_f64(q), to_f64(k), to_f64(v), spec);
         for (const bool reshaped : {false, true}) {
+            for (const bool parts : {false, true}) {
             CAPTURE(reshaped);
+            CAPTURE(parts);
             Graph g;
             const auto operand = [&](const char* name, const Dims& shape) {
                 if (!reshaped) return g.input(name, DType::F32, shape);
                 return g.reshape(g.input(name, DType::F32, {shape[0], shape[1] * shape[2]}), shape);
             };
-            g.output("out", g.attention(operand("q", {c.queries, c.heads, c.dim}), operand("k", {c.keys, c.kv_heads, c.dim}),
-                                        operand("v", {c.keys, c.kv_heads, c.dim}),
+            const int64_t tail = c.queries;  // the second part: the last 50 keys
+            const auto kv = [&](const char* whole, const char* a, const char* b) {
+                if (!parts) return operand(whole, {c.keys, c.kv_heads, c.dim});
+                return g.concat({operand(a, {c.keys - tail, c.kv_heads, c.dim}), operand(b, {tail, c.kv_heads, c.dim})}, 0);
+            };
+            g.output("out", g.attention(operand("q", {c.queries, c.heads, c.dim}), kv("k", "k1", "k2"), kv("v", "v1", "v2"),
                                         g.input("bias", DType::F32, {c.keys}), attrs));
             const auto flat = [&](const HostTensor& t) {
                 return reshaped ? t.reshaped({t.shape()[0], t.shape()[1] * t.shape()[2]}) : t.clone();
             };
+            TensorMap inputs = {{"q", flat(q)}, {"bias", key_bias}};
+            if (parts) {
+                inputs["k1"] = flat(rows(k, 0, c.keys - tail));
+                inputs["k2"] = flat(rows(k, c.keys - tail, c.keys));
+                inputs["v1"] = flat(rows(v, 0, c.keys - tail));
+                inputs["v2"] = flat(rows(v, c.keys - tail, c.keys));
+            } else {
+                inputs["k"] = flat(k);
+                inputs["v"] = flat(v);
+            }
             for (const std::string& impl : env.attention_impls) {
                 CAPTURE(impl);
                 SessionOptions o = env.options();
                 if (impl != "auto") o.extra["attention"] = impl;
-                const HostTensor out =
-                    run(env, g, {{"q", flat(q)}, {"k", flat(k)}, {"v", flat(v)}, {"bias", key_bias}}, o).at("out");
+                const HostTensor out = run(env, g, inputs, o).at("out");
                 CHECK(all_close(out, expected, env.attn_atol, env.attn_rtol));
                 CHECK_FALSE(all_close(out, unmasked, env.attn_atol, env.attn_rtol));  // planted: the mask matters
+            }
             }
         }
     }
