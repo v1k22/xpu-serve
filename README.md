@@ -19,8 +19,8 @@ backend. [CLAUDE.md](CLAUDE.md) maps the code.
 |---|---|---|---|---|
 | Gemma 4 E2B / E4B | language, images | f16, q8, q4 | 61.5 / 92 tok/s decode (f16 / q8) | Arc Pro B60 |
 | Qwen3.5 4B | language | f16, q8, q4 | 42 / 71 tok/s decode (f16 / q8) | Arc Pro B60 |
-| Qwen3.6-35B-A3B | language, MoE | q4 | 58 tok/s decode, 1,250 tok/s prefill | Arc Pro B60 |
-| Qwen3.8-27B | language | q4 | 22 tok/s decode, 630 tok/s prefill; 6.7 / 307 on Arc B390 | Arc Pro B60, Arc B390 |
+| Qwen3.6-35B-A3B | language, MoE | q4 | 59 tok/s decode, 1,550 tok/s prefill | Arc Pro B60 |
+| Qwen3.8-27B | language | q4 | 22 tok/s decode, 830 tok/s prefill; 6.8 / 460 on Arc B390 | Arc Pro B60, Arc B390 |
 | π0.5 | robot policy | f16, q8 | 239 / 225 ms per call (f16 / q8) | Arc B390, 3 cameras |
 
 | Model | Checkpoint (`model_type`) | Checked against |
