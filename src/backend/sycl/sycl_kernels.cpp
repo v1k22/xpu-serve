@@ -145,6 +145,87 @@ inline float reduce_lanes(sycl::sub_group sg, float v) {
 // memory in parallel, then every column steps through the block in order.
 constexpr int kDeltaRows = 32;
 
+// The same for a few tokens (decode): one work-group per (v head, 16 columns of its state), each of its eight
+// sub-groups holding RS = dk / 8 rows of those columns in registers, a lane per column. The state then streams in
+// whole rows and the device fills at one token; the two sums over the rows (k . S, q . S) go through local memory,
+// and every sub-group finds the q and k norms itself.
+constexpr int kDeltaColsSgs = 8;
+constexpr int64_t kDeltaColsMaxTokens = 8;
+
+template <int RS>
+void gated_delta_cols_t(sycl::queue& q, const float* qp, const float* kp, const float* vp, const float* g,
+                        const float* beta, const float* state_in, float* state_out, float* out, int64_t tokens,
+                        int64_t k_heads, int64_t v_heads, int64_t dk, int64_t dv, float eps) {
+    const int64_t group = v_heads / k_heads;
+    const int64_t col_blocks = dv / kSubGroup;
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(dk));
+    syclex::submit(q, [&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> kv_parts(sycl::range<1>(kDeltaColsSgs * kSubGroup), h);
+        sycl::local_accessor<float, 1> o_parts(sycl::range<1>(kDeltaColsSgs * kSubGroup), h);
+        syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(v_heads * col_blocks * kDeltaColsSgs * kSubGroup),
+                                               kDeltaColsSgs * kSubGroup),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int sgid = static_cast<int>(sg.get_group_linear_id());
+            const int lane = static_cast<int>(sg.get_local_linear_id());
+            const int64_t hv = static_cast<int64_t>(it.get_group(0)) / col_blocks;
+            const int64_t col = (static_cast<int64_t>(it.get_group(0)) % col_blocks) * kSubGroup + lane;
+            const int64_t kh = hv / group;
+            const int64_t row0 = static_cast<int64_t>(sgid) * RS;
+            float s[RS];
+            const float* s_in = state_in + hv * dk * dv;
+            for (int r = 0; r < RS; ++r)
+                s[r] = s_in[(row0 + r) * dv + col];
+            for (int64_t t = 0; t < tokens; ++t) {
+                const float* qt = qp + (t * k_heads + kh) * dk;
+                const float* kt = kp + (t * k_heads + kh) * dk;
+                float q_norm = q_scale;
+                float k_norm = 1.0f;
+                if (eps > 0.0f) {
+                    float sq = 0.0f;
+                    float sk = 0.0f;
+                    for (int64_t d = lane; d < dk; d += kSubGroup) {
+                        sq += qt[d] * qt[d];
+                        sk += kt[d] * kt[d];
+                    }
+                    q_norm = q_scale / sycl::sqrt(sycl::reduce_over_group(sg, sq, sycl::plus<float>()) + eps);
+                    k_norm = 1.0f / sycl::sqrt(sycl::reduce_over_group(sg, sk, sycl::plus<float>()) + eps);
+                }
+                const float decay = sycl::exp(g[t * v_heads + hv]);
+                float kr[RS];
+                float kv = 0.0f;
+                for (int r = 0; r < RS; ++r) {
+                    kr[r] = kt[row0 + r] * k_norm;
+                    s[r] *= decay;
+                    kv += s[r] * kr[r];
+                }
+                kv_parts[sgid * kSubGroup + lane] = kv;
+                sycl::group_barrier(it.get_group());
+                kv = 0.0f;
+                for (int j = 0; j < kDeltaColsSgs; ++j)
+                    kv += kv_parts[j * kSubGroup + lane];
+                const float delta = beta[t * v_heads + hv] * (vp[(t * v_heads + hv) * dv + col] - kv);
+                float o = 0.0f;
+                for (int r = 0; r < RS; ++r) {
+                    s[r] += kr[r] * delta;
+                    o += s[r] * (qt[row0 + r] * q_norm);
+                }
+                o_parts[sgid * kSubGroup + lane] = o;
+                sycl::group_barrier(it.get_group());  // also: every kv_parts read is done before the next token writes
+                if (sgid == 0) {
+                    o = 0.0f;
+                    for (int j = 0; j < kDeltaColsSgs; ++j)
+                        o += o_parts[j * kSubGroup + lane];
+                    out[(t * v_heads + hv) * dv + col] = o;
+                }
+            }
+            float* s_out = state_out + hv * dk * dv;
+            for (int r = 0; r < RS; ++r)
+                s_out[(row0 + r) * dv + col] = s[r];
+        });
+    });
+}
+
 template <int P>
 void gated_delta_t(sycl::queue& q, const float* qp, const float* kp, const float* vp, const float* g,
                    const float* beta, const float* state_in, float* state_out, float* out, int64_t tokens,
@@ -1144,6 +1225,14 @@ void causal_conv(sycl::queue& q, const float* x, const float* w, const float* st
 void gated_delta(sycl::queue& q, const float* qp, const float* kp, const float* vp, const float* g, const float* beta,
                  const float* state_in, float* state_out, float* out, int64_t tokens, int64_t k_heads,
                  int64_t v_heads, int64_t dk, int64_t dv, float qk_l2norm_eps) {
+    if (tokens <= kDeltaColsMaxTokens && dv % kSubGroup == 0 && dk % kDeltaColsSgs == 0) {
+        switch (dk / kDeltaColsSgs) {
+            case 8: return gated_delta_cols_t<8>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dk, dv, qk_l2norm_eps);
+            case 16: return gated_delta_cols_t<16>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dk, dv, qk_l2norm_eps);
+            case 32: return gated_delta_cols_t<32>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dk, dv, qk_l2norm_eps);
+            default: break;
+        }
+    }
     switch (dk / kDeltaRows) {
         case 1: return gated_delta_t<1>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dk, dv, qk_l2norm_eps);
         case 2: return gated_delta_t<2>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dk, dv, qk_l2norm_eps);

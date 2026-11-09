@@ -123,8 +123,9 @@ inline void gated_delta_steps(const Env& env) {
         int64_t dk, dv;
         std::vector<int64_t> steps;
     };
-    // Small heads, and Qwen3.5's 128 x 128 heads over a step longer than a backend's staging block.
-    for (const Dims& dims : {Dims{32, 16, {7, 1, 4}}, Dims{128, 128, {70, 1, 4}}})
+    // Small heads, and Qwen3.5's 128 x 128 heads over a step longer than a backend's staging block; the short steps
+    // after a long one carry the state between a backend's prefill and decode kernels.
+    for (const Dims& dims : {Dims{32, 16, {7, 1, 4}}, Dims{64, 32, {12, 1, 3}}, Dims{128, 128, {70, 1, 4}}})
     for (const float eps : {0.0f, 1e-6f}) {
         const int64_t hk = 2, hv = 4, dk = dims.dk, dv = dims.dv;
         CAPTURE(dk);
