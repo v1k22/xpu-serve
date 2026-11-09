@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/logo.png" alt="xpu-serve: one repo, one binary, Intel GPUs" width="380">
+</p>
+
 # xpu-serve
 Experimental engine to run LLMs on Intel platforms.
 
