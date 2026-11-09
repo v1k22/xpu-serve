@@ -53,13 +53,13 @@ if(XS_WITH_SYCL)
   target_compile_definitions(xs_backends PRIVATE XS_HAVE_SYCL=1)
 endif()
 
-xs_add_library(xs_server DIRS server DEPS xs_core xs_tokenizer xs_chat xs_httplib)
+# The policy runtime: a robot policy, its tokenizer and its compiled programs on one device.
+xs_add_library(xs_policy DIRS policy DEPS xs_core xs_backends xs_tokenizer)
+
+xs_add_library(xs_server DIRS server DEPS xs_core xs_tokenizer xs_chat xs_policy xs_httplib)
 
 # `convert`: checkpoint -> pack; AWQ calibration runs the model on a backend and needs the tokenizer.
 xs_add_library(xs_convert DIRS convert DEPS xs_core xs_backends xs_tokenizer)
-
-# The policy runtime: a robot policy, its tokenizer and its compiled programs on one device.
-xs_add_library(xs_policy DIRS policy DEPS xs_core xs_backends xs_tokenizer)
 
 # The InferenceService that ties model, backend, tokenizer and chat template together.
 xs_add_library(xs_service DIRS service DEPS xs_core xs_backends xs_tokenizer xs_chat)

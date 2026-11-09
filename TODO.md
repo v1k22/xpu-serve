@@ -271,12 +271,18 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
       DPAS rate); the packed q4 dequantization spilled (2-3x slower) and needs registers freed first
 - [ ] q4 for policies: AWQ-style calibration on policy activations (or q4 with q8 for the most sensitive matmuls)
 - [ ] Flash attention at head_dim 256 (Gemma): 8 rows per sub-group fill the registers, so every K/V tile feeds one
-      DPAS and oneMKL's GEMMs match it; needs K/V or P shared across sub-groups through local memory
+      DPAS and oneMKL's GEMMs match it; needs K/V or P shared across sub-groups through local memory. Tried on Arc
+      B390 (pi05, 2026-11-09): the joint_matrix kernel with one 8-row tile per sub-group and the 8 query heads of a
+      KV head in one work-group spilled 2 KB (Q in registers), 450-580 bytes with Q read from local memory (32 or 16
+      keys per block), and ran 10-15 ms slower per call than the GEMM path; it needs hand-placed DPAS (as quant_gemm)
 - [ ] Low precision on Panther Lake: the B390 compiles fp8 (E4M3 / E5M2) DPAS but returns wrong results; int8 DPAS is
       exact at ~122 TOPS (2x f16). A w8a8 path is the low-precision option there (lossy, opt-in)
 - [ ] Normalization statistics (quantiles, mean/std) and resize-with-pad for other image sizes
-- [ ] Policy service and API: `/v1/policy/info`, `/v1/policy/act` (JSON + msgpack), latest-wins queue, `/ready` after
-      warm-up; then the openpi-compatible WebSocket; RTC (previous chunk + delay)
+- [x] Policy service and API (JSON): `xpu-serve serve <policy-dir>` mounts `/v1/policy/info`, `/v1/policy/act` (base64
+      PNG / JPEG or raw RGB, fixed noise optional, requests fail by name), a latest-wins one-slot queue (a waiting call
+      is answered 409 when a newer one arrives) and `/ready` after warm-up (`--cameras N`). pi05 on Arc B390: actions
+      identical to policy-eval, 199-218 ms per call at 2 cameras (~20-30 ms of it HTTP and JSON)
+- [ ] Policy API next: msgpack bodies (no base64), the openpi-compatible WebSocket, RTC (previous chunk + delay)
 - [ ] More policies: π0, SmolVLA, GR00T N1.6 / N1.7, π0-FAST (through the language engine), OpenVLA-OFT
 
 ## World models

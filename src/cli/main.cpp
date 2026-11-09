@@ -16,6 +16,7 @@
 #include "convert/convert.h"
 #include "models/policy.h"
 #include "policy/runner.h"
+#include "policy/service.h"
 #include "server/server.h"
 #include "service/engine_service.h"
 #include "tokenizer/tokenizer.h"
@@ -192,18 +193,30 @@ int cmd_serve(const std::vector<std::string>& argv) {
         .value("port", "port", "8080")
         .value("api-key", "require 'Authorization: Bearer <key>'")
         .value("model-id", "model name reported by /v1/models (default: directory name)")
-        .value("http-threads", "HTTP worker threads", "8");
+        .value("http-threads", "HTTP worker threads", "8")
+        .value("cameras", "policies: warm up for the first N cameras (default: all; others compile on first use)", "0");
     a.parse(argv);
     if (wants_help(a, "serve", "<model-dir> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
     ServiceOptions so = service_options(a);
     so.model_id = a.get("model-id");
-    auto service = EngineService::create(model_dir_arg(a, "serve"), so);
+    const std::string dir = model_dir_arg(a, "serve");
     server::ServerOptions opts;
     opts.host = a.get("host");
     opts.port = a.get_int("port");
     opts.api_key = a.get("api-key");
     opts.http_threads = a.get_int("http-threads");
+    if (model_kind(dir) == ModelKind::Policy) {  // the policy API; /ready once warmed up
+        PolicyRunnerOptions ro;
+        ro.backend = so.backend;
+        ro.session = so.session;
+        auto policy = PolicyService::create(PolicyRunner::create(dir, ro), static_cast<int>(a.get_int("cameras")));
+        server::Server srv(*policy, opts);
+        log::info("serving policy ", policy->spec().id, " on http://", opts.host, ":", opts.port);
+        srv.run();
+        return 0;
+    }
+    auto service = EngineService::create(dir, so);
     server::Server srv(*service, opts);
     log::info("serving ", service->model().id, " on http://", opts.host, ":", opts.port);
     srv.run();
