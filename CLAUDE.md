@@ -1,4 +1,6 @@
-# PROJECT.md: how this repo is laid out
+Always build code cleanly, modularly, and with proper architecture and separation of concerns. Never simply bolt on a feature because I asked for it. If you can’t find an easy way to build it naturally, and you'd recommend a refactor to make the whole thing cleanly, stop your work ahead of time and say so.
+
+# CLAUDE.md: how this repo is laid out
 
 The orientation guide for anyone (person or AI) about to change this code. Read this first, then
 [DESIGN.md](DESIGN.md) for the reasoning and [TODO.md](TODO.md) for what is planned. Keep this file current: a change
@@ -63,7 +65,7 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
 xpu-serve/
 ├── CMakeLists.txt          options XS_WITH_SYCL, XS_SYCL_TARGETS, XS_BUILD_TESTS, XS_WERROR; C++20; warnings target
 ├── README.md               user-facing intro and quick start
-├── PROJECT.md              this file
+├── CLAUDE.md               this file
 ├── DESIGN.md               the design (why), roadmap, open questions
 ├── TODO.md                 phase checklists; [x] = done and tested
 ├── docs/decisions/         one short record per decision (NNNN-title.md)

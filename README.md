@@ -11,7 +11,7 @@ live here, and the math runs on Intel GPUs through our SYCL backend (our own ker
 
 **Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6) and a robot policy (π0.5), from the original
 checkpoint or a q8 / q4 pack written by `xpu-serve convert`, one request at a time, on Intel GPUs through the SYCL
-backend. [PROJECT.md](PROJECT.md) maps the code.
+backend. [CLAUDE.md](CLAUDE.md) maps the code.
 
 ## Supported models
 
@@ -32,7 +32,7 @@ backend. [PROJECT.md](PROJECT.md) maps the code.
 Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B at q4 fits one 24 GB card; π0.5 maps camera images, the
 robot state and an instruction to 50 x 32 actions in 10 flow steps, and its q8 pack quantizes the action expert.
 
-A model is added in `src/models/<arch>/` (language models: [PROJECT.md](PROJECT.md); policies:
+A model is added in `src/models/<arch>/` (language models: [CLAUDE.md](CLAUDE.md); policies:
 [docs/design-vla.md](docs/design-vla.md)); these tables list what has been enabled and measured.
 
 ## Build

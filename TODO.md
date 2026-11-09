@@ -13,7 +13,7 @@ below are done and tested; the parity numbers are in `tests/unit/model/model_par
 tokenizer with NFC, Qwen3.5 chat template parity and output parser.
 
 **v0.2 (2026-11-07):** image input for Gemma 4 E2B/E4B (OpenAI `image_url` data URLs), checked against Hugging Face
-end to end (`docs/decisions/0005`, `tests/unit/model/gemma4_vision_parity.cpp`). `PROJECT.md` maps the code.
+end to end (`docs/decisions/0005`, `tests/unit/model/gemma4_vision_parity.cpp`). `CLAUDE.md` maps the code.
 
 Legend: `[x]` done · `[ ]` to do · **Done when** = the check that closes the item.
 
@@ -219,7 +219,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ### Model enablement checklist
 
-Every model below is enabled the same way (PROJECT.md 8.1); a model is done when every box is ticked:
+Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when every box is ticked:
 
 1. Config parsed, unsupported variants refused by name (`models/<arch>/<arch>_config.cpp`, config test)
 2. Graph built from shared blocks (`models/common/`), new ops added to the IR, cpu-ref and SYCL first
@@ -228,7 +228,7 @@ Every model below is enabled the same way (PROJECT.md 8.1); a model is done when
 5. Tokenizer and chat template byte-exact vs Hugging Face; output parser (thinking, tool calls) if the format needs one
 6. Packs: `convert` q8 and q4 (AWQ), quality on the parity prompts and MMLU-Pro (25 questions) through the server
 7. Fits and runs on the target device (Arc Pro B60, Panther Lake iGPU); bench decode / TTFT at 1k / 4k / 16k
-8. Docs: TODO, PROJECT.md map, README supported list
+8. Docs: TODO, CLAUDE.md map, README supported list
 
 | # | Model | Hugging Face ID | Notes |
 |---|---|---|---|

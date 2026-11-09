@@ -5,7 +5,7 @@ Status: **draft v0.1, for review** · 2026-11-06 · Owner: v1k22
 > **Update 2026-11-07:** after the first comparison, SYCL became the GPU backend
 > ([decision 0007](docs/decisions/0007-sycl-backend.md)) and the OpenVINO backend was removed from the code
 > ([decision 0008](docs/decisions/0008-remove-openvino.md)). The sections below that describe the OpenVINO backend
-> and the two-backend plan are kept as design history; PROJECT.md describes the code as it is.
+> and the two-backend plan are kept as design history; CLAUDE.md describes the code as it is.
 
 xpu-serve runs LLMs on Intel GPUs. It is one repo and one binary, with one command to convert a model and one to
 serve it. The model code, the engine (KV cache, scheduling, speculative decoding), the converter and the server all
