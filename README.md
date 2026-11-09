@@ -11,15 +11,25 @@ backend. [PROJECT.md](PROJECT.md) maps the code.
 
 ## Supported models
 
-| Model | Kind | Checkpoint (`model_type` / LeRobot `type`) | Weights | Checked against | Measured |
-|---|---|---|---|---|---|
-| Gemma 4 E2B / E4B | language, images | `google/gemma-4-E2B-it` (`gemma4`) | f16, q8, q4 | Hugging Face fp32 logits, greedy text, image features | Arc Pro B60: 61.5 tok/s decode (f16), 92 tok/s (q8) |
-| Qwen3.5 4B | language | `Qwen/Qwen3.5-4B` (`qwen3_5`) | f16, q8, q4 (AWQ) | Hugging Face fp32 logits, greedy text | Arc Pro B60: 42 tok/s decode (f16), 71 tok/s (q8) |
-| Qwen3.6-35B-A3B | language, mixture of experts | `Qwen/Qwen3.6-35B-A3B` (`qwen3_5_moe`) | q4 (fits one 24 GB card) | tiny-checkpoint parity, MMLU-Pro (25 questions): 84 % | Arc Pro B60: 48 tok/s decode, 1,250 tok/s prefill |
-| π0.5 | robot policy (cameras, state, instruction -> 50 x 32 actions) | `lerobot/pi05_base` (`pi05`) | f32 / f16, q8 (action expert) | LeRobot f32 actions: max error 5e-6 (cpu-ref), 2e-3 (GPU f16) | Arc B390, 3 cameras, 10 steps: 239 ms (f16), 225 ms (q8) |
+| Model | Kind | Weights | Speed | Measured on |
+|---|---|---|---|---|
+| Gemma 4 E2B / E4B | language, images | f16, q8, q4 | 61.5 / 92 tok/s decode (f16 / q8) | Arc Pro B60 |
+| Qwen3.5 4B | language | f16, q8, q4 | 42 / 71 tok/s decode (f16 / q8) | Arc Pro B60 |
+| Qwen3.6-35B-A3B | language, MoE | q4 | 48 tok/s decode, 1,250 tok/s prefill | Arc Pro B60 |
+| π0.5 | robot policy | f16, q8 | 239 / 225 ms per call (f16 / q8) | Arc B390, 3 cameras |
+
+| Model | Checkpoint (`model_type`) | Checked against |
+|---|---|---|
+| Gemma 4 E2B / E4B | `google/gemma-4-E2B-it` (`gemma4`) | Hugging Face fp32 logits, greedy text, image features |
+| Qwen3.5 4B | `Qwen/Qwen3.5-4B` (`qwen3_5`) | Hugging Face fp32 logits, greedy text |
+| Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B` (`qwen3_5_moe`) | tiny-checkpoint parity; MMLU-Pro (25 questions): 84 % |
+| π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 2e-3 (GPU f16) |
+
+Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B at q4 fits one 24 GB card; π0.5 maps camera images, the
+robot state and an instruction to 50 x 32 actions in 10 flow steps, and its q8 pack quantizes the action expert.
 
 A model is added in `src/models/<arch>/` (language models: [PROJECT.md](PROJECT.md); policies:
-[docs/design-vla.md](docs/design-vla.md)); this table lists what has been enabled and measured.
+[docs/design-vla.md](docs/design-vla.md)); these tables list what has been enabled and measured.
 
 ## Build
 
