@@ -5,6 +5,7 @@
 #include <limits>
 #include <type_traits>
 
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 
 #include "util/error.h"
@@ -14,6 +15,7 @@ namespace xs::sycl_be {
 // Event-less launches (sycl_ext_oneapi_enqueue_functions): the in-order queue orders them, and skipping the event
 // makes each launch cheaper on the host.
 namespace syclex = sycl::ext::oneapi::experimental;
+namespace intelex = sycl::ext::intel::experimental;
 
 namespace {
 
@@ -224,6 +226,96 @@ void gated_delta_cols_t(sycl::queue& q, const float* qp, const float* kp, const 
                 s_out[(row0 + r) * dv + col] = s[r];
         });
     });
+}
+
+// The same for many tokens (prefill): one sub-group per (v head, 16 state columns), a lane per column holding all DK
+// rows of it in registers (256 per thread), so the sums over rows (k . S, q . S) stay within the lane and the tokens
+// step without a barrier. Each lane loads a DK / 16 slice of the token's q and k (one coalesced load, and the norms'
+// partial sums) and the rows reach every lane by sub-group broadcasts. (One work-group per v head, the rows split
+// between lanes and staged per token, kept 48 work-groups on the GPU's 160 cores: 99 ms of a 512-token Qwen3.8
+// prefill; uniform loads of q and k per row cost more still.)
+template <int DK>
+struct GatedDeltaLanes {
+    static constexpr int kSlice = DK / kSubGroup;  // q and k values per lane
+    const float* qp;
+    const float* kp;
+    const float* vp;
+    const float* g;
+    const float* beta;
+    const float* state_in;
+    float* state_out;
+    float* out;
+    int64_t tokens, k_heads, v_heads, dv;
+    float eps, q_scale;
+
+    auto get(syclex::properties_tag) const {
+        return syclex::properties{syclex::sub_group_size<kSubGroup>, intelex::grf_size<256>};
+    }
+
+    void operator()(sycl::nd_item<1> it) const {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const int64_t blocks = dv / kSubGroup;
+        const int64_t hv = static_cast<int64_t>(it.get_group(0)) / blocks;
+        const int64_t col = (static_cast<int64_t>(it.get_group(0)) % blocks) * kSubGroup + lane;
+        const int64_t kh = hv / (v_heads / k_heads);
+        constexpr int kAcc = 4;  // partial sums: the chains over rows run in parallel
+        // every loop over rows unrolled: s stays in registers (a loop indexes it in scratch memory)
+        float s[DK];
+        const float* s_in = state_in + hv * DK * dv;
+        #pragma unroll
+        for (int r = 0; r < DK; ++r) s[r] = s_in[r * dv + col];
+        for (int64_t t = 0; t < tokens; ++t) {
+            const sycl::vec<float, kSlice> kl =
+                *reinterpret_cast<const sycl::vec<float, kSlice>*>(kp + (t * k_heads + kh) * DK + lane * kSlice);
+            const sycl::vec<float, kSlice> ql =
+                *reinterpret_cast<const sycl::vec<float, kSlice>*>(qp + (t * k_heads + kh) * DK + lane * kSlice);
+            float q_norm = q_scale;
+            float k_norm = 1.0f;
+            if (eps > 0.0f) {
+                float sq = 0.0f;
+                float sk = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < kSlice; ++i) {
+                    sq += ql[i] * ql[i];
+                    sk += kl[i] * kl[i];
+                }
+                q_norm = q_scale / sycl::sqrt(sycl::reduce_over_group(sg, sq, sycl::plus<float>()) + eps);
+                k_norm = 1.0f / sycl::sqrt(sycl::reduce_over_group(sg, sk, sycl::plus<float>()) + eps);
+            }
+            const float decay = sycl::exp(g[t * v_heads + hv]);
+            // row r of q and k lives in lane r / kSlice (broadcast where used: a register each, not 2 x DK more)
+            float kv[kAcc] = {};
+            #pragma unroll
+            for (int r = 0; r < DK; ++r) {
+                s[r] *= decay;
+                kv[r % kAcc] += s[r] * sycl::group_broadcast(sg, kl[r % kSlice], r / kSlice);
+            }
+            const float kv_sum = (kv[0] + kv[1]) + (kv[2] + kv[3]);
+            const float delta = beta[t * v_heads + hv] * (vp[(t * v_heads + hv) * dv + col] - kv_sum * k_norm) * k_norm;
+            float o[kAcc] = {};
+            #pragma unroll
+            for (int r = 0; r < DK; ++r) {
+                s[r] += sycl::group_broadcast(sg, kl[r % kSlice], r / kSlice) * delta;
+                o[r % kAcc] += s[r] * sycl::group_broadcast(sg, ql[r % kSlice], r / kSlice);
+            }
+            out[(t * v_heads + hv) * dv + col] = ((o[0] + o[1]) + (o[2] + o[3])) * q_norm;
+        }
+        float* s_out = state_out + hv * DK * dv;
+        #pragma unroll
+        for (int r = 0; r < DK; ++r) s_out[r * dv + col] = s[r];
+    }
+};
+
+template <int DK>
+void gated_delta_lanes_t(sycl::queue& q, const float* qp, const float* kp, const float* vp, const float* g,
+                         const float* beta, const float* state_in, float* state_out, float* out, int64_t tokens,
+                         int64_t k_heads, int64_t v_heads, int64_t dv, float eps) {
+    const float q_scale = 1.0f / std::sqrt(static_cast<float>(DK));
+    const auto sgs = static_cast<size_t>(v_heads * (dv / kSubGroup));
+    syclex::nd_launch(q, sycl::nd_range<1>(sgs * kSubGroup, kSubGroup),
+                      GatedDeltaLanes<DK>{qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dv,
+                                          eps, q_scale});
 }
 
 template <int P>
@@ -566,8 +658,13 @@ inline void quant_rows_dot(const QuantWeight& w, const int64_t (&rows)[R], const
     constexpr int kChunk = Q4 ? 2 * CB : CB;
     const int64_t groups = k / w.group;
     const int64_t row_bytes = Q4 ? k / 2 : k;
+    // the group of a column by a shift (a division is emulated, and ran once per chunk); groups are powers of two
+    // in every pack, a division otherwise
+    const auto group = static_cast<int32_t>(w.group);
+    const bool pow2 = (group & (group - 1)) == 0;
+    const int shift = sycl::ctz(group);
     for (int64_t k0 = static_cast<int64_t>(lane) * kChunk; k0 < k; k0 += kSubGroup * kChunk) {
-        const int64_t g = k0 / w.group;
+        const int64_t g = pow2 ? static_cast<int32_t>(k0) >> shift : static_cast<int32_t>(k0) / group;
         float wv[R][kChunk];
         float s[R];
         float b[R];
@@ -682,17 +779,6 @@ void gemv_quant_q(sycl::queue& q, const float* x, const QuantParts& parts, int64
         case 6: return gemv_quant_t<Q4, AWQ, 6>(q, x, parts, k);
         case 7: return gemv_quant_t<Q4, AWQ, 7>(q, x, parts, k);
         default: return gemv_quant_t<Q4, AWQ, 8>(q, x, parts, k);
-    }
-}
-
-// Calls f.template operator()<Q4, AWQ>() for w's format and whether it carries AWQ input scales.
-template <typename F>
-void quant_dispatch(const QuantWeight& w, F&& f) {
-    const bool awq = w.input_scales != nullptr;
-    if (w.q4) {
-        awq ? f.template operator()<true, true>() : f.template operator()<true, false>();
-    } else {
-        awq ? f.template operator()<false, true>() : f.template operator()<false, false>();
     }
 }
 
@@ -1225,6 +1311,12 @@ void causal_conv(sycl::queue& q, const float* x, const float* w, const float* st
 void gated_delta(sycl::queue& q, const float* qp, const float* kp, const float* vp, const float* g, const float* beta,
                  const float* state_in, float* state_out, float* out, int64_t tokens, int64_t k_heads,
                  int64_t v_heads, int64_t dk, int64_t dv, float qk_l2norm_eps) {
+    // a lane per state column with every row in registers where they fit (any number of tokens); else a few tokens
+    // with the rows split between sub-groups, or a work-group per head
+    if (dv % kSubGroup == 0 && (dk == 64 || dk == 128)) {
+        return dk == 64 ? gated_delta_lanes_t<64>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dv, qk_l2norm_eps)
+                        : gated_delta_lanes_t<128>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dv, qk_l2norm_eps);
+    }
     if (tokens <= kDeltaColsMaxTokens && dv % kSubGroup == 0 && dk % kDeltaColsSgs == 0) {
         switch (dk / kDeltaColsSgs) {
             case 8: return gated_delta_cols_t<8>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dk, dv, qk_l2norm_eps);
@@ -1476,35 +1568,32 @@ void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, 
     gemv_quant_parts(q, x, &part, 1, m, k);
 }
 
-// One work item per 16 bytes of codes (32 q4 or 16 q8 values, all in one group), vector loads and stores.
+// One work item per 8 columns (within one group): neighbouring work items write neighbouring 16 (f16) or 32 bytes, so
+// every store of a sub-group covers whole cache lines. (A work item per 32 columns, 64 bytes apart, wrote at half the
+// bandwidth on the Arc Pro B60.)
 template <typename T, bool Q4>
 void dequantize_t(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k) {
-    constexpr int kChunk = Q4 ? 32 : 16;
     const QuantWeight wc = w;
-    const int64_t chunks = k / kChunk;
     const int64_t groups = k / w.group;
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n * chunks)), [=](sycl::id<1> idx) {
-        const int64_t i = static_cast<int64_t>(idx[0]);
-        const int64_t r = i / chunks;
-        const int64_t c0 = (i % chunks) * kChunk;
-        const sycl::vec<uint8_t, 16> c = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(wc.codes + i * 16);
-        const int64_t sg = r * groups + c0 / wc.group;
+    const auto group = static_cast<int32_t>(w.group);
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(n), static_cast<size_t>(k / 8)), [=](sycl::item<2> it) {
+        const auto r = static_cast<int64_t>(it[0]);
+        const auto c0 = static_cast<int32_t>(it[1]) * 8;
+        const int64_t sg = r * groups + c0 / group;
         const float s = static_cast<float>(wc.scales[sg]);
-        sycl::vec<T, 16> v[kChunk / 16];  // sycl::vec holds at most 16 elements
-        const float* in = wc.input_scales != nullptr ? wc.input_scales + c0 : nullptr;
-        const auto col = [&](int j) { return in != nullptr ? in[j] : 1.0f; };
+        float v[8];
         if constexpr (Q4) {
+            const uint32_t c = *reinterpret_cast<const uint32_t*>(wc.codes + (r * k + c0) / 2);
             const float b = static_cast<float>(wc.biases[sg]);
-            for (int j = 0; j < 16; ++j) {
-                v[j / 8][(2 * j) % 16] = static_cast<T>((s * static_cast<float>(c[j] & 0x0F) + b) * col(2 * j));
-                v[j / 8][(2 * j + 1) % 16] = static_cast<T>((s * static_cast<float>(c[j] >> 4) + b) * col(2 * j + 1));
-            }
+            for (int j = 0; j < 8; ++j) v[j] = s * static_cast<float>((c >> (4 * j)) & 0x0F) + b;
         } else {
-            for (int j = 0; j < 16; ++j)
-                v[0][j] = static_cast<T>(s * static_cast<float>(static_cast<int8_t>(c[j])) * col(j));
+            const sycl::vec<int8_t, 8> c = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(wc.codes + r * k + c0);
+            for (int j = 0; j < 8; ++j) v[j] = s * static_cast<float>(c[j]);
         }
-        for (int h = 0; h < kChunk / 16; ++h)
-            *reinterpret_cast<sycl::vec<T, 16>*>(out + r * k + c0 + 16 * h) = v[h];
+        sycl::vec<T, 8> o;
+        for (int j = 0; j < 8; ++j)
+            o[j] = static_cast<T>(wc.input_scales != nullptr ? v[j] * wc.input_scales[c0 + j] : v[j]);
+        *reinterpret_cast<sycl::vec<T, 8>*>(out + r * k + c0) = o;
     });
 }
 

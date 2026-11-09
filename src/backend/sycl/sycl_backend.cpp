@@ -182,14 +182,32 @@ bool integrated_gpu(const sycl::device& d) {
 #pragma clang diagnostic pop
 }
 
+// How quantized matmuls run on a device. On an integrated GPU (system memory) the matrix-engine kernels that dequantize
+// on the way win: quant_gemm up to kQuantGemmMaxRows rows, quant_gemm_tiled up to kTiledMaxRows (Arc B390, a
+// 17408 x 5120 q4 weight at 512 rows: 3.1 ms against 4.0 for dequantize + GEMM); past that oneMKL's GEMM amortizes the
+// f16 copy of the weight (1,024 rows: 6.3 against 5.2 ms). On a discrete card's faster memory dequantize + GEMM is as
+// fast or faster at every row count (Arc Pro B60: 1.5 ms both at 512 rows, 1.1 against 1.5 at 128).
+constexpr int64_t kTiledMaxRows = 512;
+
+sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::AttentionPlan& attention, DType precision) {
+    sycl_be::QuantMatmulPlan p;
+    p.f32 = precision == DType::F32;
+    p.compute_units = attention.compute_units;
+    if (attention.xmx && integrated_gpu(d)) {
+        p.few_rows = true;
+        p.tiled_rows = kTiledMaxRows;
+    }
+    return p;
+}
+
 class SyclSession final : public Session, private sycl_be::Scratch {
 public:
     SyclSession(const graph::Graph& graph, const WeightStore& weights, const SessionOptions& options, sycl::queue q,
-                const sycl_be::AttentionPlan& attention, bool quant_gemm)
+                const sycl_be::AttentionPlan& attention, const sycl_be::QuantMatmulPlan& quant)
         : graph_(graph),
           q_(std::move(q)),
           attention_(attention),
-          quant_gemm_(quant_gemm),
+          quant_(quant),
           precision_(options.precision),
           kv_i8_(options.kv_dtype == DType::I8),
           max_context_(options.max_context),
@@ -688,9 +706,10 @@ private:
                 }
             }
         }
-        // Add(a, MatMul(x, w)) with an f16 weight on the GEMM path and the matmul read only here: one GEMM adding into
-        // the output (beta 1), which the plan puts in a's memory when nothing reads a afterwards: a residual stream's
-        // update without the add's three passes over [T, width]. reads_: a, x, w.
+        // Add(a, MatMul(x, w)) with an f16 or quantized weight past the GEMV and the matmul read only here: one GEMM
+        // adding into the output (beta 1, or a quantized kernel's adding epilogue), which the plan puts in a's memory
+        // when nothing reads a afterwards: a residual stream's update without the add's three passes over [T, width].
+        // reads_: a, x, w.
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
             if (n.kind != OpKind::Add || fused_[i] != Fused::No || norm_bias_[i] >= 0 || add_mul_[i] >= 0 || add3_[i] >= 0)
@@ -700,7 +719,8 @@ private:
                 const auto mm = static_cast<size_t>(n.inputs[1 - k].node);
                 const Node& m = nodes[mm];
                 if (m.kind != OpKind::MatMul || readers[mm] != 1 || fused_[mm] != Fused::No) continue;
-                if (dt(m.inputs[1]) != DType::F16 || graph_.type(n.inputs[k]).shape != out) continue;
+                const DType wt = dt(m.inputs[1]);
+                if ((wt != DType::F16 && !is_quantized(wt)) || graph_.type(n.inputs[k]).shape != out) continue;
                 const Dims& x = graph_.type(m.inputs[0]).shape;
                 if (std::any_of(x.begin(), x.end(), [](int64_t v) { return v == kT || v == kL; }) ||
                     numel(x) / x.back() <= sycl_be::kGemvMaxRows)
@@ -802,10 +822,10 @@ private:
                            [&](int32_t m) { return dt(Value{m, 0}) == DType::F32; });
     }
 
-    // Values that only GEMM-path matmuls and quant_gemm (as x) and GEMM-path attention (as q, k, v) read are kept in
-    // f16, written so by the kernel that makes them: those GEMMs run on f16 operands anyway, so a conversion pass
-    // disappears and the traffic halves. Attention operands produced in f16 (projections, RoPE) round q, k and v to f16 before the
-    // scores, the convention of the f16 KV cache. Static shapes only (dynamic ones can take the f32-only GEMV and
+    // Values that only GEMM-path matmuls and quantized matmuls past the GEMV (as x) and GEMM-path attention (as q, k,
+    // v) read are kept in f16, written so by the kernel that makes them: those GEMMs run on f16 operands anyway, so a
+    // conversion pass disappears and the traffic halves. Attention operands produced in f16 (projections, RoPE) round
+    // q, k and v to f16 before the scores, the convention of the f16 KV cache. Static shapes only (dynamic ones can take the f32-only GEMV and
     // per-row paths). A fixed point: start from every eligible value, drop any whose readers cannot take f16.
     void plan_half_values() {
         if (precision_ != DType::F16) return;
@@ -829,15 +849,12 @@ private:
             const Dims& x = graph_.type(n.inputs[0]).shape;
             return static_shape(x) && numel(x) / x.back() > sycl_be::kGemvMaxRows;
         };
-        // the matmul runs quant_gemm (a quantized weight, 9 to 64 rows), which reads x in f16
+        // a quantized matmul past the GEMV's rows: every path there reads x in f16 (sycl_be::QuantPath)
         const auto quant_matmul = [&](size_t m) {
             const Node& n = nodes[m];
-            if (!quant_gemm_ || n.kind != OpKind::MatMul || !is_quantized(dt(n.inputs[1]))) return false;
+            if (n.kind != OpKind::MatMul || !is_quantized(dt(n.inputs[1]))) return false;
             const Dims& x = graph_.type(n.inputs[0]).shape;
-            const Dims& w = graph_.type(n.inputs[1]).shape;
-            if (!static_shape(x)) return false;
-            const int64_t rows = numel(x) / x.back();
-            return rows > sycl_be::kGemvMaxRows && rows <= sycl_be::kQuantGemmMaxRows && w[0] % 32 == 0 && w[1] % 128 == 0;
+            return static_shape(x) && numel(x) / x.back() > sycl_be::kGemvMaxRows;
         };
         const auto gemm_attention = [&](size_t a) {
             const Node& n = nodes[a];
@@ -856,7 +873,8 @@ private:
             const bool producer = k == OpKind::RmsNorm || k == OpKind::LayerNorm || k == OpKind::Add ||
                                   k == OpKind::Mul || k == OpKind::GeluTanh || k == OpKind::Silu ||
                                   k == OpKind::Rope || k == OpKind::Reshape || k == OpKind::Slice ||
-                                  k == OpKind::Transpose || k == OpKind::Concat || (k == OpKind::MatMul && gemm_matmul(i));
+                                  k == OpKind::Transpose || k == OpKind::Concat ||
+                                  (k == OpKind::MatMul && (gemm_matmul(i) || quant_matmul(i)));
             half[i] = producer && fused_[i] == Fused::No && mm_add_[i] < 0 && dtype_[i][0] == DType::F32 && output[i] == 0 &&
                       nodes[i].outputs.size() == 1 && static_shape(nodes[i].outputs[0].shape) && !readers[i].empty();
         }
@@ -1357,6 +1375,14 @@ private:
             }
         };
         const auto read_f32 = [&](size_t k) { return reinterpret_cast<const float*>(ptr(p, reads_[i][k])); };
+        // A value that may be f16 (plan_half_values) as const float* or const half*.
+        const auto with_value = [&](const Value& v, auto&& fn) {
+            if (dt(v) == DType::F16) {
+                fn(reinterpret_cast<const half*>(ptr(p, v)));
+            } else {
+                fn(reinterpret_cast<const float*>(ptr(p, v)));
+            }
+        };
         const auto unary = [&](UnaryOp op, float a = 0.0f, float b = 0.0f) {
             if (unary_bias_[i] >= 0) {  // act(x + bias): op is Silu, GeluTanh or Sigmoid
                 const Value bias = reads_[i][1];
@@ -1426,14 +1452,11 @@ private:
                     sycl_be::gemv_quant_parts(q_, x, parts, count, m, k);
                     return;
                 }
-                if (is_quantized(in_dt(1)) && in_dt(0) == DType::F16) {  // plan_half_values: quant_gemm's x in f16
-                    sycl_be::matmul_quant_half_x(q_, *this, reinterpret_cast<const half*>(in_ptr(0)),
-                                                 leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out, m, rows, k,
-                                                 quant_gemm_, attention_.compute_units);
-                } else if (is_quantized(in_dt(1))) {
-                    sycl_be::matmul_quant(q_, *this, in_f32(0), leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out,
-                                          m, rows, k, precision_ == DType::F32, quant_gemm_,
-                                          attention_.compute_units);
+                if (is_quantized(in_dt(1))) {  // plan_half_values: x and y in f16 or f32
+                    const sycl_be::QuantWeight& w = leaf_quant_[static_cast<size_t>(n.inputs[1].node)];
+                    with_value(n.inputs[0], [&](const auto* x) {
+                        with_out([&](auto* y) { sycl_be::matmul_quant(q_, *this, x, w, y, m, rows, k, quant_); });
+                    });
                 } else if (dt(Value{static_cast<int32_t>(i), 0}) == DType::F16) {  // plan_half_values: y in f16
                     auto* y = reinterpret_cast<half*>(out_raw);
                     const auto* w = reinterpret_cast<const half*>(in_ptr(1));
@@ -1463,6 +1486,13 @@ private:
                              "sycl: a residual GEMM in f16");
                     const int64_t m = out_n / ws[0];
                     if (p.in_place[i] == 0) q_.memcpy(out, ptr(p, a), static_cast<size_t>(out_n) * sizeof(float));
+                    if (is_quantized(dt(reads_[i][2]))) {
+                        const sycl_be::QuantWeight& qw = leaf_quant_[static_cast<size_t>(reads_[i][2].node)];
+                        with_value(x, [&](const auto* xp) {
+                            sycl_be::matmul_quant(q_, *this, xp, qw, out, m, ws[0], ws[1], quant_, true);
+                        });
+                        return;
+                    }
                     const auto* w = reinterpret_cast<const half*>(ptr(p, reads_[i][2]));
                     if (dt(x) == DType::F16) {
                         sycl_be::matmul_accumulate(q_, *this, reinterpret_cast<const half*>(ptr(p, x)), w, out, m, ws[0], ws[1]);
@@ -1867,7 +1897,7 @@ private:
     const graph::Graph graph_;
     sycl::queue q_;
     const sycl_be::AttentionPlan attention_;
-    const bool quant_gemm_;  // quantized matmuls of up to kQuantGemmMaxRows rows take quant_gemm
+    const sycl_be::QuantMatmulPlan quant_;  // how quantized matmuls run on this device (sycl_be::quant_path)
     const DType precision_;
     const bool kv_i8_;  // KV slots that only attention reads are int8 (SessionOptions::kv_dtype)
     const int64_t max_context_;
@@ -1971,10 +2001,8 @@ public:
         }
         attention.xmx = sycl_be::xmx_device(devices_[index]);
         attention.compute_units = devices_[index].get_info<sycl::info::device::max_compute_units>();
-        // quant_gemm wins where streaming the weight bounds small matmuls (system memory); on a discrete card's
-        // faster memory, dequantizing to f16 for oneMKL's GEMM is still ahead of it (TODO: quant_gemm at 50 rows).
-        const bool quant_gemm = attention.xmx && integrated_gpu(devices_[index]);
-        return std::make_unique<SyclSession>(graph, weights, options, it->second, attention, quant_gemm);
+        return std::make_unique<SyclSession>(graph, weights, options, it->second, attention,
+                                             quant_plan(devices_[index], attention, options.precision));
     }
 
 private:

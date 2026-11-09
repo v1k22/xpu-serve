@@ -99,54 +99,91 @@ void matmul_half_y(sycl::queue& q, Scratch& scratch, const X* x, const half* w, 
 template void matmul_half_y<float>(sycl::queue&, Scratch&, const float*, const half*, half*, int64_t, int64_t, int64_t);
 template void matmul_half_y<half>(sycl::queue&, Scratch&, const half*, const half*, half*, int64_t, int64_t, int64_t);
 
-void matmul_quant_half_x(sycl::queue& q, Scratch& scratch, const half* x, const QuantWeight& w, float* y, int64_t m,
-                         int64_t n, int64_t k, bool use_quant_gemm, int64_t compute_units) {
-    if (use_quant_gemm && m > kGemvMaxRows && m <= kQuantGemmMaxRows && quant_gemm_fits(m, n, k, w, x)) {
-        quant_gemm(q, x, w, y, m, n, k, quant_gemm_slices(n, k, compute_units));
-        return;
-    }
-    auto* xf = static_cast<float*>(scratch.get(static_cast<size_t>(m * k) * sizeof(float)));
-    q.parallel_for(sycl::range<1>(static_cast<size_t>(m * k)), [=](sycl::id<1> i) { xf[i] = static_cast<float>(x[i]); });
-    matmul_quant(q, scratch, xf, w, y, m, n, k, false, use_quant_gemm, compute_units);
+QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const QuantMatmulPlan& plan) {
+    if (m <= kGemvMaxRows) return QuantPath::Gemv;
+    if (plan.f32) return QuantPath::Dequant;
+    if (plan.few_rows && m <= kQuantGemmMaxRows && quant_gemm_fits(m, n, k, w)) return QuantPath::FewRows;
+    if (m <= plan.tiled_rows && quant_gemm_tiled_fits(m, n, k, w)) return QuantPath::Tiled;
+    return QuantPath::Dequant;
 }
 
-void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantWeight& w, float* y, int64_t m,
-                  int64_t n, int64_t k, bool f32, bool use_quant_gemm, int64_t compute_units) {
-    if (m <= kGemvMaxRows) {
-        if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the kernel loads x in float4s
-            auto* aligned = static_cast<float*>(scratch.get(static_cast<size_t>(m * k) * sizeof(float)));
-            q.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
-            x = aligned;
+template <typename X, typename Y>
+void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeight& w, Y* y, int64_t m, int64_t n,
+                  int64_t k, const QuantMatmulPlan& plan, bool add) {
+    constexpr bool kHalfX = std::is_same_v<X, half>;
+    constexpr bool kHalfY = std::is_same_v<Y, half>;
+    QuantPath path = quant_path(m, n, k, w, plan);
+    XS_CHECK(path != QuantPath::Gemv || (!kHalfX && !kHalfY && !add), "sycl matmul_quant: the GEMV takes f32 x and y");
+    XS_CHECK(!add || !kHalfY, "sycl matmul_quant: adding into an f16 y");
+    if (path == QuantPath::Gemv) {
+        if constexpr (!kHalfX && !kHalfY) {
+            if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the kernel loads x in float4s
+                auto* aligned = static_cast<float*>(scratch.get(static_cast<size_t>(m * k) * sizeof(float)));
+                q.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
+                x = aligned;
+            }
+            gemv_quant(q, x, w, y, m, n, k);
         }
-        gemv_quant(q, x, w, y, m, n, k);
         return;
     }
-    if (!f32 && use_quant_gemm && m <= kQuantGemmMaxRows) {
-        auto* xh = static_cast<half*>(scratch.get(static_cast<size_t>(m * k) * sizeof(half)));
-        if (quant_gemm_fits(m, n, k, w, xh)) {
-            to_half(q, x, xh, m * k);
-            quant_gemm(q, xh, w, y, m, n, k, quant_gemm_slices(n, k, compute_units));
+    const float beta = add ? 1.0f : 0.0f;
+    if (plan.f32) {  // the weight dequantized to f32 for an f32 GEMM
+        XS_CHECK(!kHalfX && !kHalfY, "sycl matmul_quant: f16 values in f32 precision");
+        if constexpr (!kHalfX && !kHalfY) {
+            auto* wf = static_cast<float*>(scratch.get(static_cast<size_t>(n * k) * sizeof(float)));
+            dequantize(q, w, wf, n, k);
+            ordered(q, [&](const std::vector<sycl::event>& deps) {
+                return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, 1.0f, x, k, wf, k, beta, y, n, deps);
+            });
+        }
+        return;
+    }
+    // the f16 paths: an f32 x is converted into scratch (aligned), behind the dequantized weight when there is one
+    if constexpr (kHalfX) {
+        if (path != QuantPath::Dequant && !block_load_aligned(x)) path = QuantPath::Dequant;
+    }
+    const size_t w_bytes = path == QuantPath::Dequant ? align_up(static_cast<size_t>(n * k) * sizeof(half)) : 0;
+    const size_t x_bytes = kHalfX ? 0 : static_cast<size_t>(m * k) * sizeof(half);
+    auto* base = static_cast<char*>(scratch.get(w_bytes + x_bytes));
+    const half* xh = nullptr;
+    if constexpr (kHalfX) {
+        xh = x;
+    } else {
+        auto* conv = reinterpret_cast<half*>(base + w_bytes);
+        to_half(q, x, conv, m * k);
+        xh = conv;
+    }
+    switch (path) {
+        case QuantPath::FewRows:
+            quant_gemm(q, xh, w, y, m, n, k, quant_gemm_slices(n, k, plan.compute_units), add);
             return;
+        case QuantPath::Tiled:
+            quant_gemm_tiled(q, xh, w, y, m, n, k, add);
+            return;
+        default: {
+            auto* wh = reinterpret_cast<half*>(base);
+            dequantize(q, w, wh, n, k);
+            ordered(q, [&](const std::vector<sycl::event>& deps) {
+                if constexpr (kHalfY) {
+                    return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, half(1.0f), xh, k, wh, k,
+                                      half(0.0f), y, n, deps);
+                } else {
+                    return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, 1.0f, xh, k, wh, k, beta, y, n,
+                                      deps);
+                }
+            });
         }
     }
-    if (f32) {
-        auto* wf = static_cast<float*>(scratch.get(static_cast<size_t>(n * k) * sizeof(float)));
-        dequantize(q, w, wf, n, k);
-        ordered(q, [&](const std::vector<sycl::event>& deps) {
-            return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, 1.0f, x, k, wf, k, 0.0f, y, n, deps);
-        });
-        return;
-    }
-    const size_t w_bytes = align_up(static_cast<size_t>(n * k) * sizeof(half));
-    auto* base = static_cast<char*>(scratch.get(w_bytes + static_cast<size_t>(m * k) * sizeof(half)));
-    auto* wh = reinterpret_cast<half*>(base);
-    auto* xh = reinterpret_cast<half*>(base + w_bytes);
-    dequantize(q, w, wh, n, k);
-    to_half(q, x, xh, m * k);
-    ordered(q, [&](const std::vector<sycl::event>& deps) {
-        return blas::gemm(q, transpose::nontrans, transpose::trans, m, n, k, 1.0f, xh, k, wh, k, 0.0f, y, n, deps);
-    });
 }
+
+template void matmul_quant<float, float>(sycl::queue&, Scratch&, const float*, const QuantWeight&, float*, int64_t,
+                                         int64_t, int64_t, const QuantMatmulPlan&, bool);
+template void matmul_quant<half, float>(sycl::queue&, Scratch&, const half*, const QuantWeight&, float*, int64_t,
+                                        int64_t, int64_t, const QuantMatmulPlan&, bool);
+template void matmul_quant<float, half>(sycl::queue&, Scratch&, const float*, const QuantWeight&, half*, int64_t,
+                                        int64_t, int64_t, const QuantMatmulPlan&, bool);
+template void matmul_quant<half, half>(sycl::queue&, Scratch&, const half*, const QuantWeight&, half*, int64_t,
+                                       int64_t, int64_t, const QuantMatmulPlan&, bool);
 
 namespace {
 

@@ -163,9 +163,21 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       410 to 447 GB/s on 17408 x 5120 and larger, 357 to 412 on 6144 to 12288 rows): codes read as 32-bit words, q4
       decoded from its bits (no int-to-float conversion), two rows per sub-group at M = 1; quantized matmuls that
       read the same x run as one launch (gate + up, q + k + v); float GEMVs under 512 rows split K
-- [ ] Prefill without the f16 copy of each weight (a large-M GEMM that dequantizes in registers; on Qwen3.8-27B q4
-      writing the copies is about 150 ms of an 815 ms 512-token prefill on the B60). The bar: OpenVINO GenAI prefills
-      Qwen3.8-27B int4 at 1,250 tok/s on the B60 (ours 634 at 512 tokens, 763 at 4k)
+- [x] Quantized prefill (2026-11-09): the f16 copy of a weight written with coalesced stores (B60: 220 to about
+      400 GB/s; a work item per 32 columns wrote 64 bytes apart); quant_gemm_tiled, a matrix-engine GEMM that
+      dequantizes each weight tile once per 512-row work-group into local memory, runs on integrated GPUs up to 512
+      rows (B390, 17408 x 5120 q4 at 512 rows: 3.1 ms against 4.0 for dequantize + oneMKL); on the B60 dequantize +
+      oneMKL ties it at 512 rows and wins elsewhere, so discrete cards keep it (sycl_be::quant_path). Qwen3.8-27B q4
+      on the B60: 630 to 838 tok/s at 512 tokens, 763 to 945 at 4,096. The bar: OpenVINO GenAI 1,255 tok/s at 512
+      with its default int8 activations (1,086 with f16 activations, as ours)
+- [ ] A matrix-engine GEMM over q4 weights at oneMKL's efficiency: oneMKL's f16 GEMM reaches 91 TFLOPS on the B60 at
+      512 rows; quant_gemm_tiled 60, of which the structure alone (no dequantization) 74. ESIMD (explicit registers,
+      no unpacking moves around packed f16 math) dequantized faster but needs the large register file per kernel,
+      which ESIMD kernels ignore as a property (a global build flag only)
+- [ ] Per-regime planning in the SYCL backend: the f16 value plan (plan_half_values) and the residual-GEMM fold
+      (mm_add_) need static shapes, so a language model's prefill (a symbolic T) keeps every value in f32 and every
+      residual add separate. Planned per T regime (the GEMV's rows, the GEMM's) they would reach LLM prefill: about
+      30 ms of a 512-token Qwen3.8 prefill on the B60 (the f32 traffic of SwiGLU's Mul, the adds, conv and slices)
 - [x] MoE expert matmuls over q8 / q4 banks: one GEMV per (token, expert) up to 32 pairs (decode), pairs grouped by
       expert up to 256, grouped oneMKL GEMMs on dequantized banks beyond (prefill)
 - [ ] MoE prefill without the f16 copy of each expert bank (a GEMM that dequantizes in registers); the expert union
@@ -173,10 +185,17 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Paged decode attention: head dims 256 / 512, GQA, sliding window, chain and **tree** masks
 - [x] Prefill: oneMKL GEMM (f16 x f16 -> f32); prefill attention through two batched GEMMs per query chunk
 - [ ] Prefill attention on XMX without the score matrix (flash attention, e.g. SYCL*TLA)
-- [ ] Gated delta prefill in chunks (WY form, GEMMs) instead of the per-token loop (Qwen3.8-27B: 99 ms of an
-      815 ms 512-token prefill on the B60)
+- [x] Gated delta at any length: a sub-group per (v head, 16 state columns), a lane per column with all of its rows
+      in registers, no barrier between tokens (Qwen3.8-27B on the B60: 99 to 33 ms of a 512-token prefill; decode as
+      fast as the per-(head, columns) work-group kernel, which stays for 256-row heads)
+- [ ] Gated delta prefill in chunks (WY form, matrix engines): the per-token chain is now 33 ms of a 512-token
+      Qwen3.8 prefill on the B60
 - [x] Gated delta decode (up to 8 tokens): a work-group per (v head, 16 state columns), state rows coalesced
       (Qwen3.8-27B: 41 to 19 us per layer on the B60)
+- [ ] Decode beyond the GEMVs (Qwen3.8-27B on the B60, measured by skipping op kinds: of a 44.8 ms token the norms
+      take 2.1 ms, gated delta 1.4, the Mul, Softplus and Sigmoid kernels 1.4; the q4 GEMVs stream at 96 % of the
+      bandwidth). A one-row RmsNorm costs 12 us in the engine where an isolated kernel with a sub-group reduction and
+      one barrier takes 4: unexplained so far
 - [x] Norms, RoPE, activations, embedding gather; f16 GEMV for decode; split-K decode attention (sampling stays on host)
 - [x] SYCL command-graph replay measured (decode, the ops between stateful ones replayed): host submission of a
       Qwen3.8-27B step 4.0 to 1.3 ms, device time unchanged (45 ms, device-bound; a dependent small kernel costs the

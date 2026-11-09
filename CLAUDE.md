@@ -115,9 +115,9 @@ area).
 | `src/backend/cpu_ref/ops.cpp` | f32/f64 reference kernels, one per op: the accuracy oracle |
 | `src/backend/sycl/sycl_backend.cpp` | SYCL session: device dtypes, fusions, per-T memory plan (one arena), op dispatch, KV and state buffers |
 | `src/backend/sycl/sycl_kernels.cpp` | SYCL kernels: elementwise, norms, RoPE, gather, copies, causal conv, gated delta, decode attention, GEMV |
-| `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond; quantized: quant_gemm up to 64 rows) and Attention (per-row kernel with split-K, the fused kernel, or GEMMs) |
+| `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond; quantized: `quant_path` picks the GEMV, quant_gemm, quant_gemm_tiled or dequantize + oneMKL per device and shape) and Attention (per-row kernel with split-K, the fused kernel, or GEMMs) |
 | `src/backend/sycl/sycl_flash_attention.cpp` | Fused attention on the matrix engines (joint_matrix; head_dim up to 128) |
-| `src/backend/sycl/sycl_quant_gemm.cpp` | Quantized matmul of 9 to 64 rows reading the q8 / q4 weight once (DPAS and 2D block load builtins) |
+| `src/backend/sycl/sycl_quant_gemm.cpp` | Quantized matmuls past the GEMV on the matrix engines (DPAS and 2D block load builtins): quant_gemm (9 to 64 rows, the weight read once) and quant_gemm_tiled (many rows: each weight tile dequantized once per work-group of 512 rows into local memory, no f16 copy of the weight) |
 | `src/engine/engine.cpp` | Generation loop for one sequence; encodes images and splices their rows into prefill chunks |
 | `src/service/engine_service.cpp` | Wiring from a model directory to a ready service |
 | `src/server/completion_handlers.cpp` | `/v1/chat/completions` and `/v1/completions` |
@@ -278,6 +278,7 @@ Parse and validate it in `src/server/openai_request.cpp` (a bad value is a 400 n
   head are not loaded; MoE checkpoints must use fused expert banks, as the released ones do). No audio or video. Images only as base64 data: URLs.
 - Linear-attention models re-prefill when a new prompt does not extend the cached sequence (no state snapshots).
 - Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)
-  and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 before its GEMM.
+  and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 for oneMKL's GEMM, except
+  on integrated GPUs up to 512 rows (quant_gemm / quant_gemm_tiled dequantize on the way; sycl_be::quant_path).
 - One sequence at a time; no batching.
 - Sliding-window layers keep every key in memory (the kernels read only the window; memory still grows with context).

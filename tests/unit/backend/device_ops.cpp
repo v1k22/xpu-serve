@@ -58,9 +58,20 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
 
     TEST_CASE("a residual add folded into the GEMM: in the residual's memory or on a copy, the same values") {
         test::TensorRng rng(52);
-        const int64_t m = 24, k = 64, n = 48;
+        const int64_t k = 128, n = 64;
+        // f16 weights (oneMKL, beta 1) and q8 / q4 ones (the quantized kernels' adding epilogue: quant_gemm_tiled, or
+        // quant_gemm on an integrated GPU; past the tiled rows, dequantize + oneMKL)
+        for (const DType format : {DType::F16, DType::Q8, DType::Q4}) {
+        for (const int64_t m : {24, 600}) {
+        CAPTURE(dtype_name(format));
+        CAPTURE(m);
         test::MemoryWeights w;
-        w.add("w", rng.uniform(DType::F16, {n, k}, 1.0f / std::sqrt(static_cast<float>(k))));
+        const HostTensor dense = rng.uniform(DType::F32, {n, k}, 1.0f / std::sqrt(static_cast<float>(k)));
+        if (format == DType::F16) {
+            w.add("w", rng.uniform(DType::F16, {n, k}, 1.0f / std::sqrt(static_cast<float>(k))));
+        } else {
+            w.add_quantized("w", quant::quantize(dense.view(), format, 32));
+        }
         const HostTensor x = rng.uniform(DType::F32, {m, k});
         const HostTensor a = rng.uniform(DType::F32, {m, n});
         const HostTensor b = rng.uniform(DType::F32, {m, n});
@@ -87,12 +98,39 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
                 CHECK(dev::close("residual kept", out.at("again"), sq, {1e-5, 1e-5}));
             }
         }
+        }
+        }
+    }
+
+    TEST_CASE("quantized matmuls chained past the GEMV: the value between them in f16 (written by the first)") {
+        test::TensorRng rng(53);
+        const int64_t k = 256, h = 128, n = 64;
+        for (const DType format : {DType::Q8, DType::Q4}) {
+            for (const int64_t m : {24, 300, 700}) {
+                CAPTURE(dtype_name(format));
+                CAPTURE(m);
+                test::MemoryWeights w;
+                w.add_quantized("w1", quant::quantize(rng.uniform(DType::F32, {h, k}, 1.0f / 16).view(), format, 32));
+                w.add_quantized("w2", quant::quantize(rng.uniform(DType::F32, {n, h}, 1.0f / 11).view(), format, 32));
+                const HostTensor x = rng.uniform(DType::F32, {m, k});
+                const HostTensor zero(DType::F32, {m, k});
+                Graph g;
+                const Value xs = g.add(g.input("x", DType::F32, {m, k}), g.input("zero", DType::F32, {m, k}));
+                g.output("out", g.matmul(g.matmul(xs, g.weight(w, "w1")), g.weight(w, "w2")));
+                const Tensor64 expected =
+                    test::ref::matmul(test::ref::matmul(to_f64(x), to_f64(w.tensor("w1"))), to_f64(w.tensor("w2")));
+                CHECK(dev::close("chained matmul_quant", run_out(g, w, {{"x", x}, {"zero", zero}}), expected,
+                                 dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+            }
+        }
     }
 
     TEST_CASE("matmul and gather on q8 / q4 pack weights against fp64 of the dequantized values") {
         test::TensorRng rng(41);
-        // K = 2048 lets quant_gemm split K between up to 8 sub-groups of a work-group
-        for (const auto& [n, k] : {std::pair<int64_t, int64_t>{96, 512}, std::pair<int64_t, int64_t>{64, 2048}}) {
+        // K = 2048 lets quant_gemm split K between up to 8 sub-groups of a work-group; N = 96 is no multiple of
+        // quant_gemm_tiled's 64 features (dequantize + GEMM)
+        for (const auto& [n, k] : {std::pair<int64_t, int64_t>{96, 512}, std::pair<int64_t, int64_t>{64, 2048},
+                                   std::pair<int64_t, int64_t>{128, 512}}) {
         CAPTURE(k);
         for (const DType format : {DType::Q8, DType::Q4}) {
             for (const int64_t group : {32, 128}) {
@@ -117,6 +155,23 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
                     const Tensor64 expected = test::ref::matmul(to_f64(x), to_f64(w.tensor("w")));
                     CHECK(dev::close("matmul_quant", run_out(g, w, {{"x", x}}), expected,
                                      dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+                }
+                // many rows (prefill): quant_gemm_tiled's work-groups of 128, 256 and 512 rows and past them; x made
+                // by an op of a static shape is kept in f16 (plan_half_values), of a dynamic one in f32
+                for (const int64_t m : {65, 200, 513, 1100}) {
+                    CAPTURE(m);
+                    const HostTensor x = rng.uniform(DType::F32, {m, k});
+                    const HostTensor zero(DType::F32, {m, k});
+                    const Tensor64 expected = test::ref::matmul(to_f64(x), to_f64(w.tensor("w")));
+                    for (const bool static_rows : {true, false}) {
+                        CAPTURE(static_rows);
+                        const int64_t rows = static_rows ? m : kT;
+                        Graph g;
+                        const Value xs = g.add(g.input("x", DType::F32, {rows, k}), g.input("zero", DType::F32, {rows, k}));
+                        g.output("out", g.matmul(xs, g.weight(w, "w")));
+                        CHECK(dev::close("matmul_quant rows", run_out(g, w, {{"x", x}, {"zero", zero}}), expected,
+                                         dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+                    }
                 }
                 Graph g;
                 g.output("out", g.gather(g.weight(w, "w"), g.input("ids", DType::I32, {kT})));

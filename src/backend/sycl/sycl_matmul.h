@@ -33,15 +33,25 @@ void matmul_accumulate(sycl::queue& q, Scratch& scratch, const X* x, const half*
 template <typename X>
 void matmul_half_y(sycl::queue& q, Scratch& scratch, const X* x, const half* w, half* y, int64_t m, int64_t n, int64_t k);
 
-// y [M, N] = x [M, K] @ dequant(w)^T: the quantized GEMV up to kGemvMaxRows rows; up to kQuantGemmMaxRows with
-// `use_quant_gemm` (a device with matrix engines where it wins) quant_gemm, which reads the weight once; beyond (or when
-// `f32`), w is dequantized once (to f16, or f32 when `f32`) and multiplied with oneMKL's GEMM.
-void matmul_quant(sycl::queue& q, Scratch& scratch, const float* x, const QuantWeight& w, float* y, int64_t m,
-                  int64_t n, int64_t k, bool f32, bool use_quant_gemm, int64_t compute_units);
-// The same with x in f16 (plan_half_values keeps quant_gemm's inputs in f16, saving a conversion kernel per call):
-// quant_gemm when it fits, else x widened to f32 and matmul_quant.
-void matmul_quant_half_x(sycl::queue& q, Scratch& scratch, const half* x, const QuantWeight& w, float* y, int64_t m,
-                         int64_t n, int64_t k, bool use_quant_gemm, int64_t compute_units);
+// How a quantized matmul runs: the GEMV up to kGemvMaxRows rows; beyond, a matrix-engine kernel that dequantizes the
+// weight on the way (quant_gemm for a few rows, quant_gemm_tiled for many) or, past those, the weight dequantized once
+// to f16 (f32 in f32 precision) and multiplied by oneMKL's GEMM. Every path but the GEMV reads x in f16.
+enum class QuantPath : uint8_t { Gemv, FewRows, Tiled, Dequant };
+struct QuantMatmulPlan {  // what the device favours, set once per session
+    bool f32 = false;           // f32 precision: the GEMV, else dequantize to f32 and oneMKL
+    bool few_rows = false;      // quant_gemm up to kQuantGemmMaxRows (wins where streaming the weight bounds them)
+    int64_t tiled_rows = 0;     // quant_gemm_tiled up to this many rows (0: never)
+    int64_t compute_units = 0;  // quant_gemm's split of K
+};
+// The path for these shapes and this weight (x assumed 64-byte aligned; matmul_quant falls back to Dequant if not).
+QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const QuantMatmulPlan& plan);
+// y [M, N] = x [M, K] @ dequant(w)^T along quant_path, or with `add` y += x @ dequant(w)^T (a residual folded in).
+// x in f32 (converted in scratch where a path reads f16), or in f16 for M > kGemvMaxRows; y in f32, or in f16 for
+// M > kGemvMaxRows (plan_half_values keeps such values in f16, saving the conversions). `add` needs an f32 y and
+// M > kGemvMaxRows.
+template <typename X, typename Y>
+void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeight& w, Y* y, int64_t m, int64_t n,
+                  int64_t k, const QuantMatmulPlan& plan, bool add = false);
 
 // ExpertMatMul over a quantized bank (expert_matmul_quant's contract) through oneMKL, for many (token, slot) pairs
 // (prefill): the pairs are grouped by expert, each expert's input rows gathered, its bank dequantized (to f16, or f32

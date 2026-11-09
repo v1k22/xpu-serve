@@ -205,6 +205,17 @@ struct QuantGemvPart {
     float* y = nullptr;
     int64_t n = 0;
 };
+// Calls f.template operator()<Q4, AWQ>() for w's format and whether it carries AWQ input scales (the kernels'
+// compile-time variants).
+template <typename F>
+void quant_dispatch(const QuantWeight& w, F&& f) {
+    const bool awq = w.input_scales != nullptr;
+    if (w.q4) {
+        awq ? f.template operator()<true, true>() : f.template operator()<true, false>();
+    } else {
+        awq ? f.template operator()<false, true>() : f.template operator()<false, false>();
+    }
+}
 bool quant_gemv_parts_match(const QuantWeight& a, const QuantWeight& b);
 void gemv_quant_parts(sycl::queue& q, const float* x, const QuantGemvPart* parts, int count, int64_t m, int64_t k);
 // The same for kGemvMaxRows < M <= kQuantGemmMaxRows on the matrix engines (sycl_quant_gemm.cpp; needs xmx_device),
@@ -212,11 +223,21 @@ void gemv_quant_parts(sycl::queue& q, const float* x, const QuantGemvPart* parts
 // their partial sums in local memory (quant_gemm_slices picks enough to keep the memory busy).
 inline constexpr int64_t kQuantGemmMaxRows = 64;
 inline constexpr int64_t kQuantGemmMaxSlices = 8;
-bool quant_gemm_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const void* x);
+// The matrix-engine kernels read x by 2D block loads: its base 64-byte aligned (the *_fits checks cover the shapes and
+// the weight).
+bool block_load_aligned(const void* x);
+bool quant_gemm_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w);
 int64_t quant_gemm_slices(int64_t n, int64_t k, int64_t compute_units);
+// With `add` the kernels add their product into y (a residual folded in) instead of storing it.
 template <typename Y>
 void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
-                int64_t slices);
+                int64_t slices, bool add = false);
+// The same for any number of rows (needs xmx_device): a work-group dequantizes each weight tile once into local
+// memory for 512 rows, so the weight is read once per 512 rows and never written out in f16.
+bool quant_gemm_tiled_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w);
+template <typename Y>
+void quant_gemm_tiled(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
+                      bool add = false);
 // ExpertMatMul over a quantized expert bank (rows = E * N of K columns): out [T, S, N], x [T, K] or (per_slot)
 // [T, S, K], expert ids outside [0, E) read expert 0. Up to kExpertPairsDirect (token, slot) pairs run one GEMV each;
 // more are grouped by expert on the device in `grouping` (expert_grouping_bytes) so an expert's rows are read once
