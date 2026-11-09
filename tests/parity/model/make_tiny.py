@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3_5_moe --tokenizer-from <Qwen3.5 dir> --out <dir>
+    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe --tokenizer-from <Qwen3.5 dir> --out <dir>
 
 The model keeps the real layer pattern and tensor names (Qwen3.5 MoE: three Gated DeltaNet layers then one full
 attention layer, fused gate_up expert banks, a gated shared expert) at a width a CPU runs in seconds. The tokenizer
@@ -42,7 +42,25 @@ def qwen3_5_moe(vocab_size):
     return model
 
 
-ARCHS = {"qwen3_5_moe": qwen3_5_moe}
+def qwen3_5(vocab_size):
+    """Dense, with Qwen3.8-27B's ratios: three linear value heads per key head, six query heads per KV head, gated
+    attention output, a quarter of the head rotary with interleaved multimodal sections, an untied head."""
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    config = Qwen3_5TextConfig(
+        vocab_size=vocab_size, hidden_size=96, intermediate_size=192, num_hidden_layers=4,
+        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+        full_attention_interval=4, num_attention_heads=6, num_key_value_heads=1, head_dim=64, attn_output_gate=True,
+        linear_num_key_heads=2, linear_num_value_heads=6, linear_key_head_dim=32, linear_value_head_dim=32,
+        linear_conv_kernel_dim=4, max_position_embeddings=4096, tie_word_embeddings=False, rms_norm_eps=1e-6,
+        initializer_range=0.05,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25,
+                         "mrope_interleaved": True, "mrope_section": [3, 3, 2]},
+    )
+    return Qwen3_5ForCausalLM(config)
+
+
+ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe}
 
 
 def fuse_experts(path):

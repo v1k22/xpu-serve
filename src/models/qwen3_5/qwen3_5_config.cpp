@@ -13,6 +13,9 @@ Config parse_config(const nlohmann::json& config_json) {
     if (cfg::get_bool_or(t, "attention_bias", false, where)) fail(where, ": attention_bias is not supported");
     const std::string act = cfg::get_string(t, "hidden_act", where);
     if (act != "silu") fail(where, ": hidden_act '", act, "' is not supported");
+    // The gate of linear attention's output norm (Qwen3.8 names it; earlier checkpoints imply it): SiLU.
+    const std::string gate = t.contains("output_gate_type") ? cfg::get_string(t, "output_gate_type", where) : "swish";
+    if (gate != "swish") fail(where, ": output_gate_type '", gate, "' is not supported (supported: swish)");
     if (t.contains("mlp_only_layers") && t.at("mlp_only_layers").is_array() && !t.at("mlp_only_layers").empty()) {
         fail(where, ": mlp_only_layers is not supported");
     }

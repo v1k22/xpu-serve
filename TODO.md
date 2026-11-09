@@ -159,7 +159,12 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Toolchain: oneAPI DPC++ build in CMake; device selection; USM allocation; in-order queues (2026-11-07, oneAPI 2026.2)
 - [ ] Bandwidth probe in SYCL (matches 0.2)
 - [x] int4 / int8 GEMV for decode; dequantize + GEMM for prefill; quantized gather (device suites, groups 32 / 128)
-- [ ] int4 / int8 GEMV at ≥ 85% of measured bandwidth; prefill without the f16 copy of each weight
+- [x] int4 / int8 GEMV at ≥ 85% of measured bandwidth (B60: a plain read streams 426 to 453 GB/s; the q4 GEMV
+      410 to 447 GB/s on 17408 x 5120 and larger, 357 to 412 on 6144 to 12288 rows): codes read as 32-bit words, q4
+      decoded from its bits (no int-to-float conversion), two rows per sub-group at M = 1; quantized matmuls that
+      read the same x run as one launch (gate + up, q + k + v); float GEMVs under 512 rows split K
+- [ ] Prefill without the f16 copy of each weight (a large-M GEMM that dequantizes in registers; on Qwen3.8-27B q4
+      writing the copies is about 150 ms of an 815 ms 512-token prefill on the B60)
 - [x] MoE expert matmuls over q8 / q4 banks: one GEMV per (token, expert) up to 32 pairs (decode), pairs grouped by
       expert up to 256, grouped oneMKL GEMMs on dequantized banks beyond (prefill)
 - [ ] MoE prefill without the f16 copy of each expert bank (a GEMM that dequantizes in registers); the expert union
@@ -167,9 +172,14 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Paged decode attention: head dims 256 / 512, GQA, sliding window, chain and **tree** masks
 - [x] Prefill: oneMKL GEMM (f16 x f16 -> f32); prefill attention through two batched GEMMs per query chunk
 - [ ] Prefill attention on XMX without the score matrix (flash attention, e.g. SYCL*TLA)
-- [ ] Gated delta prefill in chunks (WY form, GEMMs) instead of the per-token loop
+- [ ] Gated delta prefill in chunks (WY form, GEMMs) instead of the per-token loop (Qwen3.8-27B: 99 ms of an
+      815 ms 512-token prefill on the B60)
+- [x] Gated delta decode (up to 8 tokens): a work-group per (v head, 16 state columns), state rows coalesced
+      (Qwen3.8-27B: 41 to 19 us per layer on the B60)
 - [x] Norms, RoPE, activations, embedding gather; f16 GEMV for decode; split-K decode attention (sampling stays on host)
-- [ ] SYCL command-graph capture/replay per shape bucket; eager fallback; measure per-step overhead
+- [x] SYCL command-graph replay measured (decode, the ops between stateful ones replayed): host submission of a
+      Qwen3.8-27B step 4.0 to 1.3 ms, device time unchanged (45 ms, device-bound; a dependent small kernel costs the
+      GPU under 1 us). Not adopted; revisit for small models or if the host becomes the bound
 - [x] Tiny + real parity on SYCL: op suites at f32 and f16; Gemma 4 E2B and Qwen3.5-4B match HF (f32 cosine 1.0, greedy exact)
 - [ ] Multi-GPU: layer split and tensor split across two Arc Pro B60s in one process
 - [x] End-to-end comparison with OpenVINO 2026.4.1 (docs/decisions/0007); per-op profile with `XS_SYCL_PROFILE=1`
@@ -232,8 +242,8 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 
 | # | Model | Hugging Face ID | Notes |
 |---|---|---|---|
-| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | |
-| 2 | Qwen3.6-35B-A3B (preferred) | `Qwen/Qwen3.6-35B-A3B` | MoE (3B active). **Runs** (text): tiny-model HF parity; q4 g64 pack 18.9 GiB on one Arc Pro B60, decode ~48 tok/s, prefill ~1,250 tok/s, MMLU-Pro 84 % (25 q). To do: Panther Lake, AWQ, vision, MTP |
+| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | Dense `qwen3_5`. **Runs** (text): tiny-checkpoint HF parity with its ratios (cosine 1, greedy exact on cpu-ref and SYCL); q4 g32 pack 19.2 GB (16.2 GiB on device) on one Arc Pro B60: decode 21.9 tok/s, prefill 630 tok/s (512 tokens), MMLU-Pro 76 % (25 q; 3 answers hit the 4,096-token cap); q4 g64: 23.8 tok/s. Arc B390: decode 6.7 tok/s, prefill 307 / 370 tok/s (512 / 4,096). q4 (RTN) vs HF fp32 last-token cosine 0.67 to 0.99, as Qwen3.5-4B's q4 (0.87 to 0.99). To do: AWQ, vision, MTP |
+| 2 | Qwen3.6-35B-A3B (preferred) | `Qwen/Qwen3.6-35B-A3B` | MoE (3B active). **Runs** (text): tiny-model HF parity; q4 g64 pack 18.9 GiB on one Arc Pro B60, decode ~58 tok/s, prefill ~1,250 tok/s, MMLU-Pro 84 % (25 q). To do: Panther Lake, AWQ, vision, MTP |
 | | Qwen3.5-35B-A3B (older) | `Qwen/Qwen3.5-35B-A3B` | MoE; the Qwen3.5 Gated DeltaNet hybrid |
 | 3 | Gemma 4 31B | `google/gemma-4-31B-it` | vision tower uses `standardize` |
 | 4 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` | MoE (4B active) |

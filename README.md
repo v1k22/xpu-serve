@@ -9,7 +9,7 @@ One repo, one binary: the model code, the engine, the tokenizer, chat templates 
 live here, and the math runs on Intel GPUs through our SYCL backend (our own kernels, oneMKL for large matmuls). Read
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
-**Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6) and a robot policy (π0.5), from the original
+**Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8) and a robot policy (π0.5), from the original
 checkpoint or a q8 / q4 pack written by `xpu-serve convert`, one request at a time, on Intel GPUs through the SYCL
 backend. [CLAUDE.md](CLAUDE.md) maps the code.
 
@@ -19,7 +19,8 @@ backend. [CLAUDE.md](CLAUDE.md) maps the code.
 |---|---|---|---|---|
 | Gemma 4 E2B / E4B | language, images | f16, q8, q4 | 61.5 / 92 tok/s decode (f16 / q8) | Arc Pro B60 |
 | Qwen3.5 4B | language | f16, q8, q4 | 42 / 71 tok/s decode (f16 / q8) | Arc Pro B60 |
-| Qwen3.6-35B-A3B | language, MoE | q4 | 48 tok/s decode, 1,250 tok/s prefill | Arc Pro B60 |
+| Qwen3.6-35B-A3B | language, MoE | q4 | 58 tok/s decode, 1,250 tok/s prefill | Arc Pro B60 |
+| Qwen3.8-27B | language | q4 | 22 tok/s decode, 630 tok/s prefill; 6.7 / 307 on Arc B390 | Arc Pro B60, Arc B390 |
 | π0.5 | robot policy | f16, q8 | 239 / 225 ms per call (f16 / q8) | Arc B390, 3 cameras |
 
 | Model | Checkpoint (`model_type`) | Checked against |
@@ -27,9 +28,10 @@ backend. [CLAUDE.md](CLAUDE.md) maps the code.
 | Gemma 4 E2B / E4B | `google/gemma-4-E2B-it` (`gemma4`) | Hugging Face fp32 logits, greedy text, image features |
 | Qwen3.5 4B | `Qwen/Qwen3.5-4B` (`qwen3_5`) | Hugging Face fp32 logits, greedy text |
 | Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B` (`qwen3_5_moe`) | tiny-checkpoint parity; MMLU-Pro (25 questions): 84 % |
+| Qwen3.8-27B | `Qwen/Qwen3.8-27B` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE); MMLU-Pro (25 questions): 76 % |
 | π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 2e-3 (GPU f16) |
 
-Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B at q4 fits one 24 GB card; π0.5 maps camera images, the
+Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card; π0.5 maps camera images, the
 robot state and an instruction to 50 x 32 actions in 10 flow steps, and its q8 pack quantizes the action expert.
 
 A model is added in `src/models/<arch>/` (language models: [CLAUDE.md](CLAUDE.md); policies:

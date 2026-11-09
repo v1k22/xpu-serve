@@ -23,8 +23,8 @@ How that works:
   conversion step yet; a `convert` command for quantized packs is planned (DESIGN.md section 6).
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
-Status (see TODO.md): Gemma 4 E2B/E4B (text and images) and Qwen3.5 (text; a hybrid of Gated DeltaNet linear
-attention and full attention, dense or mixture of experts), served end to end on the SYCL backend (Arc Pro B60),
+Status (see TODO.md): Gemma 4 E2B/E4B (text and images) and the Qwen3.5 family (Qwen3.5, Qwen3.6, Qwen3.8; text; a
+hybrid of Gated DeltaNet linear attention and full attention, dense or mixture of experts), served end to end on the SYCL backend (Arc Pro B60),
 matching Hugging Face fp32 logits and greedy output; q8 / q4 packs from `convert`. One sequence at a time.
 
 ## 2. Build, run, test
@@ -194,7 +194,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`; tables from `gen_unicode_tables.py`) |
 | `tests/unit/chat/` | template rendering, Gemma 4 and Qwen3.5 output parsing | `apply_chat_template` outputs in `tests/fixtures/chat/` |
 | `tests/unit/server/` | request parsing, response format, stop strings, HTTP end to end | a fake `InferenceService` (`fake_service.h`) |
-| `tests/unit/model/gemma4_config.cpp` | config parsing and refusals | |
+| `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp` | config parsing and refusals | |
 | `tests/unit/model/model_parity.cpp` | whole model: last-token logits and greedy continuations | Hugging Face fp32, from `tests/parity/model/hf_reference.py` |
 | `tests/unit/model/policy_parity.cpp` | a robot policy end to end: prompt ids and the action chunk, all cameras and one camera (`XS_TEST_POLICY_DIR`, `XS_POLICY_FIXTURES`) | LeRobot fp32 with fixed noise, from `tests/parity/policy/lerobot_reference.py` |
 | `tests/unit/backend/*_policy_ops.cpp` | LayerNorm, Concat, attention with a key bias over static queries (head dims 72, 256) | fp64 references (`policy_ops_cases.h`) |
