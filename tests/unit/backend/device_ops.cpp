@@ -128,6 +128,58 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
+    TEST_CASE("quantized matmuls that read the same x: one launch at decode sizes, each output intact") {
+        test::TensorRng rng(43);
+        const int64_t k = 512;
+        test::MemoryWeights w;
+        struct Spec {
+            const char* name;
+            int64_t n;
+            DType format;
+            int64_t group;
+            bool awq;
+        };
+        // w1..w4 run together (q4); w5 and w7 (AWQ) together; w6 (q8) and w8 (q4 without AWQ, after w7) alone
+        const Spec specs[] = {{"w1", 96, DType::Q4, 32, false},  {"w2", 40, DType::Q4, 64, false},
+                              {"w3", 130, DType::Q4, 32, false}, {"w4", 33, DType::Q4, 128, false},
+                              {"w5", 64, DType::Q4, 128, true},  {"w6", 48, DType::Q8, 64, false},
+                              {"w7", 96, DType::Q4, 128, true},  {"w8", 24, DType::Q4, 32, false}};
+        for (const Spec& sp : specs) {
+            const HostTensor dense = rng.uniform(DType::F32, {sp.n, k}, 1.0f / std::sqrt(static_cast<float>(k)));
+            if (sp.awq) {
+                std::vector<double> ms(static_cast<size_t>(k), 1.0);
+                for (int64_t c = 0; c < k; c += 29)
+                    ms[static_cast<size_t>(c)] = 300.0;
+                w.add_quantized(sp.name, quant::quantize_awq(dense.view(), sp.group, ms, nullptr));
+            } else {
+                w.add_quantized(sp.name, quant::quantize(dense.view(), sp.format, sp.group));
+            }
+        }
+        Graph g;
+        const Value x = g.input("x", DType::F32, {kT, k});
+        const Value y1 = g.matmul(x, g.weight(w, "w1"));
+        const Value t = g.scale(y1, 2.0f);  // made and dead between the first matmul and the others
+        g.output("u", g.add(t, t));
+        for (const Spec& sp : specs) {
+            g.output(std::string("y") + (sp.name + 1),
+                     std::string(sp.name) == "w1" ? y1 : g.matmul(x, g.weight(w, sp.name)));
+        }
+        for (const int64_t m : {1, 3, 8, 9}) {  // one launch per group up to kGemvMaxRows rows
+            CAPTURE(m);
+            const HostTensor xv = rng.uniform(DType::F32, {m, k});
+            const TensorMap out = dev::run(g, w, {{"x", xv}});
+            for (const Spec& sp : specs) {
+                CAPTURE(sp.name);
+                const Tensor64 expected = test::ref::matmul(to_f64(xv), to_f64(w.tensor(sp.name)));
+                CHECK(dev::close("matmul_quant parts", out.at(std::string("y") + (sp.name + 1)), expected,
+                                 dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+            }
+            const Tensor64 y1_ref = test::ref::matmul(to_f64(xv), to_f64(w.tensor("w1")));
+            const Tensor64 u_ref = test::ref::broadcast(y1_ref, y1_ref, [](double a, double b) { return 2 * a + 2 * b; });
+            CHECK(dev::close("between", out.at("u"), u_ref, dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+        }
+    }
+
     TEST_CASE("add and mul broadcast like numpy, including a dynamic T operand") {
         test::TensorRng rng(2);
         struct Case {

@@ -197,6 +197,16 @@ struct QuantWeight {
 };
 // y [M, N] = x [M, K] @ dequant(w)^T for M <= kGemvMaxRows; K a multiple of 32.
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k);
+// Up to kQuantGemvParts weights that read the same x, in one launch: y_p [M, N_p] = x @ dequant(w_p)^T. The parts
+// match in format and in carrying AWQ input scales (quant_gemv_parts_match); groups and N may differ.
+inline constexpr int kQuantGemvParts = 4;
+struct QuantGemvPart {
+    QuantWeight w;
+    float* y = nullptr;
+    int64_t n = 0;
+};
+bool quant_gemv_parts_match(const QuantWeight& a, const QuantWeight& b);
+void gemv_quant_parts(sycl::queue& q, const float* x, const QuantGemvPart* parts, int count, int64_t m, int64_t k);
 // The same for kGemvMaxRows < M <= kQuantGemmMaxRows on the matrix engines (sycl_quant_gemm.cpp; needs xmx_device),
 // x in f16: the weight is read once and dequantized on the way. `slices` sub-groups of a work-group divide K and add
 // their partial sums in local memory (quant_gemm_slices picks enough to keep the memory busy).

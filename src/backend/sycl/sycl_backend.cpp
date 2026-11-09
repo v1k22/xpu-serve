@@ -214,6 +214,7 @@ public:
         plan_fusions();
         plan_half_values();
         upload_leaves(weights);
+        finish_mm_parts();
         for (const graph::KvSlot& s : graph_.kv_slots()) {
             KvBuffers b;
             b.heads = s.num_kv_heads;
@@ -742,6 +743,63 @@ private:
             reads_[i].push_back(nodes[kc].inputs[1]);
             reads_[i].push_back(nodes[vc].inputs[1]);
         }
+        // MatMuls with quantized weights of one format that read the same x (an MLP's gate and up, attention's q, k
+        // and v): at decode sizes the first runs them all in one GEMV launch, which fills the device where a small
+        // one alone does not, each output in its own memory, live from there (build_plan). finish_mm_parts drops
+        // the weights the kernel cannot pair once they are on the device.
+        mm_parts_.assign(nodes.size(), {});
+        mm_leader_.assign(nodes.size(), -1);
+        std::map<std::pair<int32_t, int32_t>, size_t> filling;  // x -> the MatMul collecting its siblings
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const Node& n = nodes[i];
+            if (n.kind != OpKind::MatMul || fused_[i] != Fused::No || !is_quantized(dt(n.inputs[1])) ||
+                nodes[static_cast<size_t>(n.inputs[1].node)].kind != OpKind::Weight)
+                continue;
+            const auto x = std::make_pair(n.inputs[0].node, n.inputs[0].index);
+            const auto it = filling.find(x);
+            if (it != filling.end() && dt(nodes[it->second].inputs[1]) == dt(n.inputs[1]) &&
+                mm_parts_[it->second].size() < static_cast<size_t>(sycl_be::kQuantGemvParts)) {
+                mm_parts_[it->second].push_back(static_cast<int32_t>(i));
+                mm_leader_[i] = static_cast<int32_t>(it->second);
+            } else {
+                filling[x] = i;
+                mm_parts_[i] = {static_cast<int32_t>(i)};
+            }
+        }
+        for (auto& parts : mm_parts_) {
+            if (parts.size() == 1) parts.clear();
+        }
+    }
+
+    void finish_mm_parts() {
+        const auto& nodes = graph_.nodes();
+        const auto weight = [&](int32_t m) -> const sycl_be::QuantWeight& {
+            return leaf_quant_[static_cast<size_t>(nodes[static_cast<size_t>(m)].inputs[1].node)];
+        };
+        for (size_t i = 0; i < mm_parts_.size(); ++i) {
+            std::vector<int32_t>& parts = mm_parts_[i];
+            if (parts.empty()) continue;
+            std::vector<int32_t> kept{parts[0]};
+            for (size_t j = 1; j < parts.size(); ++j) {
+                if (sycl_be::quant_gemv_parts_match(weight(parts[j]), weight(parts[0]))) {
+                    kept.push_back(parts[j]);
+                } else {
+                    mm_leader_[static_cast<size_t>(parts[j])] = -1;
+                }
+            }
+            parts = kept.size() > 1 ? std::move(kept) : std::vector<int32_t>{};
+        }
+    }
+
+    // Whether MatMul `lead`'s siblings run in its launch this step: an x of at most kGemvMaxRows rows in f32, f32
+    // outputs.
+    bool mm_parts_run(size_t lead, const Plan& p) const {
+        const Node& n = graph_.nodes()[lead];
+        const Dims& x = p.shapes[static_cast<size_t>(n.inputs[0].node)][static_cast<size_t>(n.inputs[0].index)];
+        if (numel(x) / graph_.type(n.inputs[1]).shape[1] > sycl_be::kGemvMaxRows || dt(n.inputs[0]) != DType::F32)
+            return false;
+        return std::all_of(mm_parts_[lead].begin(), mm_parts_[lead].end(),
+                           [&](int32_t m) { return dt(Value{m, 0}) == DType::F32; });
     }
 
     // Values that only GEMM-path matmuls and quant_gemm (as x) and GEMM-path attention (as q, k, v) read are kept in
@@ -1130,8 +1188,11 @@ private:
                 block_of[i][j] = static_cast<int>(block_size.size());
                 p.locs[i][j] = Loc{Store::Arena, block_of[i][j], 0};
                 block_size.push_back(align_up(std::max<size_t>(bytes, 1)));
-                // Inputs are all uploaded before the first op runs: live from the start.
-                block_def.push_back(n.kind == OpKind::Input ? 0 : i);
+                // Inputs are all uploaded before the first op runs: live from the start; a MatMul run in a
+                // sibling's launch, from the sibling.
+                block_def.push_back(n.kind == OpKind::Input ? 0
+                                    : mm_leader_[i] >= 0 ? static_cast<size_t>(mm_leader_[i])
+                                                         : i);
                 block_last.push_back(i);
             };
             const auto alias_input = [&](int64_t extra_bytes) {
@@ -1345,6 +1406,26 @@ private:
                 const int64_t rows = in_shape(1)[0];
                 const int64_t k = in_shape(1)[1];
                 const int64_t m = numel(in_shape(0)) / k;
+                if (mm_leader_[i] >= 0 && mm_parts_run(static_cast<size_t>(mm_leader_[i]), p)) return;  // ran there
+                if (!mm_parts_[i].empty() && mm_parts_run(i, p)) {
+                    const float* x = in_f32(0);
+                    if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the kernel loads x in float4s
+                        auto* aligned = static_cast<float*>(get(static_cast<size_t>(m * k) * sizeof(float)));
+                        q_.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
+                        x = aligned;
+                    }
+                    sycl_be::QuantGemvPart parts[sycl_be::kQuantGemvParts];
+                    const auto count = static_cast<int>(mm_parts_[i].size());
+                    for (int j = 0; j < count; ++j) {
+                        const auto mj = static_cast<size_t>(mm_parts_[i][static_cast<size_t>(j)]);
+                        const Value wj = graph_.nodes()[mj].inputs[1];
+                        parts[j] = {leaf_quant_[static_cast<size_t>(wj.node)],
+                                    reinterpret_cast<float*>(ptr(p, Value{static_cast<int32_t>(mj), 0})),
+                                    graph_.type(wj).shape[0]};
+                    }
+                    sycl_be::gemv_quant_parts(q_, x, parts, count, m, k);
+                    return;
+                }
                 if (is_quantized(in_dt(1)) && in_dt(0) == DType::F16) {  // plan_half_values: quant_gemm's x in f16
                     sycl_be::matmul_quant_half_x(q_, *this, reinterpret_cast<const half*>(in_ptr(0)),
                                                  leaf_quant_[static_cast<size_t>(n.inputs[1].node)], out, m, rows, k,
@@ -1807,6 +1888,8 @@ private:
     std::vector<int32_t> add3_;              // Add run as a + (b + c) with the inner Add folded in, or -1
     std::vector<int8_t> attn_split_;         // Attention over two-part keys and values: where k2 is in reads_, or -1
     std::vector<int32_t> mm_add_;            // Add run as a GEMM adding into the residual (the MatMul folded in), or -1
+    std::vector<std::vector<int32_t>> mm_parts_;  // MatMul whose siblings run in its GEMV: all of them, itself first
+    std::vector<int32_t> mm_leader_;         // MatMul run in a sibling's GEMV (mm_parts_): that sibling, or -1
     std::vector<DeviceBuffer> leaves_;
     std::vector<char*> leaf_ptr_;  // by node index, weights and constants
     std::vector<sycl_be::QuantWeight> leaf_quant_;  // by node index, quantized weights

@@ -7,6 +7,8 @@
 
 #include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 
+#include "util/error.h"
+
 namespace xs::sycl_be {
 
 // Event-less launches (sycl_ext_oneapi_enqueue_functions): the in-order queue orders them, and skipping the event
@@ -375,56 +377,82 @@ void attention_rows_dispatch(sycl::queue& q, const float* qp, const KV* k, const
     }
 }
 
-// Each sub-group computes kGemvRows output rows for all m <= M x rows; lanes stride K in chunks of 8.
+// Each sub-group computes kGemvRows output rows for all m <= M x rows; lanes stride K in chunks of 8. With KS > 1
+// the work-group's KS sub-groups of a row pair split K and add up in local memory: a few rows (a gate's) then
+// still fill the device.
 constexpr int kGemvSgPerWg = 8;
 constexpr int kGemvRows = 2;
 
-template <typename W, int M, bool Vec>
+template <typename W, int M, bool Vec, int KS>
 void gemv_t(sycl::queue& q, const float* x, const W* w, float* y, int64_t n, int64_t k) {
-    constexpr int64_t kRowsPerWg = kGemvSgPerWg * kGemvRows;
+    constexpr int kSets = kGemvSgPerWg / KS;
+    constexpr int64_t kRowsPerWg = kSets * kGemvRows;
     const int64_t wgs = ceil_div(n, kRowsPerWg);
-    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(wgs * kGemvSgPerWg * kSubGroup), kGemvSgPerWg * kSubGroup),
-                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int lane = static_cast<int>(sg.get_local_linear_id());
-        const int64_t row0 = (static_cast<int64_t>(it.get_group(0)) * kGemvSgPerWg + sg.get_group_linear_id()) * kGemvRows;
-        int64_t rows[kGemvRows];
-        for (int r = 0; r < kGemvRows; ++r)
-            rows[r] = std::min<int64_t>(row0 + r, n - 1);
-        float acc[kGemvRows][M];
-        for (int r = 0; r < kGemvRows; ++r)
-            for (int mm = 0; mm < M; ++mm)
-                acc[r][mm] = 0.0f;
-        if constexpr (Vec) {
-            for (int64_t k0 = static_cast<int64_t>(lane) * 8; k0 < k; k0 += kSubGroup * 8) {
-                sycl::vec<float, 8> wf[kGemvRows];
-                for (int r = 0; r < kGemvRows; ++r) {
-                    const auto wv = *reinterpret_cast<const sycl::vec<W, 8>*>(w + rows[r] * k + k0);
-                    wf[r] = wv.template convert<float>();
-                }
-                for (int mm = 0; mm < M; ++mm) {
-                    const sycl::vec<float, 8> xv = *reinterpret_cast<const sycl::vec<float, 8>*>(x + mm * k + k0);
+    syclex::submit(q, [&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> partial(sycl::range<1>(KS > 1 ? kGemvSgPerWg * kGemvRows * M : 1), h);
+        syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(wgs * kGemvSgPerWg * kSubGroup),
+                                               kGemvSgPerWg * kSubGroup),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = static_cast<int>(sg.get_local_linear_id());
+            const int sgid = static_cast<int>(sg.get_group_linear_id());
+            const int set = sgid / KS;
+            const int slice = sgid % KS;
+            const int64_t row0 = (static_cast<int64_t>(it.get_group(0)) * kSets + set) * kGemvRows;
+            int64_t rows[kGemvRows];
+            for (int r = 0; r < kGemvRows; ++r)
+                rows[r] = std::min<int64_t>(row0 + r, n - 1);
+            float acc[kGemvRows][M];
+            for (int r = 0; r < kGemvRows; ++r)
+                for (int mm = 0; mm < M; ++mm)
+                    acc[r][mm] = 0.0f;
+            const int64_t first = static_cast<int64_t>(slice) * kSubGroup + lane;  // this lane's first chunk
+            if constexpr (Vec) {
+                for (int64_t k0 = first * 8; k0 < k; k0 += KS * kSubGroup * 8) {
+                    sycl::vec<float, 8> wf[kGemvRows];
                     for (int r = 0; r < kGemvRows; ++r) {
-                        const sycl::vec<float, 8> p = wf[r] * xv;
-                        acc[r][mm] += ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
+                        const auto wv = *reinterpret_cast<const sycl::vec<W, 8>*>(w + rows[r] * k + k0);
+                        wf[r] = wv.template convert<float>();
+                    }
+                    for (int mm = 0; mm < M; ++mm) {
+                        const sycl::vec<float, 8> xv = *reinterpret_cast<const sycl::vec<float, 8>*>(x + mm * k + k0);
+                        for (int r = 0; r < kGemvRows; ++r) {
+                            const sycl::vec<float, 8> p = wf[r] * xv;
+                            acc[r][mm] += ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
+                        }
+                    }
+                }
+            } else {
+                for (int64_t kk = first; kk < k; kk += KS * kSubGroup) {
+                    for (int r = 0; r < kGemvRows; ++r) {
+                        const float wv = static_cast<float>(w[rows[r] * k + kk]);
+                        for (int mm = 0; mm < M; ++mm)
+                            acc[r][mm] += wv * x[mm * k + kk];
                     }
                 }
             }
-        } else {
-            for (int64_t kk = lane; kk < k; kk += kSubGroup) {
-                for (int r = 0; r < kGemvRows; ++r) {
-                    const float wv = static_cast<float>(w[rows[r] * k + kk]);
-                    for (int mm = 0; mm < M; ++mm)
-                        acc[r][mm] += wv * x[mm * k + kk];
+            for (int r = 0; r < kGemvRows; ++r) {
+                for (int mm = 0; mm < M; ++mm) {
+                    const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
+                    if constexpr (KS == 1) {
+                        if (lane == 0 && row0 + r < n) y[mm * n + row0 + r] = sum;
+                    } else if (lane == 0) {
+                        partial[(sgid * kGemvRows + r) * M + mm] = sum;
+                    }
                 }
             }
-        }
-        for (int r = 0; r < kGemvRows; ++r) {
-            for (int mm = 0; mm < M; ++mm) {
-                const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
-                if (lane == 0 && row0 + r < n) y[mm * n + row0 + r] = sum;
+            if constexpr (KS > 1) {
+                sycl::group_barrier(it.get_group());
+                if (slice == 0 && lane < kGemvRows * M) {
+                    const int r = lane / M;
+                    const int mm = lane % M;
+                    float sum = 0.0f;
+                    for (int j = 0; j < KS; ++j)
+                        sum += partial[((set * KS + j) * kGemvRows + r) * M + mm];
+                    if (row0 + r < n) y[mm * n + row0 + r] = sum;
+                }
             }
-        }
+        });
     });
 }
 
@@ -508,17 +536,43 @@ inline void quant_rows_dot(const QuantWeight& w, const int64_t (&rows)[R], const
     }
 }
 
+// The parts of a GEMV launch and where each one's work-groups start (a work-group's rows lie in one part).
+struct QuantParts {
+    QuantWeight w[kQuantGemvParts];
+    float* y[kQuantGemvParts];
+    int64_t n[kQuantGemvParts];
+    int64_t wg_begin[kQuantGemvParts + 1];
+    int count = 0;
+};
+
 template <bool Q4, bool AWQ, int M>
-void gemv_quant_t(sycl::queue& q, const float* x, QuantWeight w, float* y, int64_t n, int64_t k) {
+void gemv_quant_t(sycl::queue& q, const float* x, QuantParts parts, int64_t k) {
     using Shape = QuantGemvShape<Q4, M, AWQ>;
     constexpr int R = Shape::kRows;
-    constexpr int64_t kRowsPerWg = kQSgPerWg * R;
-    const int64_t wgs = ceil_div(n, kRowsPerWg);
+    for (int j = 0; j < kQuantGemvParts; ++j)
+        parts.wg_begin[j + 1] = parts.wg_begin[j] + (j < parts.count ? ceil_div(parts.n[j], kQSgPerWg * R) : 0);
+    const int64_t wgs = parts.wg_begin[parts.count];
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(wgs * kQSgPerWg * kSubGroup), kQSgPerWg * kSubGroup),
                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = static_cast<int>(sg.get_local_linear_id());
-        const int64_t row0 = (static_cast<int64_t>(it.get_group(0)) * kQSgPerWg + sg.get_group_linear_id()) * R;
+        const auto wg = static_cast<int64_t>(it.get_group(0));
+        int part = 0;  // uniform across the work-group; selected without indexing the argument arrays
+        for (int j = 1; j < kQuantGemvParts; ++j)
+            part += j < parts.count && wg >= parts.wg_begin[j] ? 1 : 0;
+        QuantWeight w = parts.w[0];
+        float* y = parts.y[0];
+        int64_t n = parts.n[0];
+        int64_t begin = 0;
+        for (int j = 1; j < kQuantGemvParts; ++j) {
+            if (part == j) {
+                w = parts.w[j];
+                y = parts.y[j];
+                n = parts.n[j];
+                begin = parts.wg_begin[j];
+            }
+        }
+        const int64_t row0 = ((wg - begin) * kQSgPerWg + sg.get_group_linear_id()) * R;
         int64_t rows[R];
         for (int r = 0; r < R; ++r)
             rows[r] = std::min<int64_t>(row0 + r, n - 1);
@@ -537,16 +591,16 @@ void gemv_quant_t(sycl::queue& q, const float* x, QuantWeight w, float* y, int64
 }
 
 template <bool Q4, bool AWQ>
-void gemv_quant_q(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k) {
+void gemv_quant_q(sycl::queue& q, const float* x, const QuantParts& parts, int64_t m, int64_t k) {
     switch (m) {
-        case 1: return gemv_quant_t<Q4, AWQ, 1>(q, x, w, y, n, k);
-        case 2: return gemv_quant_t<Q4, AWQ, 2>(q, x, w, y, n, k);
-        case 3: return gemv_quant_t<Q4, AWQ, 3>(q, x, w, y, n, k);
-        case 4: return gemv_quant_t<Q4, AWQ, 4>(q, x, w, y, n, k);
-        case 5: return gemv_quant_t<Q4, AWQ, 5>(q, x, w, y, n, k);
-        case 6: return gemv_quant_t<Q4, AWQ, 6>(q, x, w, y, n, k);
-        case 7: return gemv_quant_t<Q4, AWQ, 7>(q, x, w, y, n, k);
-        default: return gemv_quant_t<Q4, AWQ, 8>(q, x, w, y, n, k);
+        case 1: return gemv_quant_t<Q4, AWQ, 1>(q, x, parts, k);
+        case 2: return gemv_quant_t<Q4, AWQ, 2>(q, x, parts, k);
+        case 3: return gemv_quant_t<Q4, AWQ, 3>(q, x, parts, k);
+        case 4: return gemv_quant_t<Q4, AWQ, 4>(q, x, parts, k);
+        case 5: return gemv_quant_t<Q4, AWQ, 5>(q, x, parts, k);
+        case 6: return gemv_quant_t<Q4, AWQ, 6>(q, x, parts, k);
+        case 7: return gemv_quant_t<Q4, AWQ, 7>(q, x, parts, k);
+        default: return gemv_quant_t<Q4, AWQ, 8>(q, x, parts, k);
     }
 }
 
@@ -705,10 +759,12 @@ template <typename W, int M>
 void gemv_m(sycl::queue& q, const float* x, const W* w, float* y, int64_t n, int64_t k) {
     const bool vec = k % 8 == 0 && reinterpret_cast<uintptr_t>(x) % 32 == 0 &&
                      reinterpret_cast<uintptr_t>(w) % (8 * sizeof(W)) == 0;
+    // Under a few hundred rows the sub-groups would not fill the device: split K over a work-group's eight.
+    const bool split = n < 512 && k >= 8 * kSubGroup * 8;
     if (vec) {
-        gemv_t<W, M, true>(q, x, w, y, n, k);
+        split ? gemv_t<W, M, true, 8>(q, x, w, y, n, k) : gemv_t<W, M, true, 1>(q, x, w, y, n, k);
     } else {
-        gemv_t<W, M, false>(q, x, w, y, n, k);
+        split ? gemv_t<W, M, false, 8>(q, x, w, y, n, k) : gemv_t<W, M, false, 1>(q, x, w, y, n, k);
     }
 }
 
@@ -1307,8 +1363,28 @@ void gemv(sycl::queue& q, const float* x, const W* w, float* y, int64_t m, int64
     }
 }
 
+bool quant_gemv_parts_match(const QuantWeight& a, const QuantWeight& b) {
+    return a.q4 == b.q4 && (a.input_scales == nullptr) == (b.input_scales == nullptr);
+}
+
+void gemv_quant_parts(sycl::queue& q, const float* x, const QuantGemvPart* parts, int count, int64_t m, int64_t k) {
+    XS_CHECK(count >= 1 && count <= kQuantGemvParts, "gemv_quant_parts: ", count, " parts");
+    QuantParts qp;
+    qp.count = count;
+    qp.wg_begin[0] = 0;
+    for (int j = 0; j < kQuantGemvParts; ++j) {
+        const QuantGemvPart& part = parts[std::min(j, count - 1)];  // unused slots repeat the last part
+        XS_CHECK(quant_gemv_parts_match(part.w, parts[0].w), "gemv_quant_parts: parts differ in format");
+        qp.w[j] = part.w;
+        qp.y[j] = part.y;
+        qp.n[j] = part.n;
+    }
+    quant_dispatch(parts[0].w, [&]<bool Q4, bool AWQ>() { gemv_quant_q<Q4, AWQ>(q, x, qp, m, k); });
+}
+
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k) {
-    quant_dispatch(w, [&]<bool Q4, bool AWQ>() { gemv_quant_q<Q4, AWQ>(q, x, w, y, m, n, k); });
+    const QuantGemvPart part{w, y, n};
+    gemv_quant_parts(q, x, &part, 1, m, k);
 }
 
 // One work item per 16 bytes of codes (32 q4 or 16 q8 values, all in one group), vector loads and stores.
