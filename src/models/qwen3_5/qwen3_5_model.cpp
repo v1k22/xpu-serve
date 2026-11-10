@@ -139,10 +139,15 @@ private:
 
         Graph::Scope scope(g, "head");
         if (head == Head::LastLogits) {
-            g.output("logits", g.matmul(norm(g, g.slice(h, 0, -1), prefix_ + "norm.weight"), lm_head(g)));
+            const Value logits = g.matmul(norm(g, g.slice(h, 0, -1), prefix_ + "norm.weight"), lm_head(g));
+            g.output("logits", logits);
+            g.output("argmax", blocks::argmax_rows(g, logits));
         } else {
             const Value hidden = norm(g, h, prefix_ + "norm.weight");
-            g.output("logits", g.matmul(head == Head::AllLogitsAllHidden ? hidden : g.slice(hidden, 0, -1), lm_head(g)));
+            const Value logits =
+                g.matmul(head == Head::AllLogitsAllHidden ? hidden : g.slice(hidden, 0, -1), lm_head(g));
+            g.output("logits", logits);
+            g.output("argmax", blocks::argmax_rows(g, logits));
             g.output("hidden", hidden);
         }
         g.validate();

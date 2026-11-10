@@ -290,10 +290,14 @@ private:
 
         Graph::Scope scope(g, "head");
         if (head == Head::LastLogits) {
-            g.output("logits", lm_logits(g, g.rms_norm(g.slice(h, 0, -1), weight(g, w("norm.weight")), eps())));
+            const Value logits = lm_logits(g, g.rms_norm(g.slice(h, 0, -1), weight(g, w("norm.weight")), eps()));
+            g.output("logits", logits);
+            g.output("argmax", blocks::argmax_rows(g, logits));
         } else {
             const Value hidden = g.rms_norm(h, weight(g, w("norm.weight")), eps());
-            g.output("logits", lm_logits(g, head == Head::AllLogitsAllHidden ? hidden : g.slice(hidden, 0, -1)));
+            const Value logits = lm_logits(g, head == Head::AllLogitsAllHidden ? hidden : g.slice(hidden, 0, -1));
+            g.output("logits", logits);
+            g.output("argmax", blocks::argmax_rows(g, logits));
             g.output("hidden", hidden);
         }
         g.validate();

@@ -22,6 +22,9 @@ TEST_SUITE("cpu-ref programs") {
     TEST_CASE("truncate inside a short step equals never running the dropped tokens") {
         xs::test::session::truncate_inside_step(cpu_env());
     }
+    TEST_CASE("a run asked for some outputs: just those, the state advanced all the same") {
+        xs::test::session::requested_outputs(cpu_env());
+    }
     TEST_CASE("programs share KV slots by label; KvRead attends without appending") {
         xs::test::session::shared_kv_slot(cpu_env());
     }

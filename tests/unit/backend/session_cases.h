@@ -1,7 +1,8 @@
 #pragma once
 
 // Backend-agnostic cases for sessions of several programs (Backend::compile over a list of graphs): state slots shared
-// by label, KvRead, and truncate inside a short step (SessionOptions::rewind_tokens) for KV, conv and recurrent state.
+// by label, KvRead, truncate inside a short step (SessionOptions::rewind_tokens) for KV, conv and recurrent state, and
+// runs asked for some of their outputs.
 // Each backend's test file runs them with its own tolerance.
 
 #include <doctest/doctest.h>
@@ -98,6 +99,53 @@ inline bool outputs_close(const TensorMap& a, const TensorMap& b, const Env& env
         ok = ok && close;
     }
     return ok;
+}
+
+// A run asked for some outputs returns just those, with a full run's values, and advances every state slot all the
+// same (what follows agrees with a session that asked for everything); a name the program lacks is refused.
+inline void requested_outputs(const Env& env) {
+    const HybridLayer layer;
+    const Graph* programs[] = {&layer.graph};
+    TensorRng rng(43);
+    const TensorMap first = HybridLayer::inputs(rng, 3), second = HybridLayer::inputs(rng, 2);
+    const auto full = env.compile(programs, layer.weights, 0);
+    const auto some = env.compile(programs, layer.weights, 0);
+    TensorMap want, got;
+    full->run(0, first, want);
+    const std::string only[] = {"attn"};
+    some->run(0, first, got, only);
+    CHECK(got.size() == 1);
+    CHECK(all_close(got.at("attn"), want.at("attn"), env.atol, env.rtol));
+    full->run(0, second, want);
+    some->run(0, second, got);
+    CHECK(got.size() == 3);
+    outputs_close(got, want, env);
+    const std::string missing[] = {"attn", "nope"};
+    CHECK_THROWS_AS(some->run(0, second, got, missing), Error);
+    CHECK(some->num_cached() == 5);  // the refusal ran nothing
+
+    // An output nothing else reads (a row's argmax beside its scores) is not computed unless asked for, and equals
+    // the full run's when it is.
+    MemoryWeights w;
+    w.add("w", rng.uniform(DType::F32, {40, 64}));
+    Graph g;
+    const Value scores = g.matmul(g.input("x", DType::F32, {kT, 64}), g.weight(w, "w"));
+    g.output("scores", scores);
+    g.output("argmax", g.reshape(g.topk(scores, 1).second, {kT}));
+    const Graph* heads[] = {&g};
+    const auto session = env.compile(heads, w, 0);
+    const TensorMap in{{"x", rng.uniform(DType::F32, {4, 64})}};
+    TensorMap all, one;
+    session->run(0, in, all);
+    const std::string top[] = {"argmax"};
+    session->run(0, in, one, top);
+    CHECK(one.size() == 1);
+    CHECK(to_ints(one.at("argmax")) == to_ints(all.at("argmax")));
+    const std::string values[] = {"scores"};
+    one.clear();
+    session->run(0, in, one, values);
+    CHECK(one.size() == 1);
+    CHECK(all_close(one.at("scores"), all.at("scores"), 0, 0));
 }
 
 // After a step of up to rewind_tokens tokens, truncating to any count inside it and continuing gives what a session

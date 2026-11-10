@@ -26,6 +26,10 @@ Shortlist shortlist_head(Graph& g, Value x, Value head, const quant::SignSketch&
     return {g.matmul(x, g.gather(head, candidates)), candidates};
 }
 
+Value argmax_rows(Graph& g, Value logits) {
+    return g.reshape(g.topk(logits, 1).second, {g.type(logits).shape[0]});
+}
+
 Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p) {
     Graph::Scope scope(g, "moe");
     XS_CHECK(s.top_k >= 1 && s.top_k <= s.experts, "moe: top_k ", s.top_k, " of ", s.experts, " experts");

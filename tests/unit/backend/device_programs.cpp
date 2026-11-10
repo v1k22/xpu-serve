@@ -26,6 +26,9 @@ TEST_SUITE("device programs" * doctest::skip(!dev::enabled())) {
     TEST_CASE("truncate inside a short step equals never running the dropped tokens") {
         xs::test::session::truncate_inside_step(device_env());
     }
+    TEST_CASE("a run asked for some outputs: just those, the state advanced all the same") {
+        xs::test::session::requested_outputs(device_env());
+    }
     TEST_CASE("programs share KV slots by label; KvRead attends without appending") {
         xs::test::session::shared_kv_slot(device_env());
     }

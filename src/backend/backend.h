@@ -48,10 +48,13 @@ public:
 
     // Runs one step of program `program` (its index in compile's list). `inputs` holds every graph input by name
     // (shapes resolve kT). Fills `outputs` with every graph output by name as freshly allocated host tensors (f32 for
-    // float outputs). Advances the slots the program writes by T tokens; a failed step leaves the state as it was. A
-    // program without slots is stateless.
-    virtual void run(size_t program, const TensorMap& inputs, TensorMap& outputs) = 0;
-    void run(const TensorMap& inputs, TensorMap& outputs) { run(0, inputs, outputs); }
+    // float outputs), or with just the outputs named in `only` when it is not empty (a backend then skips what neither
+    // they nor the state need: a row's argmax asked for instead of its logits never brings the logits back).
+    // Advances the slots the program writes by T tokens; a failed step leaves the state as it was. A program without
+    // slots is stateless.
+    virtual void run(size_t program, const TensorMap& inputs, TensorMap& outputs, std::span<const std::string> only) = 0;
+    void run(size_t program, const TensorMap& inputs, TensorMap& outputs) { run(program, inputs, outputs, {}); }
+    void run(const TensorMap& inputs, TensorMap& outputs) { run(0, inputs, outputs, {}); }
 
     // Tokens in the slots `program` writes (L of its last run, 0 after reset or for a program writing none).
     virtual int64_t num_cached(size_t program) const = 0;

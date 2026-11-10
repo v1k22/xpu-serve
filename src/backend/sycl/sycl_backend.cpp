@@ -361,9 +361,10 @@ public:
         if (profiling_) report_profile();
     }
 
-    void run(const TensorMap& inputs, TensorMap& outputs) {
+    void run(const TensorMap& inputs, TensorMap& outputs, std::span<const std::string> only) {
         const Step step = check_inputs(inputs);
         XS_CHECK(step.kv_len <= max_context_, "sycl: ", step.kv_len, " tokens exceed max_context ", max_context_);
+        const std::vector<char>* live = only.empty() ? nullptr : &live_for(only);
         std::vector<HostTensor> keep_alive;  // host sources of pending copies
         rewinding_ = step.tokens <= shared_.rewind_tokens;
         try {
@@ -392,6 +393,7 @@ public:
             if (profile_step) marks_.assign(1, {std::string(), q_.ext_oneapi_submit_barrier()});
             for (size_t i = 0; i < nodes.size(); ++i) {
                 if (plan.alias[i] != 0 || nodes[i].kind == OpKind::Input) continue;
+                if (live != nullptr && (*live)[i] == 0) continue;
                 if (profile_step) {
                     timed_launch(i, plan, step);
                 } else if (sync_) {
@@ -417,6 +419,7 @@ public:
             }
             std::vector<std::pair<std::string, HostTensor>> results;
             for (const auto& out : graph_.outputs()) {
+                if (!only.empty() && std::find(only.begin(), only.end(), out.name) == only.end()) continue;
                 const Value v = out.value;
                 const DType dt = dtype_[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
                 HostTensor t(dt, resolve(plan.shapes[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)], step));
@@ -456,6 +459,42 @@ public:
         if (profiling_ && profiled_shapes_.count(step.tokens) != 0 && profiled_runs_[step.tokens]++ > 0) {
             ++(step.tokens == 1 ? decode_steps_ : prefill_steps_);
         }
+    }
+
+    // The nodes a run asked for the outputs `only` launches: what those outputs and the state slots read, and every
+    // matmul of a sibling launch one of them is in.
+    const std::vector<char>& live_for(std::span<const std::string> only) {
+        std::string key;
+        for (const std::string& name : only) key += name + '\n';
+        const auto it = live_.find(key);
+        if (it != live_.end()) return it->second;
+        const auto& nodes = graph_.nodes();
+        std::vector<char> live(nodes.size(), 0);
+        std::vector<size_t> stack;
+        const auto need = [&](size_t i) {
+            if (live[i] == 0) {
+                live[i] = 1;
+                stack.push_back(i);
+            }
+        };
+        for (const std::string& name : only) {
+            const auto out = std::find_if(graph_.outputs().begin(), graph_.outputs().end(),
+                                          [&](const auto& o) { return o.name == name; });
+            XS_CHECK(out != graph_.outputs().end(), "sycl: the program has no output '", name, "'");
+            need(static_cast<size_t>(out->value.node));
+        }
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const OpKind kind = nodes[i].kind;
+            if (kind == OpKind::KvCache || kind == OpKind::CausalConv || kind == OpKind::GatedDelta) need(i);
+        }
+        while (!stack.empty()) {
+            const size_t i = stack.back();
+            stack.pop_back();
+            for (const Value& in : nodes[i].inputs) need(static_cast<size_t>(in.node));
+            const auto leader = static_cast<size_t>(mm_leader_[i] >= 0 ? mm_leader_[i] : static_cast<int32_t>(i));
+            for (const int32_t part : mm_parts_[leader]) need(static_cast<size_t>(part));
+        }
+        return live_.emplace(std::move(key), std::move(live)).first->second;
     }
 
     // Tokens in the slots this program writes (they agree after every run and truncate).
@@ -2173,6 +2212,7 @@ private:
     std::vector<size_t> fixed_slot_;  // the shared slot of each conv slot, then each recurrent slot
     size_t conv_states_ = 0;
     bool reads_kv_ = false;   // the program reads its KV slots (KvRead) instead of appending
+    std::map<std::string, std::vector<char>> live_;  // live_for, by the requested outputs
     bool rewinding_ = false;  // the running step keeps its conv and recurrent inputs (SharedFixed)
     std::map<std::pair<int64_t, int64_t>, Plan> plans_;
     std::map<std::string, double> decode_ms_, prefill_ms_;
@@ -2191,8 +2231,8 @@ public:
     SyclShared& shared() { return *shared_; }
     void add(std::unique_ptr<SyclProgram> program) { programs_.push_back(std::move(program)); }
 
-    void run(size_t program, const TensorMap& inputs, TensorMap& outputs) override {
-        at(program).run(inputs, outputs);
+    void run(size_t program, const TensorMap& inputs, TensorMap& outputs, std::span<const std::string> only) override {
+        at(program).run(inputs, outputs, only);
     }
     int64_t num_cached(size_t program) const override {
         XS_CHECK(program < programs_.size(), "sycl: no program ", program);

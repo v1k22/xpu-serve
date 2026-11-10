@@ -44,12 +44,17 @@ private:
     // What a cached position holds: the token id, or for an image's soft token the image's hash and the row.
     using PositionKey = uint64_t;
 
-    // Runs a target program over `tokens` (appended after the cached ones); its outputs are in outputs_.
+    // Runs a target program over `tokens` (appended after the cached ones); the outputs the round reads are in
+    // outputs_: each row's logits, or with argmax_only_ its argmax alone, and the hidden rows a drafter takes.
     void run_target(size_t program, std::span<const int32_t> tokens, std::span<const PositionKey> keys,
                     std::span<const float* const> embeddings);
-    // Feeds `tokens` (appended after the cached ones) and returns the logits of the last one.
-    std::vector<float> forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
-                               std::span<const float* const> embeddings);
+    // Feeds `tokens` (appended after the cached ones); target_token(sampler, 0, ...) is then the token after them.
+    void forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
+                 std::span<const float* const> embeddings);
+    // The target's token after row `row` of the last run: sampled from the row's logits (checked against `draft`
+    // when there is one, Sampler::verify), or the row's argmax when that is all the sampler reads (argmax_only_).
+    int32_t target_token(Sampler& sampler, int64_t row, std::span<const int32_t> prompt,
+                         std::span<const int32_t> generated, const int32_t* draft);
     // One speculative round after `token` (emitted, not yet cached): `k` drafts, one verify of them all, acceptance
     // and rollback. Returns the accepted drafts and the target's next token.
     std::vector<int32_t> spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
@@ -70,6 +75,8 @@ private:
     std::list<std::pair<uint64_t, std::shared_ptr<const HostTensor>>> encoded_;  // most recent first
     TensorMap inputs_;
     TensorMap outputs_;
+    bool has_argmax_ = false;   // every target program outputs "argmax" beside "logits"
+    bool argmax_only_ = false;  // this request's sampler reads no more than a row's argmax, and the programs give it
 };
 
 }  // namespace xs

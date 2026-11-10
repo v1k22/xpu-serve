@@ -37,10 +37,15 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, s
     XS_CHECK(options_.max_context > 1 && options_.prefill_chunk > 0, "invalid engine options");
     XS_CHECK(vision_session_ == nullptr || model_->vision() != nullptr, "a vision session for a model without vision");
     XS_CHECK(options_.spec_k >= 0, "spec_k must not be negative, got ", options_.spec_k);
+    const auto offers_argmax = [](const graph::Graph& g) {
+        return std::any_of(g.outputs().begin(), g.outputs().end(), [](const auto& o) { return o.name == "argmax"; });
+    };
+    has_argmax_ = offers_argmax(model_->graph());
     if (options_.spec_k > 0) {
         const Speculation* spec = model_->speculation();
         XS_CHECK(spec != nullptr, "model ", model_->info().id, " has no drafter for speculative decoding");
         drafter_ = std::make_unique<spec::DraftRunner>(*spec, *session_);
+        has_argmax_ = has_argmax_ && offers_argmax(spec->prefill_graph()) && offers_argmax(spec->verify_graph());
     }
 }
 
@@ -63,24 +68,41 @@ void Engine::run_target(size_t program, std::span<const int32_t> tokens, std::sp
              start + static_cast<int64_t>(tokens.size()), " tokens exceeds the context limit of ", options_.max_context);
     inputs_.clear();
     model_->prepare_inputs(tokens, start, embeddings, inputs_);
-    session_->run(program, inputs_, outputs_);
+    std::vector<std::string> wanted{argmax_only_ ? "argmax" : "logits"};
+    if (program != spec::kStep) wanted.emplace_back("hidden");
+    outputs_.clear();
+    session_->run(program, inputs_, outputs_, wanted);
     cached_.insert(cached_.end(), keys.begin(), keys.end());
     XS_CHECK(session_->num_cached() == static_cast<int64_t>(cached_.size()), "backend holds ", session_->num_cached(),
              " cached tokens, engine expected ", cached_.size());
 }
 
-std::vector<float> Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
-                                   std::span<const float* const> embeddings) {
+void Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
+                     std::span<const float* const> embeddings) {
     const auto start = static_cast<int64_t>(cached_.size());
     run_target(drafter_ ? spec::kPrefill : spec::kStep, tokens, keys, embeddings);
     if (drafter_) {
         drafter_->add(outputs_.at("hidden"), static_cast<int64_t>(tokens.size()), start, tokens);
         drafter_->flush();
     }
-    const HostTensor& logits = outputs_.at("logits");
-    XS_CHECK(logits.dtype() == DType::F32 && logits.numel() == model_->info().vocab_size, "logits output is ",
-             dtype_name(logits.dtype()), dims_to_string(logits.shape()));
-    return {logits.data<float>(), logits.data<float>() + logits.numel()};
+}
+
+int32_t Engine::target_token(Sampler& sampler, int64_t row, std::span<const int32_t> prompt,
+                             std::span<const int32_t> generated, const int32_t* draft) {
+    const int64_t vocab = model_->info().vocab_size;
+    if (argmax_only_) {
+        const HostTensor& top = outputs_.at("argmax");
+        XS_CHECK(top.dtype() == DType::I32 && row < top.numel(), "argmax output is ", dtype_name(top.dtype()),
+                 dims_to_string(top.shape()), ", row ", row, " asked");
+        const int32_t token = top.data<int32_t>()[row];
+        XS_CHECK(token >= 0 && token < vocab, "argmax output holds token ", token, " of ", vocab);
+        return token;
+    }
+    HostTensor& logits = outputs_.at("logits");
+    XS_CHECK(logits.dtype() == DType::F32 && logits.numel() % vocab == 0 && row < logits.numel() / vocab,
+             "logits output is ", dtype_name(logits.dtype()), dims_to_string(logits.shape()), ", row ", row, " asked");
+    const std::span<float> values(logits.data<float>() + row * vocab, static_cast<size_t>(vocab));
+    return draft != nullptr ? sampler.verify(values, prompt, generated, *draft) : sampler.sample(values, prompt, generated);
 }
 
 std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
@@ -98,18 +120,13 @@ std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, 
     run_target(spec::kVerify, fed, keys, {});
     stats.spec_draft_ms += draft_ms;
     stats.spec_verify_ms += timer.elapsed_ms() - draft_ms;
-    HostTensor& logits = outputs_.at("logits");
-    const int64_t vocab = model_->info().vocab_size;
-    XS_CHECK(logits.dtype() == DType::F32 && logits.numel() == static_cast<int64_t>(fed.size()) * vocab,
-             "verify logits output is ", dtype_name(logits.dtype()), dims_to_string(logits.shape()));
 
     // Row i of the verify is the target's distribution after fed[i]: it accepts the draft fed[i + 1] or replaces it.
     std::vector<int32_t> history(generated.begin(), generated.end());
     std::vector<int32_t> out;
     for (size_t i = 0; i < fed.size(); ++i) {
-        const std::span<float> row(logits.data<float>() + static_cast<int64_t>(i) * vocab, static_cast<size_t>(vocab));
         const bool last = i + 1 == fed.size();
-        const int32_t t = last ? sampler.sample(row, prompt, history) : sampler.verify(row, prompt, history, fed[i + 1]);
+        const int32_t t = target_token(sampler, static_cast<int64_t>(i), prompt, history, last ? nullptr : &fed[i + 1]);
         out.push_back(t);
         history.push_back(t);
         if (!last && t != fed[i + 1]) break;
@@ -216,12 +233,13 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
             keys[i] = media_key(request.media[item].key, row++);
         }
 
+        Sampler sampler(request.sampling);
+        argmax_only_ = has_argmax_ && !sampler.needs_logits();
         Timer prefill_timer;
         const int64_t cached = reuse_prefix(keys);
         result.stats.cached_tokens = static_cast<int>(cached);
         std::vector<std::shared_ptr<const HostTensor>> encoded(request.media.size());
         std::vector<const float*> rows;
-        std::vector<float> logits;
         const int64_t width = model_->info().hidden_size;
         for (auto pos = static_cast<size_t>(cached); pos < n;) {
             const size_t len = std::min(n - pos, static_cast<size_t>(options_.prefill_chunk));
@@ -235,20 +253,19 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
                 rows[j] = e->data<float>() + media_row[pos + j] * width;
                 any_rows = true;
             }
-            logits = forward(std::span<const int32_t>(prompt).subspan(pos, len),
-                             std::span<const PositionKey>(keys).subspan(pos, len),
-                             any_rows ? std::span<const float* const>(rows) : std::span<const float* const>());
+            forward(std::span<const int32_t>(prompt).subspan(pos, len),
+                    std::span<const PositionKey>(keys).subspan(pos, len),
+                    any_rows ? std::span<const float* const>(rows) : std::span<const float* const>());
             pos += len;
         }
         result.stats.prefill_ms = prefill_timer.elapsed_ms() - result.stats.encode_ms;
 
-        Sampler sampler(request.sampling);
         Timer decode_timer;
         const int64_t room = options_.max_context - static_cast<int64_t>(n);
         const int64_t max_new = std::min<int64_t>(request.max_new_tokens, room);
         result.finish = FinishReason::Length;
         std::deque<int32_t> ready;  // tokens a speculative round produced, not emitted yet
-        int32_t token = max_new > 0 ? sampler.sample(logits, prompt, result.tokens) : 0;
+        int32_t token = max_new > 0 ? target_token(sampler, 0, prompt, result.tokens, nullptr) : 0;
         while (static_cast<int64_t>(result.tokens.size()) < max_new) {
             if (std::find(request.stop_token_ids.begin(), request.stop_token_ids.end(), token) !=
                 request.stop_token_ids.end()) {
@@ -274,8 +291,8 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
             } else if (ready.empty()) {
                 const int32_t next[] = {token};
                 const PositionKey next_key[] = {text_key(token)};
-                logits = forward(next, next_key, {});
-                ready.push_back(sampler.sample(logits, prompt, result.tokens));
+                forward(next, next_key, {});
+                ready.push_back(target_token(sampler, 0, prompt, result.tokens, nullptr));
             }
             token = ready.front();
             ready.pop_front();

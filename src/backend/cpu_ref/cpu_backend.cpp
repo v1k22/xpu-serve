@@ -134,9 +134,14 @@ class CpuProgram {
             last_use_[static_cast<size_t>(out.value.node)] = nodes.size();
     }
 
-    void run(const TensorMap& inputs, TensorMap& outputs) {
+    void run(const TensorMap& inputs, TensorMap& outputs, std::span<const std::string> only) {
         const Step step = check_inputs(inputs);
         XS_CHECK(step.kv_len <= max_context_, "cpu-ref: ", step.kv_len, " tokens exceed max_context ", max_context_);
+        for (const std::string& name : only) {
+            XS_CHECK(std::any_of(graph_.outputs().begin(), graph_.outputs().end(),
+                                 [&](const auto& out) { return out.name == name; }),
+                     "cpu-ref: the program has no output '", name, "'");
+        }
         const auto& nodes = graph_.nodes();
         std::vector<std::vector<HostTensor>> values(nodes.size());
         // Conv and recurrent ops update copies, committed only when the whole step succeeds; a short step keeps its
@@ -175,6 +180,7 @@ class CpuProgram {
         commit(conv_, conv_state, conv_inputs);
         commit(recurrent_, recurrent_state, recurrent_inputs);
         for (const auto& out : graph_.outputs()) {
+            if (!only.empty() && std::find(only.begin(), only.end(), out.name) == only.end()) continue;
             const HostTensor& t = values[static_cast<size_t>(out.value.node)][static_cast<size_t>(out.value.index)];
             outputs[out.name] = is_leaf(nodes[static_cast<size_t>(out.value.node)].kind) ? t.clone() : t;
         }
@@ -491,8 +497,8 @@ class CpuSession final : public Session {
     void add(std::unique_ptr<CpuProgram> program) { programs_.push_back(std::move(program)); }
     SharedState& shared() { return shared_; }
 
-    void run(size_t program, const TensorMap& inputs, TensorMap& outputs) override {
-        at(program).run(inputs, outputs);
+    void run(size_t program, const TensorMap& inputs, TensorMap& outputs, std::span<const std::string> only) override {
+        at(program).run(inputs, outputs, only);
     }
     int64_t num_cached(size_t program) const override {
         XS_CHECK(program < programs_.size(), "cpu-ref: no program ", program);

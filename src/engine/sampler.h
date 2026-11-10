@@ -23,6 +23,13 @@ public:
     int32_t verify(std::span<float> logits, std::span<const int32_t> prompt, std::span<const int32_t> generated,
                    int32_t draft);
 
+    // False when sample() and verify() return the largest logit's index whatever the history (greedy, no penalties):
+    // a row's argmax then stands for its logits.
+    bool needs_logits() const {
+        return !greedy() || params_.repetition_penalty != 1.0f || params_.presence_penalty != 0.0f ||
+               params_.frequency_penalty != 0.0f;
+    }
+
 private:
     void apply_penalties(std::span<float> logits, std::span<const int32_t> prompt,
                          std::span<const int32_t> generated) const;

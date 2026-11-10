@@ -75,6 +75,10 @@ struct Shortlist {
 };
 Shortlist shortlist_head(Graph& g, Value x, Value head, const quant::SignSketch& sketch, int64_t count);
 
+// The index of each row's largest logit (ties to the lower index), [rows] i32: the "argmax" output a target program
+// offers beside "logits", so that greedy decoding never brings the logits back from the device.
+Value argmax_rows(Graph& g, Value logits);
+
 // ---- RMSNorm variants (plain x * w is Graph::rms_norm)
 
 // x * rsqrt(mean(x^2) + eps) * (1 + w): zero-centered norms (Qwen3.5); `1 + w` is read on the host as a constant.

@@ -44,12 +44,29 @@ std::optional<DType> fitting(const std::string& name, const TensorView& v, DType
     return format;
 }
 
-// Weights of the matmuls whose output decides a TopK (through Softmax / Sigmoid): mixture-of-experts routers. They stay
-// unquantized: a rounded router picks different experts for some tokens, a much larger error than rounding a weight.
+// Weights of the matmuls whose output decides a TopK (through Softmax / Sigmoid) that picks what the graph reads next
+// (experts, a drafter's centroids): mixture-of-experts routers. They stay unquantized: a rounded router picks
+// different experts for some tokens, a much larger error than rounding a weight. A TopK whose indices only leave the
+// graph (a head's argmax) picks nothing.
 std::set<std::string> router_weights(const graph::Graph& g) {
+    const auto& nodes = g.nodes();
+    const auto selects = [&](size_t topk) {  // its indices reach an ExpertMatMul or a Gather, through reshapes
+        std::vector<graph::Value> open{graph::Value{static_cast<int32_t>(topk), 1}};
+        while (!open.empty()) {
+            const graph::Value v = open.back();
+            open.pop_back();
+            for (size_t c = 0; c < nodes.size(); ++c) {
+                if (std::find(nodes[c].inputs.begin(), nodes[c].inputs.end(), v) == nodes[c].inputs.end()) continue;
+                if (nodes[c].kind == OpKind::ExpertMatMul || nodes[c].kind == OpKind::Gather) return true;
+                if (nodes[c].kind == OpKind::Reshape) open.push_back(graph::Value{static_cast<int32_t>(c), 0});
+            }
+        }
+        return false;
+    };
     std::set<std::string> out;
-    for (const auto& n : g.nodes()) {
-        if (n.kind != OpKind::TopK) continue;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto& n = nodes[i];
+        if (n.kind != OpKind::TopK || !selects(i)) continue;
         graph::Value v = n.inputs[0];
         while (g.node(v).kind == OpKind::Softmax || g.node(v).kind == OpKind::Sigmoid) v = g.node(v).inputs[0];
         const auto& mm = g.node(v);

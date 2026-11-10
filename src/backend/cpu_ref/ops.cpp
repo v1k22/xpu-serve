@@ -554,7 +554,8 @@ std::pair<HostTensor, HostTensor> topk(const HostTensor& x, int64_t k) {
         const float* in = x.data<float>() + r * width;
         for (int64_t i = 0; i < width; ++i)
             order[static_cast<size_t>(i)] = static_cast<int32_t>(i);
-        std::stable_sort(order.begin(), order.end(), [&](int32_t a, int32_t b) { return in[a] > in[b]; });
+        std::partial_sort(order.begin(), order.begin() + k, order.end(),
+                          [&](int32_t a, int32_t b) { return in[a] > in[b] || (in[a] == in[b] && a < b); });
         for (int64_t j = 0; j < k; ++j) {
             indices.data<int32_t>()[r * k + j] = order[static_cast<size_t>(j)];
             values.data<float>()[r * k + j] = in[order[static_cast<size_t>(j)]];

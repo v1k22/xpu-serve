@@ -1,6 +1,7 @@
 // Speculative decoding in the engine, on cpu-ref: greedy output with a drafter equals greedy output without one, over
 // a model with every kind of state (conv, gated delta, KV) and a drafter with its own KV that is right only part of
-// the time, through prefix reuse, chunked prefill, stop tokens and rounds cut short.
+// the time, through prefix reuse, chunked prefill, stop tokens and rounds cut short. And the same tokens when the
+// target programs offer each row's argmax and the engine reads that instead of the logits.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -10,6 +11,7 @@
 #include "../backend/backend_test_util.h"
 #include "backend/cpu_ref/cpu_backend.h"
 #include "engine/engine.h"
+#include "models/common/blocks.h"
 
 namespace xs {
 namespace {
@@ -28,7 +30,8 @@ public:
     static constexpr float kMix = 4.0f;        // how much the target's layers move the hidden state
     static constexpr float kDraftMix = 0.15f;  // how much the drafter's
 
-    TinySpecModel() {
+    // `argmax`: the target programs also output each row's argmax (what greedy decoding reads instead of the logits).
+    explicit TinySpecModel(bool argmax = false) : argmax_(argmax) {
         test::TensorRng rng(7);
         const HostTensor embed = rng.uniform(DType::F32, {kVocab, kHidden});
         HostTensor head(DType::F32, {kVocab, kHidden}), draft_head(DType::F32, {kVocab, kHidden});
@@ -126,7 +129,9 @@ private:
         h = g.add(h, g.scale(g.matmul(g.reshape(o, {kT, kd}), g.weight(weights_, "out")), kMix));
         h = attention(g, "attn.", "attn", h, pos, kMix);
         const Value hidden = g.rms_norm(h, 1e-6f);
-        g.output("logits", g.matmul(all_logits ? hidden : g.slice(hidden, 0, -1), g.weight(weights_, "lm_head")));
+        const Value logits = g.matmul(all_logits ? hidden : g.slice(hidden, 0, -1), g.weight(weights_, "lm_head"));
+        g.output("logits", logits);
+        if (argmax_) g.output("argmax", blocks::argmax_rows(g, logits));
         if (hidden_out) g.output("hidden", hidden);
     }
 
@@ -143,14 +148,15 @@ private:
         g.output("hidden", last);
     }
 
+    bool argmax_ = false;
     test::MemoryWeights weights_;
     ModelInfo info_;
     Graph step_, prefill_, verify_, draft_;
 };
 
-std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk) {
+std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argmax = false) {
     static const auto backend = make_cpu_ref_backend();
-    auto model = std::make_unique<TinySpecModel>();
+    auto model = std::make_unique<TinySpecModel>(argmax);
     std::vector<const Graph*> programs{&model->graph()};
     SessionOptions options;
     options.precision = DType::F32;
@@ -210,6 +216,30 @@ TEST_CASE("speculative decoding emits exactly the greedy tokens") {
             CHECK(stats.spec_accepted > 0);                    // drafts are accepted ...
             CHECK(stats.spec_accepted < stats.spec_drafted);   // ... and rejected
         }
+    }
+}
+
+TEST_CASE("programs that offer each row's argmax: greedy decoding reads it, sampling still reads the logits") {
+    for (const int k : {0, 3}) {
+        CAPTURE(k);
+        const auto by_logits = make_engine(k, 5);
+        const auto by_argmax = make_engine(k, 5, true);
+        const auto same = [&](const GenerateRequest& req) {
+            const GenerateResult want = by_logits->generate(req, {});
+            const GenerateResult got = by_argmax->generate(req, {});
+            REQUIRE(want.finish != FinishReason::Error);
+            CHECK(got.error == "");
+            CHECK(got.tokens == want.tokens);
+            CHECK(got.stats.spec_accepted == want.stats.spec_accepted);
+        };
+        same(greedy({1, 7, 3, 12, 5, 9, 0, 14, 2, 11}, 40));
+        GenerateRequest sampled = greedy({6, 2, 13, 1}, 30);  // a seeded sampler draws the same tokens from the logits
+        sampled.sampling.temperature = 0.9f;
+        sampled.sampling.seed = 11;
+        same(sampled);
+        GenerateRequest penalized = greedy({6, 2, 13, 1, 4}, 30);  // greedy, but the penalty needs the logits
+        penalized.sampling.repetition_penalty = 1.3f;
+        same(penalized);
     }
 }
 
