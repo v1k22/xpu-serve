@@ -1294,6 +1294,23 @@ void prev_row(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t wi
 }
 
 void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner) {
+    // A long axis (a row's width): a work-group per output, each lane summing a stride of the axis.
+    constexpr int64_t kLongAxis = 256;
+    constexpr int64_t kWg = 4 * kSubGroup;
+    if (dim >= kLongAxis) {
+        syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(outer * inner * kWg), static_cast<size_t>(kWg)),
+                          [=](sycl::nd_item<1> it) {
+            const int64_t out = static_cast<int64_t>(it.get_group(0));
+            const int64_t o = out / inner;
+            const int64_t i = out % inner;
+            const int64_t lane = static_cast<int64_t>(it.get_local_id(0));
+            float sum = 0.0f;
+            for (int64_t d = lane; d < dim; d += kWg) sum += x[(o * dim + d) * inner + i];
+            const float total = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+            if (lane == 0) y[out] = total;
+        });
+        return;
+    }
     syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(outer), static_cast<size_t>(inner)), [=](sycl::item<2> it) {
         const int64_t o = static_cast<int64_t>(it[0]);
         const int64_t i = static_cast<int64_t>(it[1]);

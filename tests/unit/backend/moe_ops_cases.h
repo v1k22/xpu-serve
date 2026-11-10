@@ -55,7 +55,17 @@ inline void div_softmax_reduce(const Env& env) {
     const Value r = g.input("r3", DType::F32, {kT, 3, 5});
     g.output("sum1", g.reduce_sum(r, 1));
     g.output("sum2", g.reduce_sum(r, 2));
-    const TensorMap out = run(env, g, MemoryWeights{}, {{"a", a}, {"b", b}, {"big", big}, {"r3", r3}});
+    // a long axis (a row's width; the GPU sums it by lanes), last and in the middle, its length no multiple of a lane count
+    HostTensor wide = rng.uniform(DType::F32, {6, 300, 1001}, 0.5f);
+    for (float& v : wide.span<float>())
+        v = 1.0f + v;  // sums far from zero, so the comparison is relative
+    const Value w = g.input("wide", DType::F32, {kT, 300, 1001});
+    g.output("sum_wide1", g.reduce_sum(w, 1));
+    g.output("sum_wide2", g.reduce_sum(w, 2));
+    const TensorMap out =
+        run(env, g, MemoryWeights{}, {{"a", a}, {"b", b}, {"big", big}, {"r3", r3}, {"wide", wide}});
+    CHECK(all_close(out.at("sum_wide1"), ref::reduce_sum(to_f64(wide), 1), env.atol, 10 * env.rtol));
+    CHECK(all_close(out.at("sum_wide2"), ref::reduce_sum(to_f64(wide), 2), env.atol, 10 * env.rtol));
     CHECK(all_close(out.at("div"), ref::broadcast(to_f64(a), to_f64(b), [](double x, double y) { return x / y; }),
                     env.atol, env.rtol));
     CHECK(all_close(out.at("softmax"), ref::softmax(to_f64(big)), env.atol, env.rtol));
