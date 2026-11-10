@@ -20,7 +20,7 @@
 
 #include "backend/backend.h"
 #include "engine/engine.h"
-#include "engine/spec/draft_runner.h"
+#include "engine/spec/chain_drafter.h"
 #include "models/model.h"
 #include "parity_util.h"
 #include "test_support.h"
@@ -30,27 +30,12 @@ namespace {
 using xs::test::compare;
 using xs::test::Compare;
 using xs::test::env_or;
+using xs::test::parity_options;
 using xs::test::read_f32;
 
-std::filesystem::path fixtures() {
-    std::string model_type = "unknown";
-    if (const auto dir = xs::test::model_dir()) {
-        std::ifstream in(*dir / "config.json");
-        if (in.good()) model_type = nlohmann::json::parse(in).value("model_type", model_type);
-    }
-    return env_or("XS_PARITY_FIXTURES", std::string(XS_SOURCE_DIR) + "/tests/fixtures/generated/" + model_type);
-}
+std::filesystem::path fixtures() { return xs::test::model_fixtures(); }
 
 bool enabled() { return xs::test::model_dir().has_value() && std::filesystem::exists(fixtures() / "manifest.json"); }
-
-xs::SessionOptions parity_options() {
-    xs::SessionOptions options;
-    options.device = env_or("XS_PARITY_DEVICE", "");
-    options.precision = env_or("XS_PARITY_PRECISION", "f32") == "f32" ? xs::DType::F32 : xs::DType::F16;
-    options.max_context = 4096;
-    if (env_or("XS_PARITY_KV_DTYPE", "auto") == "i8") options.kv_dtype = xs::DType::I8;
-    return options;
-}
 
 }  // namespace
 
@@ -120,7 +105,8 @@ TEST_CASE("the drafter matches the reference (MTP head or assistant)" * doctest:
     const xs::graph::Graph* programs[] = {&model->graph(), &spec->prefill_graph(), &spec->verify_graph(),
                                           &spec->draft_graph()};
     auto session = xs::make_backend(env_or("XS_PARITY_BACKEND", "cpu-ref"))->compile(programs, model->weights(), options);
-    xs::spec::DraftRunner drafter(*spec, *session);
+    if (spec->chain() == nullptr) return;  // a block drafter: block_drafter_parity.cpp
+    xs::spec::ChainDrafter drafter(*spec, *session);
     for (const auto& c : manifest["cases"]) {
         const auto ids = c["input_ids"].get<std::vector<int32_t>>();
         const int32_t first = c["greedy"].at(0).get<int32_t>();
@@ -136,13 +122,13 @@ TEST_CASE("the drafter matches the reference (MTP head or assistant)" * doctest:
         next.push_back(first);
         std::span<const float> rows(hidden.data<float>(), static_cast<size_t>(hidden.numel()));
         int64_t start = 0;
-        if (!spec->drafter_keeps_state()) {
+        if (!spec->chain()->drafter_keeps_state()) {
             start = static_cast<int64_t>(ids.size()) - 1;
             next = {first};
             rows = rows.last(static_cast<size_t>(hidden.dim(1)));
         }
         inputs.clear();
-        spec->prepare_draft(next, rows, start, 0, inputs);
+        spec->chain()->prepare_draft(next, rows, start, 0, inputs);
         session->run(xs::spec::kDraft, inputs, outputs);
         // Our logits and the reference's over the same tokens: the vocabulary, or the candidates of an ordered head
         // that the reference also scored (a centroid at the top-k boundary can flip on rounding).
@@ -171,9 +157,9 @@ TEST_CASE("the drafter matches the reference (MTP head or assistant)" * doctest:
         const Compare r = compare(ours, ref);
         const int32_t ours_token = token_of[static_cast<size_t>(r.argmax_ours)];
         const auto ref_token = static_cast<int32_t>(std::max_element(ref_all.begin(), ref_all.end()) - ref_all.begin());
-        if (spec->drafter_keeps_state()) session->truncate(xs::spec::kDraft, 0);
+        if (spec->chain()->drafter_keeps_state()) session->truncate(xs::spec::kDraft, 0);
 
-        drafter.add(hidden, hidden.dim(0), 0, ids);
+        drafter.add(xs::TensorMap{{"hidden", hidden}}, hidden.dim(0), 0, ids);
         const std::vector<int32_t> drafts = drafter.propose(first, 3);
         const auto want = c["mtp_drafts"].get<std::vector<int32_t>>();
         MESSAGE(c["name"].get<std::string>(), ": drafter cosine ", r.cosine, ", argmax ", ours_token, " vs ", ref_token,
@@ -220,7 +206,7 @@ TEST_CASE("an MTP head's shortlist: the whole head's logits over its candidates"
             next.push_back(c["greedy"].at(0).get<int32_t>());
             inputs.clear();
             outputs.clear();
-            spec->prepare_draft(next, std::span<const float>(hidden.data<float>(), static_cast<size_t>(hidden.numel())), 0,
+            spec->chain()->prepare_draft(next, std::span<const float>(hidden.data<float>(), static_cast<size_t>(hidden.numel())), 0,
                                 0, inputs);
             session->run(xs::spec::kDraft, inputs, outputs);
             all.push_back(std::move(outputs));

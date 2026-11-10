@@ -14,13 +14,21 @@
 
 namespace xs {
 
+// EngineOptions::spec_k as given to the service: the count that suits the kind of drafter asked for. A chain drafter
+// drafts 3 a round; a block drafter 7 (its drafts come in one run, and a verify of up to 8 tokens costs little more
+// than one of 4: docs/design-spec-decode.md), or its whole block where that is shorter.
+inline constexpr int kDraftersCount = -1;
+inline constexpr int kChainDrafts = 3;
+inline constexpr int kBlockDrafts = 7;
+
 struct ServiceOptions {
     std::string backend = "sycl";
     SessionOptions session;
-    EngineOptions engine;
+    EngineOptions engine;  // spec_k: 0 is off, kDraftersCount the drafter's own
     std::string model_id;  // empty = the model directory name
     bool vision = true;    // load the vision encoder when the checkpoint has one
-    std::filesystem::path drafter;  // a drafter checkpoint for speculative decoding (a Gemma 4 assistant)
+    std::string spec;               // the kind of drafter asked for: "mtp", "dflash", "dspine" (empty: any)
+    std::filesystem::path drafter;  // a drafter checkpoint for speculative decoding (an assistant, a block drafter)
     int64_t draft_shortlist = 64;   // LoadOptions::draft_shortlist
 };
 

@@ -704,14 +704,26 @@ private:
                 case OpKind::Transpose:
                     dtype_[i][0] = dt(n.inputs[0]);
                     break;
-                case OpKind::KvCache:
-                    if (kv_i8_ && attention_reads_only(i, consumers)) {
+                case OpKind::KvCache: {
+                    // A slot this program only appends to is read by another one (a block drafter's context, written
+                    // by its target's programs): it takes the dtype that program gave it, or the one attention reads.
+                    const bool unread = consumers[i].empty() &&
+                                        std::none_of(graph_.outputs().begin(), graph_.outputs().end(), [&](const auto& o) {
+                                            return static_cast<size_t>(o.value.node) == i;
+                                        });
+                    const SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(
+                        std::get<graph::KvCacheAttrs>(n.attrs).slot)]];
+                    if (unread && slot.typed) {
+                        dtype_[i][0] = dtype_[i][1] = slot.buf.dtype;
+                    } else if (kv_i8_ && (unread || attention_reads_only(i, consumers))) {
                         dtype_[i][0] = dtype_[i][1] = DType::I8;
                     } else {
-                        dtype_[i][0] = dtype_[i][1] =
-                            precision_ == DType::F16 && f16_readers_only(i, consumers) ? DType::F16 : DType::F32;
+                        dtype_[i][0] = dtype_[i][1] = precision_ == DType::F16 && (unread || f16_readers_only(i, consumers))
+                                                          ? DType::F16
+                                                          : DType::F32;
                     }
                     break;
+                }
                 case OpKind::KvRead: {  // in the dtype its writer stores (a program compiled before this one)
                     const SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(
                         std::get<graph::KvCacheAttrs>(n.attrs).slot)]];
@@ -791,6 +803,9 @@ private:
                     need(1, dt(n.inputs[1]) == DType::I32, "i32");
                     need(2, is_f32(2), "f32");
                     break;
+                case OpKind::PrevRow:
+                    need(0, is_f32(0), "f32");
+                    break;
                 case OpKind::Rope:
                     need(0, is_f32(0), "f32");
                     need(1, is_int(1), "i32 or i64");
@@ -808,9 +823,6 @@ private:
                 }
                 case OpKind::GatedDelta: {
                     for (size_t k = 0; k < n.inputs.size(); ++k)
-                case OpKind::PrevRow:
-                    need(0, is_f32(0), "f32");
-                    break;
                         need(k, is_f32(k), "f32");
                     const int64_t dk = graph_.type(n.inputs[0]).shape.back();
                     const int64_t dv = graph_.type(n.inputs[2]).shape.back();
@@ -1946,6 +1958,8 @@ private:
                 s.softcap = a.softcap;
                 s.window = a.sliding_window;
                 s.causal = a.causal;
+                XS_CHECK(s.causal || s.window == 0 || s.tokens <= s.window, "non-causal attention of ", s.tokens,
+                         " queries with a window of ", s.window);
                 if (n.inputs.size() == 4) s.key_bias = in_f32(3);
                 if (in_dt(1) == DType::I8) {
                     const int slot = std::get<graph::KvCacheAttrs>(graph_.node(n.inputs[1]).attrs).slot;
@@ -1963,8 +1977,6 @@ private:
                 } else {
                     // Keys and values in place, in two parts when the concats were fused away (attn_split_).
                     const int split = attn_split_[i];
-                XS_CHECK(s.causal || s.window == 0 || s.tokens <= s.window, "non-causal attention of ", s.tokens,
-                         " queries with a window of ", s.window);
                     const Value kv_k = split >= 0 ? reads_[i][1] : n.inputs[1];
                     const Value kv_v = split >= 0 ? reads_[i][2] : n.inputs[2];
                     sycl_be::KvSecond second;
@@ -2032,6 +2044,11 @@ private:
                 sycl_be::softmax(q_, in_f32(0), out, out_n / width, width);
                 return;
             }
+            case OpKind::PrevRow: {
+                const int64_t rows = out_shape[0];
+                sycl_be::prev_row(q_, in_f32(0), out, rows, rows > 0 ? out_n / rows : 0);
+                return;
+            }
             case OpKind::TopK: {
                 const int64_t width = in_shape(0).back();
                 const int64_t k = std::get<graph::TopKAttrs>(n.attrs).k;
@@ -2049,11 +2066,6 @@ private:
                     outer *= in[static_cast<size_t>(d)];
                 const int64_t dim = in[static_cast<size_t>(axis)];
                 sycl_be::reduce_sum(q_, in_f32(0), out, outer, dim, numel(in) / (outer * dim));
-            case OpKind::PrevRow: {
-                const int64_t rows = out_shape[0];
-                sycl_be::prev_row(q_, in_f32(0), out, rows, rows > 0 ? out_n / rows : 0);
-                return;
-            }
                 return;
             }
             case OpKind::ExpertMatMul: {

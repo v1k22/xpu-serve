@@ -1,7 +1,8 @@
 // Speculative decoding in the engine, on cpu-ref: greedy output with a drafter equals greedy output without one, over
 // a model with every kind of state (conv, gated delta, KV) and a drafter with its own KV that is right only part of
 // the time, through prefix reuse, chunked prefill, stop tokens and rounds cut short. And the same tokens when the
-// target programs offer each row's argmax and the engine reads that instead of the logits.
+// target programs offer each row's argmax and the engine reads that instead of the logits. And with a block drafter:
+// one run proposes a round's drafts from state the target's own programs append to.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -11,7 +12,9 @@
 #include "../backend/backend_test_util.h"
 #include "backend/cpu_ref/cpu_backend.h"
 #include "engine/engine.h"
+#include "engine/spec/block_drafter.h"
 #include "models/common/blocks.h"
+#include "util/error.h"
 
 namespace xs {
 namespace {
@@ -24,14 +27,18 @@ using graph::Value;
 // and an attention layer perturb the hidden state enough to change it sometimes. The drafter predicts f of its token
 // (but f + 1 after every third token) from the embedding, perturbed a little by the target's hidden and by attention
 // over its own KV.
-class TinySpecModel final : public Model, public Speculation {
+class TinySpecModel final : public Model, public Speculation, public ChainDrafting, public BlockDrafting {
 public:
     static constexpr int64_t kVocab = 16, kHidden = 24, kHeads = 2, kDim = 8, kKernel = 4;
     static constexpr float kMix = 4.0f;        // how much the target's layers move the hidden state
     static constexpr float kDraftMix = 0.15f;  // how much the drafter's
+    static constexpr int64_t kBlockDrafts = 4;   // of the block drafter, after the pending token
 
     // `argmax`: the target programs also output each row's argmax (what greedy decoding reads instead of the logits).
-    explicit TinySpecModel(bool argmax = false) : argmax_(argmax) {
+    // `block`: the drafter proposes a block a run instead of a token (BlockDrafting): the target's prefill and verify
+    // programs append a context row per token to its KV slot, and its program attends over them and its own block.
+    // It is handed its guesses, right except after every third token, and gives them back unless its state is off.
+    explicit TinySpecModel(bool argmax = false, bool block = false) : argmax_(argmax), block_(block) {
         test::TensorRng rng(7);
         const HostTensor embed = rng.uniform(DType::F32, {kVocab, kHidden});
         HostTensor head(DType::F32, {kVocab, kHidden}), draft_head(DType::F32, {kVocab, kHidden});
@@ -71,7 +78,7 @@ public:
         build_target(step_, false, false);
         build_target(prefill_, false, true);
         build_target(verify_, true, true);
-        build_draft();
+        block_ ? build_block() : build_draft();
     }
 
     const ModelInfo& info() const override { return info_; }
@@ -90,6 +97,18 @@ public:
     const Graph& prefill_graph() const override { return prefill_; }
     const Graph& verify_graph() const override { return verify_; }
     const Graph& draft_graph() const override { return draft_; }
+    const ChainDrafting* chain() const override { return block_ ? nullptr : this; }
+    const BlockDrafting* block() const override { return block_ ? this : nullptr; }
+    std::string_view drafter_name() const override { return block_ ? "tiny-block" : "tiny"; }
+    int64_t block_drafts() const override { return kBlockDrafts; }
+    void prepare_block(int32_t token, int64_t position, TensorMap& inputs) const override {
+        std::vector<int32_t> ids{token};
+        for (int64_t j = 0; j < kBlockDrafts; ++j) {
+            const int32_t t = ids.back();
+            ids.push_back(static_cast<int32_t>((5 * t + 3 + (t % 3 == 0 ? 1 : 0)) % kVocab));
+        }
+        prepare_inputs(ids, position, {}, inputs);
+    }
     bool drafter_keeps_state() const override { return true; }
     void prepare_draft(std::span<const int32_t> tokens, std::span<const float> hidden, int64_t start_pos, int depth,
                        TensorMap& inputs) const override {
@@ -132,7 +151,22 @@ private:
         const Value logits = g.matmul(all_logits ? hidden : g.slice(hidden, 0, -1), g.weight(weights_, "lm_head"));
         g.output("logits", logits);
         if (argmax_) g.output("argmax", blocks::argmax_rows(g, logits));
-        if (hidden_out) g.output("hidden", hidden);
+        if (hidden_out && !block_) g.output("hidden", hidden);
+        if (hidden_out && block_) {  // the block drafter's context: a key and a value per token, in its own slot
+            const auto row = [&](const char* w) {
+                return g.reshape(g.matmul(hidden, g.weight(weights_, std::string("draft.") + w)), {kT, 1, kDim});
+            };
+            g.kv_cache(g.add_kv_slot(1, kDim, 0, "draft"), g.rope(row("k"), pos, freq(g)), row("v"));
+        }
+    }
+
+    void build_block() {
+        Graph& g = draft_;
+        const Value ids = g.input("token_ids", DType::I32, {kT});
+        const Value pos = g.input("positions", DType::I32, {kT});
+        const Value h = attention(g, "draft.", "draft", g.gather(g.weight(weights_, "embed"), ids), pos, kDraftMix);
+        const Value rows = g.rms_norm(g.slice(h, 0, -kBlockDrafts), 1e-6f);
+        g.output("drafts", blocks::argmax_rows(g, g.matmul(rows, g.weight(weights_, "embed"))));
     }
 
     void build_draft() {
@@ -149,14 +183,15 @@ private:
     }
 
     bool argmax_ = false;
+    bool block_ = false;
     test::MemoryWeights weights_;
     ModelInfo info_;
     Graph step_, prefill_, verify_, draft_;
 };
 
-std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argmax = false) {
+std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argmax = false, bool block = false) {
     static const auto backend = make_cpu_ref_backend();
-    auto model = std::make_unique<TinySpecModel>(argmax);
+    auto model = std::make_unique<TinySpecModel>(argmax, block);
     std::vector<const Graph*> programs{&model->graph()};
     SessionOptions options;
     options.precision = DType::F32;
@@ -217,6 +252,54 @@ TEST_CASE("speculative decoding emits exactly the greedy tokens") {
             CHECK(stats.spec_accepted < stats.spec_drafted);   // ... and rejected
         }
     }
+}
+
+TEST_CASE("a block drafter: one run proposes a round's drafts, and the greedy tokens are the same") {
+    for (const int k : {1, 2, 4}) {
+        for (const int64_t chunk : {int64_t{3}, int64_t{64}}) {
+            CAPTURE(k);
+            CAPTURE(chunk);
+            const auto plain = make_engine(0, chunk);
+            const auto spec = make_engine(k, chunk, k == 2, true);
+            GenerateStats stats;
+            const auto same = [&](const GenerateRequest& req) {
+                const GenerateResult want = plain->generate(req, {});
+                const GenerateResult got = spec->generate(req, {});
+                REQUIRE(want.finish != FinishReason::Error);
+                CHECK(got.error == "");
+                CHECK(got.tokens == want.tokens);
+                CHECK(got.finish == want.finish);
+                stats.spec_drafted += got.stats.spec_drafted;
+                stats.spec_accepted += got.stats.spec_accepted;
+                return want.tokens;
+            };
+            const std::vector<int32_t> first = {1, 7, 3, 12, 5, 9, 0, 14, 2, 11};
+            const std::vector<int32_t> out = same(greedy(first, 40));
+            std::vector<int32_t> extended = first;  // the next turn extends the cached sequence
+            extended.insert(extended.end(), out.begin(), out.end());
+            extended.insert(extended.end(), {4, 8, 15});
+            const std::vector<int32_t> out2 = same(greedy(extended, 30));
+            same(greedy({6, 2, 13}, 7));  // a new sequence; a round cut short by max_new_tokens
+            same(greedy({6, 2, 13, 1}, 30, {out2.at(9), out2.at(17)}));
+            CHECK(stats.spec_accepted > 0);
+            CHECK(stats.spec_accepted < stats.spec_drafted);
+        }
+    }
+    CHECK_THROWS_AS(make_engine(5, 64, false, true), xs::Error);  // more drafts a round than the block holds
+}
+
+TEST_CASE("a block's drafts: as given, or the path of the best score of each row through the candidates") {
+    TensorMap given;
+    given["drafts"] = test::make_tensor(DType::I32, {3}, std::vector<int32_t>{9, 4, 7});
+    CHECK(spec::block_drafts(given) == std::vector<int32_t>{9, 4, 7});
+    // three drafts, two candidates each; scores[i][j][k]: the draft before took its candidate j
+    TensorMap paths;
+    paths["candidates"] = test::make_tensor(DType::I32, {3, 2}, std::vector<int32_t>{10, 11, 20, 21, 30, 31});
+    paths["scores"] = test::make_tensor(DType::F32, {3, 2, 2},
+                                        std::vector<float>{0.1f, 0.9f, /* unused row */ 5.0f, 0.0f,  // draft 0: 11
+                                                           1.0f, 0.0f, /* after 11 */ 0.2f, 0.3f,     // draft 1: 21
+                                                           0.0f, 1.0f, /* after 21 */ 0.7f, 0.7f});   // tie: the first
+    CHECK(spec::block_drafts(paths) == std::vector<int32_t>{11, 21, 30});
 }
 
 TEST_CASE("programs that offer each row's argmax: greedy decoding reads it, sampling still reads the logits") {

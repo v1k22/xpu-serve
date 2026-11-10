@@ -13,6 +13,11 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
+#include "backend/backend.h"
+#include "test_support.h"
+
 namespace xs::test {
 
 inline std::string env_or(const char* name, const std::string& fallback) {
@@ -32,6 +37,27 @@ inline std::vector<float> read_f32(const std::filesystem::path& path) {
     std::copy(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(v.size() * sizeof(float)),
               reinterpret_cast<char*>(v.data()));
     return v;
+}
+
+// Where the references of the model in XS_TEST_MODEL_DIR are: XS_PARITY_FIXTURES, or the generated directory of its
+// model_type.
+inline std::filesystem::path model_fixtures() {
+    std::string model_type = "unknown";
+    if (const auto dir = model_dir()) {
+        std::ifstream in(*dir / "config.json");
+        if (in.good()) model_type = nlohmann::json::parse(in).value("model_type", model_type);
+    }
+    return env_or("XS_PARITY_FIXTURES", std::string(XS_SOURCE_DIR) + "/tests/fixtures/generated/" + model_type);
+}
+
+// The session a parity test compiles: XS_PARITY_DEVICE, XS_PARITY_PRECISION (f32 by default), XS_PARITY_KV_DTYPE.
+inline SessionOptions parity_options() {
+    SessionOptions options;
+    options.device = env_or("XS_PARITY_DEVICE", "");
+    options.precision = env_or("XS_PARITY_PRECISION", "f32") == "f32" ? DType::F32 : DType::F16;
+    options.max_context = 4096;
+    if (env_or("XS_PARITY_KV_DTYPE", "auto") == "i8") options.kv_dtype = DType::I8;
+    return options;
 }
 
 struct Compare {

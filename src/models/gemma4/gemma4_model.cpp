@@ -59,7 +59,7 @@ struct Decoder {
 
 // The step graph of a Gemma 4 checkpoint and, with an assistant (LoadOptions::drafter), the programs of speculative
 // decoding: the target with "hidden" outputs (prefill, verify) and the assistant reading the target's KV (draft).
-class Gemma4Model final : public Model, public Speculation {
+class Gemma4Model final : public Model, public Speculation, public ChainDrafting {
 public:
     // `vision`: the vision config when the encoder should be loaded (the checkpoint has one and it was asked for).
     // `assistant`: the drafter's config and weights (under "assistant." in weights()), built when `speculation`.
@@ -134,6 +134,8 @@ public:
     const graph::Graph& prefill_graph() const override { return prefill_; }
     const graph::Graph& verify_graph() const override { return verify_; }
     const graph::Graph& draft_graph() const override { return draft_; }
+    const ChainDrafting* chain() const override { return this; }
+    std::string_view drafter_name() const override { return "assistant"; }
     bool drafter_keeps_state() const override { return false; }
 
     // Every draft of a round runs at the position of the token it starts from, the one after the hidden row's.

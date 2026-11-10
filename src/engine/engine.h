@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "backend/backend.h"
-#include "engine/spec/draft_runner.h"
+#include "engine/spec/drafter.h"
 #include "engine/types.h"
 #include "models/model.h"
 
@@ -59,6 +59,9 @@ private:
     // and rollback. Returns the accepted drafts and the target's next token.
     std::vector<int32_t> spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
                                     std::span<const int32_t> generated, GenerateStats& stats);
+    // The program whose state slots are the sequence's: the step graph's, and speculating the verify graph's, which
+    // also writes what a block drafter reads of the target.
+    size_t state_program() const;
     // Drops the sequence: every slot of the session, and what waits for the drafter.
     void reset_sequence();
     // Makes the session hold a prefix of the prompt and returns how many prompt positions are already cached.
@@ -70,7 +73,7 @@ private:
     std::unique_ptr<Session> session_;
     std::unique_ptr<Session> vision_session_;
     EngineOptions options_;
-    std::unique_ptr<spec::DraftRunner> drafter_;  // speculating
+    std::unique_ptr<spec::Drafter> drafter_;  // speculating
     std::vector<PositionKey> cached_;  // positions whose KV the session holds, in order
     std::list<std::pair<uint64_t, std::shared_ptr<const HostTensor>>> encoded_;  // most recent first
     TensorMap inputs_;

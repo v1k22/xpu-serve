@@ -62,9 +62,10 @@ void add_engine_options(Args& a) {
         .value("ctx", "context length in tokens (prompt + output)", "8192")
         .value("prefill-chunk", "tokens per prefill step", "1024")
         .value("backend-opt", "backend options as key=value[,key=value]")
-        .value("spec", "speculative decoding: off | mtp (the model's drafter: its MTP head, or --drafter)", "off")
-        .value("spec-k", "speculative decoding: drafts per round", "3")
-        .value("drafter", "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, e.g. gemma-4-E2B-it-assistant)")
+        .value("spec", "speculative decoding: off | mtp (the model's MTP head, or a Gemma 4 assistant with --drafter) | "
+                       "dflash | dspine (a block drafter checkpoint with --drafter)", "off")
+        .value("spec-k", "speculative decoding: drafts per round (default: 3, or 7 of a block drafter's block)")
+        .value("drafter", "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, a DFlash or DSpine drafter)")
         .value("draft-shortlist", "speculative decoding: an MTP head picks among this many tokens, chosen by a one-bit "
                                   "sketch of the output layer and re-scored exactly (0: it reads the whole layer)", "64")
         .value("log-level", "debug | info | warn | error", "info")
@@ -94,14 +95,16 @@ ServiceOptions service_options(const Args& a) {
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");
     const std::string& spec = a.get("spec");
-    if (spec == "mtp") {
-        o.engine.spec_k = a.get_int("spec-k");
-        if (o.engine.spec_k < 1) fail("--spec-k must be at least 1, got ", o.engine.spec_k);
+    if (spec == "mtp" || spec == "dflash" || spec == "dspine") {
+        o.spec = spec;
+        o.engine.spec_k = a.get("spec-k").empty() ? kDraftersCount : a.get_int("spec-k");
+        if (o.engine.spec_k != kDraftersCount && o.engine.spec_k < 1) fail("--spec-k must be at least 1, got ", o.engine.spec_k);
     } else if (spec != "off") {
-        fail("--spec must be off or mtp, got '", spec, "'");
+        fail("--spec must be off, mtp, dflash or dspine, got '", spec, "'");
     }
     o.drafter = a.get("drafter");
-    if (!o.drafter.empty() && spec != "mtp") fail("--drafter drafts for --spec mtp");
+    if (!o.drafter.empty() && spec == "off") fail("--drafter drafts for --spec mtp, dflash or dspine");
+    if (o.drafter.empty() && (spec == "dflash" || spec == "dspine")) fail("--spec ", spec, " needs --drafter <its checkpoint>");
     o.draft_shortlist = a.get_int("draft-shortlist");
     if (o.draft_shortlist < 0) fail("--draft-shortlist must be 0 or more, got ", o.draft_shortlist);
     const std::string& opts = a.get("backend-opt");

@@ -1,9 +1,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <optional>
 
 #include "models/common/blocks.h"
+#include "io/joined_weights.h"
 #include "models/config_util.h"
+#include "models/drafters/dflash.h"
 #include "models/qwen3_5/qwen3_5.h"
 #include "quant/quant.h"
 #include "util/error.h"
@@ -38,15 +42,34 @@ HostTensor to_f32(const std::string& name, const TensorView& t) {
     return out;
 }
 
+// Where a block drafter's weights sit beside the target's.
+constexpr const char* kDrafterPrefix = "drafter.";
+
 // The programs of a Qwen3.5 checkpoint, built from one set of layer builders: the step graph, and with speculation the
-// prefill and verify programs (the same decoder, other outputs) and the MTP head (vLLM's Qwen3.5 MTP: one decoder
-// layer of the target's kind over fc(cat(norm(embed(t_{i+1})), norm(h_i))), then the target's lm_head).
-class Qwen35Model final : public Model, public Speculation {
+// prefill and verify programs (the same decoder, other outputs) and the drafter's. The drafter is the checkpoint's MTP
+// head (vLLM's Qwen3.5 MTP: one decoder layer of the target's kind over fc(cat(norm(embed(t_{i+1})), norm(h_i))),
+// then the target's lm_head), or, with a drafter checkpoint beside the model, a block drafter of the DFlash family
+// (models/drafters/dflash.h), whose context the prefill and verify programs append.
+class Qwen35Model final : public Model, public Speculation, public ChainDrafting {
 public:
-    Qwen35Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> weights, const LoadOptions& options)
+    // `drafter`: a block drafter's config, its weights already in `weights` under kDrafterPrefix.
+    Qwen35Model(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights, const LoadOptions& options,
+                std::optional<dflash::Config> drafter)
         : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)), prefix_(probe_prefix(*weights_)) {
         build_target(step_, Head::LastLogits);
         if (!options.speculation) return;
+        if (drafter) {
+            XS_CHECK(drafter->hidden_size == cfg_.hidden_size && drafter->vocab_size == cfg_.vocab_size &&
+                         drafter->num_target_layers == cfg_.num_layers,
+                     "qwen3_5: the drafter was trained for a target of ", drafter->num_target_layers, " layers of ",
+                     drafter->hidden_size, " and ", drafter->vocab_size, " tokens; this model has ", cfg_.num_layers,
+                     " of ", cfg_.hidden_size, " and ", cfg_.vocab_size);
+            block_ = std::make_unique<dflash::Drafter>(std::move(*drafter), *weights_, kDrafterPrefix, options.drafts);
+            build_target(prefill_, Head::LastLogitsAllHidden);
+            build_target(verify_, Head::AllLogitsAllHidden);
+            block_->build_block(draft_, weight(draft_, prefix_ + "embed_tokens.weight"), lm_head(draft_));
+            return;
+        }
         if (cfg_.mtp_layers == 0 || !weights_->contains("mtp.fc.weight")) {
             log::warn("qwen3_5: the checkpoint has no MTP head (mtp.*); speculative decoding is unavailable");
             return;
@@ -61,7 +84,7 @@ public:
     const ModelInfo& info() const override { return info_; }
     const graph::Graph& graph() const override { return step_; }
     const WeightStore& weights() const override { return *weights_; }
-    const Speculation* speculation() const override { return has_mtp_ ? this : nullptr; }
+    const Speculation* speculation() const override { return has_mtp_ || block_ ? this : nullptr; }
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
                         TensorMap& inputs) const override {
@@ -72,6 +95,9 @@ public:
     const graph::Graph& prefill_graph() const override { return prefill_; }
     const graph::Graph& verify_graph() const override { return verify_; }
     const graph::Graph& draft_graph() const override { return draft_; }
+    const ChainDrafting* chain() const override { return block_ ? nullptr : this; }
+    const BlockDrafting* block() const override { return block_.get(); }
+    std::string_view drafter_name() const override { return block_ ? dflash::variant_name(block_->config().variant) : "mtp"; }
     bool drafter_keeps_state() const override { return true; }
 
     // The pair (h_i, token i + 1) runs at position i, a chained draft one position after the previous one.
@@ -132,23 +158,34 @@ private:
         const Value pos = g.input("positions", DType::I32, {kT});
         Value h = g.gather(weight(g, prefix_ + "embed_tokens.weight"), ids);
         const Value freq = inv_freq(g);
+        std::vector<Value> after;  // the state after each layer
         for (int64_t i = 0; i < cfg_.num_layers; ++i) {
             const std::string layer = "layers." + std::to_string(i);
             h = decoder_layer(g, prefix_ + layer + ".", layer, cfg_.layer_kinds[static_cast<size_t>(i)], h, pos, freq);
+            after.push_back(h);
         }
-
-        Graph::Scope scope(g, "head");
         if (head == Head::LastLogits) {
+            Graph::Scope scope(g, "head");
             const Value logits = g.matmul(norm(g, g.slice(h, 0, -1), prefix_ + "norm.weight"), lm_head(g));
             g.output("logits", logits);
             g.output("argmax", blocks::argmax_rows(g, logits));
         } else {
             const Value hidden = norm(g, h, prefix_ + "norm.weight");
+            if (block_ != nullptr) {
+                // A block drafter's context: Hugging Face's hidden_states after the layers it names, the last of which
+                // is the normed one.
+                std::vector<Value> states;
+                for (const int64_t id : block_->config().target_layer_ids) {
+                    states.push_back(id + 1 < cfg_.num_layers ? after[static_cast<size_t>(id)] : hidden);
+                }
+                block_->append_context(g, states, pos);
+            }
+            Graph::Scope scope(g, "head");
             const Value logits =
                 g.matmul(head == Head::AllLogitsAllHidden ? hidden : g.slice(hidden, 0, -1), lm_head(g));
             g.output("logits", logits);
             g.output("argmax", blocks::argmax_rows(g, logits));
-            g.output("hidden", hidden);
+            if (block_ == nullptr) g.output("hidden", hidden);  // what the MTP head takes
         }
         g.validate();
         log::debug("qwen3_5: graph has ", g.nodes().size(), " nodes, ", g.kv_slots().size(), " kv, ",
@@ -288,10 +325,11 @@ private:
 
     Config cfg_;
     ModelInfo info_;
-    std::unique_ptr<SafetensorsWeights> weights_;
+    std::unique_ptr<WeightStore> weights_;
     std::string prefix_;
     graph::Graph step_, prefill_, verify_, draft_;
     bool has_mtp_ = false;
+    std::unique_ptr<dflash::Drafter> block_;  // a block drafter instead of the MTP head
 };
 
 }  // namespace
@@ -335,8 +373,15 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     XS_CHECK(!stops.empty(), "qwen3_5: no end-of-sequence token in config.json or tokenizer_config.json");
     info.stop_token_ids = std::move(stops);
 
-    auto weights = SafetensorsWeights::open_dir(dir);
-    return std::make_unique<Qwen35Model>(std::move(cfg), std::move(info), std::move(weights), options);
+    std::unique_ptr<WeightStore> weights = SafetensorsWeights::open_dir(dir);
+    std::optional<dflash::Config> drafter;
+    if (options.speculation && !options.drafter.empty()) {
+        std::ifstream in(options.drafter / "config.json");
+        XS_CHECK(in.good(), "qwen3_5: cannot read ", (options.drafter / "config.json").string());
+        drafter = dflash::parse_config(nlohmann::json::parse(in));
+        weights = std::make_unique<JoinedWeights>(std::move(weights), dflash::open_weights(options.drafter), kDrafterPrefix);
+    }
+    return std::make_unique<Qwen35Model>(std::move(cfg), std::move(info), std::move(weights), options, std::move(drafter));
 }
 
 }  // namespace xs::qwen3_5

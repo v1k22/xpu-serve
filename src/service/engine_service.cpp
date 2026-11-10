@@ -1,5 +1,6 @@
 #include "service/engine_service.h"
 
+#include <algorithm>
 #include <future>
 
 #include "chat/chat_template.h"
@@ -24,13 +25,21 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     Timer timer;
     s->tokenizer_ = tok::Tokenizer::load(model_dir);
     s->template_ = chat::ChatTemplate::load(model_dir);
-    const bool speculate = options.engine.spec_k > 0;
-    auto model = load_model(model_dir, LoadOptions{options.vision, speculate, options.drafter, options.draft_shortlist});
+    const bool speculate = options.engine.spec_k != 0;
+    const bool own_count = options.engine.spec_k == kDraftersCount;
+    int spec_k = options.engine.spec_k;
+    if (own_count) spec_k = options.spec == "dflash" || options.spec == "dspine" ? kBlockDrafts : kChainDrafts;
+    auto model = load_model(model_dir, LoadOptions{.vision = options.vision,
+                                                   .speculation = speculate,
+                                                   .drafter = options.drafter,
+                                                   .draft_shortlist = options.draft_shortlist,
+                                                   .drafts = spec_k});
     const ModelInfo& info = model->info();
     log::info("model ", info.id, " (", info.arch, "): graph of ", model->graph().nodes().size(), " nodes, ",
               model->graph().kv_slots().size(), " KV slots", model->vision() ? "; vision encoder" : "");
 
     EngineOptions engine_options = options.engine;
+    engine_options.spec_k = spec_k;
     if (engine_options.max_context > info.max_position) {
         log::warn("context ", engine_options.max_context, " exceeds the model's ", info.max_position,
                   "; using ", info.max_position);
@@ -48,9 +57,21 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
             fail("model ", info.id, " has no drafter: speculative decoding needs one (an MTP head in the checkpoint, or "
                  "--drafter <an assistant checkpoint>)");
         }
+        // --spec names a kind of drafter: the checkpoints must hold one of it
+        const std::string_view name = spec->drafter_name();
+        const bool kind = options.spec.empty() || (options.spec == "mtp" && (name == "mtp" || name == "assistant")) ||
+                          (options.spec == "dflash" && (name == "dflash" || name == "dflash2")) || options.spec == name;
+        if (!kind) fail("--spec ", options.spec, " was asked for, but the drafter of ", info.id, " is ", name);
+        const int block = spec->block() != nullptr ? static_cast<int>(spec->block()->block_drafts()) : 0;
+        if (block > 0 && engine_options.spec_k > block) {
+            if (!own_count) {
+                fail("--spec-k ", engine_options.spec_k, " is more than the ", block, " drafts a block of ", name, " holds");
+            }
+            engine_options.spec_k = block;
+        }
         programs.insert(programs.end(), {&spec->prefill_graph(), &spec->verify_graph(), &spec->draft_graph()});
-        session_options.rewind_tokens = options.engine.spec_k + 1;
-        log::info("speculative decoding: ", options.engine.spec_k, " drafts per round, drafter graph of ",
+        session_options.rewind_tokens = engine_options.spec_k + 1;
+        log::info("speculative decoding: ", name, ", ", engine_options.spec_k, " drafts per round, drafter graph of ",
                   spec->draft_graph().nodes().size(), " nodes");
     }
     auto backend = make_backend(options.backend);

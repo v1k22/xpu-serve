@@ -22,6 +22,10 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
     if (type == "qwen3_5" || type == "qwen3_5_text" || type == "qwen3_5_moe" || type == "qwen3_5_moe_text") {
         return qwen3_5::load(dir, config, options);
     }
+    if (config.contains("dflash_config")) {
+        fail("'", dir.string(), "' is a block drafter checkpoint: it drafts for the model it was trained with ",
+             "(--drafter beside that model)");
+    }
     std::string list;
     for (const auto& t : supported_model_types()) list += (list.empty() ? "" : ", ") + t;
     fail("model_type '", type, "' is not supported (supported: ", list, ")");

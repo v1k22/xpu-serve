@@ -19,112 +19,18 @@
 #include "io/safetensors_writer.h"
 #include "models/model.h"
 #include "quant/quant.h"
+#include "tiny_checkpoints.h"
 #include "util/error.h"
 #include "util/half.h"
 
 using namespace xs;
 namespace fs = std::filesystem;
 namespace dev = xs::test::device;
+using xs::test::TempDir;
+using xs::test::TinyQwen;
+using xs::test::write_tiny_qwen;
 
 namespace {
-
-struct TinyQwen {
-    int64_t vocab = 256, hidden = 128, ffn = 256, heads = 4, kv_heads = 2, head_dim = 64;
-    int64_t lin_k_heads = 2, lin_v_heads = 4, lin_dim = 32, conv = 4;
-    std::vector<std::string> layers{"linear_attention", "linear_attention", "linear_attention", "full_attention"};
-    int64_t experts = 0, top_k = 2, moe_ffn = 64, shared_ffn = 96;  // experts > 0: Qwen3.5 MoE (fused banks)
-};
-
-// Writes config.json and model.safetensors (bf16, random) for `m` into `dir`.
-void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t seed) {
-    fs::create_directories(dir);
-    nlohmann::json config = {
-        {"model_type", "qwen3_5_text"}, {"vocab_size", m.vocab}, {"hidden_size", m.hidden},
-        {"intermediate_size", m.ffn}, {"num_hidden_layers", m.layers.size()}, {"rms_norm_eps", 1e-6},
-        {"max_position_embeddings", 4096}, {"num_attention_heads", m.heads}, {"num_key_value_heads", m.kv_heads},
-        {"head_dim", m.head_dim}, {"linear_num_key_heads", m.lin_k_heads}, {"linear_num_value_heads", m.lin_v_heads},
-        {"linear_key_head_dim", m.lin_dim}, {"linear_value_head_dim", m.lin_dim}, {"linear_conv_kernel_dim", m.conv},
-        {"hidden_act", "silu"}, {"tie_word_embeddings", true}, {"eos_token_id", 1}, {"layer_types", m.layers},
-        {"rope_parameters", {{"rope_type", "default"}, {"rope_theta", 1e7}, {"partial_rotary_factor", 0.25}}}};
-    if (m.experts > 0) {
-        config["model_type"] = "qwen3_5_moe_text";
-        config.erase("intermediate_size");
-        config["num_experts"] = m.experts;
-        config["num_experts_per_tok"] = m.top_k;
-        config["moe_intermediate_size"] = m.moe_ffn;
-        config["shared_expert_intermediate_size"] = m.shared_ffn;
-    }
-    std::ofstream(dir / "config.json") << config.dump(1);
-    std::ofstream(dir / "tokenizer_config.json") << R"({"eos_token": "<|end|>"})";
-
-    std::mt19937 rng(seed);
-    std::vector<std::pair<std::string, Dims>> specs;
-    const auto add = [&](const std::string& name, Dims shape) { specs.emplace_back("model." + name, std::move(shape)); };
-    add("embed_tokens.weight", {m.vocab, m.hidden});
-    add("norm.weight", {m.hidden});
-    const int64_t conv_width = 2 * m.lin_k_heads * m.lin_dim + m.lin_v_heads * m.lin_dim;
-    for (size_t i = 0; i < m.layers.size(); ++i) {
-        const std::string L = "layers." + std::to_string(i) + ".";
-        add(L + "input_layernorm.weight", {m.hidden});
-        add(L + "post_attention_layernorm.weight", {m.hidden});
-        if (m.experts > 0) {
-            add(L + "mlp.gate.weight", {m.experts, m.hidden});
-            add(L + "mlp.experts.gate_up_proj", {m.experts, 2 * m.moe_ffn, m.hidden});
-            add(L + "mlp.experts.down_proj", {m.experts, m.hidden, m.moe_ffn});
-            add(L + "mlp.shared_expert.gate_proj.weight", {m.shared_ffn, m.hidden});
-            add(L + "mlp.shared_expert.up_proj.weight", {m.shared_ffn, m.hidden});
-            add(L + "mlp.shared_expert.down_proj.weight", {m.hidden, m.shared_ffn});
-            add(L + "mlp.shared_expert_gate.weight", {1, m.hidden});
-        } else {
-            add(L + "mlp.gate_proj.weight", {m.ffn, m.hidden});
-            add(L + "mlp.up_proj.weight", {m.ffn, m.hidden});
-            add(L + "mlp.down_proj.weight", {m.hidden, m.ffn});
-        }
-        if (m.layers[i] == "linear_attention") {
-            const std::string A = L + "linear_attn.";
-            add(A + "in_proj_qkv.weight", {conv_width, m.hidden});
-            add(A + "conv1d.weight", {conv_width, 1, m.conv});
-            add(A + "in_proj_b.weight", {m.lin_v_heads, m.hidden});
-            add(A + "in_proj_a.weight", {m.lin_v_heads, m.hidden});
-            add(A + "A_log", {m.lin_v_heads});
-            add(A + "dt_bias", {m.lin_v_heads});
-            add(A + "norm.weight", {m.lin_dim});
-            add(A + "in_proj_z.weight", {m.lin_v_heads * m.lin_dim, m.hidden});
-            add(A + "out_proj.weight", {m.hidden, m.lin_v_heads * m.lin_dim});
-        } else {
-            const std::string A = L + "self_attn.";
-            add(A + "q_proj.weight", {2 * m.heads * m.head_dim, m.hidden});
-            add(A + "k_proj.weight", {m.kv_heads * m.head_dim, m.hidden});
-            add(A + "v_proj.weight", {m.kv_heads * m.head_dim, m.hidden});
-            add(A + "o_proj.weight", {m.hidden, m.heads * m.head_dim});
-            add(A + "q_norm.weight", {m.head_dim});
-            add(A + "k_norm.weight", {m.head_dim});
-        }
-    }
-    std::vector<std::vector<uint16_t>> data;
-    data.reserve(specs.size());  // the units below keep references into it
-    std::vector<OutUnit> units;
-    for (const auto& [name, shape] : specs) {
-        // 1/sqrt(fan-in) for matrices keeps activations O(1); small values for norms (zero-centered) and the rest. The
-        // router is larger, so each token's top-k experts win clearly (a near tie may route differently at f16).
-        const bool router = name.size() > 15 && name.compare(name.size() - 15, 15, "mlp.gate.weight") == 0;
-        const float range = shape.size() >= 2 ? (router ? 8.0f : 1.0f) / std::sqrt(static_cast<float>(shape.back()))
-                                              : 0.1f;
-        std::uniform_real_distribution<float> dist(-range, range);
-        std::vector<uint16_t> values(static_cast<size_t>(numel(shape)));
-        for (uint16_t& v : values)
-            v = f32_to_bf16(dist(rng));
-        data.push_back(std::move(values));
-        const std::vector<uint16_t>& bytes = data.back();
-        OutUnit u;
-        u.tensors = {OutTensor{name, DType::BF16, shape}};
-        u.write = [&bytes](std::ostream& out) {
-            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size() * 2));
-        };
-        units.push_back(std::move(u));
-    }
-    write_safetensors(dir / "model.safetensors", units);
-}
 
 // Logits of the last prompt token, from a fresh state.
 std::vector<float> last_logits(Session& session, const Model& model, const std::vector<int32_t>& ids) {
@@ -145,12 +51,6 @@ double cosine(const std::vector<float>& a, const std::vector<float>& b) {
     }
     return ab / std::sqrt(aa * bb);
 }
-
-struct TempDir {
-    fs::path path;
-    explicit TempDir(const std::string& name) : path(fs::temp_directory_path() / name) { fs::remove_all(path); }
-    ~TempDir() { fs::remove_all(path); }
-};
 
 }  // namespace
 

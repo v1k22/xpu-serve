@@ -9,6 +9,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "engine/types.h"
@@ -48,29 +49,55 @@ public:
     virtual int32_t soft_token() const = 0;
 };
 
-// Speculative decoding with a model's own drafter (an MTP head in the checkpoint, or an assistant checkpoint): the
-// programs it adds to the step graph and how the drafter is fed. The engine compiles them into the step graph's
-// session after it, in the order prefill, verify, draft (engine/spec/programs.h); they share its weights by name and
-// its state slots by label. "hidden" is whatever the drafter takes from the target (the same width in every program).
-class Speculation {
+// A drafter that proposes one token a run (an MTP head, an assistant): Speculation::draft_graph takes pairs (the
+// target's "hidden" row of position i, the token at i + 1) and gives "logits" [1, n] and "hidden" [1, width] of the
+// last pair (the hidden the next chained step takes), where the logits are over the vocabulary or, when the graph has
+// an I32 "candidates" output [n], over the tokens it lists. The target's prefill and verify programs output "hidden":
+// whatever the drafter takes of them, one row per token.
+class ChainDrafting {
 public:
-    virtual ~Speculation() = default;
-    // The target with "logits" of the last row and "hidden" of every row: a prefill chunk.
-    virtual const graph::Graph& prefill_graph() const = 0;
-    // The target with "logits" and "hidden" of every row: verifying a pending token and its drafts.
-    virtual const graph::Graph& verify_graph() const = 0;
-    // One drafter step over pairs (the target's hidden row of position i, the token at i + 1): "logits" [1, n] and
-    // "hidden" [1, width] of the last pair (the hidden the next chained step takes), where the logits are over the
-    // vocabulary or, when the graph has an I32 "candidates" output [n], over the tokens it lists.
-    virtual const graph::Graph& draft_graph() const = 0;
-    // Inputs of draft_graph. depth 0: the pairs at positions start_pos, start_pos + 1, ... (`hidden` holds one row
-    // per token). depth d > 0: one chained step, the d-th draft after the pair at start_pos, from the token drafted
-    // before it and the drafter's own "hidden".
+    virtual ~ChainDrafting() = default;
+    // Inputs of the draft graph. depth 0: the pairs at positions start_pos, start_pos + 1, ... (`hidden` holds one
+    // row per token). depth d > 0: one chained step, the d-th draft after the pair at start_pos, from the token
+    // drafted before it and the drafter's own "hidden".
     virtual void prepare_draft(std::span<const int32_t> tokens, std::span<const float> hidden, int64_t start_pos,
                                int depth, TensorMap& inputs) const = 0;
     // The drafter keeps its own KV over the sequence: every pair goes through it once, in order (catching up on
     // the pairs a verify accepted). Otherwise a round starts from the last pair alone.
     virtual bool drafter_keeps_state() const = 0;
+};
+
+// A drafter that proposes a block in one run (DFlash, DSpine): block_drafts() tokens after a pending one. Nothing is
+// handed over: the target's prefill and verify programs append what the drafter reads of them to state slots of its
+// own (they count the same tokens as the target's), and Speculation::draft_graph, fed the pending token at its
+// position, appends its block to those slots; the engine cuts them back after the run. It gives "drafts" [n] i32, or
+// "candidates" [n, K] i32 with "scores" [n, K, K] f32: scores[i][j][k] ranks candidate k of draft i given that draft
+// i - 1 was its candidate j (row j = 0 for the first draft), and the drafts follow the best of each row in turn.
+class BlockDrafting {
+public:
+    virtual ~BlockDrafting() = default;
+    virtual int64_t block_drafts() const = 0;
+    // Inputs of the draft graph for the block after `token`, which sits at `position`.
+    virtual void prepare_block(int32_t token, int64_t position, TensorMap& inputs) const = 0;
+};
+
+// Speculative decoding with a model's drafter (an MTP head in the checkpoint, an assistant or a block drafter beside
+// it): the programs it adds to the step graph. The engine compiles them into the step graph's session after it, in
+// the order prefill, verify, draft (engine/spec/drafter.h); they share its weights by name and its state slots by
+// label.
+class Speculation {
+public:
+    virtual ~Speculation() = default;
+    // The target with "logits" of the last row: a prefill chunk.
+    virtual const graph::Graph& prefill_graph() const = 0;
+    // The target with "logits" of every row: verifying a pending token and its drafts.
+    virtual const graph::Graph& verify_graph() const = 0;
+    // The drafter's program: what it takes and gives is its way of drafting, exactly one of the two below.
+    virtual const graph::Graph& draft_graph() const = 0;
+    virtual const ChainDrafting* chain() const { return nullptr; }
+    virtual const BlockDrafting* block() const { return nullptr; }
+    // What drafts: "mtp", "assistant", "dflash", "dflash2", "dspine".
+    virtual std::string_view drafter_name() const = 0;
 };
 
 class Model {
@@ -96,10 +123,14 @@ public:
 struct LoadOptions {
     bool vision = true;        // load the vision encoder when the checkpoint has one
     bool speculation = false;  // build the speculative decoding programs when the model has a drafter
-    std::filesystem::path drafter;  // a drafter checkpoint beside the model (a Gemma 4 assistant), for speculation
+    // A drafter checkpoint beside the model, for speculation: a Gemma 4 assistant, a block drafter (DFlash, DSpine).
+    std::filesystem::path drafter;
     // A drafter that reads the target's head (an MTP head) picks among this many of its rows, chosen by a one-bit
     // sketch of the head and re-scored exactly (blocks::shortlist_head); 0: it reads the whole head.
     int64_t draft_shortlist = 64;
+    // The drafts a round will ask for, when known (0: the drafter's own count): a block drafter whose rows do not see
+    // the rows after them runs no more than these.
+    int64_t drafts = 0;
 };
 
 // Reads <dir>/config.json and dispatches on model_type. Throws xs::Error naming unsupported architectures.

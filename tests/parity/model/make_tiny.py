@@ -2,15 +2,24 @@
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
     python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe --tokenizer-from <dir> --out <dir>
+    python -I tests/parity/model/make_tiny.py --drafter dflash|dflash2|dspine --target <tiny dir> --dflash-repo <clone
+        of github.com/z-lab/dflash> --out <dir>
 
 The model keeps the real layer pattern and tensor names (Qwen3.5 MoE: three Gated DeltaNet layers then one full
 attention layer, fused gate_up expert banks, a gated shared expert; an MTP head) at a width a CPU runs in seconds. The tokenizer
 files are copied from a real checkpoint, so the vocabulary is the real one. Router weights are scaled up so each
 token's top-k experts win by a clear margin: a near tie could route differently at f16 and fail parity for a reason
 that is not a bug. Then run hf_reference.py on the output.
+
+A drafter is a block drafter for a tiny target, in the released checkpoints' layout (config keys and tensor names):
+z-lab's DFlash model, DFlash 2 with its convolutions and candidate selector, or DSpine with its code bridge. Its
+window is shorter than most prompts and its bridge writes and selector terms are as large as the states they change,
+so a wrong mask, write or pairing shows. Then run block_drafter_reference.py on target and drafter.
 """
 
 import argparse
+import importlib.util
+import json
 import os
 import re
 import shutil
@@ -118,6 +127,81 @@ def mtp_head(model):
     return {"mtp." + k: v.contiguous() for k, v in head.state_dict().items()}
 
 
+def drafter(kind, target_dir, dflash_repo, out):
+    """A random block drafter for the target in `target_dir`."""
+    spec = importlib.util.spec_from_file_location("dflash_model", os.path.join(dflash_repo, "dflash", "model.py"))
+    dflash = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dflash)
+    with open(os.path.join(target_dir, "config.json")) as f:
+        target = json.load(f)
+    target = target.get("text_config", target)
+    hidden, vocab, layers = target["hidden_size"], target["vocab_size"], 3
+    window = kind != "dflash"
+    config = dflash.Qwen3Config(
+        vocab_size=vocab, hidden_size=hidden, intermediate_size=2 * hidden, num_hidden_layers=layers,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=32, max_position_embeddings=4096, rms_norm_eps=1e-6,
+        initializer_range=0.05, tie_word_embeddings=False, use_sliding_window=window, sliding_window=24,
+        max_window_layers=layers, layer_types=["sliding_attention" if window else "full_attention"] * layers,
+        rope_parameters={"rope_theta": 10000000, "rope_type": "default"},
+    )
+    config.num_target_layers = target["num_hidden_layers"]
+    mask = min(248070, vocab - 1)
+    ids = [0, 1, target["num_hidden_layers"] - 1]
+    if kind == "dflash":
+        config.block_size = 6
+        config.dflash_config = {"mask_token_id": mask, "target_layer_ids": ids}
+    elif kind == "dflash2":
+        config.is_causal = False
+        config.dflash_config = {"block_size": 6, "conv_group_size": 16, "conv_kernel_size": 2, "mask_token_id": mask,
+                                "selector_rank": 16, "selector_top_k": 4, "target_layer_ids": ids}
+    else:
+        config.is_causal = True
+        config.block_size = 6
+        config.code_bridge_second_pass = {"first_exact": layers - 1, "head_topk": 4, "mode": "serial_table"}
+        config.dflash_config = {
+            "context_fusion_checkpointing": True, "decoder_checkpointing": True, "draft_block_causal": True,
+            "mask_token_id": mask, "selected_prefix_code_bridge": {"code_size": 32, "eps": 1e-6, "kappa": 10.0, "rank": 16},
+            "selected_prefix_decode_mode": "serial", "selected_prefix_feature_gt_training": True,
+            "selected_prefix_feature_layers": list(range(1, layers + 1)),
+            "selected_prefix_feature_write_mode": "independent", "selected_prefix_feature_writes": True,
+            "selected_prefix_last_write_refine": {"head_topk": 4, "kind": "exact_sender", "version": 1, "weight": 1.0},
+            "selected_prefix_terminal": False, "target_layer_ids": ids,
+        }
+    config.architectures = ["DFlash2DraftModel" if kind == "dflash2" else "DFlashDraftModel"]
+    model = (dflash.DFlash2DraftModel if kind == "dflash2" else dflash.DFlashDraftModel)(config)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dim() == 1:
+                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
+            elif name.endswith("base_kernel"):
+                p.normal_(0.0, 0.5)
+                p[:, 0] += 1.0
+            elif name.startswith("candidate_selector."):
+                p.normal_(0.0, 0.3)
+    tensors = {k: v.contiguous() for k, v in model.state_dict().items()}
+    for name in ("predecessor_codebook", "successor_codebook"):  # the released layout: the tables without ".weight"
+        if f"candidate_selector.{name}.weight" in tensors:
+            tensors[f"candidate_selector.{name}"] = tensors.pop(f"candidate_selector.{name}.weight")
+    if kind == "dspine":
+        code, rank, b = 32, 16, "selected_prefix_bridge."
+        for name in ("draft_block_causal_version", "last_write_refine_version", b + "independent_write_version",
+                     b + "terminal_disabled_version"):
+            tensors[name] = torch.tensor(1, dtype=torch.int64)
+        tensors.update({
+            b + "codebook": torch.nn.functional.normalize(torch.randn(vocab, code), dim=-1),
+            b + "early_read_weights": 0.2 * torch.randn(layers - 1, code, hidden),
+            b + "read_weight": 0.2 * torch.randn(code, hidden),
+            b + "feature_write_weights": 0.2 * torch.randn(layers, hidden, rank),
+            b + "gate.weight": 0.3 * torch.randn(rank, code), b + "gate.bias": 0.5 * torch.randn(rank),
+            b + "predecessor_gate.weight": 0.3 * torch.randn(rank, code), b + "prev.weight": 0.3 * torch.randn(rank, code),
+            b + "out.weight": torch.zeros(code, rank),
+        })
+    os.makedirs(out, exist_ok=True)
+    config.save_pretrained(out)
+    save_file(tensors, os.path.join(out, "model.safetensors"), metadata={"format": "pt"})
+    print(f"{kind} drafter: {sum(v.numel() for v in tensors.values()) / 1e6:.1f} M parameters -> {out}")
+
+
 def fuse_experts(path):
     """Rewrites per-expert tensors (what save_pretrained writes) as the fused banks the released checkpoints ship:
     experts.gate_up_proj [E, 2 I, H] (gate rows first) and experts.down_proj [E, H, I]."""
@@ -137,12 +221,22 @@ def fuse_experts(path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arch", required=True, choices=sorted(ARCHS))
-    ap.add_argument("--tokenizer-from", required=True)
+    ap.add_argument("--arch", choices=sorted(ARCHS))
+    ap.add_argument("--tokenizer-from")
+    ap.add_argument("--drafter", choices=["dflash", "dflash2", "dspine"])
+    ap.add_argument("--target", help="--drafter: the tiny target it drafts for")
+    ap.add_argument("--dflash-repo", help="--drafter: a clone of github.com/z-lab/dflash")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     torch.manual_seed(args.seed)
+    if args.drafter:
+        if not args.target or not args.dflash_repo:
+            ap.error("--drafter needs --target and --dflash-repo")
+        drafter(args.drafter, args.target, args.dflash_repo, args.out)
+        return
+    if not args.arch or not args.tokenizer_from:
+        ap.error("--arch and --tokenizer-from are required")
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer_from)

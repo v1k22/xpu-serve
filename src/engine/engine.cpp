@@ -44,9 +44,15 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, s
     if (options_.spec_k > 0) {
         const Speculation* spec = model_->speculation();
         XS_CHECK(spec != nullptr, "model ", model_->info().id, " has no drafter for speculative decoding");
-        drafter_ = std::make_unique<spec::DraftRunner>(*spec, *session_);
+        drafter_ = spec::make_drafter(*spec, *session_);
+        XS_CHECK(options_.spec_k <= drafter_->max_drafts(), "spec_k ", options_.spec_k, " is more than the ",
+                 drafter_->max_drafts(), " drafts a round of ", spec->drafter_name(), " proposes");
         has_argmax_ = has_argmax_ && offers_argmax(spec->prefill_graph()) && offers_argmax(spec->verify_graph());
     }
+}
+
+size_t Engine::state_program() const {
+    return drafter_ ? spec::kVerify : spec::kStep;
 }
 
 void Engine::reset_sequence() {
@@ -69,7 +75,7 @@ void Engine::run_target(size_t program, std::span<const int32_t> tokens, std::sp
     inputs_.clear();
     model_->prepare_inputs(tokens, start, embeddings, inputs_);
     std::vector<std::string> wanted{argmax_only_ ? "argmax" : "logits"};
-    if (program != spec::kStep) wanted.emplace_back("hidden");
+    if (drafter_) wanted.insert(wanted.end(), drafter_->target_outputs().begin(), drafter_->target_outputs().end());
     outputs_.clear();
     session_->run(program, inputs_, outputs_, wanted);
     cached_.insert(cached_.end(), keys.begin(), keys.end());
@@ -82,7 +88,7 @@ void Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKe
     const auto start = static_cast<int64_t>(cached_.size());
     run_target(drafter_ ? spec::kPrefill : spec::kStep, tokens, keys, embeddings);
     if (drafter_) {
-        drafter_->add(outputs_.at("hidden"), static_cast<int64_t>(tokens.size()), start, tokens);
+        drafter_->add(outputs_, static_cast<int64_t>(tokens.size()), start, tokens);
         drafter_->flush();
     }
 }
@@ -134,10 +140,10 @@ std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, 
     const auto accepted = static_cast<int64_t>(out.size()) - 1;
     const int64_t keep = start + accepted + 1;  // the token and the accepted drafts
     if (keep < static_cast<int64_t>(cached_.size())) {
-        session_->truncate(keep);
+        session_->truncate(state_program(), keep);
         cached_.resize(static_cast<size_t>(keep));
     }
-    drafter_->add(outputs_.at("hidden"), accepted + 1, start, fed);
+    drafter_->add(outputs_, accepted + 1, start, fed);
     ++stats.spec_rounds;
     stats.spec_drafted += k;
     stats.spec_accepted += static_cast<int>(accepted);
@@ -159,7 +165,7 @@ int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
             reset_sequence();
             return 0;
         }
-        session_->truncate(keep);
+        session_->truncate(state_program(), keep);
         cached_.resize(static_cast<size_t>(keep));
         if (drafter_) drafter_->truncate(keep);
     }
