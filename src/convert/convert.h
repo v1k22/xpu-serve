@@ -9,6 +9,10 @@
 // take q8 (a tied LM head reads them too), and so do tables a language model reads on the host
 // (Model::host_tables). Every other tensor and every other file (config, tokenizer, chat template, processor
 // configs) is copied unchanged, and xpu_pack.json records each quantized tensor's format.
+//
+// A drafter checkpoint beside a model (a block drafter, an assistant) converts the same way, into a pack of its own:
+// the model it drafts for (ConvertOptions::target, a checkpoint or a pack) is loaded with it, and the programs that
+// read the drafter's weights decide their formats.
 
 #include <cstdint>
 #include <filesystem>
@@ -37,6 +41,7 @@ inline constexpr int64_t kBandwidthRows = 64;
 
 struct ConvertOptions {
     std::filesystem::path source;
+    std::filesystem::path target;     // set: `source` is a drafter checkpoint of this model
     std::filesystem::path output;     // created; must not exist or be empty
     DType format = DType::Q4;         // matmul weights: Q4 or Q8
     int64_t group = 64;               // columns per scale: 32, 64 or 128

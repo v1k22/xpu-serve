@@ -24,7 +24,7 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
     }
     if (config.contains("dflash_config")) {
         fail("'", dir.string(), "' is a block drafter checkpoint: it drafts for the model it was trained with ",
-             "(--drafter beside that model)");
+             "(--drafter beside that model; convert --target)");
     }
     std::string list;
     for (const auto& t : supported_model_types()) list += (list.empty() ? "" : ", ") + t;

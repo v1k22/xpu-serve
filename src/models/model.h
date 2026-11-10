@@ -98,6 +98,9 @@ public:
     virtual const BlockDrafting* block() const { return nullptr; }
     // What drafts: "mtp", "assistant", "dflash", "dflash2", "dspine".
     virtual std::string_view drafter_name() const = 0;
+    // The prefix a drafter checkpoint beside the model (LoadOptions::drafter) has its weights under in
+    // Model::weights(); empty when the drafter is the checkpoint's own.
+    virtual std::string_view drafter_weights() const { return {}; }
 };
 
 class Model {

@@ -156,6 +156,15 @@ std::map<std::string, DType> plan_formats(const Model& model, const ConvertOptio
     return plan;
 }
 
+// A drafter checkpoint beside `model`: the drafter's program and the target's verify program (what a block drafter
+// reads of the target is computed there) at the requested format.
+std::map<std::string, DType> plan_drafter_formats(const Model& model, const ConvertOptions& o) {
+    std::map<std::string, DType> plan;
+    plan_graph(model.speculation()->draft_graph(), model.weights(), o.format, o.scope, o, plan);
+    plan_graph(model.speculation()->verify_graph(), model.weights(), o.format, o.scope, o, plan);
+    return plan;
+}
+
 // A policy: the program for every camera, the checkpoint's flow steps and its longest prompt (the call shape every
 // other one is a part of).
 std::map<std::string, DType> plan_formats(const Policy& policy, const ConvertOptions& o) {
@@ -243,17 +252,30 @@ ConvertReport convert_model(const ConvertOptions& o) {
     }
     if (fs::exists(o.output) && fs::equivalent(o.source, o.output)) fail("convert: the output is the source");
 
-    const bool policy = model_kind(o.source) == ModelKind::Policy;
+    const bool drafter = !o.target.empty();
+    const bool policy = !drafter && model_kind(o.source) == ModelKind::Policy;
     XS_CHECK(!policy || o.method == QuantMethod::Rtn, "convert: AWQ calibrates on text; policies take round to nearest");
+    XS_CHECK(!drafter || o.method == QuantMethod::Rtn, "convert: AWQ calibrates a model; a drafter takes round to nearest");
     std::unique_ptr<Model> model;
     std::unique_ptr<Policy> policy_model;
+    // What is written: the model's weights, or a drafter's own tensors, which the model holds under `prefix`.
+    std::unique_ptr<WeightStore> drafter_weights;
+    std::string prefix;
     if (policy) {
         policy_model = load_policy(o.source);
+    } else if (drafter) {
+        model = load_model(o.target, LoadOptions{.vision = false, .speculation = true, .drafter = o.source});
+        const Speculation* spec = model->speculation();
+        XS_CHECK(spec != nullptr && !spec->drafter_weights().empty(), "convert: '", o.target.string(),
+                 "' does not draft with '", o.source.string(), "'");
+        prefix = spec->drafter_weights();
+        drafter_weights = SafetensorsWeights::open_dir(o.source);
     } else {
         model = load_model(o.source, LoadOptions{.vision = true, .speculation = true});
     }
-    const WeightStore& weights = policy ? policy_model->weights() : model->weights();
-    const std::map<std::string, DType> plan = policy ? plan_formats(*policy_model, o) : plan_formats(*model, o);
+    const WeightStore& weights = drafter ? *drafter_weights : policy ? policy_model->weights() : model->weights();
+    const std::map<std::string, DType> plan =
+        policy ? plan_formats(*policy_model, o) : drafter ? plan_drafter_formats(*model, o) : plan_formats(*model, o);
 
     ConvertReport report;
     // AWQ: activation statistics for the text decoder's q4 weights.
@@ -282,7 +304,7 @@ ConvertReport convert_model(const ConvertOptions& o) {
     for (const std::string& name : names) {
         const TensorView& v = weights.get(name);
         report.source_bytes += v.nbytes();
-        const auto it = plan.find(name);
+        const auto it = plan.find(prefix + name);
         if (it == plan.end()) {
             units.push_back(copy_unit(name, v));
             ++report.kept;
@@ -345,6 +367,7 @@ ConvertReport convert_model(const ConvertOptions& o) {
     if (source_dir.filename().empty()) source_dir = source_dir.parent_path();
     manifest["source"] = {{"name", source_dir.filename().string()},
                           {"model_type", config.value("model_type", config.value("type", ""))}};
+    if (drafter) manifest["source"]["drafter"] = model->speculation()->drafter_name();
     manifest["quant"] = {{"format", o.format == DType::Q4 ? "q4" : "q8"}, {"group", o.group},
                          {"method", report.awq > 0 ? "awq" : "rtn"}, {"min_elements", o.min_elements},
                          {"q8_names", o.q8_names}, {"scope", o.scope == QuantScope::All ? "all" : "bandwidth"}};

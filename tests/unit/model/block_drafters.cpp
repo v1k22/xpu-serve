@@ -1,7 +1,7 @@
-// Block drafters (DFlash, DFlash 2, DSpine) on a tiny random Qwen3.5 written to disk: what the engine relies on,
-// checked without a reference (their math against the references is block_drafter_parity.cpp): a context fed in
-// chunks or cut back after a verify is the same context, a causal block stops after the drafts asked for, and
-// configs that are not implemented are refused by name.
+// Block drafters (DFlash, DFlash 2, DSpine) on a tiny random Qwen3.5 written to disk: what the engine and `convert`
+// rely on, checked without a reference (their math against the references is block_drafter_parity.cpp): a context
+// fed in chunks or cut back after a verify is the same context, a causal block stops after the drafts asked for, a
+// drafter converts to a pack of its own, and configs that are not implemented are refused by name.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -12,6 +12,7 @@
 
 #include "backend/backend_test_util.h"
 #include "backend/cpu_ref/cpu_backend.h"
+#include "convert/convert.h"
 #include "engine/spec/block_drafter.h"
 #include "models/drafters/dflash.h"
 #include "models/model.h"
@@ -106,6 +107,7 @@ TEST_SUITE("block drafters") {
             CAPTURE(kind);
             Loaded whole(files.target, files.drafter(kind));
             CHECK(whole.model->speculation()->drafter_name() == kind);
+            CHECK(whole.model->speculation()->drafter_weights() == "drafter.");
             const int64_t n = whole.block->block_drafts();
             CHECK(n == 5);
             whole.feed(spec::kPrefill, kPrompt);
@@ -169,9 +171,87 @@ TEST_SUITE("block drafters") {
         for (const char* kind : {"dflash", "dflash2"}) CHECK(Loaded(files.target, files.drafter(kind), 2).block->block_drafts() == 5);
     }
 
-    TEST_CASE("a drafter does not load as a model, nor beside a model it was not trained for") {
+    TEST_CASE("convert writes a drafter's pack: its matmul weights and tables quantized, close to the original") {
+        const Checkpoints files("xs_block_drafters_convert");
+        for (const std::string kind : {"dflash2", "dspine"}) {
+            CAPTURE(kind);
+            Loaded original(files.target, files.drafter(kind));
+            original.feed(spec::kPrefill, kPrompt);
+            const TensorMap want = original.draft(9);
+
+            ConvertOptions o;
+            o.source = files.drafter(kind);
+            o.target = files.target;
+            o.output = files.work.path / (kind + "-q8");
+            o.format = DType::Q8;
+            o.group = 32;
+            o.min_elements = 0;
+            const ConvertReport r = convert_model(o);
+            CHECK(r.q4 == 0);
+            CHECK(r.q8 > 14);  // fc and seven matmuls a layer, at least
+            CHECK(r.output_bytes < r.source_bytes);
+            CHECK(fs::exists(o.output / "config.json"));
+            const auto manifest = nlohmann::json::parse(std::ifstream(o.output / kPackManifest));
+            CHECK(manifest.at("source").at("drafter") == kind);
+            CHECK(manifest.at("source").at("name") == kind);
+
+            const auto pack = SafetensorsWeights::open_dir(o.output);
+            CHECK(pack->get("fc.weight").dtype == DType::Q8);
+            CHECK(pack->get("layers.1.mlp.down_proj.weight").dtype == DType::Q8);
+            CHECK(pack->get("layers.0.self_attn.k_proj.weight").dtype == DType::Q8);
+            CHECK(pack->get("norm.weight").dtype == DType::BF16);
+            CHECK_FALSE(pack->contains("model.embed_tokens.weight"));  // the target's stay the target's
+            if (kind == "dspine") {
+                CHECK(pack->get("selected_prefix_bridge.codebook").dtype == DType::Q8);
+                // the stacks are read one matrix at a time and stay as they are
+                CHECK(pack->get("selected_prefix_bridge.feature_write_weights").dtype == DType::BF16);
+                CHECK(pack->get("selected_prefix_bridge.early_read_weights").shape == Dims{1, 32, 128});
+            } else {
+                CHECK(pack->get("candidate_selector.successor_codebook").dtype == DType::Q8);
+                CHECK(pack->get("layers.0.mlp_conv.kernel_projection.weight").dtype == DType::Q8);
+                CHECK(pack->get("layers.0.mlp_conv.base_kernel").dtype == DType::BF16);
+            }
+
+            Loaded packed(files.target, o.output);
+            packed.feed(spec::kPrefill, kPrompt);
+            const TensorMap got = packed.draft(9);
+            // Scores over the candidates both list (a near tie at the edge of the list may flip).
+            const HostTensor& c0 = want.at("candidates");
+            const HostTensor& c1 = got.at("candidates");
+            const int64_t k = c0.dim(1);
+            size_t shared = 0;
+            double dot = 0, a2 = 0, b2 = 0;
+            for (int64_t i = 0; i < c0.dim(0); ++i) {
+                for (int64_t a = 0; a < k; ++a) {
+                    const int32_t* row = c1.data<int32_t>() + i * k;
+                    const auto b = std::find(row, row + k, c0.data<int32_t>()[i * k + a]) - row;
+                    if (b == k) continue;
+                    ++shared;
+                    const double x = want.at("scores").data<float>()[(i * k) * k + a];  // sender 0
+                    const double y = got.at("scores").data<float>()[(i * k) * k + b];
+                    if (i > 0 && c0.data<int32_t>()[(i - 1) * k] != c1.data<int32_t>()[(i - 1) * k]) continue;
+                    dot += x * y;
+                    a2 += x * x;
+                    b2 += y * y;
+                }
+            }
+            MESSAGE(kind, " q8 pack: ", shared, " of ", c0.numel(), " candidates shared, scores cosine ",
+                    dot / std::sqrt(a2 * b2));
+            CHECK(shared * 4 >= static_cast<size_t>(c0.numel()) * 3);
+            CHECK(dot / std::sqrt(a2 * b2) > 0.99);
+        }
+    }
+
+    TEST_CASE("convert and load refuse a drafter without its target, another model's drafter, and AWQ") {
         const Checkpoints files("xs_block_drafters_refuse");
+        ConvertOptions o;
+        o.source = files.drafter("dspine");
+        o.output = files.work.path / "out";
+        CHECK_THROWS_WITH_AS(convert_model(o), doctest::Contains("block drafter"), xs::Error);
         CHECK_THROWS_WITH_AS(load_model(files.drafter("dflash2")), doctest::Contains("block drafter"), xs::Error);
+        o.target = files.target;
+        o.method = QuantMethod::Awq;
+        CHECK_THROWS_WITH_AS(convert_model(o), doctest::Contains("AWQ"), xs::Error);
 
         TinyQwen wider;
         wider.hidden = 160;

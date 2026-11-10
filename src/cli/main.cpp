@@ -133,6 +133,7 @@ bool wants_help(const Args& a, const char* command, const char* summary) {
 int cmd_convert(const std::vector<std::string>& argv) {
     Args a;
     a.value("out", "output directory for the pack (must not exist or be empty)")
+        .value("target", "<model-dir> is a drafter checkpoint (DFlash, DSpine, an assistant) of this model or pack")
         .value("quant", "format of the matmul weights: q4 | q8 (embedding tables are always q8)", "q4")
         .value("group", "columns per scale: 32 | 64 | 128 (default: 32 for q4, 64 for q8)")
         .value("q8", "comma-separated parts of weight names to keep at q8 (e.g. linear_attn,down_proj)")
@@ -150,6 +151,7 @@ int cmd_convert(const std::vector<std::string>& argv) {
     log::set_level(log::parse_level(a.get("log-level")));
     ConvertOptions o;
     o.source = model_dir_arg(a, "convert");
+    o.target = a.get("target");
     o.output = a.get("out");
     if (o.output.empty()) fail("usage: xpu-serve convert <model-dir> --out <dir> [options]");
     const std::string& quant = a.get("quant");

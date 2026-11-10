@@ -98,6 +98,7 @@ public:
     const ChainDrafting* chain() const override { return block_ ? nullptr : this; }
     const BlockDrafting* block() const override { return block_.get(); }
     std::string_view drafter_name() const override { return block_ ? dflash::variant_name(block_->config().variant) : "mtp"; }
+    std::string_view drafter_weights() const override { return block_ ? kDrafterPrefix : ""; }
     bool drafter_keeps_state() const override { return true; }
 
     // The pair (h_i, token i + 1) runs at position i, a chained draft one position after the previous one.

@@ -136,6 +136,7 @@ public:
     const graph::Graph& draft_graph() const override { return draft_; }
     const ChainDrafting* chain() const override { return this; }
     std::string_view drafter_name() const override { return "assistant"; }
+    std::string_view drafter_weights() const override { return "assistant."; }
     bool drafter_keeps_state() const override { return false; }
 
     // Every draft of a round runs at the position of the token it starts from, the one after the hidden row's.
