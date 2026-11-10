@@ -17,11 +17,11 @@ backend; speculative decoding with each model's drafter (Qwen's MTP head, Gemma 
 
 | Model | Kind | Weights | Speed | Measured on |
 |---|---|---|---|---|
-| Gemma 4 E2B / E4B | language, images | f16, q8, q4 | 61.5 / 92 tok/s decode (f16 / q8); q4: 127, 165 with its assistant | Arc Pro B60 |
-| Gemma 4 26B-A4B | language, MoE | q4 | 66 tok/s decode, 84 with its assistant | Arc Pro B60 |
+| Gemma 4 E2B / E4B | language, images | f16, q8, q4 | 61.5 / 92 tok/s decode (f16 / q8); q4: 140, 174 with its assistant | Arc Pro B60 |
+| Gemma 4 26B-A4B | language, MoE | q4 | 67 tok/s decode, 91 with its assistant | Arc Pro B60 |
 | Qwen3.5 4B | language | f16, q8, q4 | 42 / 71 tok/s decode (f16 / q8) | Arc Pro B60 |
-| Qwen3.6-35B-A3B | language, MoE | q4 | 60 tok/s decode, 86 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
-| Qwen3.8-27B | language | q4 | 22 tok/s decode, 42 with MTP (45 at q4 g128); 830 tok/s prefill; on Arc B390 6.8 tok/s decode, 16 with MTP, 460 prefill | Arc Pro B60, Arc B390 |
+| Qwen3.6-35B-A3B | language, MoE | q4 | 62 tok/s decode, 94 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
+| Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP (53 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP (20 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | π0.5 | robot policy | f16, q8 | 239 / 225 ms per call (f16 / q8) | Arc B390, 3 cameras |
 
 | Model | Checkpoint (`model_type`) | Checked against |
@@ -67,12 +67,13 @@ build/src/xpu-serve serve ~/models/gemma-4-E2B-it --device GPU     # http://127.
 build/src/xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1024 --gen-tokens 128
 ```
 
-Speculative decoding (`--spec mtp` on `run`, `serve` and `bench`) drafts with the model's own drafter and verifies
-the drafts in one step; greedy output stays the model's own and sampling keeps its distribution (rejection
-sampling). Qwen3.5-family checkpoints carry an MTP head; a Gemma 4 model takes its assistant checkpoint with
-`--drafter`. `--spec-k` sets the drafts per round (3 by default: dense Qwen3.8 does best at 3 or 4, the MoE models at 2,
-[docs/design-spec-decode.md](docs/design-spec-decode.md)); `bench --prompts file` measures over real prompts, since
-acceptance depends on the text:
+Speculative decoding (`--spec mtp` on `run`, `serve` and `bench`) drafts with the model's own drafter and verifies the
+drafts in one step; greedy output stays the model's own and sampling keeps its distribution (rejection sampling).
+Qwen3.5-family checkpoints carry an MTP head; a Gemma 4 model takes its assistant checkpoint with `--drafter`.
+`--spec-k` sets the drafts per round (3 by default: dense Qwen3.8 does best at 4 or 5, the MoE models at 2 or 3,
+[docs/design-spec-decode.md](docs/design-spec-decode.md)). An MTP head picks each draft among 64 tokens that a one-bit
+sketch of the output layer shortlists (`--draft-shortlist`, 0 to read the whole layer). `bench --prompts file` measures
+over real prompts, since acceptance depends on the text, and prints where a round's time goes:
 
 ```bash
 build/src/xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4

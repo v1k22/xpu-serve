@@ -146,62 +146,78 @@ assistants run from their bf16 checkpoints.
 
 | Model | spec off | k = 1 | k = 2 | k = 3 | k = 4 | best |
 |---|---|---|---|---|---|---|
-| Qwen3.8-27B | 22.2 | 35.0 (1.85) | **39.6** (2.47) | 37.5 (2.92) | 35.8 (3.21) | 1.78x |
-| Qwen3.6-35B-A3B | 59.9 | 80.6 (1.84) | **85.6** (2.44) | 83.5 (2.82) | 64.9 (3.06) | 1.43x |
-| Gemma 4 E2B + assistant | 127.3 | **164.5** (1.65) | 144.5 (2.02) | 147.2 (2.27) | 132.4 (2.40) | 1.29x |
-| Gemma 4 26B-A4B + assistant | 65.6 | 81.7 (1.81) | **84.2** (2.41) | 79.2 (2.86) | 61.0 (3.20) | 1.28x |
+| Qwen3.8-27B | 22.5 | 35.7 (1.85) | 42.3 (2.46) | 47.6 (2.92) | **49.5** (3.20) | 2.20x |
+| Qwen3.6-35B-A3B | 61.6 | 84.9 (1.84) | 94.1 (2.43) | **94.4** (2.83) | 92.5 (3.09) | 1.53x |
+| Gemma 4 E2B + assistant | 139.9 | **173.7** (1.65) | 169.5 (2.02) | 169.2 (2.27) | 163.1 (2.40) | 1.24x |
+| Gemma 4 26B-A4B + assistant | 67.2 | 83.6 (1.81) | **91.4** (2.41) | 82.6 (2.83) | 82.4 (3.17) | 1.36x |
 
-tok/s, with tokens per verify in parentheses; they follow the references of section 2. Greedy output with k = 2
-equals plain decoding prompt by prompt on Qwen3.8, Qwen3.6 and E2B (6 of 6 each) and on 5 of 6 for 26B-A4B: its story
-diverges after 673 of 902 bytes ("It wasn't painting a perfect circle" / "It wasn't a perfect circle"), the kind of
-near tie a wider verify (another kernel path at f16) can flip (DESIGN.md 10.4; the margin was not measured).
+tok/s, with tokens per verify in parentheses; they follow the references of section 2. Qwen3.8 at k = 5 / 6: 49.1 /
+48.6 (3.35 / 3.48). Greedy output with k = 2 equals plain decoding prompt by prompt on Qwen3.8, Qwen3.6 and E2B (6 of
+6 each) and on 5 of 6 for 26B-A4B: its story diverges after 673 of 902 bytes ("It wasn't painting a perfect circle" /
+"It wasn't a perfect circle"), the kind of near tie a wider verify (another kernel path at f16) can flip (DESIGN.md
+10.4; the margin was not measured).
 
-Where the time goes, and what would move it:
+`bench` prints where a round's time goes (a draft, a verify, a round). Qwen3.8 at k = 4: a draft 2.6 ms, a verify
+53.4 ms, a round 64.6 ms. What the round costs, and what brought it there (each from its own measurement):
 
-- A verify of T tokens costs more than a decode step. Qwen3.8 at T = 1 / 2 / 3 / 4: 44.8 / 48.2 / 52.4 / 61.9 ms (the
-  q4 GEMV re-tuned for 2 and 3 rows took T = 2 from 60.2 ms). The GEMV's arithmetic grows with the rows; its
-  matrix-engine version (`gemv_quant_xmx`, from 4 rows) costs about the same at any row count: T = 4 / 5 / 6 / 8 now
-  55.1 / 56.3 / 57.3 / 59.0 ms (from 62.0 / 68.5 / 78.1 / -), which takes Qwen3.8 at k = 3 / 4 to 41.1 / 42.1 tok/s
-  (from 37.5 / 35.8), past k = 2 (39.2).
+- A verify of T tokens costs more than a decode step (44.4 ms). The GEMV's arithmetic grows with the rows; its
+  matrix-engine version (`gemv_quant_xmx`, from 4 rows) costs about the same at any row count. Its sub-groups used to
+  convert x to f16 and sum it per group (a DPAS by ones) themselves: one small launch before now does both for every
+  weight that reads the same x (an isolated chain of MLP-sized matmuls at 5 rows, Arc B390: 8.71 to 8.22 ms, the
+  one-row GEMV 7.66).
+- Greedy decoding read every verify row's logits back and searched them on the host: 5 MB over PCIe and five scans
+  of 248k floats, about 10 ms a verify. The target programs now also output each row's `argmax`, a run returns just
+  the outputs it is asked for (`Session::run(..., only)`) and skips what neither they nor the state need: greedy
+  decoding without penalties reads a token per row (Qwen3.8 k = 4: a verify 62.7 to 53.4 ms; spec off 22.2 to 22.5,
+  E2B 127 to 140).
+- A draft step of an MTP head was mostly the target's lm_head (0.79 GB over 248k tokens). It now scores every row
+  with a one-bit sketch of the head and computes the exact logits of the 64 best (docs/decisions/0011): 3.6 to 2.6
+  ms a draft, with 1,038 of 1,876 drafts accepted against 1,040 of 1,872.
+- A verify keeps its conv and recurrent inputs so that a rejected draft can be rolled back: one launch a slot (the
+  driver's memcpy per input was 5 ms a verify on the Arc B390).
 - MoE targets (Qwen3.6, 26B-A4B): a verify of k + 1 tokens reads the union of their experts, so it grows faster with
-  k than a dense model's; best k is 2. Up to 64 (token, expert) pairs (a verify of up to 8 tokens with eight experts
-  each) run one GEMV per pair: the grouped path, which used to start at 33 pairs (k = 4), runs its GEMV at 8 rows, and
-  took Qwen3.6 / 26B-A4B at k = 4 to 64.9 / 61.0 tok/s; now 81.5 / 75.2.
-- Drafter steps: Qwen3.8's MTP step is about 2.5 ms (its lm_head over 248k tokens alone 1.8 ms). The E2B target's
-  step is short (about 7 ms), so its rounds are bound by per-program host overhead (several programs per round, each
-  waiting for its outputs); k = 1 is best there.
-- Adaptive k (DESIGN.md 10.1) is not done: `--spec-k` is fixed (3 by default); dense Qwen3.8 does best at 3 or 4, the
-  MoE targets at 2, E2B at 1.
+  k than a dense model's (Qwen3.6: 19.4 / 21.8 / 24.2 / 26.0 ms at k = 1..4). Up to 64 (token, expert) pairs (a
+  verify of up to 8 tokens with eight experts each) run one GEMV per pair.
+- The E2B target's step is short (about 7 ms), so its rounds are bound by per-program host overhead (several programs
+  per round, each waiting for its outputs); k = 1 is best there.
+- Adaptive k (DESIGN.md 10.1) is not done: `--spec-k` is fixed (3 by default); dense Qwen3.8 does best at 4 or 5, the
+  MoE targets at 2 or 3, E2B at 1.
 
 ### 6.1 Arc B390
 
 Qwen3.8-27B on the Arc B390 (integrated; reads stream at about 115 GB/s, measured, of 153.6 theoretical), the same
 prompts and bench; tok/s with tokens per verify in parentheses:
 
-| Pack | spec off | k = 2 | k = 3 | k = 4 | k = 5 | k = 6 |
-|---|---|---|---|---|---|---|
-| q4 g32 | 6.9 | 14.0 (2.47) | 15.4 (2.92) | **15.9** (3.21) | **15.9** (3.36) | 15.6 (3.49) |
-| q4 g128 | 7.8 | 15.4 (2.42) | **16.2** (2.77) | 16.0 (3.03) | 15.6 (3.14) | 15.1 (3.21) |
+| Pack | spec off | k = 3 | k = 4 | k = 5 | best |
+|---|---|---|---|---|---|
+| q4 g32 | 6.9 | | 17.6 (3.20) | **18.0** to 18.4 (3.35) | 2.6x |
+| q4 g128 | 7.8 | 18.7 (2.77) | 19.6 (3.03) | **19.8** (3.14) | 2.5x |
 
-- A decode step runs at the memory's speed (16.6 GB of g32 weights at 6.9 steps a second is 115 GB/s), so the GEMV
-  has nothing left to gain there: every further gain is fewer bytes read per emitted token.
-- With every verify on the GEMV, as before, k = 2 / 3 / 4 / 5 ran 14.2 / 13.7 / 13.4 / 12.3 (g32) and k = 2 was best.
-  With the matrix-engine GEMV from 4 rows, k = 4 and 5 run 15.9: 1.12x the old best, 2.3x spec off (back to back at
-  k = 4, `gemv=vector` / auto / `gemv=vector`: 13.3 / 16.1 / 13.4). From 1 row it
-  costs plain decode 4% (7.5 against 7.8 at g128); from 3 rows it ties (k = 2: 15.6 against 15.4). 4 rows holds on
-  both devices. Timing single steps (as for the B60 numbers above) put the crossover at 7 rows here; whole runs did not.
-- g128 reads 15% fewer bytes than g32 (4.25 against 5 bits per weight) and decodes 13% faster without drafts (B60:
-  25.1 against 22.2); its MTP head's drafts are accepted a little less often (3.03 against 3.21 tokens per verify at
-  k = 4), so with drafts it gains 2% here and 7% on the B60 (k = 4: 45.2 against 42.1).
-- A round at g32, k = 4 (about 200 ms for 3.21 tokens): four drafts of about 9.5 ms, most of each the MTP head's
-  lm_head over 248k tokens, and a verify of about 1.1 decode steps. 20 tok/s needs the round at 160 ms: drafts over
-  the frequent part of the vocabulary, or a verify nearer one decode step. Token ids are not a frequency order: drafts
-  over the 32k / 64k lowest ids were accepted 2.78 / 3.02 tokens per verify against 3.21.
+(Before the work of this section's list: 15.9 at g32, 16.2 at g128. The laptop's numbers move 2 to 3% with how long
+it has been under load: the driver reports the GPU throttled by its sustained power limit, 2.0 to 2.2 of 2.5 GHz.)
+
+- A decode step runs at the memory's speed (16.1 GB of g32 matmul weights in 144 ms is 112 GB/s): every further
+  gain is fewer bytes read per emitted token, or less time not reading. A round at g32, k = 5 (181 ms for 3.35
+  tokens): a verify of 6 rows 158 ms, five drafts of 4.3 ms each.
+- The verify's 14 ms over a decode step: about 7 ms the matrix-engine GEMV (its launches cost 13 to 29 us more than
+  the one-row GEMV's, of which the launch that prepares x is 7), 3 ms the rows in the other ops, 1 ms the kept
+  inputs. Sleeping through a step instead of polling for its end left the GPU more of the power budget (2.36 GHz, 40%
+  of a core instead of 103%) and changed nothing: the step waits on the memory.
+- A draft: the MTP layer's 0.26 GB (2.2 ms), the sketch's 159 MB (1.5 ms), the top 64 (0.3 ms). Host time per
+  draft is 0.1 ms.
+- g128 reads 15% fewer bytes than g32 and decodes 13% faster without drafts; its drafts are accepted less often (3.03
+  against 3.20 tokens per verify at k = 4). That comes from the target, not from the drafter's own weights: the g128
+  target with the g32 pack's MTP head accepts the same (3.04). AWQ at g128 does not bring it back (2.96).
 
 ## 7. Next
 
+- Block drafters (DFlash, DSpine): one drafter pass proposes a block of up to 16 tokens from the target's hidden
+  states; a verify of that many rows costs a memory-bound GPU little more than one of 6.
+- A recurrent state that lags a step behind: a verify would apply the tokens the previous step kept and then its own
+  without storing them, instead of storing all and replaying the kept ones after a rejection (2.6 ms a round on
+  the Arc B390).
+- x prepared for the matrix-engine GEMV by the kernel that produces it (RMSNorm, the fused activation) instead of a
+  launch of its own.
 - MoE verify that reads each expert once per verify; q8 weights on the matrix-engine GEMV (q4 only so far).
-- Drafts over the frequent tokens of the vocabulary (frequencies measured on text), where the drafter's lm_head is
-  most of a draft step (Arc B390).
-- Fewer host round trips per round (the drafter's chained steps without waiting for each output).
 - Adaptive k; packing a Gemma assistant with its target (`convert --with-drafter`); the assistant at q8.
+- Prompt lookup drafts (free drafts where the reply copies the prompt).
