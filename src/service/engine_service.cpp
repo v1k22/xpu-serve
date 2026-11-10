@@ -25,7 +25,7 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     s->tokenizer_ = tok::Tokenizer::load(model_dir);
     s->template_ = chat::ChatTemplate::load(model_dir);
     const bool speculate = options.engine.spec_k > 0;
-    auto model = load_model(model_dir, LoadOptions{options.vision, speculate, options.drafter});
+    auto model = load_model(model_dir, LoadOptions{options.vision, speculate, options.drafter, options.draft_shortlist});
     const ModelInfo& info = model->info();
     log::info("model ", info.id, " (", info.arch, "): graph of ", model->graph().nodes().size(), " nodes, ",
               model->graph().kv_slots().size(), " KV slots", model->vision() ? "; vision encoder" : "");

@@ -65,6 +65,8 @@ void add_engine_options(Args& a) {
         .value("spec", "speculative decoding: off | mtp (the model's drafter: its MTP head, or --drafter)", "off")
         .value("spec-k", "speculative decoding: drafts per round", "3")
         .value("drafter", "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, e.g. gemma-4-E2B-it-assistant)")
+        .value("draft-shortlist", "speculative decoding: an MTP head picks among this many tokens, chosen by a one-bit "
+                                  "sketch of the output layer and re-scored exactly (0: it reads the whole layer)", "64")
         .value("log-level", "debug | info | warn | error", "info")
         .flag("no-vision", "do not load the model's vision encoder (text only)")
         .flag("help", "show this help");
@@ -100,6 +102,8 @@ ServiceOptions service_options(const Args& a) {
     }
     o.drafter = a.get("drafter");
     if (!o.drafter.empty() && spec != "mtp") fail("--drafter drafts for --spec mtp");
+    o.draft_shortlist = a.get_int("draft-shortlist");
+    if (o.draft_shortlist < 0) fail("--draft-shortlist must be 0 or more, got ", o.draft_shortlist);
     const std::string& opts = a.get("backend-opt");
     for (size_t pos = 0; pos < opts.size();) {
         const size_t comma = std::min(opts.find(',', pos), opts.size());

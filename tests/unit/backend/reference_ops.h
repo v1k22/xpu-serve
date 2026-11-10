@@ -407,4 +407,23 @@ inline Tensor64 expert_matmul(const Tensor64& x, const Tensor64& w, const std::v
     return out;
 }
 
+// x [M, K] @ the one-bit weight of signs [N, K / 32] (bit c % 32 of word c / 32: set = positive) and scales [N].
+inline Tensor64 sign_matmul(const Tensor64& x, const std::vector<int64_t>& signs, const Tensor64& scales) {
+    const int64_t n = scales.numel();
+    const int64_t k = x.shape.back();
+    const int64_t rows = x.numel() / k;
+    Tensor64 out({rows, n});
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t i = 0; i < n; ++i) {
+            double acc = 0;
+            for (int64_t c = 0; c < k; ++c) {
+                const auto word = static_cast<uint32_t>(signs[static_cast<size_t>(i * (k / 32) + c / 32)]);
+                acc += (word >> (c % 32)) & 1u ? x[r * k + c] : -x[r * k + c];
+            }
+            out[r * n + i] = acc * scales[i];
+        }
+    }
+    return out;
+}
+
 }  // namespace xs::test::ref

@@ -97,6 +97,9 @@ struct LoadOptions {
     bool vision = true;        // load the vision encoder when the checkpoint has one
     bool speculation = false;  // build the speculative decoding programs when the model has a drafter
     std::filesystem::path drafter;  // a drafter checkpoint beside the model (a Gemma 4 assistant), for speculation
+    // A drafter that reads the target's head (an MTP head) picks among this many of its rows, chosen by a one-bit
+    // sketch of the head and re-scored exactly (blocks::shortlist_head); 0: it reads the whole head.
+    int64_t draft_shortlist = 64;
 };
 
 // Reads <dir>/config.json and dispatches on model_type. Throws xs::Error naming unsupported architectures.

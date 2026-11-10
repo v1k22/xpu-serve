@@ -115,8 +115,10 @@ void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_
         const bool q8_by_name = std::any_of(o.q8_names.begin(), o.q8_names.end(), [&](const std::string& part) {
             return !part.empty() && name.find(part) != std::string::npos;
         });
+        // A weight planned from an earlier graph keeps that format (a drafter's shortlist gathers rows of the head
+        // the target multiplies by).
         if (const auto f = fitting(name, weights.get(name), table || q8_by_name ? DType::Q8 : matmul_format, o)) {
-            plan[name] = *f;
+            plan.try_emplace(name, *f);
         }
     }
 }

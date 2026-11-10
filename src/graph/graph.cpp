@@ -58,6 +58,7 @@ std::string_view op_name(OpKind kind) {
         case OpKind::TopK: return "TopK";
         case OpKind::ReduceSum: return "ReduceSum";
         case OpKind::ExpertMatMul: return "ExpertMatMul";
+        case OpKind::SignMatMul: return "SignMatMul";
         case OpKind::LayerNorm: return "LayerNorm";
         case OpKind::Concat: return "Concat";
     }
@@ -244,6 +245,20 @@ Value Graph::expert_matmul(Value x, Value w, Value idx) {
              shape_to_string(ws));
     return add_node(OpKind::ExpertMatMul, {x, w, idx}, {}, {TensorType{DType::F32, {is[0], is[1], ws[1]}}},
                     "expert_matmul");
+}
+
+Value Graph::sign_matmul(Value x, Value signs, Value scales) {
+    const Dims& xs = type(x).shape;
+    const Dims& ss = type(signs).shape;
+    XS_CHECK(ss.size() == 2 && type(signs).dtype == DType::I32, "sign_matmul signs must be [N, K / 32] i32, got ",
+             dtype_name(type(signs).dtype), shape_to_string(ss), " at ", where(signs));
+    XS_CHECK(type(scales).shape == Dims{ss[0]} && is_float(type(scales).dtype), "sign_matmul scales must be [",
+             ss[0], "] floats, got ", dtype_name(type(scales).dtype), shape_to_string(type(scales).shape));
+    XS_CHECK(!xs.empty() && xs.back() == ss[1] * 32, "sign_matmul x ", shape_to_string(xs), " does not fit signs ",
+             shape_to_string(ss), " (32 columns a word)");
+    Dims out = xs;
+    out.back() = ss[0];
+    return add_node(OpKind::SignMatMul, {x, signs, scales}, {}, {TensorType{DType::F32, std::move(out)}}, "sign_matmul");
 }
 
 Value Graph::elementwise_unary(OpKind kind, Value x, Attrs attrs) {

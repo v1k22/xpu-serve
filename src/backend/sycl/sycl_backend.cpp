@@ -742,6 +742,11 @@ private:
                              "columns, got ", k);
                     break;
                 }
+                case OpKind::SignMatMul:
+                    need(0, is_f32(0), "f32");
+                    need(1, dt(n.inputs[1]) == DType::I32, "i32");
+                    need(2, is_f32(2), "f32");
+                    break;
                 case OpKind::Rope:
                     need(0, is_f32(0), "f32");
                     need(1, is_int(1), "i32 or i64");
@@ -1982,7 +1987,9 @@ private:
                 const int64_t width = in_shape(0).back();
                 const int64_t k = std::get<graph::TopKAttrs>(n.attrs).k;
                 auto* indices = reinterpret_cast<int32_t*>(ptr(p, Value{static_cast<int32_t>(i), 1}));
-                sycl_be::topk(q_, in_f32(0), out, indices, numel(in_shape(0)) / width, width, k);
+                const int64_t rows = numel(in_shape(0)) / width;
+                const size_t scratch = sycl_be::topk_scratch(rows, width);
+                sycl_be::topk(q_, in_f32(0), out, indices, rows, width, k, scratch > 0 ? get(scratch) : nullptr);
                 return;
             }
             case OpKind::ReduceSum: {
@@ -2041,6 +2048,13 @@ private:
                 } else {
                     run(in_f32(1));
                 }
+                return;
+            }
+            case OpKind::SignMatMul: {
+                const int64_t rows = in_shape(1)[0];
+                const int64_t k = in_shape(1)[1] * 32;
+                sycl_be::sign_matmul(q_, in_f32(0), reinterpret_cast<const uint32_t*>(in_ptr(1)), in_f32(2), out,
+                                     numel(in_shape(0)) / k, rows, k, get(sycl_be::sign_matmul_scratch(k)));
                 return;
             }
             case OpKind::CausalConv: {

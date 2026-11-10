@@ -440,6 +440,8 @@ class CpuProgram {
                 return {cpu_ref::reduce_sum(f32(0), std::get<graph::AxisAttrs>(n.attrs).axis)};
             case OpKind::ExpertMatMul:
                 return {cpu_ref::expert_matmul(*pool_, f32(0), f32(1), in(2))};
+            case OpKind::SignMatMul:
+                return {cpu_ref::sign_matmul(*pool_, f32(0), in(1), f32(2))};
         }
         fail("cpu-ref: unhandled op ", graph::op_name(n.kind));
     }

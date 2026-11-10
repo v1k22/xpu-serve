@@ -91,6 +91,24 @@ inline void topk_rows(const Env& env) {
     const std::vector<int64_t> wide_idx = to_ints(wout.at("indices"));
     CHECK(wide_idx == wref_indices);
     CHECK(std::vector<int64_t>(wide_idx.begin(), wide_idx.begin() + 3) == std::vector<int64_t>{100, 700, 1900});
+
+    // Very wide rows (a shortlist of a vocabulary): ties in one block and across blocks, more picks than one block
+    // holds of the largest, a row whose largest all sit in its last, partial block.
+    const int64_t vocab = 40000;
+    HostTensor huge = rng.uniform(DType::F32, {2, vocab});
+    for (const int64_t at : {5, 6, 300, 39999, 20000}) huge.data<float>()[at] = 4.0f;
+    for (int64_t at = 1024; at < 1024 + 90; ++at) huge.data<float>()[at] = 3.0f - 0.001f * static_cast<float>(at % 7);
+    for (int64_t at = vocab - 30; at < vocab; ++at) huge.data<float>()[vocab + at] = 5.0f + static_cast<float>(at % 3);
+    Graph gh;
+    const auto [hv, hi] = gh.topk(gh.input("x", DType::F32, {kT, vocab}), 64);
+    gh.output("values", hv);
+    gh.output("indices", hi);
+    const TensorMap hout = run(env, gh, MemoryWeights{}, {{"x", huge}});
+    const auto [href_values, href_indices] = ref::topk(to_f64(huge), 64);
+    CHECK(all_close(hout.at("values"), href_values, 0, 0));
+    const std::vector<int64_t> huge_idx = to_ints(hout.at("indices"));
+    CHECK(huge_idx == href_indices);
+    CHECK(std::vector<int64_t>(huge_idx.begin(), huge_idx.begin() + 5) == std::vector<int64_t>{5, 6, 300, 20000, 39999});
 }
 
 inline void expert_matmul_shared_and_per_slot(const Env& env) {

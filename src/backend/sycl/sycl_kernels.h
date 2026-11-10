@@ -54,7 +54,16 @@ void add3(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, 
 // Rows of `width`.
 void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width);
 // The k largest per row of x [rows, width]: values and indices [rows, k], largest first, ties to the lower index.
-void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64_t rows, int64_t width, int64_t k);
+// `scratch`: topk_scratch bytes (0 for most shapes: then it may be null).
+size_t topk_scratch(int64_t rows, int64_t width);
+void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64_t rows, int64_t width, int64_t k,
+          void* scratch);
+// SignMatMul (graph.h): y [M, N] = x [M, K] @ w^T for the one-bit weight of signs [N, K / 32] and scales [N], meant
+// for a row or two of x. x is rounded to 12 bits of each row's largest magnitude. `scratch` (sign_matmul_scratch
+// bytes, 64-byte aligned) holds a row's bit planes while it runs.
+size_t sign_matmul_scratch(int64_t k);
+void sign_matmul(sycl::queue& q, const float* x, const uint32_t* signs, const float* scales, float* y, int64_t m,
+                 int64_t n, int64_t k, void* scratch);
 // y [outer, inner] = the sum over the middle axis of x [outer, dim, inner].
 void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner);
 // out [T, S, N] = x[t] (per_slot: x[t, s]) @ w[idx[t, s]]^T, w [E, N, K]; expert ids outside [0, E) read expert 0.

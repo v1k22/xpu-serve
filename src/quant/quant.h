@@ -63,6 +63,15 @@ Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<dou
 // Float values of rows [first, first + count) of a Q8 / Q4 view, row-major into `out` (input_scales applied).
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out);
 
+// The one-bit sketch of a weight [N, K] (f32 / f16 / bf16 / q8 / q4, K a multiple of 32) that graph::SignMatMul
+// scores every row with: signs [N, K / 32] i32, bit c % 32 of word c / 32 set where w[n, c] >= 0, and scales [N] f32,
+// each row's mean magnitude (the scale that brings +-scale closest to the row).
+struct SignSketch {
+    HostTensor signs;
+    HostTensor scales;
+};
+SignSketch sign_sketch(const TensorView& w);
+
 // The int8 KV cache rounding of one row (one token's head): code = rint(x * 127 / max|x|) and scale = max|x| / 127,
 // so the value is code * scale. Writes `codes` and returns the scale (0 for an all-zero row). Backends match it.
 float quantize_kv_row_i8(const float* x, int64_t width, int8_t* codes);

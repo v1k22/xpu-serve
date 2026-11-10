@@ -11,6 +11,7 @@
 
 #include "graph/graph.h"
 #include "io/safetensors.h"
+#include "quant/quant.h"
 #include "tensor/tensor.h"
 
 namespace xs::blocks {
@@ -61,6 +62,18 @@ struct MoeParts {
 // x [T, hidden] -> [T, hidden]: the router picks top_k experts per token, each runs a gated MLP, and their outputs
 // are summed with the routing weights; plus the (optionally gated) shared expert.
 Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p);
+
+// ---- A drafter's head over a shortlist
+
+// A drafter's pick over a large vocabulary without reading its whole head: every row is scored by the head's one-bit
+// sketch (Graph::sign_matmul), and the `count` best are multiplied exactly. x [1, hidden], head [V, hidden].
+// The candidates [count] (rows of the head) and their logits [1, count]: the outputs "candidates" and "logits" of a
+// draft program. A pick the shortlist misses costs a draft, never output: the target verifies it.
+struct Shortlist {
+    Value logits;
+    Value candidates;
+};
+Shortlist shortlist_head(Graph& g, Value x, Value head, const quant::SignSketch& sketch, int64_t count);
 
 // ---- RMSNorm variants (plain x * w is Graph::rms_norm)
 

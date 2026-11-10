@@ -1019,11 +1019,111 @@ void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t wid
 
 // Pick j of a row: the largest (value, then lowest index) strictly after pick j - 1 in that order. Few wide rows (a
 // drafter's centroids) take a work-group each, a pick per pair of group reductions; many narrow rows (MoE routers,
-// one per token) a work-item each.
+// one per token) a work-item each. Very wide rows (a shortlist of a vocabulary) first keep the best of each block of
+// kTopkBlock elements, and one sub-group then picks among the blocks, replacing a picked block's best by its next: a
+// pick reads the block bests and one block instead of the row, and reduces within the sub-group (no barrier).
 constexpr int64_t kTopkGroupWidth = 512;
 constexpr int kTopkGroup = 256;
+constexpr int64_t kTopkWideWidth = 16384;
+constexpr int64_t kTopkBlock = 256;
+constexpr int kTopkLoad = 16;  // block bests per load
 
-void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64_t rows, int64_t width, int64_t k) {
+// Block bests per lane, whole loads: lane l owns blocks [l * per, (l + 1) * per), -inf past the last block.
+int64_t topk_blocks_per_lane(int64_t width) {
+    return ceil_div(ceil_div(ceil_div(width, kTopkBlock), kSubGroup), kTopkLoad) * kTopkLoad;
+}
+
+bool topk_wide(int64_t rows, int64_t width) {
+    return width >= kTopkWideWidth && rows <= 64 && width < std::numeric_limits<int32_t>::max();
+}
+
+void topk_wide_rows(sycl::queue& q, const float* x, float* values, int32_t* indices, int64_t rows, int64_t width,
+                    int64_t k, void* scratch) {
+    const int64_t per = topk_blocks_per_lane(width);
+    const int64_t slots = per * kSubGroup;  // of block bests per row
+    auto* best_v = static_cast<float*>(scratch);
+    auto* best_i = reinterpret_cast<int32_t*>(best_v + rows * slots);
+    constexpr int32_t kNone = std::numeric_limits<int32_t>::max();
+    constexpr float kLowest = -std::numeric_limits<float>::infinity();
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(rows), static_cast<size_t>(slots)), [=](sycl::item<2> it) {
+        const auto r = static_cast<int64_t>(it[0]);
+        const auto b = static_cast<int64_t>(it[1]);
+        float v = kLowest;
+        int32_t at = kNone;
+        for (int64_t e = b * kTopkBlock; e < std::min(width, (b + 1) * kTopkBlock); ++e) {
+            if (at == kNone || x[r * width + e] > v) {
+                v = x[r * width + e];
+                at = static_cast<int32_t>(e);
+            }
+        }
+        best_v[r * slots + b] = v;
+        best_i[r * slots + b] = at;
+    });
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows * kSubGroup), kSubGroup),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+        using Load = sycl::vec<float, kTopkLoad>;
+        const sycl::sub_group sg = it.get_sub_group();
+        const auto r = static_cast<int64_t>(it.get_group(0));
+        const auto lane = static_cast<int64_t>(it.get_local_id(0));
+        const float* xr = x + r * width;
+        float* bv = best_v + r * slots;
+        int32_t* bi = best_i + r * slots;
+        for (int64_t j = 0; j < k; ++j) {
+            // the best block: the largest best, the lowest block among equals (its elements have the lower indices)
+            float top = kLowest;
+            int64_t top_b = slots;
+            for (int64_t c = 0; c < per; c += kTopkLoad) {
+                const Load v = *reinterpret_cast<const Load*>(bv + lane * per + c);
+                #pragma unroll
+                for (int e = 0; e < kTopkLoad; ++e) {
+                    if (top_b == slots || v[e] > top) {
+                        top = v[e];
+                        top_b = lane * per + c + e;
+                    }
+                }
+            }
+            const float v = sycl::reduce_over_group(sg, top, sycl::maximum<float>());
+            const int64_t b = sycl::reduce_over_group(sg, top == v ? top_b : slots, sycl::minimum<int64_t>());
+            const int32_t i = bi[b];
+            if (lane == 0) {
+                values[r * k + j] = v;
+                indices[r * k + j] = i;
+            }
+            // that block's best among what is left: after (v, i) in the picking order
+            float next = kLowest;
+            int32_t next_i = kNone;
+            for (int64_t e = b * kTopkBlock + lane; e < std::min(width, (b + 1) * kTopkBlock); e += kSubGroup) {
+                const float ve = xr[e];
+                const bool left = ve < v || (ve == v && e > i);
+                if (left && (next_i == kNone || ve > next)) {
+                    next = ve;
+                    next_i = static_cast<int32_t>(e);
+                }
+            }
+            const int32_t any = sycl::reduce_over_group(sg, next_i, sycl::minimum<int32_t>());
+            const float nv = sycl::reduce_over_group(sg, next_i == kNone ? kLowest : next, sycl::maximum<float>());
+            const int32_t ni =
+                sycl::reduce_over_group(sg, next_i != kNone && next == nv ? next_i : kNone, sycl::minimum<int32_t>());
+            if (lane == 0) {
+                bv[b] = any == kNone ? kLowest : nv;
+                bi[b] = any == kNone ? kNone : ni;
+            }
+        }
+    });
+}
+
+size_t topk_scratch(int64_t rows, int64_t width) {
+    if (!topk_wide(rows, width)) return 0;
+    return static_cast<size_t>(rows * topk_blocks_per_lane(width) * kSubGroup) * (sizeof(float) + sizeof(int32_t));
+}
+
+void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64_t rows, int64_t width, int64_t k,
+          void* scratch) {
+    if (topk_wide(rows, width)) {
+        XS_CHECK(scratch != nullptr && reinterpret_cast<uintptr_t>(scratch) % 64 == 0, "sycl topk: no scratch");
+        topk_wide_rows(q, x, values, indices, rows, width, k, scratch);
+        return;
+    }
     if (width >= kTopkGroupWidth && rows <= 64) {
         syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows * kTopkGroup), kTopkGroup),
                           [=](sycl::nd_item<1> it) {
@@ -1079,6 +1179,111 @@ void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64
             prev_i = best_i;
         }
     });
+}
+
+// SignMatMul. x is rounded to kSignBits-bit integers of its largest magnitude, and each bit of those integers over 32
+// columns is one word (a bit plane): a row's sum over the columns its signs keep positive is then a popcount per plane
+// and word, three operations per plane for 32 columns, where selecting and adding floats takes two per column and
+// binds the kernel by its arithmetic instead of the memory. With S the sum of the integers and P their sum over the
+// positive columns, x . (+-scale) = scale * step * (2 P - S). A lane owns a row and loads its signs 16 words (a cache
+// line) at a time.
+constexpr int kSignBits = 12;
+constexpr int kSignPrepGroup = 256;
+constexpr int kSignWords = 16;  // sign words per load
+
+struct SignRow {  // at the start of the scratch, before the planes [kSignBits][words rounded up to kSignWords]
+    float step;
+    int32_t sum;
+};
+
+int64_t sign_plane_words(int64_t k) {
+    return ceil_div(k / 32, kSignWords) * kSignWords;
+}
+
+// The bit planes of one row of x, its step and the sum of its integers.
+void sign_planes(sycl::queue& q, const float* x, SignRow* header, uint32_t* planes, int64_t k) {
+    const int64_t words = k / 32;
+    const int64_t stride = sign_plane_words(k);
+    syclex::nd_launch(q, sycl::nd_range<1>(kSignPrepGroup, kSignPrepGroup), [=](sycl::nd_item<1> it) {
+        const auto group = it.get_group();
+        const auto lane = static_cast<int64_t>(it.get_local_id(0));
+        float peak = 0.0f;
+        for (int64_t c = lane; c < k; c += kSignPrepGroup) peak = sycl::fmax(peak, sycl::fabs(x[c]));
+        peak = sycl::reduce_over_group(group, peak, sycl::maximum<float>());
+        const auto top = static_cast<float>((1 << (kSignBits - 1)) - 1);
+        const float to_int = peak > 0.0f ? top / peak : 0.0f;
+        int32_t sum = 0;
+        for (int64_t w = lane; w < stride; w += kSignPrepGroup) {
+            uint32_t plane[kSignBits] = {};
+            if (w < words) {
+                for (int c = 0; c < 32; ++c) {
+                    const auto v = static_cast<int32_t>(sycl::rint(x[w * 32 + c] * to_int));
+                    sum += v;
+                    for (int p = 0; p < kSignBits; ++p) plane[p] |= ((static_cast<uint32_t>(v) >> p) & 1u) << c;
+                }
+            }
+            for (int p = 0; p < kSignBits; ++p) planes[p * stride + w] = plane[p];
+        }
+        sum = sycl::reduce_over_group(group, sum, sycl::plus<int32_t>());
+        if (lane == 0) {
+            header->step = peak / top;
+            header->sum = sum;
+        }
+    });
+}
+
+// WIDE: every row of signs starts on a cache line and is whole loads long.
+template <bool WIDE>
+void sign_scores(sycl::queue& q, const uint32_t* signs, const float* scales, const SignRow* header,
+                 const uint32_t* planes, float* y, int64_t n, int64_t k) {
+    const int64_t words = k / 32;
+    const int64_t stride = sign_plane_words(k);
+    const auto lanes = static_cast<size_t>(ceil_div(n, kSubGroup) * kSubGroup);
+    syclex::nd_launch(q, sycl::nd_range<1>(lanes, kSubGroup),
+                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+        const auto row = static_cast<int64_t>(it.get_global_id(0));
+        if (row >= n) return;
+        const uint32_t* s = signs + row * words;
+        int32_t count[kSignBits] = {};  // per plane, the set bits of x among the positive columns
+        int64_t w = 0;
+        if constexpr (WIDE) {
+            using Words = sycl::vec<uint32_t, kSignWords>;
+            for (; w < words; w += kSignWords) {
+                const Words b = *reinterpret_cast<const Words*>(s + w);
+                #pragma unroll
+                for (int p = 0; p < kSignBits; ++p) {
+                    const Words hits = sycl::popcount(b & *reinterpret_cast<const Words*>(planes + p * stride + w));
+                    #pragma unroll
+                    for (int j = 0; j < kSignWords; ++j) count[p] += static_cast<int32_t>(hits[j]);
+                }
+            }
+        }
+        for (; w < words; ++w) {
+            for (int p = 0; p < kSignBits; ++p)
+                count[p] += static_cast<int32_t>(sycl::popcount(s[w] & planes[p * stride + w]));
+        }
+        int32_t positive = -(count[kSignBits - 1] << (kSignBits - 1));  // two's complement: the top plane is the sign
+        for (int p = 0; p + 1 < kSignBits; ++p) positive += count[p] << p;
+        y[row] = scales[row] * header->step * static_cast<float>(2 * positive - header->sum);
+    });
+}
+
+size_t sign_matmul_scratch(int64_t k) {
+    return 64 + static_cast<size_t>(kSignBits * sign_plane_words(k)) * sizeof(uint32_t);
+}
+
+void sign_matmul(sycl::queue& q, const float* x, const uint32_t* signs, const float* scales, float* y, int64_t m,
+                 int64_t n, int64_t k, void* scratch) {
+    XS_CHECK(k % 32 == 0 && k < (int64_t{1} << 19), "sign_matmul: K ", k, " is not a multiple of 32 under 2^19");
+    auto* header = static_cast<SignRow*>(scratch);
+    auto* planes = reinterpret_cast<uint32_t*>(static_cast<char*>(scratch) + 64);
+    const bool wide = reinterpret_cast<uintptr_t>(signs) % 64 == 0 && (k / 32) % kSignWords == 0 &&
+                      reinterpret_cast<uintptr_t>(planes) % 64 == 0;
+    for (int64_t r = 0; r < m; ++r) {
+        sign_planes(q, x + r * k, header, planes, k);
+        wide ? sign_scores<true>(q, signs, scales, header, planes, y + r * n, n, k)
+             : sign_scores<false>(q, signs, scales, header, planes, y + r * n, n, k);
+    }
 }
 
 void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner) {

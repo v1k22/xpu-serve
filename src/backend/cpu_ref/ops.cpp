@@ -605,4 +605,26 @@ HostTensor expert_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor
     return out;
 }
 
+HostTensor sign_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& signs, const HostTensor& scales) {
+    check_f32(x, "sign_matmul x");
+    check_f32(scales, "sign_matmul scales");
+    XS_CHECK(signs.dtype() == DType::I32, "sign_matmul signs are ", dtype_name(signs.dtype()), ", expected i32");
+    const int64_t n = signs.dim(0);
+    const int64_t words = signs.dim(1);
+    const int64_t k = words * 32;
+    const int64_t rows = x.numel() / k;
+    Dims shape = x.shape();
+    shape.back() = n;
+    HostTensor out(DType::F32, shape);
+    pool.parallel_for(rows * n, [&](int64_t item) {
+        const float* xr = x.data<float>() + (item / n) * k;
+        const auto* bits = reinterpret_cast<const uint32_t*>(signs.data<int32_t>()) + (item % n) * words;
+        double acc = 0;
+        for (int64_t c = 0; c < k; ++c)
+            acc += (bits[c / 32] >> (c % 32)) & 1u ? xr[c] : -xr[c];
+        out.data<float>()[item] = static_cast<float>(acc * scales.data<float>()[item % n]);
+    });
+    return out;
+}
+
 }  // namespace xs::cpu_ref

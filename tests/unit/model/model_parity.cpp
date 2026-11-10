@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <numeric>
+#include <set>
 #include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -101,14 +102,17 @@ TEST_CASE("model matches Hugging Face logits and greedy output" * doctest::skip(
     }
 }
 
-// The drafter after each prompt's pairs and the first greedy token: its logits, then the drafts it chains.
+// The drafter after each prompt's pairs and the first greedy token: its logits, then the drafts it chains. An MTP
+// head reads the whole output layer here (draft_shortlist 0): the reference's math, token for token.
 TEST_CASE("the drafter matches the reference (MTP head or assistant)" * doctest::skip(!enabled())) {
     std::ifstream mf(fixtures() / "manifest.json");
     const auto manifest = nlohmann::json::parse(mf);
     if (!manifest["cases"].at(0).contains("mtp_logits")) return;  // a model without a drafter
     const bool f32 = env_or("XS_PARITY_PRECISION", "f32") == "f32";
-    auto model = xs::load_model(*xs::test::model_dir(),
-                                {.vision = false, .speculation = true, .drafter = env_or("XS_TEST_DRAFTER_DIR", "")});
+    auto model = xs::load_model(*xs::test::model_dir(), {.vision = false,
+                                                         .speculation = true,
+                                                         .drafter = env_or("XS_TEST_DRAFTER_DIR", ""),
+                                                         .draft_shortlist = 0});
     const xs::Speculation* spec = model->speculation();
     REQUIRE(spec != nullptr);
     xs::SessionOptions options = parity_options();
@@ -182,4 +186,70 @@ TEST_CASE("the drafter matches the reference (MTP head or assistant)" * doctest:
         if (ours_token == ref_token) CHECK(drafts[0] == want[0]);
         if (f32) CHECK(drafts == want);
     }
+}
+
+// An MTP head over its shortlist (the default) against the same head over the whole output layer: the candidates are
+// tokens, their logits the whole layer's, and the pick is the best of them. How often that is the layer's own pick
+// depends on the weights (a trained head has a clear winner, a random tiny checkpoint has none): it is reported.
+TEST_CASE("an MTP head's shortlist: the whole head's logits over its candidates" * doctest::skip(!enabled())) {
+    std::ifstream mf(fixtures() / "manifest.json");
+    const auto manifest = nlohmann::json::parse(mf);
+    if (!manifest["cases"].at(0).contains("mtp_logits") || !env_or("XS_TEST_DRAFTER_DIR", "").empty()) return;
+    const bool f32 = env_or("XS_PARITY_PRECISION", "f32") == "f32";
+    // One session at a time (a model's weights may fill the device): the whole head's logits first, then the shortlist.
+    const auto draft_outputs = [&](int64_t shortlist) {
+        auto model = xs::load_model(*xs::test::model_dir(),
+                                    {.vision = false, .speculation = true, .drafter = "", .draft_shortlist = shortlist});
+        const xs::Speculation* spec = model->speculation();
+        REQUIRE(spec != nullptr);
+        xs::SessionOptions options = parity_options();
+        options.rewind_tokens = 4;
+        const xs::graph::Graph* programs[] = {&model->graph(), &spec->prefill_graph(), &spec->verify_graph(),
+                                              &spec->draft_graph()};
+        auto session =
+            xs::make_backend(env_or("XS_PARITY_BACKEND", "cpu-ref"))->compile(programs, model->weights(), options);
+        std::vector<xs::TensorMap> all;
+        for (const auto& c : manifest["cases"]) {
+            const auto ids = c["input_ids"].get<std::vector<int32_t>>();
+            session->reset();
+            xs::TensorMap inputs, outputs;
+            model->prepare_inputs(ids, 0, {}, inputs);
+            session->run(xs::spec::kPrefill, inputs, outputs);
+            const xs::HostTensor hidden = std::move(outputs.at("hidden"));
+            std::vector<int32_t> next(ids.begin() + 1, ids.end());
+            next.push_back(c["greedy"].at(0).get<int32_t>());
+            inputs.clear();
+            outputs.clear();
+            spec->prepare_draft(next, std::span<const float>(hidden.data<float>(), static_cast<size_t>(hidden.numel())), 0,
+                                0, inputs);
+            session->run(xs::spec::kDraft, inputs, outputs);
+            all.push_back(std::move(outputs));
+        }
+        return all;
+    };
+    const std::vector<xs::TensorMap> whole = draft_outputs(0);
+    const std::vector<xs::TensorMap> listed = draft_outputs(64);
+    if (listed.at(0).count("candidates") == 0) return;  // a vocabulary too small for a shortlist
+    size_t same = 0;
+    for (size_t i = 0; i < whole.size(); ++i) {
+        CAPTURE(i);
+        const xs::HostTensor& full = whole[i].at("logits");
+        const xs::HostTensor& logits = listed[i].at("logits");
+        const xs::HostTensor& cand = listed[i].at("candidates");
+        REQUIRE(logits.numel() == cand.numel());
+        const float* f = full.data<float>();
+        const float range = *std::max_element(f, f + full.numel()) - *std::min_element(f, f + full.numel());
+        std::set<int32_t> seen;
+        float worst = 0.0f;
+        for (int64_t j = 0; j < cand.numel(); ++j) {
+            const int32_t t = cand.data<int32_t>()[j];
+            REQUIRE((t >= 0 && t < full.numel()));
+            CHECK(seen.insert(t).second);
+            worst = std::max(worst, std::abs(logits.data<float>()[j] - f[t]));
+        }
+        CHECK(worst <= (f32 ? 1e-4f : 5e-3f) * range);
+        const auto best = std::max_element(logits.data<float>(), logits.data<float>() + logits.numel()) - logits.data<float>();
+        same += cand.data<int32_t>()[best] == std::max_element(f, f + full.numel()) - f;
+    }
+    MESSAGE("the shortlist's pick is the whole head's on ", same, " of ", whole.size(), " prompts");
 }

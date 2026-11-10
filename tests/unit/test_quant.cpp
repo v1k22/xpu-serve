@@ -208,6 +208,31 @@ TEST_SUITE("quant") {
         CHECK(r.error < 0.8 * r.error_rtn);
     }
 
+    TEST_CASE("sign sketch: a bit per weight (set = not negative) and each row's mean magnitude, also of a q4 weight") {
+        const int64_t rows = 7, cols = 96;
+        std::vector<float> w = random_matrix(rows, cols, 21);
+        w[5] = 0.0f;  // zero counts as positive
+        const auto check = [&](const TensorView& view, const std::vector<float>& values) {
+            const quant::SignSketch s = quant::sign_sketch(view);
+            REQUIRE(s.signs.shape() == Dims{rows, cols / 32});
+            REQUIRE(s.scales.shape() == Dims{rows});
+            for (int64_t r = 0; r < rows; ++r) {
+                double magnitude = 0;
+                for (int64_t c = 0; c < cols; ++c) {
+                    const float v = values[static_cast<size_t>(r * cols + c)];
+                    const auto word = static_cast<uint32_t>(s.signs.data<int32_t>()[r * (cols / 32) + c / 32]);
+                    CHECK(((word >> (c % 32)) & 1u) == (v >= 0.0f ? 1u : 0u));
+                    magnitude += std::abs(v);
+                }
+                CHECK(s.scales.data<float>()[r] == doctest::Approx(magnitude / cols).epsilon(1e-6));
+            }
+        };
+        check(f32_view(w, rows, cols), w);
+        const quant::Quantized q = quant::quantize(f32_view(w, rows, cols), DType::Q4, 32);
+        check(q.view(), dequantized(q));
+        CHECK_THROWS_AS(quant::sign_sketch(f32_view(w, 6, 112)), Error);  // 112 columns: no whole words
+    }
+
     TEST_CASE("planted bug: reading the high nibble as the even column must not reproduce the weights") {
         const std::vector<float> w = random_matrix(2, 64, 9);
         quant::Quantized q = quant::quantize(f32_view(w, 2, 64), DType::Q4, 32);

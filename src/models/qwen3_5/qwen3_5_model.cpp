@@ -5,9 +5,11 @@
 #include "models/common/blocks.h"
 #include "models/config_util.h"
 #include "models/qwen3_5/qwen3_5.h"
+#include "quant/quant.h"
 #include "util/error.h"
 #include "util/half.h"
 #include "util/log.h"
+#include "util/timer.h"
 
 namespace xs::qwen3_5 {
 namespace {
@@ -41,10 +43,10 @@ HostTensor to_f32(const std::string& name, const TensorView& t) {
 // layer of the target's kind over fc(cat(norm(embed(t_{i+1})), norm(h_i))), then the target's lm_head).
 class Qwen35Model final : public Model, public Speculation {
 public:
-    Qwen35Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> weights, bool speculation)
+    Qwen35Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> weights, const LoadOptions& options)
         : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)), prefix_(probe_prefix(*weights_)) {
         build_target(step_, Head::LastLogits);
-        if (!speculation) return;
+        if (!options.speculation) return;
         if (cfg_.mtp_layers == 0 || !weights_->contains("mtp.fc.weight")) {
             log::warn("qwen3_5: the checkpoint has no MTP head (mtp.*); speculative decoding is unavailable");
             return;
@@ -52,7 +54,7 @@ public:
         if (cfg_.mtp_layers != 1) fail("qwen3_5: an MTP head of ", cfg_.mtp_layers, " layers is not supported (1 is)");
         build_target(prefill_, Head::LastLogitsAllHidden);
         build_target(verify_, Head::AllLogitsAllHidden);
-        build_mtp(draft_);
+        build_mtp(draft_, options.draft_shortlist);
         has_mtp_ = true;
     }
 
@@ -116,9 +118,10 @@ private:
     blocks::Linear proj(Graph& g, const std::string& name) const {
         return [this, &g, name](Value x) { return g.matmul(x, weight(g, name)); };
     }
-    Value lm_head(Graph& g) const {
-        return weight(g, weights_->contains("lm_head.weight") ? "lm_head.weight" : prefix_ + "embed_tokens.weight");
+    std::string lm_head_name() const {
+        return weights_->contains("lm_head.weight") ? "lm_head.weight" : prefix_ + "embed_tokens.weight";
     }
+    Value lm_head(Graph& g) const { return weight(g, lm_head_name()); }
     Value inv_freq(Graph& g) const {
         return g.constant(
             blocks::rope_inv_freq(cfg_.rope_theta, cfg_.rotary_dim, cfg_.rotary_dim / 2, cfg_.rotary_dim / 2));
@@ -147,7 +150,9 @@ private:
                    g.conv_slots().size(), " conv and ", g.recurrent_slots().size(), " recurrent slots");
     }
 
-    void build_mtp(Graph& g) const {
+    // `shortlist` > 0: the drafts pick among that many tokens (blocks::shortlist_head) instead of reading the whole
+    // head, which is most of a draft step.
+    void build_mtp(Graph& g, int64_t shortlist) const {
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
         const Value hidden = g.input("hidden", DType::F32, {kT, cfg_.hidden_size});
@@ -158,7 +163,18 @@ private:
                                  weight(g, "mtp.fc.weight"));
         const Value h = decoder_layer(g, "mtp.layers.0.", "mtp.layers.0", LayerKind::Full, x, pos, inv_freq(g));
         const Value last = norm(g, g.slice(h, 0, -1), "mtp.norm.weight");
-        g.output("logits", g.matmul(last, lm_head(g)));
+        if (shortlist > 0 && shortlist < cfg_.vocab_size && cfg_.hidden_size % 32 == 0) {
+            Timer timer;
+            const quant::SignSketch sketch = quant::sign_sketch(weights_->get(lm_head_name()));
+            log::info("qwen3_5: drafts pick among ", shortlist, " of ", cfg_.vocab_size, " tokens (a one-bit sketch of ",
+                      "the head, ", sketch.signs.nbytes() >> 20, " MiB, built in ", static_cast<int>(timer.elapsed_ms()),
+                      " ms)");
+            const blocks::Shortlist s = blocks::shortlist_head(g, last, lm_head(g), sketch, shortlist);
+            g.output("logits", s.logits);
+            g.output("candidates", s.candidates);
+        } else {
+            g.output("logits", g.matmul(last, lm_head(g)));
+        }
         g.output("hidden", last);
         g.validate();
     }
@@ -315,7 +331,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     info.stop_token_ids = std::move(stops);
 
     auto weights = SafetensorsWeights::open_dir(dir);
-    return std::make_unique<Qwen35Model>(std::move(cfg), std::move(info), std::move(weights), options.speculation);
+    return std::make_unique<Qwen35Model>(std::move(cfg), std::move(info), std::move(weights), options);
 }
 
 }  // namespace xs::qwen3_5

@@ -71,6 +71,9 @@ enum class OpKind : uint8_t {
     ReduceSum,  // sum over one axis (AxisAttrs::axis), which is removed; f32
     ExpertMatMul, // (x [T, K] or [T, S, K], w [E, N, K], idx [T, S] int) -> [T, S, N]: out[t, s] = x[t] (or
                   // x[t, s]) @ w[idx[t, s]]^T; every idx in [0, E). The expert matmuls of a mixture of experts
+    SignMatMul, // (x [..., K], signs [N, K / 32] i32, scales [N]) -> [..., N] = x @ w^T for the one-bit weight
+                // w[n, c] = scales[n] if bit c % 32 of signs[n, c / 32] is set, else -scales[n] (quant::sign_sketch
+                // of a weight): a cheap score of every row, to shortlist the rows worth an exact product
     Concat,     // (x0, x1, ...) joined along AxisAttrs::axis (static there); the other dims and the dtype agree
     KvRead,     // () -> (k_all [L, Hkv, D], v_all [L, Hkv, D]): a KV slot another program of the session writes, read
                 // without appending; L is that slot's length (a graph either appends to its KV slots or only reads)
@@ -241,6 +244,7 @@ public:
     std::pair<Value, Value> topk(Value x, int64_t k);  // (values, indices)
     Value reduce_sum(Value x, int axis);
     Value expert_matmul(Value x, Value w, Value idx);
+    Value sign_matmul(Value x, Value signs, Value scales);
     Value concat(const std::vector<Value>& parts, int axis);
 
     void output(const std::string& name, Value v);

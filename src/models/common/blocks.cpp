@@ -19,6 +19,13 @@ Value gated_mlp(Graph& g, Value x, const Linear& gate, const Linear& up, const L
     return down(g.mul(a, up(x)));
 }
 
+Shortlist shortlist_head(Graph& g, Value x, Value head, const quant::SignSketch& sketch, int64_t count) {
+    Graph::Scope scope(g, "shortlist");
+    const Value scores = g.sign_matmul(x, g.constant(sketch.signs), g.constant(sketch.scales));  // [1, V]
+    const Value candidates = g.reshape(g.topk(scores, count).second, {count});
+    return {g.matmul(x, g.gather(head, candidates)), candidates};
+}
+
 Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p) {
     Graph::Scope scope(g, "moe");
     XS_CHECK(s.top_k >= 1 && s.top_k <= s.experts, "moe: top_k ", s.top_k, " of ", s.experts, " experts");

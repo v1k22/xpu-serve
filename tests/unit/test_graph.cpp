@@ -83,3 +83,14 @@ TEST_CASE("mixture-of-experts ops: shapes and refusals") {
     CHECK_THROWS_AS(g.reduce_sum(x, 2), xs::Error);                   // no such axis
     CHECK_THROWS_AS(g.expert_matmul(up, g.weight(w, "experts"), indices), xs::Error);  // inner dims 24 vs 16
 }
+
+TEST_CASE("sign matmul: one word of signs per 32 columns, a scale per row") {
+    Graph g;
+    const Value x = g.input("x", DType::F32, {kT, 64});
+    const Value signs = g.constant(xs::HostTensor(DType::I32, {10, 2}));
+    const Value scales = g.constant(xs::HostTensor(DType::F32, {10}));
+    CHECK(g.type(g.sign_matmul(x, signs, scales)).shape == (xs::Dims{kT, 10}));
+    CHECK_THROWS_AS(g.sign_matmul(x, g.constant(xs::HostTensor(DType::I32, {10, 3})), scales), xs::Error);  // 96 columns
+    CHECK_THROWS_AS(g.sign_matmul(x, signs, g.constant(xs::HostTensor(DType::F32, {9}))), xs::Error);       // 9 scales
+    CHECK_THROWS_AS(g.sign_matmul(x, g.constant(xs::HostTensor(DType::F32, {10, 2})), scales), xs::Error);  // float signs
+}

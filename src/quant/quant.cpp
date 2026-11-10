@@ -317,4 +317,32 @@ void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* o
     }
 }
 
+SignSketch sign_sketch(const TensorView& w) {
+    XS_CHECK(w.shape.size() == 2 && w.shape[1] % 32 == 0, "sign_sketch needs a matrix of a multiple of 32 columns, got ",
+             dims_to_string(w.shape));
+    const int64_t rows = w.shape[0];
+    const int64_t cols = w.shape[1];
+    const int64_t words = cols / 32;
+    SignSketch out{HostTensor(DType::I32, {rows, words}), HostTensor(DType::F32, {rows})};
+    parallel_rows(rows, [&](int64_t first, int64_t end) {
+        std::vector<float> row(static_cast<size_t>(cols));
+        for (int64_t r = first; r < end; ++r) {
+            if (is_quantized(w.dtype)) {
+                dequantize_rows(w, r, 1, row.data());
+            } else {
+                row_to_f32(w, r, row.data());
+            }
+            auto* bits = reinterpret_cast<uint32_t*>(out.signs.data<int32_t>()) + r * words;
+            double magnitude = 0;
+            for (int64_t c = 0; c < cols; ++c) {
+                const float v = row[static_cast<size_t>(c)];
+                if (v >= 0.0f) bits[c / 32] |= uint32_t{1} << (c % 32);
+                magnitude += std::fabs(v);
+            }
+            out.scales.data<float>()[r] = static_cast<float>(magnitude / static_cast<double>(cols));
+        }
+    });
+    return out;
+}
+
 }  // namespace xs::quant
