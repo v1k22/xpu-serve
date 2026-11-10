@@ -1649,19 +1649,18 @@ private:
                                     reinterpret_cast<float*>(ptr(p, Value{static_cast<int32_t>(mj), 0})),
                                     graph_.type(wj).shape[0]};
                     }
-                    const bool xmx = sycl_be::xmx_gemv(m, parts, count, k, quant_);
                     const float* x = in_f32(0);
-                    // the GEMV loads x in float4s, its matrix-engine version by 2D block loads
-                    if (reinterpret_cast<uintptr_t>(x) % (xmx ? 64 : 16) != 0) {
+                    if (sycl_be::xmx_gemv(m, parts, count, k, quant_)) {
+                        sycl_be::gemv_quant_xmx(q_, x, parts, count, m, k, quant_.compute_units,
+                                                get(sycl_be::gemv_quant_xmx_scratch(parts, count, m, k)));
+                        return;
+                    }
+                    if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the GEMV loads x in float4s
                         auto* aligned = static_cast<float*>(get(static_cast<size_t>(m * k) * sizeof(float)));
                         q_.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
                         x = aligned;
                     }
-                    if (xmx) {
-                        sycl_be::gemv_quant_xmx(q_, x, parts, count, m, k, quant_.compute_units);
-                    } else {
-                        sycl_be::gemv_quant_parts(q_, x, parts, count, m, k);
-                    }
+                    sycl_be::gemv_quant_parts(q_, x, parts, count, m, k);
                     return;
                 }
                 if (is_quantized(in_dt(1))) {  // plan_half_values: x and y in f16 or f32

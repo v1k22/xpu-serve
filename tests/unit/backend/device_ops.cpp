@@ -274,7 +274,7 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
                 const HostTensor xv = rng.uniform(DType::F32, {m, k});
                 const TensorMap out = dev::run(g, w, {{"x", xv}}, xmx);
                 for (const Spec& sp : specs) {
-                    CAPTURE(sp.name);
+                    CAPTURE(std::string(sp.name));
                     const Tensor64 expected = test::ref::matmul(to_f64(xv), to_f64(w.tensor(sp.name)));
                     CHECK(dev::close("gemv xmx", out.at(sp.name), expected, dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
                 }

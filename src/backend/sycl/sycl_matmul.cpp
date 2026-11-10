@@ -126,17 +126,16 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeigh
     XS_CHECK(!add || !kHalfY, "sycl matmul_quant: adding into an f16 y");
     if (gemv) {
         if constexpr (!kHalfX && !kHalfY) {
-            // the GEMV loads x in float4s, its matrix-engine version by 2D block loads
-            const uintptr_t align = path == QuantPath::GemvXmx ? 64 : 16;
-            if (reinterpret_cast<uintptr_t>(x) % align != 0) {
-                auto* aligned = static_cast<float*>(scratch.get(static_cast<size_t>(m * k) * sizeof(float)));
-                q.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
-                x = aligned;
-            }
             if (path == QuantPath::GemvXmx) {
                 const QuantGemvPart part{w, y, n};
-                gemv_quant_xmx(q, x, &part, 1, m, k, plan.compute_units);
+                gemv_quant_xmx(q, x, &part, 1, m, k, plan.compute_units,
+                               scratch.get(gemv_quant_xmx_scratch(&part, 1, m, k)));
             } else {
+                if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the GEMV loads x in float4s
+                    auto* aligned = static_cast<float*>(scratch.get(static_cast<size_t>(m * k) * sizeof(float)));
+                    q.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
+                    x = aligned;
+                }
                 gemv_quant(q, x, w, y, m, n, k);
             }
         }

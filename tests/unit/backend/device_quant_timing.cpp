@@ -1,6 +1,7 @@
 // Quantized matmul timing by rows: a chain of MLP-shaped q4 matmuls at M = 1..8 rows (a decode step and a speculative
 // verify) through the GEMV and its matrix-engine version (backend option gemv=vector / xmx), reported as weight bytes
-// streamed per second. Opt-in: XS_DEVICE_BENCH=1; XS_BENCH_GROUP sets the group size (default 32).
+// streamed per second. Opt-in: XS_DEVICE_BENCH=1; XS_BENCH_GROUP sets the group size (default 32), XS_BENCH_INTER the
+// wide side of the matmuls (default 17408: an MLP; smaller for a model's projections, whose launches are short).
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -31,9 +32,10 @@ TEST_SUITE("device timing" * doctest::skip(!dev::enabled())) {
     TEST_CASE("quantized matmul chain by rows" * doctest::skip(!bench_enabled())) {
         const char* g_env = std::getenv("XS_BENCH_GROUP");
         const int64_t group = g_env != nullptr ? std::atoll(g_env) : 32;
+        const char* inter_env = std::getenv("XS_BENCH_INTER");
         constexpr int64_t kHidden = 5120;
-        constexpr int64_t kInter = 17408;
-        constexpr int kPairs = 8;  // up then down: 16 matmuls, about 0.9 GB of q4 weights
+        const int64_t kInter = inter_env != nullptr ? std::atoll(inter_env) : 17408;
+        constexpr int kPairs = 8;  // up then down: 16 matmuls, about 0.9 GB of q4 weights at the default sizes
         test::TensorRng rng(5);
         test::MemoryWeights w;
         size_t bytes = 0;
@@ -56,7 +58,7 @@ TEST_SUITE("device timing" * doctest::skip(!dev::enabled())) {
             SessionOptions o = dev::options();
             o.extra["gemv"] = path;
             const auto session = dev::backend().compile(g, w, o);
-            std::string line = str_cat("device-timing q4 g", group, " matmul chain (", bytes / 1e9, " GB), gemv=", path,
+            std::string line = str_cat("device-timing q4 g", group, " matmul chain 5120 x ", kInter, " (", bytes / 1e9, " GB), gemv=", path,
                                        " on ", dev::device(), ":");
             for (int64_t m = 1; m <= 8; ++m) {
                 const HostTensor x = rng.uniform(DType::F32, {m, kHidden});
