@@ -69,7 +69,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Copy config / tokenizer / chat template / generation config unchanged; write `xpu_pack.json`
 - [x] End to end on a tiny Qwen3.5 written to disk (plan, layout, exact values, logits, GPU vs cpu-ref)
 - [ ] Quantize Gemma 4's per-layer embedding table (read on the host) and vision towers
-- [ ] `--with-drafter` → `drafters/<kind>/`
+- [x] A drafter checkpoint to a pack of its own: `convert <drafter> --target <model>`
 - [ ] Reproducibility test: same input + options → same bytes
 - **Done when:** `xpu-serve convert google/gemma-4-26B-A4B-it --quant q4_sym` produces a pack that `xpu-serve check`
   accepts, with a correct memory bill.
@@ -148,8 +148,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Prompt lookup (n-gram) drafter
 - [x] Gemma 4 assistants (E2B and 26B-A4B, `--drafter <dir>`): query-only layers over the target's KV, centroid
       LM head; drafts equal transformers' after every parity prompt (E2B)
-- [ ] Pack an assistant with its target (`convert --with-drafter` → `drafters/mtp/`), the assistant at q8
-- [ ] DFlash drafter (chain): hidden-state capture outputs from chosen target layers; drafter program
+- [x] A drafter checkpoint as a pack of its own (`convert <drafter> --target <model>`: an assistant, a block
+      drafter); Gemma 4 26B-A4B with its assistant at q4: 88.5 to 96.2 tok/s on the B60, the same drafts accepted
 - [ ] Adaptive k from measured acceptance and per-k step cost (MoE verify cost)
 - [x] Spec equivalence tests: greedy spec on vs off on a stateful tiny model with a partly wrong drafter; the real
       models' greedy output; rejection sampling's distribution
@@ -168,8 +168,13 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] A recurrent state that lags a step behind (no replay after a rejected draft); x prepared for the matrix-engine
       GEMV by the kernel that produces it; MoE verify reading each expert once; q8 on the matrix-engine GEMV; fewer
       host round trips per round (E2B is bound by them)
-- [ ] Block drafters: DFlash and DSpine (a block of up to 16 drafts from one drafter pass over the target's hidden
-      states), verify steps of up to 16 rows
+- [x] Block drafters: DFlash, DFlash 2 and DSpine checkpoints beside a Qwen3.5-family target (`--spec dflash|dspine
+      --drafter <dir>`; `convert <drafter> --target <model>` for a q4 / q8 drafter pack), a block of drafts from one
+      drafter pass over state the target's programs write; parity with the drafters' PyTorch code on tiny checkpoints
+      (docs/decisions/0012). Qwen3.8-27B q4 with DFlash 2 at q4, 7 drafts: 60.7 tok/s on the B60 (MTP 49.9), 20.1 on
+      the B390 (MTP 18.3; 22.8 and 19.8 with the q4 g128 target); DSpine 50.6 and 17.5
+- [ ] The matrix-engine GEMV past 8 rows (a verify of a whole 16-token block); a block drafter's head over a
+      shortlist; sampled chains from a block drafter's candidates
 - [ ] Spec stats in logs and `/metrics`
 - [ ] Bench at 32k / 64k on B390 and B60 vs the GenAI baseline with the same drafter
 - **Done when:** equivalence tests pass and decode tok/s at 32k/64k beats the GenAI baseline with the same drafter.

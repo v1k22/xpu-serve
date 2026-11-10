@@ -177,7 +177,7 @@ removes a whole class of races and keeps per-step overhead predictable.
 
 ```text
 xpu-serve convert <dir> --out DIR [--quant q4|q8] [--group 32|64|128] [--q8 name,...]
-                  [--keep REGEX ...] [--revision REV] [--with-drafter <hf-id | dir>]
+                  [--keep REGEX ...] [--revision REV] [--target <the model a drafter checkpoint drafts for>]
 xpu-serve serve   <pack | name> [--backend openvino|sycl] [--device GPU.0] [--host 127.0.0.1] [--port 8080]
                   [--ctx 65536] [--max-seqs 4] [--kv-dtype auto|i8]
                   [--spec auto|off|pld|mtp|dflash] [--spec-k N]
@@ -220,7 +220,8 @@ Steps:
 4. **Quantize** each tensor (round-to-nearest in v1; data-aware methods later, see 6.5).
 5. **Write** sharded safetensors (≤ 4 GB per shard), the index, the manifest, and copy the tokenizer, chat template and
    generation config unchanged.
-6. **Drafter** (optional): `--with-drafter` converts the drafter into `drafters/<kind>/` inside the same pack.
+6. **Drafter** (optional): a drafter checkpoint converts to a pack of its own, `convert <drafter> --target <model>`:
+   the model is loaded with it and the programs that read the drafter's weights decide their formats.
 
 ### 6.2 Pack layout
 
@@ -617,12 +618,13 @@ public:
 |---|---|---|---|
 | **Prompt lookup** (n-gram) | Copies the continuation of the last n-gram seen in the context | Token history | Nothing extra; free to run |
 | **MTP assistant** (Gemma 4) | A small model (4 layers) that reads the target's KV and its embedding table / LM head | Read access to the target's KV pools and weights | Two programs sharing KV tensors |
-| **DFlash** | A block drafter conditioned on hidden states captured from chosen target layers; proposes a block in one forward | Captured hidden states from the last verify | Hidden-state outputs |
+| **DFlash family** (DFlash, DFlash 2, DSpine) | A block drafter conditioned on the hidden states of chosen target layers; proposes a block in one forward | Nothing handed over: the target's prefill and verify programs append the drafter's context to state slots it shares | Programs sharing KV slots by label |
 | **Draft model** (generic) | Any small model of the same tokenizer with its own KV | Its own KV pool | Nothing extra |
 
 Each drafter's model-specific wiring (which layers to capture, how the assistant reads the trunk) lives in the target
-model's folder (`models/gemma4/drafter.cpp`). The loop, acceptance and rollback live in `engine/spec/`. Exact
-DFlash and MTP numerics follow their reference implementations and are pinned by parity tests against them.
+model's folder; a drafter that serves any target it was trained for lives in `models/drafters/`. The loop, acceptance
+and rollback live in `engine/spec/`. Exact DFlash, DSpine and MTP numerics follow their reference implementations and
+are pinned by parity tests against them (docs/design-spec-decode.md, docs/decisions/0012).
 
 ### 10.4 Correctness
 

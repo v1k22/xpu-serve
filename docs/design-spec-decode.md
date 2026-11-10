@@ -1,11 +1,12 @@
-# Design: speculative decoding with MTP drafters
+# Design: speculative decoding with a model's drafter
 
-Status: **implemented** · 2026-11-10 (measured speeds in section 6)
+Status: **implemented** · 2026-11-11 (measured speeds in section 6)
 
-Speculative decoding for every model that ships a multi-token-prediction drafter: the MTP head inside Qwen3.5-family
-checkpoints (Qwen3.8-27B, Qwen3.6-35B-A3B) and the Gemma 4 "assistant" drafters (`google/gemma-4-*-assistant`, one
-per Gemma 4 size). One loop in the engine, one drafter interface, the model-specific wiring in each model's folder
-(DESIGN.md section 10). This document records how the backend, the models and the engine changed.
+Speculative decoding for every model that has a drafter: the MTP head inside Qwen3.5-family checkpoints
+(Qwen3.8-27B, Qwen3.6-35B-A3B), the Gemma 4 "assistant" drafters (`google/gemma-4-*-assistant`, one per Gemma 4
+size), and block drafters trained for a target (DFlash, DFlash 2, DSpine: section 1.1). One loop in the engine, one
+drafter interface, the model-specific wiring in each model's folder (DESIGN.md section 10). This document records how
+the backend, the models and the engine changed.
 
 ## 1. The two drafter families
 
@@ -18,6 +19,22 @@ per Gemma 4 size). One loop in the engine, one drafter interface, the model-spec
 | Head | the target's `lm_head` | its own tied head through a centroid lookup (top 32 of 2048 centroids, then those tokens' logits) |
 | Next hidden (chained drafts) | its own output after `norm` | `post_projection(norm(x))`, back to the target's width |
 | Reference | vLLM `qwen3_5_mtp.py` (transformers skips `mtp.*`) | transformers `Gemma4AssistantForCausalLM` + `generate(assistant_model=...)` |
+
+### 1.1 Block drafters
+
+A block drafter is a separate checkpoint of a few decoder layers at the target's width. One pass fills a block of
+mask tokens after the pending token; the layers attend to the block and to a context made of the target's hidden
+states (the states after a few of its layers, concatenated, through `fc` and a norm). docs/decisions/0012 records the
+design.
+
+| | DFlash | DFlash 2 | DSpine |
+|---|---|---|---|
+| Checkpoint for Qwen3.8-27B | none released | `z-lab/Qwen3.8-27B-DFlash2`, 3.85 GB bf16 | `tencent/Qwen3.8-27B-DSpine-b16`, 4.05 GB bf16 |
+| Block | 16 | 8 (7 drafts) | 16 (15 drafts) |
+| A block row sees | the whole block | the whole block; context within a window of 2,048 | the rows before it; a window of 8,192 |
+| Beside the layers | | a two-tap convolution over the block's rows before and after attention and MLP, its taps predicted per row | after every layer each row receives a code of what the row before predicts (the code bridge) |
+| Choosing the drafts | each row's argmax | 16 candidates a row; a low-rank term scores each against the token chosen before | 16 candidates a row; the last layer's write is redone with the token actually chosen before |
+| Reference | `github.com/z-lab/dflash` | the same | `github.com/Tencent/DSpine` |
 
 ## 2. What the references accept
 
@@ -86,13 +103,21 @@ void Session::truncate(size_t program, int64_t n);
 ### 3.3 Models
 
 - `Model::speculation()` returns a `Speculation` (models/model.h) when the model was loaded with
-  `LoadOptions::speculation` and has a drafter: the target's prefill program ("logits" of the last row, "hidden" of
-  every row), its verify program ("logits" and "hidden" of every row), the draft program, `prepare_draft(tokens,
-  hidden, start_pos, depth)` and `drafter_keeps_state()`. "hidden" is the target's post-norm hidden state, what both
-  drafter families take.
+  `LoadOptions::speculation` and has a drafter: the target's prefill program ("logits" of the last row), its verify
+  program ("logits" of every row), the draft program, and the drafter's way of drafting, one of two. A chain drafter
+  (`ChainDrafting`: MTP heads, assistants) proposes a token a run from pairs of a token and the target's post-norm
+  "hidden" state, which the prefill and verify programs then also output: `prepare_draft(tokens, hidden, start_pos,
+  depth)`, `drafter_keeps_state()`. A block drafter (`BlockDrafting`) proposes a block a run:
+  `prepare_block(token, position)`; it is handed nothing, because the target's programs append what it reads of them
+  to its own state slots.
 - Qwen3.5 (`qwen3_5_model.cpp`): one set of layer builders (weight prefix and state label as parameters) makes the
   step, prefill and verify graphs and the MTP head, so dense and MoE heads come out of the same code; the head's KV
   slot is `mtp.layers.0`. A pair (h_i, token i + 1) runs at position i; chained drafts advance one position each.
+- Block drafters (`models/drafters/dflash.cpp`, one class for the three kinds): `append_context` adds the context's
+  keys and values to a prefill or verify graph (the model passes its layer states), `build_block` builds the draft
+  program over the model's embedding table and head. It outputs "drafts", or "candidates" and "scores" for the kinds
+  that choose each draft given the one before. Qwen3.5 takes one with `--drafter` in place of its MTP head; its
+  weights sit under `drafter.` beside the target's.
 - Gemma 4 (`gemma4_model.cpp`): the assistant from its checkpoint (`--drafter <dir>`, its weights under `assistant.`
   through `JoinedWeights`): query-only layers reading the target's last sliding / full KV slots through `KvRead`,
   the centroid head built from TopK, an i32 Gather of the cluster's tokens, Gather and MatMul (outputs "logits" over
@@ -100,9 +125,13 @@ void Session::truncate(size_t program, int64_t n);
 
 ### 3.4 Engine
 
-- `engine/spec/draft_runner`: the drafter side. Pairs wait until the drafter takes them; a drafter that keeps state
-  takes every pair once, in order (prefill chunks flush, a round's first step catches up on the pairs the last verify
-  accepted), its chained drafts are truncated away after each round. The session's program order is `spec::Program`.
+- `engine/spec/drafter.h`: the drafter side as the engine sees it (`spec::Drafter`: what it reads of the target's
+  outputs, `add`, `propose`, `truncate`), and the session's program order (`spec::Program`).
+- `engine/spec/chain_drafter`: pairs wait until the drafter takes them; a drafter that keeps state takes every pair
+  once, in order (prefill chunks flush, a round's first step catches up on the pairs the last verify accepted), its
+  chained drafts are truncated away after each round.
+- `engine/spec/block_drafter`: one run of the draft program at the pending token's position, its rows truncated
+  away; the drafts are the program's, or the path through its candidates that takes the best score of each row.
 - `Engine::spec_round`: k drafts, one verify of the pending token and the drafts, acceptance through
   `Sampler::verify` (greedy: the argmax; sampling: rejection sampling against the point-mass draft, then the
   residual, so the output distribution is exactly the target's), truncation of the target to the accepted point.
@@ -111,10 +140,12 @@ void Session::truncate(size_t program, int64_t n);
 
 ### 3.5 Flags and packs
 
-- `--spec off|mtp` (default `off`), `--spec-k N` (default 3), `--drafter <dir>` on `run`, `serve` and `bench`;
-  `bench --prompts <file>` measures over real prompts (acceptance depends on the text).
-- `convert` plans the drafter's graph too: `mtp.*` is quantized by the same rule as the target's matmuls. A Gemma
-  assistant is read from its own checkpoint (bf16); packing it with the target is not done yet.
+- `--spec off|mtp|dflash|dspine` (default `off`; `dflash` takes a DFlash or DFlash 2 checkpoint), `--spec-k N`
+  (default 3, or 7 of a block drafter's block), `--drafter <dir>` on `run`, `serve` and `bench`; `bench --prompts
+  <file>` measures over real prompts (acceptance depends on the text).
+- `convert` plans the drafter's graph too: `mtp.*` is quantized by the same rule as the target's matmuls. A drafter
+  checkpoint beside a model converts to a pack of its own, `convert <drafter> --target <model> --out <dir>`: the
+  programs that read it decide its formats (a block drafter's matmul weights q4, its token tables q8).
 
 ## 4. Prerequisite: Gemma 4 26B-A4B
 
@@ -135,9 +166,14 @@ checkpoint of its layout (`make_tiny.py --arch gemma4_moe`).
 - Drafters against PyTorch (`model_parity.cpp`, fixtures from `hf_reference.py`): the MTP heads of tiny `qwen3_5`
   dense and MoE checkpoints (`make_tiny.py` adds them) and the real Gemma 4 E2B assistant (`--assistant`): logits and
   the three chained drafts after each prompt.
+- Block drafters against PyTorch (`block_drafter_parity.cpp`, fixtures from `block_drafter_reference.py`): tiny
+  DFlash, DFlash 2 and DSpine checkpoints for the tiny `qwen3_5` (`make_tiny.py --drafter`), four rounds per prompt
+  with contexts that pass the drafter's window: drafts, candidates and scores. Without a reference
+  (`block_drafters.cpp`, checkpoints written by the test): a context fed in chunks or cut back after a verify is the
+  same context, a causal block stops after the drafts asked for, a drafter's pack drafts like its checkpoint.
 - Real models: greedy output with speculation equals output without (`run`, then the bench prompts).
 
-## 6. Measured speed (Arc Pro B60, batch 1; the Arc B390 in 6.1)
+## 6. Measured speed (Arc Pro B60, batch 1; the Arc B390 in 6.1, block drafters in 6.2)
 
 Greedy decode over the six prompts of section 2 (chat template, thinking off, up to 256 new tokens each, stopping at
 the end of the turn), `xpu-serve bench <pack> --prompts <file> --spec off|mtp --spec-k k`; decode tok/s counts the
@@ -209,15 +245,81 @@ it has been under load: the driver reports the GPU throttled by its sustained po
   against 3.20 tokens per verify at k = 4). That comes from the target, not from the drafter's own weights: the g128
   target with the g32 pack's MTP head accepts the same (3.04). AWQ at g128 does not bring it back (2.96).
 
+### 6.2 Block drafters
+
+Qwen3.8-27B (q4 g32 pack) with the released block drafters, as their bf16 checkpoints and as q8 and q4 packs
+(`convert <drafter> --target <model>`), the same prompts and bench. Arc Pro B60, tok/s with tokens per verify in
+parentheses; spec off is 22.6:
+
+| Drafter | Weights | k = 3 | k = 5 | k = 7 | best |
+|---|---|---|---|---|---|
+| MTP head | in the pack, q4 | 48.2 (2.92) | 49.8 (3.35) | 47.3 (3.55) | 2.21x (49.9 at k = 4) |
+| DFlash 2 | bf16, 3.85 GB | 45.2 (3.07) | 51.0 (3.58) | 54.0 (3.92) | 2.39x |
+| DFlash 2 | q8, 1.98 GB | 48.3 (3.07) | 54.1 (3.58) | 57.7 (3.93) | 2.55x |
+| DFlash 2 | q4, 1.26 GB | 50.6 (3.03) | 57.3 (3.55) | **60.7** (3.88) | 2.69x |
+| DSpine | bf16, 4.05 GB | 41.2 (2.70) | 44.5 (3.07) | 45.0 (3.27) | 1.99x |
+| DSpine | q8, 2.12 GB | 43.1 (2.70) | 46.4 (3.07) | 47.2 (3.26) | 2.09x |
+| DSpine | q4, 1.43 GB | 45.4 (2.73) | 49.3 (3.09) | **50.6** (3.31) | 2.24x |
+
+With the q4 g128 target pack (spec off 25.5; it reads fewer bytes a step and its drafts are accepted less often,
+section 6.1): the MTP head 51.5 at k = 5 (3.14), DFlash 2 at q4 62.1 at k = 7 (3.69), DSpine at q4 54.2 (3.12).
+
+By prompt at k = 7 (q4 drafters, the g32 target), tokens per verify and tok/s:
+
+| Prompt | MTP head | DFlash 2 | DSpine |
+|---|---|---|---|
+| Python function with tests | 6.38, 84.5 | 6.89, 109.1 | **7.29, 114.3** |
+| word problem, with reasoning | 5.10, 67.4 | 5.20, 79.8 | **5.31, 81.3** |
+| how attention works, step by step | 3.59, 48.2 | **3.86, 60.6** | 3.86, 59.2 |
+| five-bullet history summary | 2.97, 39.7 | **3.70, 57.1** | 2.45, 37.5 |
+| translation, then grammar notes | 3.11, 42.2 | **3.49, 54.3** | 2.80, 42.6 |
+| short story | 2.45, 32.1 | **2.46, 37.5** | 2.09, 31.5 |
+
+- A round with a block drafter is one verify and one block: DFlash 2 at q4 and k = 7, a verify 55.8 ms and the block
+  7.1 ms (63.8 ms a round); the MTP head at k = 4, a verify 53.3 ms and four drafts of 2.5 ms (64.0 ms). The block
+  costs less than four chained drafts and proposes seven.
+- A block is bound by reading the drafter, also on the B60: bf16 15 ms (DFlash 2, 8 rows), q8 10.7, q4 7.1. Of the
+  q4 block, the target's head over the block's rows is 2 ms, the drafter's MLPs 2.6, its attention projections 1.
+  Acceptance does not move with the drafter's format (3.92, 3.93, 3.88).
+- DSpine drafts best where the text is predictable far ahead (code, a worked calculation) and worst on prose, on
+  these prompts with thinking off; its references behave the same (3.46 tokens a round for DSpine and 3.81 for
+  DFlash 2 over the six prompts, fp32 target). Its block of 16 does not pay here: 9, 11 and 15 drafts accept 3.39,
+  3.45 and 3.53 tokens a verify, and a verify of more than 8 rows leaves the matrix-engine GEMV (117 ms at 16 rows,
+  26.4 tok/s).
+- Greedy text with a block drafter equals plain decoding on 6 of 6 prompts (DFlash 2 and DSpine at 7 drafts, DSpine
+  at 15 with its 16-row verify; 5,968 bytes).
+
+Arc B390, the q4 drafter packs, the q4 g32 target (spec off 6.6 in this session):
+
+| Drafter | k = 3 | k = 5 | k = 7 | best |
+|---|---|---|---|---|
+| MTP head | | 18.3 (3.35) | | 2.8x (17.8 at k = 4) |
+| DFlash 2, q4 | 16.8 (3.03) | 19.3 (3.55) | **20.1** (3.88) | 3.0x |
+| DSpine, q4 | 14.2 (2.73) | 16.4 (3.09) | 17.5 (3.31) | 2.7x |
+
+With the q4 g128 target pack (spec off 7.8): the MTP head 19.8 at k = 5 (3.14), DFlash 2 **22.8** at k = 7 (3.69),
+DSpine 18.3 (3.11).
+
+- A round of DFlash 2 at k = 7: a verify of 8 rows 167 ms, the block 23 ms (193 ms for 3.88 tokens); the MTP head at
+  k = 5: a verify of 6 rows 156 ms, five drafts of 4.9 ms (183 ms for 3.35 tokens). The block reads the drafter's
+  1.26 GB and the target's head (0.79 GB) once; five chained drafts read the head's sketch and the MTP layer five
+  times.
+- With a drafter pack beside the target's 16.6 GB of weights, about 7 GB of the machine's 30 GB stay available
+  during a run. The bf16 drafters (2.7 GB more) were not run here.
+- DSpine at 15 drafts: 11.1 tok/s. A verify of 16 rows takes 277 ms here too (`quant_gemm`), so a long block needs
+  the matrix-engine GEMV past 8 rows on both GPUs.
+
 ## 7. Next
 
-- Block drafters (DFlash, DSpine): one drafter pass proposes a block of up to 16 tokens from the target's hidden
-  states; a verify of that many rows costs a memory-bound GPU little more than one of 6.
+- The matrix-engine GEMV past 8 rows, so that a verify of a whole DSpine block (16 rows) costs about what one of 8
+  does; then a round's drafts chosen from what the text has been accepting.
+- A block drafter's head over a shortlist (as the MTP head's), where reading the head bounds a block.
+- Block drafters for Gemma 4 and the MoE targets when checkpoints exist; sampled chains from the candidates.
 - A recurrent state that lags a step behind: a verify would apply the tokens the previous step kept and then its own
   without storing them, instead of storing all and replaying the kept ones after a rejection (2.6 ms a round on
   the Arc B390).
 - x prepared for the matrix-engine GEMV by the kernel that produces it (RMSNorm, the fused activation) instead of a
   launch of its own.
 - MoE verify that reads each expert once per verify; q8 weights on the matrix-engine GEMV (q4 only so far).
-- Adaptive k; packing a Gemma assistant with its target (`convert --with-drafter`); the assistant at q8.
+- Adaptive k.
 - Prompt lookup drafts (free drafts where the reply copies the prompt).

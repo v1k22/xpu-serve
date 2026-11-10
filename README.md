@@ -11,7 +11,8 @@ live here, and the math runs on Intel GPUs through our SYCL backend (our own ker
 
 **Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8) and a robot policy (π0.5), from the original
 checkpoint or a q8 / q4 pack written by `xpu-serve convert`, one request at a time, on Intel GPUs through the SYCL
-backend; speculative decoding with each model's drafter (Qwen's MTP head, Gemma 4's assistant checkpoints). [CLAUDE.md](CLAUDE.md) maps the code.
+backend; speculative decoding with each model's drafter (Qwen's MTP head, Gemma 4's assistant checkpoints, DFlash 2
+and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the code.
 
 ## Supported models
 
@@ -21,7 +22,7 @@ backend; speculative decoding with each model's drafter (Qwen's MTP head, Gemma 
 | Gemma 4 26B-A4B | language, MoE | q4 | 67 tok/s decode, 91 with its assistant | Arc Pro B60 |
 | Qwen3.5 4B | language | f16, q8, q4 | 42 / 71 tok/s decode (f16 / q8) | Arc Pro B60 |
 | Qwen3.6-35B-A3B | language, MoE | q4 | 62 tok/s decode, 94 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
-| Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP (53 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP (20 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
+| Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | π0.5 | robot policy | f16, q8 | 239 / 225 ms per call (f16 / q8) | Arc B390, 3 cameras |
 
 | Model | Checkpoint (`model_type`) | Checked against |
@@ -30,7 +31,7 @@ backend; speculative decoding with each model's drafter (Qwen's MTP head, Gemma 
 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` (`gemma4`) | tiny-checkpoint parity of its layout (experts beside the MLP, K = V global layers) |
 | Qwen3.5 4B | `Qwen/Qwen3.5-4B` (`qwen3_5`) | Hugging Face fp32 logits, greedy text |
 | Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B` (`qwen3_5_moe`) | tiny-checkpoint parity; MMLU-Pro (25 questions): 84 % |
-| Qwen3.8-27B | `Qwen/Qwen3.8-27B` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE, its MTP head); MMLU-Pro (25 questions): 76 % |
+| Qwen3.8-27B | `Qwen/Qwen3.8-27B` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE, its MTP head; DFlash, DFlash 2 and DSpine drafters against their PyTorch code); MMLU-Pro (25 questions): 76 % |
 | π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 2e-3 (GPU f16) |
 
 Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card; π0.5 maps camera images, the
@@ -67,17 +68,29 @@ build/src/xpu-serve serve ~/models/gemma-4-E2B-it --device GPU     # http://127.
 build/src/xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1024 --gen-tokens 128
 ```
 
-Speculative decoding (`--spec mtp` on `run`, `serve` and `bench`) drafts with the model's own drafter and verifies the
+Speculative decoding (`--spec` on `run`, `serve` and `bench`) drafts with the model's drafter and verifies the
 drafts in one step; greedy output stays the model's own and sampling keeps its distribution (rejection sampling).
-Qwen3.5-family checkpoints carry an MTP head; a Gemma 4 model takes its assistant checkpoint with `--drafter`.
-`--spec-k` sets the drafts per round (3 by default: dense Qwen3.8 does best at 4 or 5, the MoE models at 2 or 3,
-[docs/design-spec-decode.md](docs/design-spec-decode.md)). An MTP head picks each draft among 64 tokens that a one-bit
-sketch of the output layer shortlists (`--draft-shortlist`, 0 to read the whole layer). `bench --prompts file` measures
-over real prompts, since acceptance depends on the text, and prints where a round's time goes:
+
+| `--spec` | Drafter | Where it comes from |
+|---|---|---|
+| `mtp` | the MTP head of a Qwen3.5-family checkpoint | inside the model (and its pack) |
+| `mtp` | a Gemma 4 assistant | `--drafter <google/gemma-4-*-it-assistant>` |
+| `dflash` | a DFlash or DFlash 2 block drafter | `--drafter <z-lab/Qwen3.8-27B-DFlash2>` |
+| `dspine` | a DSpine block drafter | `--drafter <tencent/Qwen3.8-27B-DSpine-b16>` |
+
+`--spec-k` sets the drafts per round: 3 by default (dense Qwen3.8 does best at 4 or 5 with its MTP head, the MoE
+models at 2 or 3), 7 for a block drafter, which proposes its whole block in one pass
+([docs/design-spec-decode.md](docs/design-spec-decode.md)). A drafter checkpoint is served as it is, or from a pack
+of its own, which is smaller and drafts faster: `convert <drafter> --target <model> --out <dir>`. An MTP head picks
+each draft among 64 tokens that a one-bit sketch of the output layer shortlists (`--draft-shortlist`, 0 to read the
+whole layer). `bench --prompts file` measures over real prompts, since acceptance depends on the text, and prints
+where a round's time goes:
 
 ```bash
 build/src/xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4
 build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 --drafter ~/models/gemma-4-E2B-it-assistant
+build/src/xpu-serve convert ~/models/Qwen3.8-27B-DFlash2 --target ~/models/Qwen3.8-27B-q4 --out ~/models/Qwen3.8-27B-DFlash2-q4
+build/src/xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec dflash --drafter ~/models/Qwen3.8-27B-DFlash2-q4
 ```
 
 The server speaks the OpenAI API (`/v1/chat/completions` with streaming, tool calls and images, `/v1/completions`,
