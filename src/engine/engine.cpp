@@ -86,14 +86,18 @@ std::vector<float> Engine::forward(std::span<const int32_t> tokens, std::span<co
 std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
                                         std::span<const int32_t> generated, GenerateStats& stats) {
     std::vector<int32_t> fed{token};
+    Timer timer;
     if (k > 0) {
         const std::vector<int32_t> drafts = drafter_->propose(token, k);
         fed.insert(fed.end(), drafts.begin(), drafts.end());
     }
+    const double draft_ms = timer.elapsed_ms();
     std::vector<PositionKey> keys(fed.size());
     std::transform(fed.begin(), fed.end(), keys.begin(), text_key);
     const auto start = static_cast<int64_t>(cached_.size());
     run_target(spec::kVerify, fed, keys, {});
+    stats.spec_draft_ms += draft_ms;
+    stats.spec_verify_ms += timer.elapsed_ms() - draft_ms;
     HostTensor& logits = outputs_.at("logits");
     const int64_t vocab = model_->info().vocab_size;
     XS_CHECK(logits.dtype() == DType::F32 && logits.numel() == static_cast<int64_t>(fed.size()) * vocab,

@@ -48,10 +48,13 @@ struct GenerateStats {
     double encode_ms = 0.0;  // time in the vision encoder, not part of prefill_ms
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
-    // Speculative decoding: verify rounds, drafts proposed, drafts the target accepted.
+    // Speculative decoding: verify rounds, drafts proposed, drafts the target accepted; of decode_ms, the time in the
+    // drafter and in the verify steps.
     int spec_rounds = 0;
     int spec_drafted = 0;
     int spec_accepted = 0;
+    double spec_draft_ms = 0.0;
+    double spec_verify_ms = 0.0;
     double prefill_tok_per_s() const { return prefill_ms > 0 ? (prompt_tokens - cached_tokens) * 1000.0 / prefill_ms : 0; }
     double decode_tok_per_s() const {
         return decode_ms > 0 && generated_tokens > 1 ? (generated_tokens - 1) * 1000.0 / decode_ms : 0;

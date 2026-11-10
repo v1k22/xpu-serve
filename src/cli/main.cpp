@@ -456,13 +456,17 @@ int bench_prompts(EngineService& service, const std::string& path, int n_gen, in
             total.spec_rounds += s.spec_rounds;
             total.spec_drafted += s.spec_drafted;
             total.spec_accepted += s.spec_accepted;
+            total.spec_draft_ms += s.spec_draft_ms;
+            total.spec_verify_ms += s.spec_verify_ms;
         }
         std::printf("run %d: %zu prompts, %d prompt tok, prefill %.1f tok/s | %d tok after the first, decode %.1f tok/s",
                     run, prompts.size(), total.prompt_tokens, total.prefill_tok_per_s(), total.generated_tokens,
                     total.decode_ms > 0 ? total.generated_tokens * 1000.0 / total.decode_ms : 0.0);
         if (total.spec_rounds > 0) {
-            std::printf(" | %.2f tok per verify, %d of %d drafts accepted", total.tokens_per_round(),
-                        total.spec_accepted, total.spec_drafted);
+            std::printf(" | %.2f tok per verify, %d of %d drafts accepted | a draft %.2f ms, a verify %.1f ms, a round %.1f ms",
+                        total.tokens_per_round(), total.spec_accepted, total.spec_drafted,
+                        total.spec_drafted > 0 ? total.spec_draft_ms / total.spec_drafted : 0.0,
+                        total.spec_verify_ms / total.spec_rounds, total.decode_ms / total.spec_rounds);
         }
         std::printf("\n");
     }
