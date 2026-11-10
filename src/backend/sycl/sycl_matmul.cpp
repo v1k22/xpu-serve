@@ -110,7 +110,7 @@ QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, cons
         return xmx_gemv(m, &part, 1, k, plan) ? QuantPath::GemvXmx : QuantPath::Gemv;
     }
     if (plan.f32) return QuantPath::Dequant;
-    if (plan.few_rows && m <= kQuantGemmMaxRows && quant_gemm_fits(m, n, k, w)) return QuantPath::FewRows;
+    if (m <= plan.few_rows && quant_gemm_fits(m, n, k, w)) return QuantPath::FewRows;
     if (m <= plan.tiled_rows && quant_gemm_tiled_fits(m, n, k, w)) return QuantPath::Tiled;
     return QuantPath::Dequant;
 }

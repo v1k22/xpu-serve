@@ -42,7 +42,7 @@ enum class QuantPath : uint8_t { Gemv, GemvXmx, FewRows, Tiled, Dequant };
 struct QuantMatmulPlan {  // what the device favours, set once per session
     bool f32 = false;           // f32 precision: the GEMV, else dequantize to f32 and oneMKL
     int64_t xmx_gemv_rows = 0;  // gemv_quant_xmx from this many rows up to kGemvMaxRows (0: never)
-    bool few_rows = false;      // quant_gemm up to kQuantGemmMaxRows (wins where streaming the weight bounds them)
+    int64_t few_rows = 0;       // quant_gemm up to this many rows, at most kQuantGemmMaxRows (0: never)
     int64_t tiled_rows = 0;     // quant_gemm_tiled up to this many rows (0: never)
     int64_t compute_units = 0;  // the matrix-engine kernels' split of K
 };

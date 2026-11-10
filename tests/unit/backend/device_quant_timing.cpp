@@ -1,7 +1,8 @@
 // Quantized matmul timing by rows: a chain of MLP-shaped q4 matmuls at M = 1..8 rows (a decode step and a speculative
 // verify) through the GEMV and its matrix-engine version (backend option gemv=vector / xmx), reported as weight bytes
 // streamed per second. Opt-in: XS_DEVICE_BENCH=1; XS_BENCH_GROUP sets the group size (default 32), XS_BENCH_INTER the
-// wide side of the matmuls (default 17408: an MLP; smaller for a model's projections, whose launches are short).
+// wide side of the matmuls (default 17408: an MLP; smaller for a model's projections, whose launches are short),
+// XS_BENCH_ROWS the most rows (default 8; past them the paths of a few rows: a long verify, a short prompt tail).
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -60,7 +61,9 @@ TEST_SUITE("device timing" * doctest::skip(!dev::enabled())) {
             const auto session = dev::backend().compile(g, w, o);
             std::string line = str_cat("device-timing q4 g", group, " matmul chain 5120 x ", kInter, " (", bytes / 1e9, " GB), gemv=", path,
                                        " on ", dev::device(), ":");
-            for (int64_t m = 1; m <= 8; ++m) {
+            const char* rows_env = std::getenv("XS_BENCH_ROWS");
+            const int64_t rows = rows_env != nullptr ? std::atoll(rows_env) : 8;
+            for (int64_t m = 1; m <= rows; ++m) {
                 const HostTensor x = rng.uniform(DType::F32, {m, kHidden});
                 TensorMap in{{"x", x}};
                 TensorMap out;

@@ -186,8 +186,11 @@ bool integrated_gpu(const sycl::device& d) {
 // on the way win: quant_gemm up to kQuantGemmMaxRows rows, quant_gemm_tiled up to kTiledMaxRows (Arc B390, a
 // 17408 x 5120 q4 weight at 512 rows: 3.1 ms against 4.0 for dequantize + GEMM); past that oneMKL's GEMM amortizes the
 // f16 copy of the weight (1,024 rows: 6.3 against 5.2 ms). On a discrete card's faster memory dequantize + GEMM is as
-// fast or faster at every row count (Arc Pro B60: 1.5 ms both at 512 rows, 1.1 against 1.5 at 128).
+// fast or faster from 128 rows (Arc Pro B60: 1.5 ms both at 512 rows, 1.1 against 1.5 at 128), and quant_gemm wins
+// only for the fewest rows, a long speculative verify or a short prompt tail (0.9 GB of q4 MLP weights: 6.4 to 7.6 ms
+// at 9 to 32 rows against 17 to 18.5 dequantized, then 58 ms at 40 to 56 rows).
 constexpr int64_t kTiledMaxRows = 512;
+constexpr int64_t kDiscreteFewRows = 32;
 // From how many rows the GEMV's matrix-engine version (gemv_quant_xmx) wins: its cost is about flat in the rows, the
 // GEMV's grows with them (Arc Pro B60, Qwen3.8-27B q4 decode steps of 1 to 6 tokens: 44.7, 48.0, 52.4, 62.0, 68.5,
 // 78.1 ms; with it from 4 rows 56.0, 56.5, 56.8).
@@ -202,8 +205,10 @@ sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::Attent
     p.compute_units = attention.compute_units;
     if (attention.xmx && !p.f32 && gemv != "vector") p.xmx_gemv_rows = gemv == "xmx" ? 1 : kXmxGemvRows;
     if (attention.xmx && integrated_gpu(d)) {
-        p.few_rows = true;
+        p.few_rows = sycl_be::kQuantGemmMaxRows;
         p.tiled_rows = kTiledMaxRows;
+    } else if (attention.xmx) {
+        p.few_rows = kDiscreteFewRows;
     }
     return p;
 }
