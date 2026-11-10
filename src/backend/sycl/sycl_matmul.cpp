@@ -99,8 +99,16 @@ void matmul_half_y(sycl::queue& q, Scratch& scratch, const X* x, const half* w, 
 template void matmul_half_y<float>(sycl::queue&, Scratch&, const float*, const half*, half*, int64_t, int64_t, int64_t);
 template void matmul_half_y<half>(sycl::queue&, Scratch&, const half*, const half*, half*, int64_t, int64_t, int64_t);
 
+bool xmx_gemv(int64_t m, const QuantGemvPart* parts, int count, int64_t k, const QuantMatmulPlan& plan) {
+    return !plan.f32 && plan.xmx_gemv_rows > 0 && m >= plan.xmx_gemv_rows && m <= kGemvMaxRows &&
+           gemv_quant_xmx_fits(parts, count, k);
+}
+
 QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const QuantMatmulPlan& plan) {
-    if (m <= kGemvMaxRows) return QuantPath::Gemv;
+    if (m <= kGemvMaxRows) {
+        const QuantGemvPart part{w, nullptr, n};
+        return xmx_gemv(m, &part, 1, k, plan) ? QuantPath::GemvXmx : QuantPath::Gemv;
+    }
     if (plan.f32) return QuantPath::Dequant;
     if (plan.few_rows && m <= kQuantGemmMaxRows && quant_gemm_fits(m, n, k, w)) return QuantPath::FewRows;
     if (m <= plan.tiled_rows && quant_gemm_tiled_fits(m, n, k, w)) return QuantPath::Tiled;
@@ -113,16 +121,24 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeigh
     constexpr bool kHalfX = std::is_same_v<X, half>;
     constexpr bool kHalfY = std::is_same_v<Y, half>;
     QuantPath path = quant_path(m, n, k, w, plan);
-    XS_CHECK(path != QuantPath::Gemv || (!kHalfX && !kHalfY && !add), "sycl matmul_quant: the GEMV takes f32 x and y");
+    const bool gemv = path == QuantPath::Gemv || path == QuantPath::GemvXmx;
+    XS_CHECK(!gemv || (!kHalfX && !kHalfY && !add), "sycl matmul_quant: the GEMVs take f32 x and y");
     XS_CHECK(!add || !kHalfY, "sycl matmul_quant: adding into an f16 y");
-    if (path == QuantPath::Gemv) {
+    if (gemv) {
         if constexpr (!kHalfX && !kHalfY) {
-            if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the kernel loads x in float4s
+            // the GEMV loads x in float4s, its matrix-engine version by 2D block loads
+            const uintptr_t align = path == QuantPath::GemvXmx ? 64 : 16;
+            if (reinterpret_cast<uintptr_t>(x) % align != 0) {
                 auto* aligned = static_cast<float*>(scratch.get(static_cast<size_t>(m * k) * sizeof(float)));
                 q.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
                 x = aligned;
             }
-            gemv_quant(q, x, w, y, m, n, k);
+            if (path == QuantPath::GemvXmx) {
+                const QuantGemvPart part{w, y, n};
+                gemv_quant_xmx(q, x, &part, 1, m, k, plan.compute_units);
+            } else {
+                gemv_quant(q, x, w, y, m, n, k);
+            }
         }
         return;
     }

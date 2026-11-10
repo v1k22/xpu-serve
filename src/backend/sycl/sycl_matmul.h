@@ -33,18 +33,23 @@ void matmul_accumulate(sycl::queue& q, Scratch& scratch, const X* x, const half*
 template <typename X>
 void matmul_half_y(sycl::queue& q, Scratch& scratch, const X* x, const half* w, half* y, int64_t m, int64_t n, int64_t k);
 
-// How a quantized matmul runs: the GEMV up to kGemvMaxRows rows; beyond, a matrix-engine kernel that dequantizes the
-// weight on the way (quant_gemm for a few rows, quant_gemm_tiled for many) or, past those, the weight dequantized once
-// to f16 (f32 in f32 precision) and multiplied by oneMKL's GEMM. Every path but the GEMV reads x in f16.
-enum class QuantPath : uint8_t { Gemv, FewRows, Tiled, Dequant };
+// How a quantized matmul runs: up to kGemvMaxRows rows the GEMV, or from xmx_gemv_rows rows its matrix-engine
+// version (gemv_quant_xmx, whose cost hardly grows with the rows: a speculative verify); beyond, a matrix-engine kernel
+// that dequantizes the weight on the way (quant_gemm for a few rows, quant_gemm_tiled for many) or, past those, the
+// weight dequantized once to f16 (f32 in f32 precision) and multiplied by oneMKL's GEMM. The paths past the GEMVs
+// read x in f16.
+enum class QuantPath : uint8_t { Gemv, GemvXmx, FewRows, Tiled, Dequant };
 struct QuantMatmulPlan {  // what the device favours, set once per session
     bool f32 = false;           // f32 precision: the GEMV, else dequantize to f32 and oneMKL
+    int64_t xmx_gemv_rows = 0;  // gemv_quant_xmx from this many rows up to kGemvMaxRows (0: never)
     bool few_rows = false;      // quant_gemm up to kQuantGemmMaxRows (wins where streaming the weight bounds them)
     int64_t tiled_rows = 0;     // quant_gemm_tiled up to this many rows (0: never)
-    int64_t compute_units = 0;  // quant_gemm's split of K
+    int64_t compute_units = 0;  // the matrix-engine kernels' split of K
 };
 // The path for these shapes and this weight (x assumed 64-byte aligned; matmul_quant falls back to Dequant if not).
 QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const QuantMatmulPlan& plan);
+// Whether `count` quantized matmuls of one x (QuantGemvPart) at m <= kGemvMaxRows rows run on gemv_quant_xmx.
+bool xmx_gemv(int64_t m, const QuantGemvPart* parts, int count, int64_t k, const QuantMatmulPlan& plan);
 // y [M, N] = x [M, K] @ dequant(w)^T along quant_path, or with `add` y += x @ dequant(w)^T (a residual folded in).
 // x in f32 (converted in scratch where a path reads f16), or in f16 for M > kGemvMaxRows; y in f32, or in f16 for
 // M > kGemvMaxRows (plan_half_values keeps such values in f16, saving the conversions). `add` needs an f32 y and

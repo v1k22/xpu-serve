@@ -159,8 +159,10 @@ near tie a wider verify (another kernel path at f16) can flip (DESIGN.md 10.4; t
 Where the time goes, and what would move it:
 
 - A verify of T tokens costs more than a decode step. Qwen3.8 at T = 1 / 2 / 3 / 4: 44.8 / 48.2 / 52.4 / 61.9 ms (the
-  q4 GEMV re-tuned for 2 and 3 rows took T = 2 from 60.2 ms). A verify as cheap as a decode step would take Qwen3.8
-  at k = 3 to about 50 tok/s.
+  q4 GEMV re-tuned for 2 and 3 rows took T = 2 from 60.2 ms). The GEMV's arithmetic grows with the rows; its
+  matrix-engine version (`gemv_quant_xmx`, from 4 rows) costs about the same at any row count: T = 4 / 5 / 6 / 8 now
+  55.1 / 56.3 / 57.3 / 59.0 ms (from 62.0 / 68.5 / 78.1 / -), which takes Qwen3.8 at k = 3 / 4 to 41.1 / 42.1 tok/s
+  (from 37.5 / 35.8), past k = 2 (39.2).
 - MoE targets (Qwen3.6, 26B-A4B): a verify of k + 1 tokens reads the union of their experts, so it grows faster with
   k than a dense model's; past 4 (token, expert) pairs per expert bank the expert path also changes kernels. Best k
   is 2.
@@ -171,7 +173,6 @@ Where the time goes, and what would move it:
 
 ## 7. Next
 
-- Verify cost at 2 to 5 rows (a DPAS path for the quantized matmuls at few rows); MoE verify that reads each expert
-  once per verify.
+- MoE verify that reads each expert once per verify; q8 weights on the matrix-engine GEMV (q4 only so far).
 - Fewer host round trips per round (the drafter's chained steps without waiting for each output).
 - Adaptive k; packing a Gemma assistant with its target (`convert --with-drafter`); the assistant at q8.

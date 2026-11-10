@@ -188,11 +188,19 @@ bool integrated_gpu(const sycl::device& d) {
 // f16 copy of the weight (1,024 rows: 6.3 against 5.2 ms). On a discrete card's faster memory dequantize + GEMM is as
 // fast or faster at every row count (Arc Pro B60: 1.5 ms both at 512 rows, 1.1 against 1.5 at 128).
 constexpr int64_t kTiledMaxRows = 512;
+// From how many rows the GEMV's matrix-engine version (gemv_quant_xmx) wins: its cost is about flat in the rows, the
+// GEMV's grows with them (Arc Pro B60, Qwen3.8-27B q4 decode steps of 1 to 6 tokens: 44.7, 48.0, 52.4, 62.0, 68.5,
+// 78.1 ms; with it from 4 rows 56.0, 56.5, 56.8).
+constexpr int64_t kXmxGemvRows = 4;
 
-sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::AttentionPlan& attention, DType precision) {
+// How quantized matmuls run (the GEMV option: auto, vector = the GEMV only, xmx = its matrix-engine version from
+// one row, where it fits).
+sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::AttentionPlan& attention, DType precision,
+                                    const std::string& gemv) {
     sycl_be::QuantMatmulPlan p;
     p.f32 = precision == DType::F32;
     p.compute_units = attention.compute_units;
+    if (attention.xmx && !p.f32 && gemv != "vector") p.xmx_gemv_rows = gemv == "xmx" ? 1 : kXmxGemvRows;
     if (attention.xmx && integrated_gpu(d)) {
         p.few_rows = true;
         p.tiled_rows = kTiledMaxRows;
@@ -1632,12 +1640,6 @@ private:
                 const int64_t m = numel(in_shape(0)) / k;
                 if (mm_leader_[i] >= 0 && mm_parts_run(static_cast<size_t>(mm_leader_[i]), p)) return;  // ran there
                 if (!mm_parts_[i].empty() && mm_parts_run(i, p)) {
-                    const float* x = in_f32(0);
-                    if (reinterpret_cast<uintptr_t>(x) % 16 != 0) {  // the kernel loads x in float4s
-                        auto* aligned = static_cast<float*>(get(static_cast<size_t>(m * k) * sizeof(float)));
-                        q_.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
-                        x = aligned;
-                    }
                     sycl_be::QuantGemvPart parts[sycl_be::kQuantGemvParts];
                     const auto count = static_cast<int>(mm_parts_[i].size());
                     for (int j = 0; j < count; ++j) {
@@ -1647,7 +1649,19 @@ private:
                                     reinterpret_cast<float*>(ptr(p, Value{static_cast<int32_t>(mj), 0})),
                                     graph_.type(wj).shape[0]};
                     }
-                    sycl_be::gemv_quant_parts(q_, x, parts, count, m, k);
+                    const bool xmx = sycl_be::xmx_gemv(m, parts, count, k, quant_);
+                    const float* x = in_f32(0);
+                    // the GEMV loads x in float4s, its matrix-engine version by 2D block loads
+                    if (reinterpret_cast<uintptr_t>(x) % (xmx ? 64 : 16) != 0) {
+                        auto* aligned = static_cast<float*>(get(static_cast<size_t>(m * k) * sizeof(float)));
+                        q_.memcpy(aligned, x, static_cast<size_t>(m * k) * sizeof(float));
+                        x = aligned;
+                    }
+                    if (xmx) {
+                        sycl_be::gemv_quant_xmx(q_, x, parts, count, m, k, quant_.compute_units);
+                    } else {
+                        sycl_be::gemv_quant_parts(q_, x, parts, count, m, k);
+                    }
                     return;
                 }
                 if (is_quantized(in_dt(1))) {  // plan_half_values: x and y in f16 or f32
@@ -2211,8 +2225,15 @@ public:
         XS_CHECK(!options.kv_dtype || *options.kv_dtype == DType::I8, "sycl KV cache dtype must be i8 when set, got ",
                  dtype_name(*options.kv_dtype));
         sycl_be::AttentionPlan attention;
+        std::string gemv = "auto";
         for (const auto& [key, value] : options.extra) {
-            if (key != "attention") fail("sycl does not know backend option '", key, "' (known: attention)");
+            if (key == "gemv") {
+                if (value != "auto" && value != "vector" && value != "xmx")
+                    fail("sycl backend option gemv=", value, " is not one of auto, vector, xmx");
+                gemv = value;
+                continue;
+            }
+            if (key != "attention") fail("sycl does not know backend option '", key, "' (known: attention, gemv)");
             if (value == "rows") {
                 attention.path = sycl_be::AttentionPath::Rows;
             } else if (value == "gemm") {
@@ -2245,7 +2266,7 @@ public:
         attention.compute_units = devices_[index].get_info<sycl::info::device::max_compute_units>();
         auto session = std::make_unique<SyclSession>(
             std::make_unique<SyclShared>(it->second, options.max_context, options.rewind_tokens));
-        const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision);
+        const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision, gemv);
         for (const graph::Graph* graph : programs) {
             session->add(std::make_unique<SyclProgram>(*graph, weights, options, session->shared(), attention, quant));
         }

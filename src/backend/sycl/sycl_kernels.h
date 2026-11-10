@@ -221,6 +221,13 @@ void quant_dispatch(const QuantWeight& w, F&& f) {
 }
 bool quant_gemv_parts_match(const QuantWeight& a, const QuantWeight& b);
 void gemv_quant_parts(sycl::queue& q, const float* x, const QuantGemvPart* parts, int count, int64_t m, int64_t k);
+// The same on the matrix engines (sycl_quant_gemm.cpp; needs xmx_device), x in f32 with a 64-byte aligned base:
+// streaming the weight costs about the same at any M up to kGemvMaxRows, where the GEMV's arithmetic grows with M
+// (it stays ahead at one or two rows). Q4 parts of one group size (32, 64 or 128) and AWQ-ness, N a multiple of 16
+// and K of 256 (gemv_quant_xmx_fits).
+bool gemv_quant_xmx_fits(const QuantGemvPart* parts, int count, int64_t k);
+void gemv_quant_xmx(sycl::queue& q, const float* x, const QuantGemvPart* parts, int count, int64_t m, int64_t k,
+                    int64_t compute_units);
 // The same for kGemvMaxRows < M <= kQuantGemmMaxRows on the matrix engines (sycl_quant_gemm.cpp; needs xmx_device),
 // x in f16: the weight is read once and dequantized on the way. `slices` sub-groups of a work-group divide K and add
 // their partial sums in local memory (quant_gemm_slices picks enough to keep the memory busy).

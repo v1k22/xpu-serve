@@ -235,6 +235,56 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
+    TEST_CASE("quantized GEMV on the matrix engines (gemv=xmx) against fp64, alone and with siblings") {
+        test::TensorRng rng(44);
+        SessionOptions xmx = dev::options();
+        xmx.extra["gemv"] = "xmx";
+        struct Spec {
+            const char* name;
+            int64_t n;
+            int64_t group;
+            bool awq;
+        };
+        // a, b and c share x, a group and AWQ-ness: one launch; d (group 64) and e (AWQ) another each; f is q8 (the
+        // GEMV); g's 40 features are no multiple of 16 (the GEMV)
+        for (const int64_t k : {512, 2048}) {
+            CAPTURE(k);
+            const Spec specs[] = {{"a", 96, 32, false}, {"b", 48, 32, false}, {"c", 16, 32, false}, {"d", 64, 64, false},
+                                  {"e", 32, 128, true}, {"f", 32, 64, false}, {"g", 40, 32, false}};
+            test::MemoryWeights w;
+            for (const Spec& sp : specs) {
+                const HostTensor dense = rng.uniform(DType::F32, {sp.n, k}, 1.0f / std::sqrt(static_cast<float>(k)));
+                if (sp.awq) {
+                    std::vector<double> ms(static_cast<size_t>(k), 1.0);
+                    for (int64_t c = 0; c < k; c += 29)
+                        ms[static_cast<size_t>(c)] = 300.0;
+                    w.add_quantized(sp.name, quant::quantize_awq(dense.view(), sp.group, ms, nullptr));
+                } else {
+                    w.add_quantized(sp.name, quant::quantize(dense.view(), std::string(sp.name) == "f" ? DType::Q8 : DType::Q4,
+                                                             sp.group));
+                }
+            }
+            Graph g;
+            const Value x = g.input("x", DType::F32, {kT, k});
+            for (const Spec& sp : specs) g.output(sp.name, g.matmul(x, g.weight(w, sp.name)));
+            Graph alone;  // one weight per matmul input: no siblings
+            alone.output("a", alone.matmul(alone.input("x", DType::F32, {kT, k}), alone.weight(w, "a")));
+            for (int64_t m = 1; m <= 8; ++m) {
+                CAPTURE(m);
+                const HostTensor xv = rng.uniform(DType::F32, {m, k});
+                const TensorMap out = dev::run(g, w, {{"x", xv}}, xmx);
+                for (const Spec& sp : specs) {
+                    CAPTURE(sp.name);
+                    const Tensor64 expected = test::ref::matmul(to_f64(xv), to_f64(w.tensor(sp.name)));
+                    CHECK(dev::close("gemv xmx", out.at(sp.name), expected, dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+                }
+                const Tensor64 expected = test::ref::matmul(to_f64(xv), to_f64(w.tensor("a")));
+                CHECK(dev::close("gemv xmx alone", dev::run(alone, w, {{"x", xv}}, xmx).at("a"), expected,
+                                 dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+            }
+        }
+    }
+
     TEST_CASE("add and mul broadcast like numpy, including a dynamic T operand") {
         test::TensorRng rng(2);
         struct Case {
