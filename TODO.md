@@ -153,8 +153,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Adaptive k from measured acceptance and per-k step cost (MoE verify cost)
 - [x] Spec equivalence tests: greedy spec on vs off on a stateful tiny model with a partly wrong drafter; the real
       models' greedy output; rejection sampling's distribution
-- [ ] Verify cost at 2 to 5 rows (Qwen3.8: 48 / 52 / 62 ms at T = 2 / 3 / 4 vs 45 at T = 1) and MoE verify reading
-      each expert once; fewer host round trips per round (E2B is bound by them)
+- [x] Verify cost: the q4 GEMV on the matrix engines from 4 rows (`gemv_quant_xmx`) costs about one row's (Qwen3.8
+      on the B60, T = 4 / 8: 55.1 / 59.0 ms against 44.8 at T = 1); Qwen3.8 with MTP 42.1 tok/s (B60), 15.9 (B390); MoE
+      verify on the direct path up to 64 (token, expert) pairs
+- [ ] MoE verify reading each expert once; q8 on the matrix-engine GEMV; fewer host round trips per round (E2B is
+      bound by them); drafts over the frequent tokens of the vocabulary (the drafter's lm_head on the B390)
 - [ ] Spec stats in logs and `/metrics`
 - [ ] Bench at 32k / 64k on B390 and B60 vs the GenAI baseline with the same drafter
 - **Done when:** equivalence tests pass and decode tok/s at 32k/64k beats the GenAI baseline with the same drafter.
@@ -185,7 +188,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       (mm_add_) need static shapes, so a language model's prefill (a symbolic T) keeps every value in f32 and every
       residual add separate. Planned per T regime (the GEMV's rows, the GEMM's) they would reach LLM prefill: about
       30 ms of a 512-token Qwen3.8 prefill on the B60 (the f32 traffic of SwiGLU's Mul, the adds, conv and slices)
-- [x] MoE expert matmuls over q8 / q4 banks: one GEMV per (token, expert) up to 32 pairs (decode), pairs grouped by
+- [x] MoE expert matmuls over q8 / q4 banks: one GEMV per (token, expert) up to 64 pairs (decode, verify), pairs grouped by
       expert up to 256, grouped oneMKL GEMMs on dequantized banks beyond (prefill)
 - [ ] MoE prefill without the f16 copy of each expert bank (a GEMM that dequantizes in registers); the expert union
       at verify width k+1
@@ -269,7 +272,7 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 
 | # | Model | Hugging Face ID | Notes |
 |---|---|---|---|
-| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | Dense `qwen3_5`. **Runs** (text): tiny-checkpoint HF parity with its ratios (cosine 1, greedy exact on cpu-ref and SYCL); q4 g32 pack 19.2 GB (16.2 GiB on device) on one Arc Pro B60: decode 22 tok/s, prefill 831 tok/s at 512 tokens and 945 at 4,096 (1,058 with --prefill-chunk 4096; 630 / 763 before the 2026-11-09 prefill work), MMLU-Pro 76 % (25 q; 3 answers hit the 4,096-token cap); q4 g64: 23.8 tok/s; with its MTP head (`--spec mtp --spec-k 2`): 39.6 tok/s over six chat prompts (2.47 tokens per verify). Arc B390: decode 6.8 tok/s, prefill 460 tok/s at 512 tokens (307 before), 270 to 385 at 4,096 (noisy, run to run). q4 (RTN) vs HF fp32 last-token cosine 0.67 to 0.99, as Qwen3.5-4B's q4 (0.87 to 0.99). Against OpenVINO 2026.4.1 GenAI (optimum-intel int4: asymmetric, group 128, int8 head; `llm_bench`, no MTP, prefix cache off), our q4 at the same group size decodes 24.9 vs 23.4 tok/s on the B60 (24.1 vs 23.0 at 4k) and 7.6 vs 7.65 on the B390; OpenVINO prefills 1.5x faster on the B60 at 512 tokens (1,255 vs 831 tok/s; with its int8 activations: 1,086 with f16 activations, as ours) and 1.3x at 4,096 (1,251 vs 945), 1.6x on the B390 at 512. To do: prefill (below), AWQ, vision |
+| 1 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` | Dense `qwen3_5`. **Runs** (text): tiny-checkpoint HF parity with its ratios (cosine 1, greedy exact on cpu-ref and SYCL); q4 g32 pack 19.2 GB (16.2 GiB on device) on one Arc Pro B60: decode 22 tok/s, prefill 831 tok/s at 512 tokens and 945 at 4,096 (1,058 with --prefill-chunk 4096; 630 / 763 before the 2026-11-09 prefill work), MMLU-Pro 76 % (25 q; 3 answers hit the 4,096-token cap); q4 g64: 23.8 tok/s; with its MTP head (`--spec mtp --spec-k 4`): 42.1 tok/s over six chat prompts (3.21 tokens per verify; 45.2 at q4 g128). Arc B390: decode 6.8 tok/s, 15.9 with MTP (k = 4), prefill 460 tok/s at 512 tokens (307 before), 270 to 385 at 4,096 (noisy, run to run). q4 (RTN) vs HF fp32 last-token cosine 0.67 to 0.99, as Qwen3.5-4B's q4 (0.87 to 0.99). Against OpenVINO 2026.4.1 GenAI (optimum-intel int4: asymmetric, group 128, int8 head; `llm_bench`, no MTP, prefix cache off), our q4 at the same group size decodes 24.9 vs 23.4 tok/s on the B60 (24.1 vs 23.0 at 4k) and 7.6 vs 7.65 on the B390; OpenVINO prefills 1.5x faster on the B60 at 512 tokens (1,255 vs 831 tok/s; with its int8 activations: 1,086 with f16 activations, as ours) and 1.3x at 4,096 (1,251 vs 945), 1.6x on the B390 at 512. To do: prefill (below), AWQ, vision |
 | 2 | Qwen3.6-35B-A3B (preferred) | `Qwen/Qwen3.6-35B-A3B` | MoE (3B active). **Runs** (text): tiny-model HF parity; q4 g64 pack 18.9 GiB on one Arc Pro B60, decode ~58 tok/s, prefill ~1,250 tok/s, MMLU-Pro 84 % (25 q); with its MTP head: 85.6 tok/s at k = 2 (59.9 without). To do: Panther Lake, AWQ, vision |
 | | Qwen3.5-35B-A3B (older) | `Qwen/Qwen3.5-35B-A3B` | MoE; the Qwen3.5 Gated DeltaNet hybrid |
 | 3 | Gemma 4 31B | `google/gemma-4-31B-it` | vision tower uses `standardize` |

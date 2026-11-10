@@ -1,6 +1,6 @@
 # Design: speculative decoding with MTP drafters
 
-Status: **implemented** · 2026-11-09 (measured speeds in section 6)
+Status: **implemented** · 2026-11-10 (measured speeds in section 6)
 
 Speculative decoding for every model that ships a multi-token-prediction drafter: the MTP head inside Qwen3.5-family
 checkpoints (Qwen3.8-27B, Qwen3.6-35B-A3B) and the Gemma 4 "assistant" drafters (`google/gemma-4-*-assistant`, one
@@ -137,7 +137,7 @@ checkpoint of its layout (`make_tiny.py --arch gemma4_moe`).
   the three chained drafts after each prompt.
 - Real models: greedy output with speculation equals output without (`run`, then the bench prompts).
 
-## 6. Measured speed (Arc Pro B60, batch 1)
+## 6. Measured speed (Arc Pro B60, batch 1; the Arc B390 in 6.1)
 
 Greedy decode over the six prompts of section 2 (chat template, thinking off, up to 256 new tokens each, stopping at
 the end of the turn), `xpu-serve bench <pack> --prompts <file> --spec off|mtp --spec-k k`; decode tok/s counts the
@@ -170,10 +170,38 @@ Where the time goes, and what would move it:
 - Drafter steps: Qwen3.8's MTP step is about 2.5 ms (its lm_head over 248k tokens alone 1.8 ms). The E2B target's
   step is short (about 7 ms), so its rounds are bound by per-program host overhead (several programs per round, each
   waiting for its outputs); k = 1 is best there.
-- Adaptive k (DESIGN.md 10.1) is not done: `--spec-k` is fixed, 2 is the best default on these four.
+- Adaptive k (DESIGN.md 10.1) is not done: `--spec-k` is fixed (3 by default); dense Qwen3.8 does best at 3 or 4, the
+  MoE targets at 2, E2B at 1.
+
+### 6.1 Arc B390
+
+Qwen3.8-27B on the Arc B390 (integrated; reads stream at about 115 GB/s, measured, of 153.6 theoretical), the same
+prompts and bench; tok/s with tokens per verify in parentheses:
+
+| Pack | spec off | k = 2 | k = 3 | k = 4 | k = 5 | k = 6 |
+|---|---|---|---|---|---|---|
+| q4 g32 | 6.9 | 14.0 (2.47) | 15.4 (2.92) | **15.9** (3.21) | **15.9** (3.36) | 15.6 (3.49) |
+| q4 g128 | 7.8 | 15.4 (2.42) | **16.2** (2.77) | 16.0 (3.03) | 15.6 (3.14) | 15.1 (3.21) |
+
+- A decode step runs at the memory's speed (16.6 GB of g32 weights at 6.9 steps a second is 115 GB/s), so the GEMV
+  has nothing left to gain there: every further gain is fewer bytes read per emitted token.
+- With every verify on the GEMV, as before, k = 2 / 3 / 4 / 5 ran 14.2 / 13.7 / 13.4 / 12.3 (g32) and k = 2 was best.
+  With the matrix-engine GEMV from 4 rows, k = 4 and 5 run 15.9: 1.12x the old best, 2.3x spec off (back to back at
+  k = 4, `gemv=vector` / auto / `gemv=vector`: 13.3 / 16.1 / 13.4). From 1 row it
+  costs plain decode 4% (7.5 against 7.8 at g128); from 3 rows it ties (k = 2: 15.6 against 15.4). 4 rows holds on
+  both devices. Timing single steps (as for the B60 numbers above) put the crossover at 7 rows here; whole runs did not.
+- g128 reads 15% fewer bytes than g32 (4.25 against 5 bits per weight) and decodes 13% faster without drafts (B60:
+  25.1 against 22.2); its MTP head's drafts are accepted a little less often (3.03 against 3.21 tokens per verify at
+  k = 4), so with drafts it gains 2% here and 7% on the B60 (k = 4: 45.2 against 42.1).
+- A round at g32, k = 4 (about 200 ms for 3.21 tokens): four drafts of about 9.5 ms, most of each the MTP head's
+  lm_head over 248k tokens, and a verify of about 1.1 decode steps. 20 tok/s needs the round at 160 ms: drafts over
+  the frequent part of the vocabulary, or a verify nearer one decode step. Token ids are not a frequency order: drafts
+  over the 32k / 64k lowest ids were accepted 2.78 / 3.02 tokens per verify against 3.21.
 
 ## 7. Next
 
 - MoE verify that reads each expert once per verify; q8 weights on the matrix-engine GEMV (q4 only so far).
+- Drafts over the frequent tokens of the vocabulary (frequencies measured on text), where the drafter's lm_head is
+  most of a draft step (Arc B390).
 - Fewer host round trips per round (the drafter's chained steps without waiting for each output).
 - Adaptive k; packing a Gemma assistant with its target (`convert --with-drafter`); the assistant at q8.

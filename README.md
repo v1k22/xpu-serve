@@ -21,7 +21,7 @@ backend; speculative decoding with each model's drafter (Qwen's MTP head, Gemma 
 | Gemma 4 26B-A4B | language, MoE | q4 | 66 tok/s decode, 84 with its assistant | Arc Pro B60 |
 | Qwen3.5 4B | language | f16, q8, q4 | 42 / 71 tok/s decode (f16 / q8) | Arc Pro B60 |
 | Qwen3.6-35B-A3B | language, MoE | q4 | 60 tok/s decode, 86 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
-| Qwen3.8-27B | language | q4 | 22 tok/s decode, 40 with MTP; 830 tok/s prefill; 6.8 / 460 on Arc B390 | Arc Pro B60, Arc B390 |
+| Qwen3.8-27B | language | q4 | 22 tok/s decode, 42 with MTP (45 at q4 g128); 830 tok/s prefill; on Arc B390 6.8 tok/s decode, 16 with MTP, 460 prefill | Arc Pro B60, Arc B390 |
 | π0.5 | robot policy | f16, q8 | 239 / 225 ms per call (f16 / q8) | Arc B390, 3 cameras |
 
 | Model | Checkpoint (`model_type`) | Checked against |
@@ -70,12 +70,12 @@ build/src/xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1
 Speculative decoding (`--spec mtp` on `run`, `serve` and `bench`) drafts with the model's own drafter and verifies
 the drafts in one step; greedy output stays the model's own and sampling keeps its distribution (rejection
 sampling). Qwen3.5-family checkpoints carry an MTP head; a Gemma 4 model takes its assistant checkpoint with
-`--drafter`. `--spec-k` sets the drafts per round (2 is the best on the models measured,
+`--drafter`. `--spec-k` sets the drafts per round (3 by default: dense Qwen3.8 does best at 3 or 4, the MoE models at 2,
 [docs/design-spec-decode.md](docs/design-spec-decode.md)); `bench --prompts file` measures over real prompts, since
 acceptance depends on the text:
 
 ```bash
-build/src/xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 2
+build/src/xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4
 build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 --drafter ~/models/gemma-4-E2B-it-assistant
 ```
 
@@ -109,11 +109,13 @@ build/src/xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --q
 build/src/xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
 ```
 
-`q8` is symmetric int8; `q4` is 4-bit with a scale and bias per group of 32 columns. Both round to nearest by
-default; `--method awq` adds an AWQ-style search calibrated on the model itself (on the GPU, about a minute; `--calib
-file` brings your own text), which helps Qwen3.5 but not yet Gemma 4 (see the decision record).
-Embedding tables are q8 in either case, small matrices and non-matmul tensors stay as they are, and `--q8 name,...`
-keeps chosen weights (parts of their names) at q8. The format of every tensor is in the pack's `xpu_pack.json`.
+`q8` is symmetric int8; `q4` is 4-bit with a scale and bias per group of 32 columns (`--group 128` reads 15% fewer
+bytes: Qwen3.8-27B decodes 13% faster on both the Arc Pro B60 and the Arc B390, and scores 80% on 25 MMLU-Pro questions
+against 76% at 32). Both round to nearest by default; `--method awq` adds an AWQ-style search calibrated on the model
+itself (on the GPU, about a minute; `--calib file` brings your own text), which helps Qwen3.5 but not yet Gemma 4 (see
+the decision record). Embedding tables are q8 in either case, small matrices and non-matmul tensors stay as they are,
+and `--q8 name,...` keeps chosen weights (parts of their names) at q8. The format of every tensor is in the pack's
+`xpu_pack.json`.
 
 Which matmul weights are quantized follows one rule for every model, read off the model's own graph: a weight whose
 matmuls read it more than they compute (a step-dependent number of rows, as in decode, or at most 64 rows per call)
