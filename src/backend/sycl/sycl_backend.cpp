@@ -527,10 +527,13 @@ private:
                 f.input_row.push_back(row);
             }
         }
-        size_t i = 0;
+        sycl_be::CopyPart parts[sycl_be::kCopyParts];
+        int count = 0;
         for (const auto& [ptr, row] : inputs) {
-            q_.memcpy(f.inputs[i++].get(), ptr, static_cast<size_t>(tokens * row) * sizeof(float));
+            parts[count] = {ptr, reinterpret_cast<float*>(f.inputs[static_cast<size_t>(count)].get()), tokens * row};
+            ++count;
         }
+        sycl_be::copy_parts(q_, parts, count);  // one launch a slot: a verify step keeps the inputs of every layer
     }
 
     size_t shared_kv(const graph::KvSlot& spec) {

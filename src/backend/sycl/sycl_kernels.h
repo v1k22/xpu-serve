@@ -105,6 +105,15 @@ struct Permute {
 void transpose(sycl::queue& q, const void* x, void* y, size_t elem, int64_t n, const Permute& p);
 
 void to_half(sycl::queue& q, const float* x, half* y, int64_t n);
+// Up to kCopyParts copies in one launch: dst[p][0, count[p]) = src[p][0, count[p]) (a queue memcpy each costs a
+// launch of the driver's, several times a kernel's on an integrated GPU).
+inline constexpr int kCopyParts = 4;
+struct CopyPart {
+    const float* src = nullptr;
+    float* dst = nullptr;
+    int64_t count = 0;
+};
+void copy_parts(sycl::queue& q, const CopyPart* parts, int count);
 
 // x [T, C], w [C, K]; reads the previous K-1 inputs from state_in [K-1, C] and writes the new ones to state_out.
 // `silu` applies SiLU to the output (a fused Silu op).

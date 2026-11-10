@@ -1332,6 +1332,32 @@ void transpose(sycl::queue& q, const void* x, void* y, size_t elem, int64_t n, c
     }
 }
 
+void copy_parts(sycl::queue& q, const CopyPart* parts, int count) {
+    XS_CHECK(count >= 1 && count <= kCopyParts, "sycl copy_parts: ", count, " parts");
+    CopyPart p[kCopyParts];
+    int64_t end[kCopyParts];  // where each part ends in the launch's range
+    int64_t total = 0;
+    for (int j = 0; j < kCopyParts; ++j) {
+        if (j < count) p[j] = parts[j];
+        total += p[j].count;
+        end[j] = total;
+    }
+    const CopyPart p0 = p[0], p1 = p[1], p2 = p[2], p3 = p[3];
+    const int64_t e0 = end[0], e1 = end[1], e2 = end[2];
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(total)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        if (i < e0) {
+            p0.dst[i] = p0.src[i];
+        } else if (i < e1) {
+            p1.dst[i - e0] = p1.src[i - e0];
+        } else if (i < e2) {
+            p2.dst[i - e1] = p2.src[i - e1];
+        } else {
+            p3.dst[i - e2] = p3.src[i - e2];
+        }
+    });
+}
+
 void to_half(sycl::queue& q, const float* x, half* y, int64_t n) {
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) { y[i] = static_cast<half>(x[i]); });
 }
