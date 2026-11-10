@@ -168,7 +168,7 @@ inline void expert_matmul_quantized(const Env& env) {
 // The MoE block against an fp64 composition of the same math. Router weights are scaled so the chosen experts are
 // clearly ahead of the rest (a near tie could pick differently at f16).
 // `quantized`: q4 banks with gate and up fused into one [E, 2 I, hidden] bank (Qwen3.5 MoE's layout); `tokens` past
-// 16 takes the grouped path for quantized banks on SYCL.
+// 32 takes the grouped path for quantized banks on SYCL.
 // gemma: Gemma 4's routing: the router reads its own input, each expert's weight is scaled after normalizing, and
 // the experts use GeGLU.
 inline void moe_block(const Env& env, blocks::Router router, bool shared, bool quantized = false, int64_t tokens = 7,

@@ -251,8 +251,10 @@ void quant_gemm_tiled(sycl::queue& q, const half* x, const QuantWeight& w, Y* y,
 // ExpertMatMul over a quantized expert bank (rows = E * N of K columns): out [T, S, N], x [T, K] or (per_slot)
 // [T, S, K], expert ids outside [0, E) read expert 0. Up to kExpertPairsDirect (token, slot) pairs run one GEMV each;
 // more are grouped by expert on the device in `grouping` (expert_grouping_bytes) so an expert's rows are read once
-// per kGemvMaxRows of its pairs.
-inline constexpr int64_t kExpertPairsDirect = 32;
+// per kGemvMaxRows of its pairs. The direct path covers a speculative verify (up to kGemvMaxRows tokens with eight
+// experts each): its tokens share few experts, and the grouped path's 8-row GEMV streams a weight at well under half
+// the one-row GEMV's rate.
+inline constexpr int64_t kExpertPairsDirect = 64;
 size_t expert_grouping_bytes(int64_t pairs, int64_t experts);
 // Groups the (token, slot) pairs by expert in `grouping` (expert_grouping_bytes): offsets [E + 1] at grouping + E,
 // the pairs in expert order at grouping + 4 E + 2 (the order inside an expert is not deterministic).

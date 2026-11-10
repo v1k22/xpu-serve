@@ -164,8 +164,9 @@ Where the time goes, and what would move it:
   55.1 / 56.3 / 57.3 / 59.0 ms (from 62.0 / 68.5 / 78.1 / -), which takes Qwen3.8 at k = 3 / 4 to 41.1 / 42.1 tok/s
   (from 37.5 / 35.8), past k = 2 (39.2).
 - MoE targets (Qwen3.6, 26B-A4B): a verify of k + 1 tokens reads the union of their experts, so it grows faster with
-  k than a dense model's; past 4 (token, expert) pairs per expert bank the expert path also changes kernels. Best k
-  is 2.
+  k than a dense model's; best k is 2. Up to 64 (token, expert) pairs (a verify of up to 8 tokens with eight experts
+  each) run one GEMV per pair: the grouped path, which used to start at 33 pairs (k = 4), runs its GEMV at 8 rows, and
+  took Qwen3.6 / 26B-A4B at k = 4 to 64.9 / 61.0 tok/s; now 81.5 / 75.2.
 - Drafter steps: Qwen3.8's MTP step is about 2.5 ms (its lm_head over 248k tokens alone 1.8 ms). The E2B target's
   step is short (about 7 ms), so its rounds are bound by per-program host overhead (several programs per round, each
   waiting for its outputs); k = 1 is best there.
