@@ -440,7 +440,7 @@ void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v,
             const int sgid = static_cast<int>(sg.get_group_linear_id());
             const int lane = static_cast<int>(sg.get_local_linear_id());
             const int64_t pos = n - tokens + t;
-            const int64_t first = causal && window > 0 ? std::max<int64_t>(0, pos - window + 1) : 0;
+            const int64_t first = window > 0 ? std::max<int64_t>(0, pos - window + 1) : 0;
             const int64_t visible_last = causal ? pos : n - 1;
             // This work-group's share of the visible keys [first, visible_last].
             const int64_t chunk = (visible_last - first + split) / split;
@@ -1286,6 +1286,13 @@ void sign_matmul(sycl::queue& q, const float* x, const uint32_t* signs, const fl
     }
 }
 
+void prev_row(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(rows * width)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y[i] = i < width ? 0.0f : x[i - width];
+    });
+}
+
 void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner) {
     syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(outer), static_cast<size_t>(inner)), [=](sycl::item<2> it) {
         const int64_t o = static_cast<int64_t>(it[0]);
@@ -1770,10 +1777,8 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
         // visible keys, relative to k_lo: [lo, hi]
         int64_t lo = 0;
         int64_t hi = keys - 1;
-        if (causal) {
-            hi = std::min<int64_t>(hi, pos - k_lo);
-            if (window > 0) lo = std::max<int64_t>(lo, pos - window + 1 - k_lo);
-        }
+        if (causal) hi = std::min<int64_t>(hi, pos - k_lo);
+        if (window > 0) lo = std::max<int64_t>(lo, pos - window + 1 - k_lo);
         const float* sr = scores + r * keys;
         CT* pr = probs + r * keys;
         const int64_t lid = static_cast<int64_t>(it.get_local_id(0));

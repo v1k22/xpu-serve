@@ -64,6 +64,8 @@ void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64
 size_t sign_matmul_scratch(int64_t k);
 void sign_matmul(sycl::queue& q, const float* x, const uint32_t* signs, const float* scales, float* y, int64_t m,
                  int64_t n, int64_t k, void* scratch);
+// y's row t is x's row t - 1, its row 0 zeros; rows of `width` values.
+void prev_row(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width);
 // y [outer, inner] = the sum over the middle axis of x [outer, dim, inner].
 void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner);
 // out [T, S, N] = x[t] (per_slot: x[t, s]) @ w[idx[t, s]]^T, w [E, N, K]; expert ids outside [0, E) read expert 0.

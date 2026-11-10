@@ -52,6 +52,8 @@ HostTensor layer_norm(const HostTensor& x, const HostTensor& weight, const HostT
 HostTensor concat(const std::vector<HostTensor>& parts, int axis);
 // x [T, K] or [T, S, K], w [E, N, K], idx [T, S] int -> [T, S, N].
 HostTensor expert_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& w, const HostTensor& idx);
+// Row t is x's row t - 1, row 0 zeros.
+HostTensor prev_row(const HostTensor& x);
 // x [..., K], signs [N, K / 32] i32, scales [N] -> [..., N] (graph.h SignMatMul).
 HostTensor sign_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& signs, const HostTensor& scales);
 

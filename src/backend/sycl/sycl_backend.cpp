@@ -803,6 +803,9 @@ private:
                 }
                 case OpKind::GatedDelta: {
                     for (size_t k = 0; k < n.inputs.size(); ++k)
+                case OpKind::PrevRow:
+                    need(0, is_f32(0), "f32");
+                    break;
                         need(k, is_f32(k), "f32");
                     const int64_t dk = graph_.type(n.inputs[0]).shape.back();
                     const int64_t dv = graph_.type(n.inputs[2]).shape.back();
@@ -1955,6 +1958,8 @@ private:
                 } else {
                     // Keys and values in place, in two parts when the concats were fused away (attn_split_).
                     const int split = attn_split_[i];
+                XS_CHECK(s.causal || s.window == 0 || s.tokens <= s.window, "non-causal attention of ", s.tokens,
+                         " queries with a window of ", s.window);
                     const Value kv_k = split >= 0 ? reads_[i][1] : n.inputs[1];
                     const Value kv_v = split >= 0 ? reads_[i][2] : n.inputs[2];
                     sycl_be::KvSecond second;
@@ -2039,6 +2044,11 @@ private:
                     outer *= in[static_cast<size_t>(d)];
                 const int64_t dim = in[static_cast<size_t>(axis)];
                 sycl_be::reduce_sum(q_, in_f32(0), out, outer, dim, numel(in) / (outer * dim));
+            case OpKind::PrevRow: {
+                const int64_t rows = out_shape[0];
+                sycl_be::prev_row(q_, in_f32(0), out, rows, rows > 0 ? out_n / rows : 0);
+                return;
+            }
                 return;
             }
             case OpKind::ExpertMatMul: {

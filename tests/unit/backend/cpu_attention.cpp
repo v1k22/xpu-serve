@@ -46,7 +46,7 @@ void append_rows(Tensor64& history, const Tensor64& step) {
 }
 
 test::ref::AttentionSpec spec_of(const AttentionAttrs& a) {
-    return {a.scale, a.sliding_window, a.softcap, 0};
+    return {a.scale, a.sliding_window, a.softcap, 0, a.causal};
 }
 
 // Each row (token, head) of x [T, H, D] as its int8 KV value.
@@ -109,6 +109,18 @@ TEST_SUITE("cpu-ref attention") {
 
     TEST_CASE("sliding window, T = 1 and T > 1") {
         check_steps({4, 1, 8, {0.3f, 3, 0.0f}}, {1, 1, 6, 1, 1, 4}, 12);
+    }
+
+    TEST_CASE("not causal with a window: a step sees itself whole and the window before each of its queries") {
+        const AttentionCase c{4, 2, 8, {0.3f, 5, 0.0f, false}};
+        const LastStep last = check_steps(c, {4, 5, 2, 3, 5}, 19);
+        test::ref::AttentionSpec causal = spec_of(c.attrs);
+        causal.causal = true;
+        CHECK_FALSE(test::all_close(last.out, test::ref::attention(last.q, last.k_all, last.v_all, causal), kAtol, kRtol));
+        test::ref::AttentionSpec off_by_one = spec_of(c.attrs);
+        off_by_one.window_slack = 1;
+        CHECK_FALSE(
+            test::all_close(last.out, test::ref::attention(last.q, last.k_all, last.v_all, off_by_one), kAtol, kRtol));
     }
 
     TEST_CASE("logit softcap with and without a window") {

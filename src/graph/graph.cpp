@@ -59,6 +59,7 @@ std::string_view op_name(OpKind kind) {
         case OpKind::ReduceSum: return "ReduceSum";
         case OpKind::ExpertMatMul: return "ExpertMatMul";
         case OpKind::SignMatMul: return "SignMatMul";
+        case OpKind::PrevRow: return "PrevRow";
         case OpKind::LayerNorm: return "LayerNorm";
         case OpKind::Concat: return "Concat";
     }
@@ -261,6 +262,13 @@ Value Graph::sign_matmul(Value x, Value signs, Value scales) {
     return add_node(OpKind::SignMatMul, {x, signs, scales}, {}, {TensorType{DType::F32, std::move(out)}}, "sign_matmul");
 }
 
+Value Graph::prev_row(Value x) {
+    const TensorType& xt = type(x);
+    XS_CHECK(!xt.shape.empty() && is_float(xt.dtype), "prev_row needs float rows, got ", dtype_name(xt.dtype),
+             shape_to_string(xt.shape), " at ", where(x));
+    return add_node(OpKind::PrevRow, {x}, {}, {TensorType{DType::F32, xt.shape}}, "prev_row");
+}
+
 Value Graph::elementwise_unary(OpKind kind, Value x, Attrs attrs) {
     TensorType t{DType::F32, type(x).shape};
     std::string what(op_name(kind));
@@ -448,7 +456,9 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     } else {
         XS_CHECK(ks.size() == 3 && ks == vs, "attention k/v must be [N, kv_heads, head_dim] and equal, got ",
                  shape_to_string(ks), " and ", shape_to_string(vs));
-        XS_CHECK(attrs.sliding_window == 0, "non-causal attention takes no sliding window");
+        XS_CHECK(attrs.sliding_window == 0 || (qs[0] == kT && ks[0] == kL),
+                 "non-causal attention with a sliding window takes q [T, ...] and k/v [L, ...], got ",
+                 shape_to_string(qs), " and ", shape_to_string(ks));
     }
     XS_CHECK(ks[2] == qs[2], "attention head_dim differs: q ", qs[2], ", k ", ks[2]);
     XS_CHECK(qs[1] % ks[1] == 0, "attention heads ", qs[1], " not a multiple of kv heads ", ks[1]);

@@ -34,11 +34,12 @@ struct AttentionCase {
     std::string impl = "auto";
     std::vector<int64_t> steps{5, 1, 3};
     bool kv_i8 = false;  // --kv-dtype i8
+    bool causal = true;
 };
 
 std::string describe(const AttentionCase& c) {
     return str_cat("D", c.head_dim, " H", c.heads, "/", c.kv_heads, " w", c.window, " cap", c.softcap, " ", c.impl,
-                   c.kv_i8 ? " kv-i8" : "");
+                   c.kv_i8 ? " kv-i8" : "", c.causal ? "" : " not causal");
 }
 
 float scale_of(const AttentionCase& c) {
@@ -51,7 +52,7 @@ Graph attention_graph(const AttentionCase& c) {
     const Value q = g.input("q", DType::F32, {kT, c.heads, c.head_dim});
     const auto [k_all, v_all] = g.kv_cache(slot, g.input("k", DType::F32, {kT, c.kv_heads, c.head_dim}),
                                            g.input("v", DType::F32, {kT, c.kv_heads, c.head_dim}));
-    g.output("out", g.attention(q, k_all, v_all, AttentionAttrs{scale_of(c), c.window, c.softcap}));
+    g.output("out", g.attention(q, k_all, v_all, AttentionAttrs{scale_of(c), c.window, c.softcap, c.causal}));
     return g;
 }
 
@@ -95,7 +96,8 @@ bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& r
 }
 
 bool attention_matches(const AttentionCase& c, uint32_t seed) {
-    return attention_matches(c, {scale_of(c), c.window, c.softcap, 0}, c.kv_i8 ? kAttentionI8 : kAttention, seed);
+    return attention_matches(c, {scale_of(c), c.window, c.softcap, 0, c.causal}, c.kv_i8 ? kAttentionI8 : kAttention,
+                             seed);
 }
 
 }  // namespace
@@ -131,6 +133,33 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
                 CHECK(attention_matches(c, static_cast<uint32_t>(100 + head_dim)));
             }
         }
+    }
+
+    TEST_CASE("not causal with a window (a drafter's block): steps of up to the window, every lowering, int8 KV") {
+        for (const int64_t head_dim : {64, 128}) {
+            for (const std::string& impl : dev::attention_impls()) {
+                for (const bool kv_i8 : {false, true}) {
+                    AttentionCase c;
+                    c.head_dim = head_dim;
+                    c.heads = 8;
+                    c.kv_heads = 2;
+                    c.window = 16;
+                    c.causal = false;
+                    c.impl = impl;
+                    c.kv_i8 = kv_i8;
+                    c.steps = {16, 9, 16, 1, 8, 16};
+                    CAPTURE(describe(c));
+                    CHECK(attention_matches(c, static_cast<uint32_t>(900 + head_dim)));
+                }
+            }
+        }
+        AttentionCase c;
+        c.window = 6;
+        c.causal = false;
+        c.steps = {6, 4, 5};
+        CHECK(attention_matches(c, {scale_of(c), c.window, 0.0, 0, false}, kAttention, 950));
+        CHECK_FALSE(attention_matches(c, {scale_of(c), c.window, 0.0, 1, false}, kAttention, 950));
+        CHECK_FALSE(attention_matches(c, {scale_of(c), c.window, 0.0, 0, true}, kAttention, 950));
     }
 
     TEST_CASE("decode over a long cache, whole and windowed (split across work-groups on SYCL)") {

@@ -212,7 +212,7 @@ bool rows_path(const AttentionShape& s, AttentionPath path) {
 template <typename Run>
 void attention_by_rows(sycl::queue& q, Scratch& scratch, float* out, const AttentionShape& s, const Run& run) {
     const int64_t rows = s.tokens * s.q_heads;
-    const int64_t keys = s.causal && s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
+    const int64_t keys = s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
     const int64_t split = std::clamp<int64_t>(std::min(kTargetWorkGroups / rows, keys / kMinSplitKeys), 1, 64);
     if (split == 1) {
         run(int64_t{1}, static_cast<float*>(nullptr));
@@ -277,10 +277,8 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
         const int64_t cur = std::min(tc, s.tokens - t0);
         int64_t k_lo = 0;
         int64_t k_hi = s.kv_len;
-        if (s.causal) {
-            k_hi = past + t0 + cur;
-            if (s.window > 0) k_lo = std::max<int64_t>(0, past + t0 - s.window + 1);
-        }
+        if (s.causal) k_hi = past + t0 + cur;
+        if (s.window > 0) k_lo = std::max<int64_t>(0, past + t0 - s.window + 1);
         const int64_t keys = k_hi - k_lo;
         const int64_t rows = cur * group;
         // The keys [k_lo, k_hi) in at most two parts: [k_lo, a_hi) of k / v, then [b_lo, k_hi) of the second.
@@ -338,7 +336,7 @@ void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const f
     }
     // Keys before `first` are outside every query's window: drop them, which shifts all positions alike.
     const int64_t past = s.kv_len - s.tokens;
-    const int64_t first = s.causal && s.window > 0 ? std::max<int64_t>(0, past - s.window + 1) : 0;
+    const int64_t first = s.window > 0 ? std::max<int64_t>(0, past - s.window + 1) : 0;
     const int64_t rows = (s.kv_len - first) * s.kv_heads;
     const size_t half_bytes = align_up(static_cast<size_t>(rows * s.head_dim) * sizeof(CT));
     auto* k = static_cast<CT*>(kv_scratch.get(2 * half_bytes));

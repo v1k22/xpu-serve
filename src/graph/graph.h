@@ -74,6 +74,7 @@ enum class OpKind : uint8_t {
     SignMatMul, // (x [..., K], signs [N, K / 32] i32, scales [N]) -> [..., N] = x @ w^T for the one-bit weight
                 // w[n, c] = scales[n] if bit c % 32 of signs[n, c / 32] is set, else -scales[n] (quant::sign_sketch
                 // of a weight): a cheap score of every row, to shortlist the rows worth an exact product
+    PrevRow,    // (x [T, ...]) -> same shape: row t is x's row t - 1, row 0 zeros: each row's predecessor in the step
     Concat,     // (x0, x1, ...) joined along AxisAttrs::axis (static there); the other dims and the dtype agree
     KvRead,     // () -> (k_all [L, Hkv, D], v_all [L, Hkv, D]): a KV slot another program of the session writes, read
                 // without appending; L is that slot's length (a graph either appends to its KV slots or only reads)
@@ -148,8 +149,11 @@ struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op'
 // position p_i = L - T + i (after a KvRead, the slot's last T positions); key j sits at position j. Key j is visible to query i iff j <= p_i and (sliding_window == 0 or
 // p_i - j < sliding_window).
 // Not causal (encoders, policy prefixes): every key is visible to every query; q may have a static length and k, v
-// any length N (e.g. kT for self-attention over the step's own tokens); sliding_window must be 0. The optional
-// key_bias [N] is added to every query's score of key j (0 keeps it, -inf masks it: prompt padding).
+// any length N (e.g. kT for self-attention over the step's own tokens). The optional key_bias [N] is added to every
+// query's score of key j (0 keeps it, -inf masks it: prompt padding).
+// Not causal with a sliding_window (a block drafter: its block sees itself whole, and the window of the cache before
+// it): q is [T, ...], k and v are KvCache outputs and positions are the causal ones; key j is visible to query i iff
+// p_i - j < sliding_window, with T <= sliding_window.
 // scores = scale * q.k (f32); if softcap > 0: scores = softcap * tanh(scores / softcap); softmax in f32.
 struct AttentionAttrs {
     float scale = 1.0f;
@@ -245,6 +249,7 @@ public:
     Value reduce_sum(Value x, int axis);
     Value expert_matmul(Value x, Value w, Value idx);
     Value sign_matmul(Value x, Value signs, Value scales);
+    Value prev_row(Value x);
     Value concat(const std::vector<Value>& parts, int axis);
 
     void output(const std::string& name, Value v);

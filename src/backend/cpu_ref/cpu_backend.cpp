@@ -448,6 +448,8 @@ class CpuProgram {
                 return {cpu_ref::expert_matmul(*pool_, f32(0), f32(1), in(2))};
             case OpKind::SignMatMul:
                 return {cpu_ref::sign_matmul(*pool_, f32(0), in(1), f32(2))};
+            case OpKind::PrevRow:
+                return {cpu_ref::prev_row(f32(0))};
         }
         fail("cpu-ref: unhandled op ", graph::op_name(n.kind));
     }

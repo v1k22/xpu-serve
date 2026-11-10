@@ -84,6 +84,24 @@ TEST_CASE("mixture-of-experts ops: shapes and refusals") {
     CHECK_THROWS_AS(g.expert_matmul(up, g.weight(w, "experts"), indices), xs::Error);  // inner dims 24 vs 16
 }
 
+TEST_CASE("attention that is not causal takes a window only over a step's rows and a cache") {
+    Graph g;
+    const Value q = g.input("q", DType::F32, {kT, 4, 8});
+    const Value k = g.input("k", DType::F32, {kT, 1, 8});
+    const auto [ka, va] = g.kv_cache(g.add_kv_slot(1, 8, 16, "block"), k, k);
+    CHECK(g.type(g.attention(q, ka, va, AttentionAttrs{1.0f, 16, 0.0f, false})).shape == (xs::Dims{kT, 4, 8}));
+    CHECK_THROWS_AS(g.attention(q, k, k, AttentionAttrs{1.0f, 16, 0.0f, false}), xs::Error);
+    const Value fixed = g.input("fixed", DType::F32, {3, 4, 8});
+    CHECK_THROWS_AS(g.attention(fixed, ka, va, AttentionAttrs{1.0f, 16, 0.0f, false}), xs::Error);
+}
+
+TEST_CASE("prev_row keeps the shape; float rows only") {
+    Graph g;
+    const Value x = g.input("x", DType::F32, {kT, 3, 5});
+    CHECK(g.type(g.prev_row(x)).shape == (xs::Dims{kT, 3, 5}));
+    CHECK_THROWS_AS(g.prev_row(g.input("ids", DType::I32, {kT})), xs::Error);
+}
+
 TEST_CASE("sign matmul: one word of signs per 32 columns, a scale per row") {
     Graph g;
     const Value x = g.input("x", DType::F32, {kT, 64});

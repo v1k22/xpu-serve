@@ -162,7 +162,7 @@ struct FlashKernel {
         // Row r is token t0 + r; the tile's span of visible keys; its split's share in whole blocks.
         const int64_t last = std::min<int64_t>(a.tokens - 1, t0 + kRows - 1);
         const int64_t hi = a.causal ? past + last + 1 : a.kv_len;
-        const int64_t lo = a.causal && a.window > 0 ? std::max<int64_t>(0, past + t0 - a.window + 1) : 0;
+        const int64_t lo = a.window > 0 ? std::max<int64_t>(0, past + t0 - a.window + 1) : 0;
         const int pos0 = static_cast<int>(past + t0);
         const int rows_valid = static_cast<int>(last - t0 + 1);
         const int64_t blocks = ceil_div(hi - lo, BC);
@@ -219,7 +219,7 @@ struct FlashKernel {
                         if (a.softcap > 0.0f) y = cap2 * (1.0f - 2.0f / (sycl::native::exp2(2.0f * kLog2e * y) + 1.0f));
                         const int pos = pos0 + r0 + i;
                         bool ok = key_ok && r0 + i < rows_valid;
-                        if (a.causal) ok = ok && j <= pos && (a.window <= 0 || j > pos - a.window);
+                        ok = ok && (!a.causal || j <= pos) && (a.window <= 0 || j > pos - a.window);
                         y = ok ? y + bias : kNegInf;
                         x = y;
                         mb[i] = sycl::fmax(mb[i], y);
@@ -367,7 +367,7 @@ bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v)
 int64_t flash_attention_split(const AttentionShape& s, int64_t compute_units) {
     const FlashConfig c = flash_config(s.head_dim);
     const int64_t tiles = s.q_heads * ceil_div(s.tokens, int64_t{kTm} * c.mt);
-    const int64_t keys = s.causal && s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
+    const int64_t keys = s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
     const int64_t blocks = ceil_div(keys, c.bc);
     // about 2.5 sub-groups per execution unit in flight (4 threads each in the large register file)
     const int64_t want = compute_units * 5 / 2 / std::max<int64_t>(tiles, 1);

@@ -451,7 +451,10 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
     const int64_t head_dim = q.dim(2);
     const int64_t kv_len = k_all.dim(0);
     const int64_t kv_heads = k_all.dim(1);
-    XS_CHECK(!attrs.causal || kv_len >= tokens, "attention has ", kv_len, " keys for ", tokens, " queries");
+    const bool positioned = attrs.causal || attrs.sliding_window > 0;  // queries are the cache's last rows
+    XS_CHECK(!positioned || kv_len >= tokens, "attention has ", kv_len, " keys for ", tokens, " queries");
+    XS_CHECK(attrs.causal || attrs.sliding_window == 0 || tokens <= attrs.sliding_window, "non-causal attention of ",
+             tokens, " queries with a window of ", attrs.sliding_window);
     XS_CHECK(k_all.shape() == v_all.shape() && k_all.dim(2) == head_dim && q_heads % kv_heads == 0,
              "attention shapes q ", dims_to_string(q.shape()), ", k ", dims_to_string(k_all.shape()), ", v ",
              dims_to_string(v_all.shape()), " do not fit");
@@ -603,6 +606,15 @@ HostTensor expert_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor
         for (int64_t c = 0; c < n; ++c)
             out.data<float>()[item * n + c] = static_cast<float>(dot(row, w.data<float>() + (e * n + c) * k, k));
     });
+    return out;
+}
+
+HostTensor prev_row(const HostTensor& x) {
+    check_f32(x, "prev_row x");
+    HostTensor out(DType::F32, x.shape());
+    const int64_t rows = x.dim(0);
+    const int64_t row = rows > 0 ? x.numel() / rows : 0;
+    if (rows > 1) std::copy_n(x.data<float>(), (rows - 1) * row, out.data<float>() + row);
     return out;
 }
 

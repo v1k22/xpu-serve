@@ -182,6 +182,21 @@ TEST_SUITE("cpu-ref ops") {
         }
     }
 
+    TEST_CASE("prev_row: each row's predecessor, zeros for the first") {
+        test::TensorRng rng(8);
+        for (const int64_t rows : {1, 2, 7}) {
+            CAPTURE(rows);
+            const HostTensor x = rng.uniform(DType::F32, {rows, 3, 4});
+            Graph g;
+            g.output("out", g.prev_row(g.input("x", DType::F32, {kT, 3, 4})));
+            const HostTensor out = run_single_output(g, test::MemoryWeights{}, {{"x", x}});
+            Tensor64 expected({rows, 3, 4});
+            const Tensor64 x64 = to_f64(x);
+            for (int64_t i = 12; i < rows * 12; ++i) expected[i] = x64[i - 12];
+            CHECK(test::all_close(out, expected, 0, 0));
+        }
+    }
+
     TEST_CASE("reshape keeps row-major order and resolves T; slice keeps int dtype") {
         Graph g;
         const Value ids = g.input("ids", DType::I32, {kT});
