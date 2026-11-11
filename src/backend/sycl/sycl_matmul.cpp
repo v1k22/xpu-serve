@@ -32,6 +32,20 @@ void ordered(sycl::queue& q, Fn&& gemm) {
     gemm(std::vector<sycl::event>{});
 }
 
+// c_h [M, N] = alpha * a_h [M, K] @ op(b_h) + beta * c_h for each of `heads` matrices a `stride` apart (op(b) is b^T,
+// b [N, K], with `tb` trans; b [K, N] otherwise). One head is a plain GEMM, which launches faster than a batch of one.
+template <typename A, typename C>
+void gemm_heads(sycl::queue& q, transpose tb, int64_t m, int64_t n, int64_t k, float alpha, const A* a, int64_t lda,
+                int64_t stride_a, const A* b, int64_t ldb, int64_t stride_b, float beta, C* c, int64_t ldc,
+                int64_t stride_c, int64_t heads) {
+    if (heads == 1) {
+        blas::gemm(q, transpose::nontrans, tb, m, n, k, alpha, a, lda, b, ldb, beta, c, ldc);
+    } else {
+        blas::gemm_batch(q, transpose::nontrans, tb, m, n, k, alpha, a, lda, stride_a, b, ldb, stride_b, beta, c, ldc,
+                         stride_c, heads);
+    }
+}
+
 }  // namespace
 
 template <typename W>
@@ -295,32 +309,23 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
         }
         if (qa == packed_q) attention_pack_q(q, qp, packed_q, s, t0, cur);
         if (n1 > 0) {
-            ordered(q, [&](const std::vector<sycl::event>& deps) {
-                return blas::gemm_batch(q, transpose::nontrans, transpose::trans, rows, n1, d, s.scale, qa, d,
-                                        rows * d, k + k_lo * hkv * d, hkv * d, d, 0.0f, scores, keys, rows * keys, hkv,
-                                        deps);
-            });
+            gemm_heads(q, transpose::trans, rows, n1, d, s.scale, qa, d, rows * d, k + k_lo * hkv * d, hkv * d, d, 0.0f,
+                       scores, keys, rows * keys, hkv);
         }
         if (n2 > 0) {  // the second part's scores: the columns after the first's
-            ordered(q, [&](const std::vector<sycl::event>& deps) {
-                return blas::gemm_batch(q, transpose::nontrans, transpose::trans, rows, n2, d, s.scale, qa, d,
-                                        rows * d, k2, hkv * d, d, 0.0f, scores + n1, keys, rows * keys, hkv, deps);
-            });
+            gemm_heads(q, transpose::trans, rows, n2, d, s.scale, qa, d, rows * d, k2, hkv * d, d, 0.0f, scores + n1,
+                       keys, rows * keys, hkv);
         }
         attention_softmax(q, scores, probs, s, t0, cur, k_lo, keys);
         // One KV head: the packed layout [1, cur, G, D] is the output's rows t0.. already, so the GEMM writes there.
         float* o = hkv == 1 ? out + t0 * s.q_heads * d : packed_o;
         if (n1 > 0) {
-            ordered(q, [&](const std::vector<sycl::event>& deps) {
-                return blas::gemm_batch(q, transpose::nontrans, transpose::nontrans, rows, d, n1, 1.0f, probs, keys,
-                                        rows * keys, v + k_lo * hkv * d, hkv * d, d, 0.0f, o, d, rows * d, hkv, deps);
-            });
+            gemm_heads(q, transpose::nontrans, rows, d, n1, 1.0f, probs, keys, rows * keys, v + k_lo * hkv * d, hkv * d,
+                       d, 0.0f, o, d, rows * d, hkv);
         }
         if (n2 > 0) {  // adds the second part's P V
-            ordered(q, [&](const std::vector<sycl::event>& deps) {
-                return blas::gemm_batch(q, transpose::nontrans, transpose::nontrans, rows, d, n2, 1.0f, probs + n1, keys,
-                                        rows * keys, v2, hkv * d, d, n1 > 0 ? 1.0f : 0.0f, o, d, rows * d, hkv, deps);
-            });
+            gemm_heads(q, transpose::nontrans, rows, d, n2, 1.0f, probs + n1, keys, rows * keys, v2, hkv * d, d,
+                       n1 > 0 ? 1.0f : 0.0f, o, d, rows * d, hkv);
         }
         if (hkv != 1) attention_unpack(q, packed_o, out, s, t0, cur);
     }
