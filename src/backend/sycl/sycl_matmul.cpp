@@ -220,7 +220,8 @@ bool quant_parts_few_rows(int64_t m, const QuantPart<Y>* parts, int count, int64
 template <typename X, typename Y>
 void matmul_quant_parts(sycl::queue& q, Scratch& scratch, const X* x, const QuantPart<Y>* parts, int count, int64_t m,
                         int64_t k, const QuantMatmulPlan& plan) {
-    XS_CHECK(quant_parts_few_rows(m, parts, count, k, plan), "sycl matmul_quant_parts: the parts do not share a launch");
+    XS_CHECK(quant_parts_few_rows(m, parts, count, k, plan),
+             "sycl matmul_quant_parts: the parts do not share a launch");
     const half* xh = nullptr;
     if constexpr (std::is_same_v<X, half>) {
         if (!block_load_aligned(x)) {
@@ -242,10 +243,10 @@ template bool quant_parts_few_rows<float>(int64_t, const QuantPart<float>*, int,
 template bool quant_parts_few_rows<half>(int64_t, const QuantPart<half>*, int, int64_t, const QuantMatmulPlan&);
 template void matmul_quant_parts<float, float>(sycl::queue&, Scratch&, const float*, const QuantPart<float>*, int,
                                                int64_t, int64_t, const QuantMatmulPlan&);
-template void matmul_quant_parts<half, float>(sycl::queue&, Scratch&, const half*, const QuantPart<float>*, int, int64_t,
-                                              int64_t, const QuantMatmulPlan&);
-template void matmul_quant_parts<float, half>(sycl::queue&, Scratch&, const float*, const QuantPart<half>*, int, int64_t,
-                                              int64_t, const QuantMatmulPlan&);
+template void matmul_quant_parts<half, float>(sycl::queue&, Scratch&, const half*, const QuantPart<float>*, int,
+                                              int64_t, int64_t, const QuantMatmulPlan&);
+template void matmul_quant_parts<float, half>(sycl::queue&, Scratch&, const float*, const QuantPart<half>*, int,
+                                              int64_t, int64_t, const QuantMatmulPlan&);
 template void matmul_quant_parts<half, half>(sycl::queue&, Scratch&, const half*, const QuantPart<half>*, int, int64_t,
                                              int64_t, const QuantMatmulPlan&);
 

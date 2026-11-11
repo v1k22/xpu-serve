@@ -1523,28 +1523,43 @@ void gather_bits(sycl::queue& q, const uint32_t* table, const I* ids, uint32_t* 
 template void gather_bits(sycl::queue&, const uint32_t*, const int32_t*, uint32_t*, int64_t, int64_t);
 template void gather_bits(sycl::queue&, const uint32_t*, const int64_t*, uint32_t*, int64_t, int64_t);
 
+// A work-item per token and rotated pair (or element past the rotated part): the angle's cosine and sine are
+// computed once and applied to every head. (An item per element computed them twice a pair for each head, with a
+// handful of 64-bit divisions: at a prefill's or a policy's sizes that cost more than reading and writing x.)
 template <typename I, typename Y>
 void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_freq, Y* y, int64_t tokens,
           int64_t heads, int64_t dim, int64_t rotary, int64_t sections) {
-    const int64_t width = rotary / sections;
-    const int64_t half_w = width / 2;
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(tokens * heads * dim)), [=](sycl::id<1> idx) {
-        const int64_t i = static_cast<int64_t>(idx[0]);
-        const int64_t d = i % dim;
-        if (d >= rotary) {
-            y[i] = static_cast<Y>(x[i]);
+    const auto width = static_cast<int>(rotary / sections);
+    const int half_w = width / 2;
+    const auto pairs = static_cast<int>(rotary / 2);
+    const auto rotated = static_cast<int>(rotary);
+    const auto h_n = static_cast<int>(heads);
+    const auto d_n = static_cast<int>(dim);
+    const sycl::range<2> items(static_cast<size_t>(tokens), static_cast<size_t>(pairs + (dim - rotary)));
+    syclex::parallel_for(q, items, [=](sycl::id<2> idx) {
+        const auto t = static_cast<int64_t>(idx[0]);
+        const auto j = static_cast<int>(idx[1]);
+        const float* xt = x + t * (h_n * d_n);
+        Y* yt = y + t * (h_n * d_n);
+        if (j >= pairs) {
+            const int d = rotated + (j - pairs);
+            for (int h = 0; h < h_n; ++h) yt[h * d_n + d] = static_cast<Y>(xt[h * d_n + d]);
             return;
         }
-        const int64_t t = i / (heads * dim);
-        const int64_t sec = d / width;
-        const int64_t c = d % width;
-        const int64_t c0 = c % half_w;
+        const int sec = j / half_w;
+        const int c0 = j % half_w;
         // f32 angle as Hugging Face computes it (inv_freq @ positions in float32)
         const float angle = static_cast<float>(positions[t * sections + sec]) * inv_freq[c0];
         const float cs = sycl::cos(angle);
         const float sn = sycl::sin(angle);
-        const int64_t base = i - c;
-        y[i] = static_cast<Y>(c < half_w ? x[i] * cs - x[base + c + half_w] * sn : x[i] * cs + x[base + c - half_w] * sn);
+        const int lo = sec * width + c0;
+        const int hi = lo + half_w;
+        for (int h = 0; h < h_n; ++h) {
+            const float a = xt[h * d_n + lo];
+            const float b = xt[h * d_n + hi];
+            yt[h * d_n + lo] = static_cast<Y>(a * cs - b * sn);
+            yt[h * d_n + hi] = static_cast<Y>(b * cs + a * sn);
+        }
     });
 }
 

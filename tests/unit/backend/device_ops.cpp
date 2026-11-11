@@ -244,12 +244,13 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
             test::MemoryWeights w;
             // a, b and c share a launch (N of 96, 64 and 32: runs of work-groups of different lengths; two group
             // sizes); `next` reads a and b in f16 when x is made by an op
-            for (const auto& [name, n, cols, group] : {std::tuple<const char*, int64_t, int64_t, int64_t>{"a", 96, k, 32},
-                                                       {"b", 64, k, 64},
-                                                       {"c", 32, k, 32},
-                                                       {"na", 32, 96, 32},
-                                                       {"nb", 32, 64, 32},
-                                                       {"nc", 32, 32, 32}}) {
+            using Spec = std::tuple<const char*, int64_t, int64_t, int64_t>;
+            for (const auto& [name, n, cols, group] : {Spec{"a", 96, k, 32},
+                                                       Spec{"b", 64, k, 64},
+                                                       Spec{"c", 32, k, 32},
+                                                       Spec{"na", 32, 96, 32},
+                                                       Spec{"nb", 32, 64, 32},
+                                                       Spec{"nc", 32, 32, 32}}) {
                 const HostTensor dense = rng.uniform(DType::F32, {n, cols}, 1.0f / std::sqrt(static_cast<float>(cols)));
                 w.add_quantized(name, quant::quantize(dense.view(), format, group));
             }
