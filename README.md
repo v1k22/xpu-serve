@@ -87,6 +87,22 @@ drafts in one step; greedy output stays the model's own and sampling keeps its d
 | `dflash` | a DFlash or DFlash 2 block drafter | `--drafter <z-lab/Qwen3.8-27B-DFlash2>` |
 | `dspine` | a DSpine block drafter | `--drafter <tencent/Qwen3.8-27B-DSpine-b16>` |
 
+Which model takes which technique (a drafter is trained for one model, so a technique works only where a drafter for
+that model exists; anything else is refused by name):
+
+| Model | `mtp` | `dflash` | `dspine` | Decode with it (tok/s, off → on) |
+|---|---|---|---|---|
+| Gemma 4 E2B | yes: `google/gemma-4-E2B-it-assistant` | no | no | 140 → 174 (q4, Arc Pro B60) |
+| Gemma 4 E4B | same code as E2B; its assistant has not been run | no | no | not measured |
+| Gemma 4 26B-A4B | yes: `google/gemma-4-26B-A4B-it-assistant` | no | no | 67 → 91 (q4, Arc Pro B60) |
+| Qwen3.5 4B | yes: the MTP head in its checkpoint | no | no | not measured |
+| Qwen3.6-35B-A3B | yes: the MTP head in its checkpoint | no | no | 62 → 94 (q4, Arc Pro B60) |
+| Qwen3.8-27B | yes: the MTP head in its checkpoint | yes: `z-lab/Qwen3.8-27B-DFlash2` | yes: `tencent/Qwen3.8-27B-DSpine-b16` | Arc Pro B60: 22 → 50 (`mtp`), 61 (`dflash`), 51 (`dspine`); Arc B390: 6.6 → 18, 20, 17.5 |
+| LFM3-1.7B | no (no drafter exists) | no | no | |
+
+DFlash 2 and DSpine checkpoints are released for Qwen3.8-27B only. The original DFlash format loads through the same
+code (`--spec dflash`), but no DFlash checkpoint exists for a model in this table.
+
 `--spec-k` sets the drafts per round: 3 by default (dense Qwen3.8 does best at 4 or 5 with its MTP head, the MoE
 models at 2 or 3), 7 for a block drafter, which proposes its whole block in one pass
 ([docs/design-spec-decode.md](docs/design-spec-decode.md)). A drafter checkpoint is served as it is, or from a pack
