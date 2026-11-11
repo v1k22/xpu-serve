@@ -80,6 +80,44 @@ inline void concat_axes(const Env& env) {
     CHECK(to_ints(out.at("ints")) == std::vector<int64_t>{7, 8, -1, 0, 9});
 }
 
+// Concats of computed values: a first part shared by several concats, whose second parts are made one after the
+// other or are still read after the next one is made (a backend that reads or makes the parts in place must keep
+// them apart), and a part that is a graph input.
+inline void concat_of_computed(const Env& env) {
+    TensorRng rng(44);
+    const HostTensor p = rng.uniform(DType::F32, {8, 16});
+    const HostTensor s1 = rng.uniform(DType::F32, {2, 16});
+    const HostTensor s2 = rng.uniform(DType::F32, {2, 16});
+    Graph g;
+    const Value vp = g.input("p", DType::F32, {8, 16});
+    const Value vs1 = g.input("s1", DType::F32, {2, 16});
+    const Value vs2 = g.input("s2", DType::F32, {2, 16});
+    const Value a = g.scale(vp, 1.5f);
+    const Value b1 = g.scale(vs1, -1.0f);
+    g.output("first", g.scale(g.concat({a, b1}, 0), 2.0f));
+    const Value b2 = g.mul(vs2, vs2);  // made after the first concat's last reader
+    g.output("second", g.scale(g.concat({a, b2}, 0), 3.0f));
+    const Value b3 = g.scale(vs1, 0.25f);
+    const Value third = g.concat({a, b3}, 0);
+    const Value b4 = g.scale(vs2, 7.0f);  // made while `third` is still to be read
+    g.output("fourth", g.scale(g.concat({a, b4}, 0), 0.5f));
+    g.output("third", g.scale(third, 4.0f));
+    g.output("input", g.scale(g.concat({a, g.reshape(vs1, {2, 16})}, 0), -2.0f));
+    const TensorMap out = run(env, g, {{"p", p}, {"s1", s1}, {"s2", s2}}, env.options());
+    const Tensor64 fp = to_f64(p), f1 = to_f64(s1), f2 = to_f64(s2);
+    const auto expect = [&](const std::function<double(size_t)>& tail, double factor) {
+        Tensor64 t({10, 16});
+        for (size_t i = 0; i < 128; ++i) t.data[i] = fp.data[i] * 1.5 * factor;
+        for (size_t i = 0; i < 32; ++i) t.data[128 + i] = tail(i) * factor;
+        return t;
+    };
+    CHECK(all_close(out.at("first"), expect([&](size_t i) { return -f1.data[i]; }, 2.0), env.atol, env.rtol));
+    CHECK(all_close(out.at("second"), expect([&](size_t i) { return f2.data[i] * f2.data[i]; }, 3.0), env.atol, env.rtol));
+    CHECK(all_close(out.at("third"), expect([&](size_t i) { return f1.data[i] * 0.25; }, 4.0), env.atol, env.rtol));
+    CHECK(all_close(out.at("fourth"), expect([&](size_t i) { return f2.data[i] * 7.0; }, 0.5), env.atol, env.rtol));
+    CHECK(all_close(out.at("input"), expect([&](size_t i) { return f1.data[i]; }, -2.0), env.atol, env.rtol));
+}
+
 // Non-causal attention over a static number of queries with keys masked by a -inf bias: SigLIP's shape (head dim 72,
 // 16 heads, outside the per-row kernels) and the action expert's (50 queries over a padded prefix, MQA, head dim 256,
 // and the same at 128). Operands as graph inputs, and through a reshape (an f16 session stores those in f16, which the
