@@ -19,9 +19,9 @@ code.
 
 | Model | Kind | Weights | Speed | Measured on |
 |---|---|---|---|---|
-| Gemma 4 E2B / E4B | language, images | f16, q8, q4 | 61.5 / 92 tok/s decode (f16 / q8); q4: 140, 174 with its assistant | Arc Pro B60 |
+| Gemma 4 E2B / E4B | language, images | f16, q8, q4 | E2B: 61.5 / 92 tok/s decode (f16 / q8); q4: 140, 174 with its assistant. E4B at q4: 84, 126 with its assistant | Arc Pro B60 |
 | Gemma 4 26B-A4B | language, MoE | q4 | 67 tok/s decode, 91 with its assistant | Arc Pro B60 |
-| Qwen3.5 4B | language | f16, q8, q4 | 42 / 71 tok/s decode (f16 / q8) | Arc Pro B60 |
+| Qwen3.5 4B | language | f16, q8, q4 | 43 / 77 / 101 tok/s decode (f16 / q8 / q4); q4: 149 with MTP; 5,000 tok/s prefill | Arc Pro B60 |
 | Qwen3.6-35B-A3B | language, MoE | q4 | 62 tok/s decode, 94 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
 | Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
@@ -89,29 +89,32 @@ drafts in one step; greedy output stays the model's own and sampling keeps its d
 | `dflash` | a DFlash or DFlash 2 block drafter | `--drafter <z-lab/Qwen3.8-27B-DFlash2>` |
 | `dspine` | a DSpine block drafter | `--drafter <tencent/Qwen3.8-27B-DSpine-b16>` |
 
-Which model takes which technique (a drafter is trained for one model, so a technique works only where a drafter for
-that model exists; anything else is refused by name):
+Which model takes which technique. A drafter is trained for one model, so a technique works only where a drafter
+for that model exists (`–`: none does, and the option is refused by name). Each cell is the decode speed in tok/s
+without → with that technique, and the `--spec-k` (drafts per round) that gave it, which is the one to use:
 
-| Model | `mtp` | `dflash` | `dspine` | Decode with it (tok/s, off → on) |
+| Model | Measured on | `mtp` | `dflash` | `dspine` |
 |---|---|---|---|---|
-| Gemma 4 E2B | yes: `google/gemma-4-E2B-it-assistant` | no | no | 140 → 174 (q4, Arc Pro B60) |
-| Gemma 4 E4B | same code as E2B; its assistant has not been run | no | no | not measured |
-| Gemma 4 26B-A4B | yes: `google/gemma-4-26B-A4B-it-assistant` | no | no | 67 → 91 (q4, Arc Pro B60) |
-| Qwen3.5 4B | yes: the MTP head in its checkpoint | no | no | not measured |
-| Qwen3.6-35B-A3B | yes: the MTP head in its checkpoint | no | no | 62 → 94 (q4, Arc Pro B60) |
-| Qwen3.8-27B | yes: the MTP head in its checkpoint | yes: `z-lab/Qwen3.8-27B-DFlash2` | yes: `tencent/Qwen3.8-27B-DSpine-b16` | Arc Pro B60: 22 → 50 (`mtp`), 61 (`dflash`), 51 (`dspine`); Arc B390: 6.6 → 18, 20, 17.5 |
-| LFM3-1.7B | no (no drafter exists) | no | no | |
+| Gemma 4 E2B | q4, Arc Pro B60 | 140 → 174, k = 1 | – | – |
+| Gemma 4 E4B | q4, Arc Pro B60 | 84 → 126, k = 2 | – | – |
+| Gemma 4 26B-A4B | q4, Arc Pro B60 | 67 → 91, k = 2 | – | – |
+| Qwen3.5 4B | q4, Arc Pro B60 | 104 → 149, k = 2 | – | – |
+| Qwen3.6-35B-A3B | q4, Arc Pro B60 | 62 → 94, k = 3 | – | – |
+| Qwen3.8-27B | q4, Arc Pro B60 | 22 → 50, k = 4 | 22 → 61, k = 7 | 22 → 51, k = 7 |
+| Qwen3.8-27B | q4, Arc B390 | 6.6 → 18, k = 5 | 6.6 → 20, k = 7 | 6.6 → 17.5, k = 7 |
+| LFM3-1.7B | | – | – | – |
 
-DFlash 2 and DSpine checkpoints are released for Qwen3.8-27B only. The original DFlash format loads through the same
-code (`--spec dflash`), but no DFlash checkpoint exists for a model in this table.
+Greedy decode over six chat prompts of up to 256 new tokens (`bench --prompts`); the drafters as q4 packs, the Gemma 4
+assistants as their checkpoints. DFlash 2 and DSpine checkpoints are released for Qwen3.8-27B only. The original
+DFlash format loads through the same code (`--spec dflash`), but no DFlash checkpoint exists for a model in this
+table.
 
-`--spec-k` sets the drafts per round: 3 by default (dense Qwen3.8 does best at 4 or 5 with its MTP head, the MoE
-models at 2 or 3), 7 for a block drafter, which proposes its whole block in one pass
-([docs/design-spec-decode.md](docs/design-spec-decode.md)). A drafter checkpoint is served as it is, or from a pack
-of its own, which is smaller and drafts faster: `convert <drafter> --target <model> --out <dir>`. An MTP head picks
-each draft among 64 tokens that a one-bit sketch of the output layer shortlists (`--draft-shortlist`, 0 to read the
-whole layer). `bench --prompts file` measures over real prompts, since acceptance depends on the text, and prints
-where a round's time goes:
+`--spec-k` is 3 by default and 7 for a block drafter, which proposes its whole block in one pass
+([docs/design-spec-decode.md](docs/design-spec-decode.md)); the table has the value to pass per model. A drafter
+checkpoint is served as it is, or from a pack of its own, which is smaller and drafts faster:
+`convert <drafter> --target <model> --out <dir>`. An MTP head picks each draft among 64 tokens that a one-bit sketch
+of the output layer shortlists (`--draft-shortlist`, 0 to read the whole layer). `bench --prompts file` measures over
+real prompts, since acceptance depends on the text, and prints where a round's time goes:
 
 ```bash
 xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4
