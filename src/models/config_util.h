@@ -25,6 +25,9 @@ int64_t get_int_or(const nlohmann::json& obj, const char* key, int64_t fallback,
 // An int or a list of ints (e.g. eos_token_id).
 std::vector<int32_t> get_int_list(const nlohmann::json& obj, const char* key, const std::string& where);
 
+// A model's display name: the last component of its directory.
+std::string model_id(const std::filesystem::path& model_dir);
+
 // Sampling defaults from generation_config.json (missing file or fields keep SamplingParams defaults).
 SamplingParams read_generation_defaults(const std::filesystem::path& model_dir, std::vector<int32_t>* eos_ids);
 

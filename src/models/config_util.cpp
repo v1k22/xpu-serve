@@ -64,6 +64,12 @@ std::vector<int32_t> get_int_list(const nlohmann::json& obj, const char* key, co
     return out;
 }
 
+std::string model_id(const std::filesystem::path& model_dir) {
+    const std::filesystem::path dir = std::filesystem::absolute(model_dir).lexically_normal();
+    const std::string name = dir.filename().string();  // empty when the path ends in a separator
+    return name.empty() ? dir.parent_path().filename().string() : name;
+}
+
 SamplingParams read_generation_defaults(const std::filesystem::path& model_dir, std::vector<int32_t>* eos_ids) {
     SamplingParams p;
     const auto path = model_dir / "generation_config.json";

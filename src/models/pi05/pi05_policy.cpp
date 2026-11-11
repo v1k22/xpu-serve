@@ -445,8 +445,7 @@ std::unique_ptr<Policy> load(const std::filesystem::path& dir, const nlohmann::j
     }
     PolicySpec spec;
     spec.arch = "pi05";
-    spec.id = std::filesystem::absolute(dir).lexically_normal().filename().string();
-    if (spec.id.empty()) spec.id = std::filesystem::absolute(dir).lexically_normal().parent_path().filename().string();
+    spec.id = cfg::model_id(dir);
     spec.cameras = cfg.cameras;
     spec.state_dim = cfg.state_dim;
     spec.action_dim = cfg.action_dim;

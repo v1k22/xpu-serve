@@ -500,8 +500,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
 
     ModelInfo info;
     info.arch = "gemma4";
-    info.id = std::filesystem::absolute(dir).lexically_normal().filename().string();
-    if (info.id.empty()) info.id = std::filesystem::absolute(dir).lexically_normal().parent_path().filename().string();
+    info.id = cfg::model_id(dir);
     info.vocab_size = cfg.vocab_size;
     info.hidden_size = cfg.hidden_size;
     info.max_position = cfg.max_position;
