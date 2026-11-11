@@ -284,8 +284,13 @@ private:
     }
 
     // SigLIP So400m/14 (transformers SiglipVisionModel, last hidden state) and the PaliGemma projector. The cameras'
-    // tokens share every matmul; attention stays within each camera's patches: with several cameras, one attention
-    // call whose heads are (camera, head) pairs.
+    // tokens share every matmul; attention stays within each camera's patches.
+    //
+    // A bias that would cost a pass over the tokens is added where it costs none, which leaves the result the same:
+    // a key bias adds q . b_k to every score of a query, and the softmax cancels it; a value bias comes through the
+    // attention as it is (a query's weights sum to one), so it joins the output projection's bias as W_o b_v; and
+    // the biases the residual stream collects (output projection, fc2) are added where the stream is read, by the
+    // layer norms, so each residual update is the matmul alone.
     Value vision(Graph& g, Value pixels, int64_t n_cam) const {
         Graph::Scope s(g, "vision");
         const int64_t tokens = n_cam * patches_;
@@ -295,18 +300,25 @@ private:
         Value x = g.add(g.matmul(pixels, patch_w), weight(g, kVision + "embeddings.patch_embedding.bias"));
         x = g.reshape(g.add(g.reshape(x, {n_cam, patches_, w}), weight(g, kVision + "embeddings.position_embedding.weight")),
                       {tokens, w});
+        std::vector<float> owed(static_cast<size_t>(w), 0.0f);  // biases the stream has not been given yet
+        bool owes = false;
+        const auto stream = [&]() { return owes ? g.add(x, g.constant(vec(owed, 0, owed.size()))) : x; };
+        const auto owe = [&](const std::vector<float>& bias) {
+            for (size_t i = 0; i < owed.size(); ++i) owed[i] += bias[i];
+            owes = true;
+        };
         AttentionAttrs attrs;
         attrs.causal = false;
         attrs.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
         for (int64_t l = 0; l < vision_layers_; ++l) {
             Graph::Scope ls(g, "layers." + std::to_string(l));
             const std::string L = kVision + "encoder.layers." + std::to_string(l) + ".";
-            Value h = g.layer_norm(x, weight(g, L + "layer_norm1.weight"), weight(g, L + "layer_norm1.bias"), kNormEps);
+            Value h = g.layer_norm(stream(), weight(g, L + "layer_norm1.weight"), weight(g, L + "layer_norm1.bias"), kNormEps);
             // Attention per camera: a camera's rows of q, k and v are a view, and the outputs concatenate along tokens
             // (cheaper than folding the cameras into heads, which takes four transposes per layer).
             const Value q = linear_bias(g, h, L + "self_attn.q_proj.");
-            const Value k = linear_bias(g, h, L + "self_attn.k_proj.");
-            const Value v = linear_bias(g, h, L + "self_attn.v_proj.");
+            const Value k = g.matmul(h, weight(g, L + "self_attn.k_proj.weight"));
+            const Value v = g.matmul(h, weight(g, L + "self_attn.v_proj.weight"));
             std::vector<Value> per_camera;
             for (int64_t c = 0; c < n_cam; ++c) {
                 const auto rows = [&](Value t) {
@@ -315,12 +327,15 @@ private:
                 per_camera.push_back(g.reshape(g.attention(rows(q), rows(k), rows(v), attrs), {patches_, w}));
             }
             const Value att = n_cam == 1 ? per_camera[0] : g.concat(per_camera, 0);
-            x = g.add(x, linear_bias(g, att, L + "self_attn.out_proj."));
-            h = g.layer_norm(x, weight(g, L + "layer_norm2.weight"), weight(g, L + "layer_norm2.bias"), kNormEps);
-            h = linear_bias(g, g.gelu_tanh(linear_bias(g, h, L + "mlp.fc1.")), L + "mlp.fc2.");
-            x = g.add(x, h);
+            x = g.add(x, g.matmul(att, weight(g, L + "self_attn.out_proj.weight")));
+            owe(linear(to_f32(*weights_, L + "self_attn.out_proj.weight"), to_f32(*weights_, L + "self_attn.out_proj.bias"),
+                       to_f32(*weights_, L + "self_attn.v_proj.bias")));
+            h = g.layer_norm(stream(), weight(g, L + "layer_norm2.weight"), weight(g, L + "layer_norm2.bias"), kNormEps);
+            h = g.gelu_tanh(linear_bias(g, h, L + "mlp.fc1."));
+            x = g.add(x, g.matmul(h, weight(g, L + "mlp.fc2.weight")));
+            owe(to_f32(*weights_, L + "mlp.fc2.bias"));
         }
-        x = g.layer_norm(x, weight(g, kVision + "post_layernorm.weight"), weight(g, kVision + "post_layernorm.bias"),
+        x = g.layer_norm(stream(), weight(g, kVision + "post_layernorm.weight"), weight(g, kVision + "post_layernorm.bias"),
                          kNormEps);
         return linear_bias(g, x, kRoot + "paligemma.model.multi_modal_projector.linear.");
     }

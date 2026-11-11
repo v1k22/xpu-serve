@@ -77,10 +77,10 @@ void expert_matmul(sycl::queue& q, const float* x, bool per_slot, const W* w, co
 template <typename Y>
 void rms_norm(sycl::queue& q, const float* x, const float* w, const float* bias, Y* y, int64_t rows, int64_t width,
               float eps);
-// Rows of `width`: (x - mean) / sqrt(var + eps) * w + b.
+// Rows of `width`: (x - mean) / sqrt(var + eps) * w + b; with `shift` (a row, or null), of x + shift.
 template <typename Y>
-void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, Y* y, int64_t rows, int64_t width,
-                float eps);
+void layer_norm(sycl::queue& q, const float* x, const float* shift, const float* w, const float* b, Y* y, int64_t rows,
+                int64_t width, float eps);
 
 // Concat as one copy kernel: `outer` rows, each the parts' rows (part k: bytes[k] from src[k] + o * bytes[k]) laid end
 // to end in `out`. Up to kConcatParts parts.

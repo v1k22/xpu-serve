@@ -856,6 +856,7 @@ private:
         act_mul_.assign(nodes.size(), -1);
         conv_silu_.assign(nodes.size(), 0);
         norm_bias_.assign(nodes.size(), -1);
+        norm_shift_.assign(nodes.size(), 0);
         add_mul_.assign(nodes.size(), -1);
         unary_bias_.assign(nodes.size(), -1);
         add3_.assign(nodes.size(), -1);
@@ -965,6 +966,27 @@ private:
                     reads_[u].clear();
                     break;
                 }
+            }
+        }
+        // LayerNorm(Add(x, c)) with c a row vector and the Add read only by the norm: one norm of x + c (a residual
+        // stream whose biases are added where it is read). reads_: x, w, b, c.
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const Node& n = nodes[i];
+            if (n.kind != OpKind::LayerNorm) continue;
+            const auto u = static_cast<size_t>(n.inputs[0].node);
+            const Node& add = nodes[u];
+            if (add.kind != OpKind::Add || readers[u] != 1 || fused_[u] != Fused::No || norm_bias_[u] >= 0 ||
+                add_mul_[u] >= 0 || add3_[u] >= 0)
+                continue;
+            const Dims& out = n.outputs[0].shape;
+            for (size_t k = 0; k < 2; ++k) {
+                const Dims& cs = graph_.type(add.inputs[1 - k]).shape;
+                if (graph_.type(add.inputs[k]).shape != out || cs.size() != 1 || cs[0] != out.back()) continue;
+                fused_[u] = Fused::Skip;
+                norm_shift_[i] = 1;
+                reads_[i] = {add.inputs[k], n.inputs[1], n.inputs[2], add.inputs[1 - k]};
+                reads_[u].clear();
+                break;
             }
         }
         // Add(a, MatMul(x, w)) with an f16 or quantized weight past the GEMV and the matmul read only here: one GEMM
@@ -2000,9 +2022,9 @@ private:
             }
             case OpKind::LayerNorm: {
                 const int64_t width = out_shape.back();
-                with_out([&](auto* y) {
-                    sycl_be::layer_norm(q_, in_f32(0), in_f32(1), in_f32(2), y, out_n / width, width,
-                                        std::get<graph::NormAttrs>(n.attrs).eps);
+                with_out([&](auto* y) {  // reads_: x, w, b and, with the Add folded in, its row
+                    sycl_be::layer_norm(q_, read_f32(0), norm_shift_[i] != 0 ? read_f32(3) : nullptr, read_f32(1),
+                                        read_f32(2), y, out_n / width, width, std::get<graph::NormAttrs>(n.attrs).eps);
                 });
                 return;
             }
@@ -2221,6 +2243,7 @@ private:
     std::vector<int8_t> act_mul_;            // Mul run as act(reads[0]) * reads[1]: the UnaryOp, or -1
     std::vector<uint8_t> conv_silu_;         // CausalConv that applies the SiLU after it
     std::vector<int32_t> norm_bias_;         // Add run as RmsNorm(node) + bias: the norm node, or -1
+    std::vector<uint8_t> norm_shift_;        // LayerNorm run on x + a row, the Add folded in
     std::vector<int32_t> add_mul_;           // Add run as a + b * c with the Mul node folded in, or -1
     std::vector<int32_t> unary_bias_;        // activation run as act(x + bias) with the Add folded in, or -1
     std::vector<int32_t> add3_;              // Add run as a + (b + c) with the inner Add folded in, or -1

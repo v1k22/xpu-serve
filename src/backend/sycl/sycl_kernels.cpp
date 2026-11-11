@@ -1407,9 +1407,12 @@ void rms_norm(sycl::queue& q, const float* x, const float* w, const float* bias,
 }
 
 template <typename Y>
-void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, Y* y, int64_t rows, int64_t width,
-                float eps) {
+void layer_norm(sycl::queue& q, const float* x, const float* shift, const float* w, const float* b, Y* y, int64_t rows,
+                int64_t width, float eps) {
     const size_t wg = width >= 1024 ? 512 : (width >= 256 ? 256 : 128);
+    // no shift: a row that is always there (w), times zero
+    const float* sp = shift != nullptr ? shift : w;
+    const float on = shift != nullptr ? 1.0f : 0.0f;
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * wg, wg), [=](sycl::nd_item<1> it) {
         const int64_t r = static_cast<int64_t>(it.get_group(0));
         const float* xr = x + r * width;
@@ -1417,15 +1420,17 @@ void layer_norm(sycl::queue& q, const float* x, const float* w, const float* b, 
         const auto lid = static_cast<int64_t>(it.get_local_id(0));
         float sum = 0.0f;
         for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
-            sum += xr[i];
+            sum += xr[i] + on * sp[i];
         const float mean = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>()) / static_cast<float>(width);
         float sq = 0.0f;
-        for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
-            sq += (xr[i] - mean) * (xr[i] - mean);
+        for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg)) {
+            const float d = xr[i] + on * sp[i] - mean;
+            sq += d * d;
+        }
         const float var = sycl::reduce_over_group(it.get_group(), sq, sycl::plus<float>()) / static_cast<float>(width);
         const float inv = 1.0f / sycl::sqrt(var + eps);
         for (int64_t i = lid; i < width; i += static_cast<int64_t>(wg))
-            yr[i] = static_cast<Y>((xr[i] - mean) * inv * w[i] + b[i]);
+            yr[i] = static_cast<Y>((xr[i] + on * sp[i] - mean) * inv * w[i] + b[i]);
     });
 }
 
@@ -1453,7 +1458,8 @@ void add3(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, 
     template void binary_same<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t);                   \
     template void binary_period<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, int64_t);        \
     template void rms_norm<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t, float);   \
-    template void layer_norm<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t, float); \
+    template void layer_norm<Y>(sycl::queue&, const float*, const float*, const float*, const float*, Y*, int64_t, \
+                                int64_t, float);                                                                    \
     template void add_mul<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t);
 XS_INSTANTIATE_OUT(float)
 XS_INSTANTIATE_OUT(half)
