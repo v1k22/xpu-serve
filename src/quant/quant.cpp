@@ -4,32 +4,13 @@
 #include <cmath>
 #include <thread>
 
+#include "quant/fp8.h"
 #include "util/error.h"
 #include "util/half.h"
 
 namespace xs::quant {
 
 namespace {
-
-void row_to_f32(const TensorView& w, int64_t row, float* out) {
-    const int64_t cols = w.shape.back();
-    const size_t offset = static_cast<size_t>(row * cols);
-    switch (w.dtype) {
-        case DType::F32: {
-            const float* src = static_cast<const float*>(w.data) + offset;
-            std::copy(src, src + cols, out);
-            return;
-        }
-        case DType::F16:
-            convert_f16_to_f32(static_cast<const uint16_t*>(w.data) + offset, out, static_cast<size_t>(cols));
-            return;
-        case DType::BF16:
-            convert_bf16_to_f32(static_cast<const uint16_t*>(w.data) + offset, out, static_cast<size_t>(cols));
-            return;
-        default:
-            fail("quantize: weights must be f32, f16 or bf16, got ", dtype_name(w.dtype));
-    }
-}
 
 // Runs fn(first_row, end_row) over `rows` split across the hardware threads.
 template <typename Fn>
@@ -68,6 +49,7 @@ std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t
 
 Quantized quantize(const TensorView& w, DType format, int64_t group) {
     XS_CHECK(w.shape.size() >= 2, "quantize needs a tensor of at least 2 dims, got ", dims_to_string(w.shape));
+    XS_CHECK(!is_quantized(w.dtype), "quantize: the weight is already ", dtype_name(w.dtype));
     const int64_t rows = matrix_rows(w.shape);
     const int64_t cols = w.shape.back();
     if (const std::string why = unsupported_reason(format, rows, cols, group); !why.empty()) fail("quantize: ", why);
@@ -85,7 +67,7 @@ Quantized quantize(const TensorView& w, DType format, int64_t group) {
     parallel_rows(rows, [&](int64_t first, int64_t end) {
         std::vector<float> row(static_cast<size_t>(cols));
         for (int64_t r = first; r < end; ++r) {
-            row_to_f32(w, r, row.data());
+            read_rows(w, r, 1, row.data());
             for (int64_t g = 0; g < groups; ++g) {
                 const float* x = row.data() + g * group;
                 const size_t sg = static_cast<size_t>(r * groups + g);
@@ -193,7 +175,7 @@ double q4_scaled(const TensorView& w, int64_t group, const std::vector<float>& s
         std::vector<float> row(static_cast<size_t>(cols));
         std::vector<float> scaled(static_cast<size_t>(cols));
         for (int64_t r = first; r < end; ++r) {
-            row_to_f32(w, r, row.data());
+            read_rows(w, r, 1, row.data());
             for (int64_t c = 0; c < cols; ++c)
                 scaled[static_cast<size_t>(c)] = row[static_cast<size_t>(c)] * s[static_cast<size_t>(c)];
             double err = 0;
@@ -217,6 +199,7 @@ double q4_scaled(const TensorView& w, int64_t group, const std::vector<float>& s
 
 Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<double>& act_ms, AwqReport* report) {
     XS_CHECK(w.shape.size() == 2, "quantize_awq needs a 2-D matrix, got ", dims_to_string(w.shape));
+    XS_CHECK(!is_quantized(w.dtype), "quantize: the weight is already ", dtype_name(w.dtype));
     const int64_t rows = w.shape[0];
     const int64_t cols = w.shape[1];
     if (const std::string why = unsupported_reason(DType::Q4, rows, cols, group); !why.empty()) fail("quantize: ", why);
@@ -317,6 +300,28 @@ void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* o
     }
 }
 
+void read_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
+    if (is_quantized(v.dtype)) return dequantize_rows(v, first, count, out);
+    if (v.dtype == DType::F8) return fp8_rows(v, first, count, out);
+    XS_CHECK(!v.shape.empty(), "a weight's rows need at least one dim");
+    const int64_t cols = v.shape.back();
+    const size_t offset = static_cast<size_t>(first * cols);
+    const size_t n = static_cast<size_t>(count * cols);
+    switch (v.dtype) {
+        case DType::F32:
+            std::copy_n(static_cast<const float*>(v.data) + offset, n, out);
+            return;
+        case DType::F16:
+            convert_f16_to_f32(static_cast<const uint16_t*>(v.data) + offset, out, n);
+            return;
+        case DType::BF16:
+            convert_bf16_to_f32(static_cast<const uint16_t*>(v.data) + offset, out, n);
+            return;
+        default:
+            fail("a weight's values are read from f32, f16, bf16, q8, q4 or f8, got ", dtype_name(v.dtype));
+    }
+}
+
 SignSketch sign_sketch(const TensorView& w) {
     XS_CHECK(w.shape.size() == 2 && w.shape[1] % 32 == 0, "sign_sketch needs a matrix of a multiple of 32 columns, got ",
              dims_to_string(w.shape));
@@ -327,11 +332,7 @@ SignSketch sign_sketch(const TensorView& w) {
     parallel_rows(rows, [&](int64_t first, int64_t end) {
         std::vector<float> row(static_cast<size_t>(cols));
         for (int64_t r = first; r < end; ++r) {
-            if (is_quantized(w.dtype)) {
-                dequantize_rows(w, r, 1, row.data());
-            } else {
-                row_to_f32(w, r, row.data());
-            }
+            read_rows(w, r, 1, row.data());
             auto* bits = reinterpret_cast<uint32_t*>(out.signs.data<int32_t>()) + r * words;
             double magnitude = 0;
             for (int64_t c = 0; c < cols; ++c) {

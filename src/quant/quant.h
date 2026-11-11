@@ -43,9 +43,10 @@ struct Quantized {
 // Why a [rows, cols] matrix cannot be stored as `format` with this group size, or empty when it can.
 std::string unsupported_reason(DType format, int64_t rows, int64_t cols, int64_t group);
 
-// Round to nearest per group of `group` columns of `w` (at least 2-D, f32 / f16 / bf16). Q8 is symmetric (scale = max|w| / 127,
-// codes in [-127, 127]); Q4 is asymmetric (bias = min, scale = (max - min) / 15, codes in [0, 15]). Codes are chosen
-// against the f16-rounded scale and bias, so dequantization reproduces exactly the values the rounding picked.
+// Round to nearest per group of `group` columns of `w` (at least 2-D; f32 / f16 / bf16, or an FP8 checkpoint's f8).
+// Q8 is symmetric (scale = max|w| / 127, codes in [-127, 127]); Q4 is asymmetric (bias = min, scale =
+// (max - min) / 15, codes in [0, 15]). Codes are chosen against the f16-rounded scale and bias, so dequantization
+// reproduces exactly the values the rounding picked.
 Quantized quantize(const TensorView& w, DType format, int64_t group);
 
 // Activation-aware q4 (AWQ-style). `act_ms` is the mean square of each input channel over calibration data. For each
@@ -62,6 +63,10 @@ Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<dou
 
 // Float values of rows [first, first + count) of a Q8 / Q4 view, row-major into `out` (input_scales applied).
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out);
+
+// The same of a float weight however it is stored: f32 / f16 / bf16, a pack's q8 / q4, or an FP8 checkpoint's f8
+// (quant/fp8.h). What a backend or a converter reads a weight's values through.
+void read_rows(const TensorView& v, int64_t first, int64_t count, float* out);
 
 // The one-bit sketch of a weight [N, K] (f32 / f16 / bf16 / q8 / q4, K a multiple of 32) that graph::SignMatMul
 // scores every row with: signs [N, K / 32] i32, bit c % 32 of word c / 32 set where w[n, c] >= 0, and scales [N] f32,

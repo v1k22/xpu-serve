@@ -19,8 +19,8 @@ How that works:
 
 - **Model code is C++ in this repo** (`src/models/<arch>/`). It reads the Hugging Face `config.json`, and builds a
   backend-neutral **step graph** out of ~20 ops (matmul, rms_norm, rope, attention, ...).
-- **Weights are read from Hugging Face safetensors at load time** (memory-mapped). There is no exported IR and no
-  conversion step yet; a `convert` command for quantized packs is planned (DESIGN.md section 6).
+- **Weights are read from Hugging Face safetensors at load time** (memory-mapped): the original checkpoint, an FP8
+  release of it, or a q8 / q4 pack written by `convert` (DESIGN.md section 6). There is no exported IR.
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
 Status (see TODO.md): Gemma 4 E2B/E4B (text and images), Gemma 4 26B-A4B (text), the Qwen3.5 family (Qwen3.5,
@@ -96,9 +96,9 @@ area).
 | Directory | Library | What lives there |
 |---|---|---|
 | `util/` | xs_core | `error.h` (`xs::Error`, `fail(...)`, `XS_CHECK`, `str_cat`), `log`, `timer.h`, `mmap_file`, `half` (f16/bf16 conversions), `base64` |
-| `tensor/` | xs_core | `DType` (incl. `Q8` / `Q4` pack weights), `TensorView` (non-owning, e.g. into an mmap; `quant` points at a pack weight's scales and biases), `HostTensor` (owning), `TensorMap` (name -> HostTensor) |
-| `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped; a pack's quantized weights appear as one Q8 / Q4 view each); `safetensors_writer` (streamed writing); `joined_weights` (a drafter checkpoint's weights under a prefix beside the target's) |
-| `quant/` | xs_core | round-to-nearest quantization into the pack formats (DESIGN.md 6.3) and dequantization; a tensor `[..., K]` is a matrix of `numel / K` rows (expert banks `[E, N, K]` included); `sign_sketch`, the one-bit copy of a weight a drafter's shortlist scores with |
+| `tensor/` | xs_core | `DType` (incl. `Q8` / `Q4` pack weights and `F8`, an FP8 checkpoint's weight), `TensorView` (non-owning, e.g. into an mmap; `quant` points at a pack weight's scales and biases, `fp8` at an FP8 weight's runs of rows), `HostTensor` (owning), `TensorMap` (name -> HostTensor) |
+| `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped; a pack's quantized weights appear as one Q8 / Q4 view each, an FP8 checkpoint's `F8_E4M3` matrices as one F8 view each over codes and block scales; `join_rows` shows F8 tensors stored in pieces as one weight, without a copy); `safetensors_writer` (streamed writing); `joined_weights` (a drafter checkpoint's weights under a prefix beside the target's) |
+| `quant/` | xs_core | round-to-nearest quantization into the pack formats (DESIGN.md 6.3) and dequantization; a tensor `[..., K]` is a matrix of `numel / K` rows (expert banks `[E, N, K]` included); `read_rows`, a float weight's rows whatever it is stored as (what backends and `convert` read through); `fp8` (the E4M3 codes and block scales of FP8 checkpoints); `sign_sketch`, the one-bit copy of a weight a drafter's shortlist scores with |
 | `convert/` | xs_core | `convert_model`: checkpoint (language model, policy, or a drafter beside its model with `--target`) -> pack; the model's own graphs decide which weights to quantize (`plan_graph_formats`: bandwidth-bound matmuls, or all with `--scope all`) |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
@@ -122,7 +122,7 @@ area).
 | `src/models/gemma4/gemma4_model.cpp` | Gemma 4 text model: graph builder + per-step host inputs; experts beside the MLP and K = V global layers (26B-A4B); an assistant checkpoint as the drafter (query-only layers over the target's KV through `kv_read`, the centroid head) |
 | `src/models/gemma4/gemma4_config.cpp` | Gemma 4 `config.json` parsing; refuses unsupported variants by name |
 | `src/models/gemma4/gemma4_vision.cpp` | Gemma 4 vision: image processor (resize, patches, pooling map) and vision tower graph |
-| `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention; dense MLP or `blocks::moe` (`qwen3_5_moe`: fused gate_up expert banks, gated shared expert); the MTP head (`mtp.*`) as the drafter, built from the same layer builders, or a block drafter checkpoint in its place |
+| `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention; dense MLP or `blocks::moe` (`qwen3_5_moe`: fused gate_up expert banks, or an FP8 release's per-expert tensors joined at load; gated shared expert); the MTP head (`mtp.*`) as the drafter, built from the same layer builders, or a block drafter checkpoint in its place |
 | `src/models/lfm3/lfm3_model.cpp` | LFM3: gated short convolutions (`causal_conv` between two gates of one projection), attention with q/k norms and a sigmoid gate per head (full layers rotate half of each head, sliding layers all of it within their window), every operator and MLP output normed again before the residual add, the head tied to the embedding |
 | `src/models/drafters/dflash.cpp` | Block drafters (DFlash, DFlash 2, DSpine): their config (refusals by name), the context a target's prefill and verify programs append for them, and the block program (DFlash 2's convolutions and candidate selector, DSpine's code bridge and refined last write) |
 | `src/backend/backend.h` | `Backend::compile(graphs, weights, options) -> Session` (programs sharing weights by name and state slots by label); `Session::run(program, inputs, outputs, only)` (every output, or just the ones asked for), `reset`, `truncate` (inside a step of up to `rewind_tokens` tokens too) |
@@ -220,6 +220,8 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`); whole tokenizers of Gemma 4, Qwen3.5 and LFM3 (`parity_cases.h`; each needs its checkpoint's `tokenizer.json`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`, `gen_lfm3_cases.py`; tables from `gen_unicode_tables.py`) |
 | `tests/unit/chat/` | template rendering (LFM3's template comes from `XS_LFM3_DIR`), Gemma 4 and Qwen3.5 output parsing, the latter on LFM3's prompts too | `apply_chat_template` outputs in `tests/fixtures/chat/` (`tests/parity/chat/gen_cases.py`) |
 | `tests/unit/server/` | request parsing, response format, stop strings, HTTP end to end | a fake `InferenceService` (`fake_service.h`) |
+| `tests/unit/test_fp8.cpp` | FP8 checkpoints: the E4M3 code table, codes paired with their block scales, tensors joined row-wise, rows read whole and in part, refusals | values written from the codes' fields and the blocks' indices; planted swapped grid |
+| `tests/unit/model/fp8_checkpoint.cpp` | a tiny Qwen3.5 (dense; mixture of experts stored expert by expert) written the way an FP8 release stores it: weights, logits (cpu-ref and GPU) and `convert`'s packs; `quantization_config` refusals | the same checkpoint with the decoded values in the usual layout (`tiny_checkpoints.h`) |
 | `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp`, `lfm3_config.cpp` | config parsing and refusals | |
 | `tests/unit/model/model_parity.cpp` | whole model: last-token logits and greedy continuations; its drafter (MTP head, or an assistant with `XS_TEST_DRAFTER_DIR`): logits and chained drafts after each prompt | Hugging Face fp32, from `tests/parity/model/hf_reference.py` (`--assistant` for a Gemma 4 assistant; a checkpoint that names its own modeling code, like LFM3, runs with it) |
 | `tests/unit/model/block_drafter_parity.cpp` | a block drafter (`XS_TEST_DRAFTER_DIR`) over rounds whose context grows by several tokens: drafts, candidates and scores | the drafters' own PyTorch code, from `tests/parity/model/block_drafter_reference.py` (clones of z-lab/dflash and Tencent/DSpine) |
@@ -230,6 +232,8 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 
 - `tests/parity/**/*.py` generate fixtures from Hugging Face (run with a Python venv that has `transformers`,
   `torch`). Small fixtures are committed; large ones go to `tests/fixtures/generated/` (gitignored).
+  `tests/parity/model/to_fp8.py` rewrites a Qwen3.5 checkpoint the way an FP8 release stores it and writes the model
+  those bytes decode to: reference outputs of the second are the fixtures for the parity tests on the first.
 - Parity bar for the whole model: cosine >= 0.9999 (f32) / 0.995 (f16) on last-token logits, same argmax, greedy
   continuations equal for >= 32 (f32) / >= 8 (f16) tokens.
 
@@ -329,6 +333,10 @@ draft program, and one way of drafting. The engine needs nothing new.
 - Models with conv or recurrent state (Qwen3.5's linear attention, LFM3's convolutions) re-prefill when a new prompt
   does not extend the cached sequence (no state snapshots): with thinking on, a template that drops earlier turns'
   reasoning makes every new user turn such a prompt.
+- An FP8 checkpoint (`quantization_config`: fp8, e4m3, one scale per 128 x 128 block) is the float model its codes
+  decode to: weights go to the device as f16, like the original's, and activations are not rounded to FP8 as the
+  reference runtime does. It is half the download; `convert` makes the pack that is smaller and faster to serve.
+  Other quantized checkpoints (bitsandbytes, AWQ, GPTQ, GGUF) are refused by name.
 - Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)
   and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 for oneMKL's GEMM, except
   on integrated GPUs up to 512 rows (quant_gemm / quant_gemm_tiled dequantize on the way; sycl_be::quant_path).

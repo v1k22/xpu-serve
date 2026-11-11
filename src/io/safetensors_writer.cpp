@@ -19,6 +19,7 @@ std::string safetensors_dtype(DType t) {
         case DType::I8: return "I8";
         case DType::U8: return "U8";
         case DType::Bool: return "BOOL";
+        case DType::F8: return "F8_E4M3";
         default: fail("safetensors has no dtype ", dtype_name(t));
     }
 }

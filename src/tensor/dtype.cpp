@@ -15,6 +15,7 @@ size_t dtype_size(DType t) {
         case DType::U8: return 1;
         case DType::Bool: return 1;
         case DType::Q8: return 1;
+        case DType::F8: return 1;
         case DType::Q4: fail("q4 packs two values per byte; use storage_bytes");
     }
     fail("unknown dtype");
@@ -37,6 +38,7 @@ std::string_view dtype_name(DType t) {
         case DType::Bool: return "bool";
         case DType::Q8: return "q8";
         case DType::Q4: return "q4";
+        case DType::F8: return "f8";
     }
     return "?";
 }
@@ -50,6 +52,7 @@ DType dtype_from_safetensors(std::string_view s) {
     if (s == "I8") return DType::I8;
     if (s == "U8") return DType::U8;
     if (s == "BOOL") return DType::Bool;
+    if (s == "F8_E4M3") return DType::F8;
     fail("unsupported safetensors dtype '", s, "'");
 }
 

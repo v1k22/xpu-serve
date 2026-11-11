@@ -2,18 +2,23 @@
 
 // Tiny random checkpoints written to disk for tests that need a model directory without downloading one: a Qwen3.5
 // target (dense or mixture of experts) and block drafters for it (DFlash, DFlash 2, DSpine), in the released
-// checkpoints' layout (config keys and tensor names).
+// checkpoints' layout (config keys and tensor names); and a checkpoint rewritten the way an FP8 release stores it.
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <random>
 #include <string>
 #include <vector>
 
+#include "io/safetensors.h"
 #include "io/safetensors_writer.h"
+#include "quant/fp8.h"
+#include "quant/quant.h"
 #include "tensor/dtype.h"
 #include "util/half.h"
 
@@ -251,6 +256,125 @@ inline void write_tiny_drafter(const fs::path& dir, const TinyDrafter& d, const 
         specs.push_back(TinyTensor{b + "out.weight", {d.code, d.rank}, 0.0f, 0.0f});
     }
     write_random(dir / "model.safetensors", specs, seed);
+}
+
+// A matrix as an FP8 release stores it: for each block of kFp8Block rows and columns a bf16 scale (the block's largest
+// magnitude over the largest code value) and, per element, the E4M3 code nearest to w / scale. `decoded` gets the
+// values the codes and scales stand for.
+struct Fp8Matrix {
+    std::vector<char> codes;
+    std::vector<char> scales;  // bf16 [ceil(rows / kFp8Block), ceil(cols / kFp8Block)]
+};
+inline Fp8Matrix to_fp8(const float* w, int64_t rows, int64_t cols, float* decoded) {
+    const int64_t grid_rows = (rows + kFp8Block - 1) / kFp8Block, grid_cols = (cols + kFp8Block - 1) / kFp8Block;
+    Fp8Matrix out;
+    out.codes.resize(static_cast<size_t>(rows * cols));
+    out.scales.resize(static_cast<size_t>(grid_rows * grid_cols) * 2);
+    for (int64_t br = 0; br < grid_rows; ++br) {
+        for (int64_t bc = 0; bc < grid_cols; ++bc) {
+            const int64_t r1 = std::min(rows, (br + 1) * kFp8Block), c1 = std::min(cols, (bc + 1) * kFp8Block);
+            float peak = 0.0f;
+            for (int64_t r = br * kFp8Block; r < r1; ++r)
+                for (int64_t c = bc * kFp8Block; c < c1; ++c)
+                    peak = std::max(peak, std::fabs(w[r * cols + c]));
+            const uint16_t stored = f32_to_bf16(peak > 0.0f ? peak / 448.0f : 1.0f);
+            std::memcpy(out.scales.data() + (br * grid_cols + bc) * 2, &stored, 2);
+            const float scale = bf16_to_f32(stored);
+            for (int64_t r = br * kFp8Block; r < r1; ++r) {
+                for (int64_t c = bc * kFp8Block; c < c1; ++c) {
+                    const float target = std::fabs(w[r * cols + c]) / scale;
+                    int best = 0;
+                    for (int code = 1; code < 0x7F; ++code) {  // the finite magnitudes, ascending
+                        if (std::fabs(quant::e4m3_to_f32(static_cast<uint8_t>(code)) - target) <
+                            std::fabs(quant::e4m3_to_f32(static_cast<uint8_t>(best)) - target)) {
+                            best = code;
+                        }
+                    }
+                    const auto code = static_cast<uint8_t>(best | (w[r * cols + c] < 0.0f ? 0x80 : 0));
+                    out.codes[static_cast<size_t>(r * cols + c)] = static_cast<char>(code);
+                    decoded[r * cols + c] = quant::e4m3_to_f32(code) * scale;
+                }
+            }
+        }
+    }
+    return out;
+}
+
+// Writes the Qwen3.5 checkpoint in `from` twice. To `fp8` the way an FP8 release stores it: every projection as E4M3
+// codes beside `<name>_scale_inv`, an expert bank expert by expert (experts.<e>.gate_proj.weight, up_proj, down_proj),
+// quantization_config in config.json. To `decoded` in the layout of `from`, with exactly the f32 values those codes
+// and scales stand for. The two are the same model.
+inline void write_fp8_twins(const fs::path& from, const fs::path& fp8, const fs::path& decoded) {
+    const auto source = SafetensorsWeights::open_dir(from);
+    const auto ends_with = [](const std::string& s, const std::string& tail) {
+        return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    std::vector<OutUnit> fp8_units, decoded_units;
+    const auto unit = [](std::vector<OutUnit>& to, const std::string& name, DType dtype, Dims shape,
+                         std::vector<char> bytes) {
+        OutUnit u;
+        u.tensors = {OutTensor{name, dtype, std::move(shape)}};
+        u.write = [held = std::make_shared<std::vector<char>>(std::move(bytes))](std::ostream& out) {
+            out.write(held->data(), static_cast<std::streamsize>(held->size()));
+        };
+        to.push_back(std::move(u));
+    };
+    for (const std::string& name : source->names()) {
+        const TensorView& v = source->get(name);
+        const bool gate_up = ends_with(name, "experts.gate_up_proj"), down = ends_with(name, "experts.down_proj");
+        const bool projection = v.shape.size() == 2 && (ends_with(name, "_proj.weight") ||
+                                                        ends_with(name, "in_proj_qkv.weight") ||
+                                                        ends_with(name, "in_proj_z.weight"));
+        if (!gate_up && !down && !projection) {
+            const auto* bytes = static_cast<const char*>(v.data);
+            unit(fp8_units, name, v.dtype, v.shape, {bytes, bytes + v.nbytes()});
+            unit(decoded_units, name, v.dtype, v.shape, {bytes, bytes + v.nbytes()});
+            continue;
+        }
+        const int64_t rows = quant::matrix_rows(v.shape), cols = v.shape.back();
+        std::vector<float> w(static_cast<size_t>(rows * cols)), values(w.size());
+        quant::read_rows(v, 0, rows, w.data());
+        // The pieces the release stores: the whole matrix, or each expert's (its gate rows, then its up rows).
+        struct Piece {
+            std::string name;
+            int64_t first, count;
+        };
+        std::vector<Piece> pieces;
+        if (projection) {
+            pieces.push_back({name, 0, rows});
+        } else {
+            const std::string base = name.substr(0, name.rfind('.') + 1);  // "...experts."
+            const int64_t per = rows / v.shape[0];
+            for (int64_t e = 0; e < v.shape[0]; ++e) {
+                const std::string x = base + std::to_string(e) + ".";
+                if (gate_up) {
+                    pieces.push_back({x + "gate_proj.weight", e * per, per / 2});
+                    pieces.push_back({x + "up_proj.weight", e * per + per / 2, per / 2});
+                } else {
+                    pieces.push_back({x + "down_proj.weight", e * per, per});
+                }
+            }
+        }
+        for (const Piece& piece : pieces) {
+            Fp8Matrix m = to_fp8(w.data() + piece.first * cols, piece.count, cols, values.data() + piece.first * cols);
+            unit(fp8_units, piece.name, DType::F8, {piece.count, cols}, std::move(m.codes));
+            unit(fp8_units, piece.name + "_scale_inv", DType::BF16,
+                 {(piece.count + kFp8Block - 1) / kFp8Block, (cols + kFp8Block - 1) / kFp8Block}, std::move(m.scales));
+        }
+        const auto* bytes = reinterpret_cast<const char*>(values.data());
+        unit(decoded_units, name, DType::F32, v.shape, {bytes, bytes + values.size() * sizeof(float)});
+    }
+    for (const fs::path& to : {fp8, decoded}) {
+        fs::create_directories(to);
+        fs::copy_file(from / "tokenizer_config.json", to / "tokenizer_config.json");
+    }
+    write_safetensors(fp8 / "model.safetensors", fp8_units);
+    write_safetensors(decoded / "model.safetensors", decoded_units);
+    fs::copy_file(from / "config.json", decoded / "config.json");
+    nlohmann::json config = nlohmann::json::parse(std::ifstream(from / "config.json"));
+    config["quantization_config"] = {{"quant_method", "fp8"}, {"fmt", "e4m3"}, {"activation_scheme", "dynamic"},
+                                     {"weight_block_size", {kFp8Block, kFp8Block}}};
+    std::ofstream(fp8 / "config.json") << config.dump(1);
 }
 
 }  // namespace xs::test

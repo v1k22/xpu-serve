@@ -42,6 +42,30 @@ HostTensor to_f32(const std::string& name, const TensorView& t) {
     return out;
 }
 
+// A mixture-of-experts checkpoint that stores each expert's projections on their own (the FP8 releases): the banks the
+// model reads are their rows in expert order, an expert's gate rows before its up rows.
+void join_expert_banks(SafetensorsWeights& weights, const Config& cfg) {
+    if (cfg.num_experts == 0) return;
+    std::vector<std::string> layers;
+    const std::string prefix = probe_prefix(weights);
+    for (int64_t i = 0; i < cfg.num_layers; ++i) layers.push_back(prefix + "layers." + std::to_string(i));
+    for (int64_t i = 0; i < cfg.mtp_layers; ++i) layers.push_back("mtp.layers." + std::to_string(i));
+    for (const std::string& layer : layers) {
+        const std::string E = layer + ".mlp.experts.";
+        if (weights.contains(E + "gate_up_proj") || !weights.contains(E + "0.gate_proj.weight")) continue;
+        std::vector<std::string> gate_up, down;
+        for (int64_t e = 0; e < cfg.num_experts; ++e) {
+            const std::string X = E + std::to_string(e) + ".";
+            gate_up.push_back(X + "gate_proj.weight");
+            gate_up.push_back(X + "up_proj.weight");
+            down.push_back(X + "down_proj.weight");
+        }
+        const int64_t experts = cfg.num_experts, inter = cfg.moe_intermediate_size;
+        weights.join_rows(E + "gate_up_proj", gate_up, {experts, 2 * inter, cfg.hidden_size});
+        weights.join_rows(E + "down_proj", down, {experts, cfg.hidden_size, inter});
+    }
+}
+
 // Where a block drafter's weights sit beside the target's.
 constexpr const char* kDrafterPrefix = "drafter.";
 
@@ -246,8 +270,8 @@ private:
         blocks::MoeParts parts;
         parts.router = weight(g, L + "gate.weight");
         if (!weights_->contains(L + "experts.gate_up_proj")) {
-            fail("qwen3_5: ", L, "experts.gate_up_proj is missing; per-expert tensors (experts.<e>.gate_proj) are not ",
-                 "supported yet, only the fused expert banks the released checkpoints ship");
+            fail("qwen3_5: ", L, "experts.gate_up_proj is missing: the expert banks come fused, or expert by expert ",
+                 "as fp8 tensors (experts.<e>.gate_proj.weight)");
         }
         parts.gate_up = weight(g, L + "experts.gate_up_proj");
         parts.down = weight(g, L + "experts.down_proj");
@@ -373,7 +397,9 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     XS_CHECK(!stops.empty(), "qwen3_5: no end-of-sequence token in config.json or tokenizer_config.json");
     info.stop_token_ids = std::move(stops);
 
-    std::unique_ptr<WeightStore> weights = SafetensorsWeights::open_dir(dir);
+    std::unique_ptr<SafetensorsWeights> checkpoint = SafetensorsWeights::open_dir(dir);
+    join_expert_banks(*checkpoint, cfg);
+    std::unique_ptr<WeightStore> weights = std::move(checkpoint);
     std::optional<dflash::Config> drafter;
     if (options.speculation && !options.drafter.empty()) {
         std::ifstream in(options.drafter / "config.json");

@@ -32,10 +32,12 @@ using graph::OpKind;
 
 constexpr uint64_t kShardBytes = uint64_t{4} << 30;
 
-// Q8 / Q4 when `format` fits the tensor (a float tensor of at least 2 dims and min_elements, quant.h's matrix view);
-// explains a refusal in the log.
+// Q8 / Q4 when `format` fits the tensor (a float tensor, as stored or as an FP8 checkpoint's f8, of at least 2 dims
+// and min_elements, quant.h's matrix view); explains a refusal in the log.
 std::optional<DType> fitting(const std::string& name, const TensorView& v, DType format, const ConvertOptions& o) {
-    if (!is_float(v.dtype) || v.shape.size() < 2 || v.numel() < o.min_elements) return std::nullopt;
+    if (!(is_float(v.dtype) || v.dtype == DType::F8) || v.shape.size() < 2 || v.numel() < o.min_elements) {
+        return std::nullopt;
+    }
     if (const std::string why = quant::unsupported_reason(format, quant::matrix_rows(v.shape), v.shape.back(), o.group);
         !why.empty()) {
         log::info("convert: keeping '", name, "' as ", dtype_name(v.dtype), ": ", why);
@@ -177,8 +179,26 @@ std::map<std::string, DType> plan_formats(const Policy& policy, const ConvertOpt
     return plan;
 }
 
+// A tensor the pack keeps: its bytes as they are; an FP8 checkpoint's weight as its f32 values (a pack holds no f8,
+// and the weights that matter for size are quantized).
 OutUnit copy_unit(const std::string& name, const TensorView& v) {
     OutUnit u;
+    if (v.dtype == DType::F8) {
+        u.tensors.push_back(OutTensor{name, DType::F32, v.shape});
+        u.write = [v](std::ostream& out) {
+            const int64_t rows = quant::matrix_rows(v.shape);
+            const int64_t cols = v.shape.back();
+            const int64_t piece = std::max<int64_t>(1, (int64_t{16} << 20) / cols);
+            std::vector<float> values(static_cast<size_t>(std::min(rows, piece) * cols));
+            for (int64_t first = 0; first < rows; first += piece) {
+                const int64_t count = std::min(piece, rows - first);
+                quant::read_rows(v, first, count, values.data());
+                out.write(reinterpret_cast<const char*>(values.data()),
+                          static_cast<std::streamsize>(static_cast<size_t>(count * cols) * sizeof(float)));
+            }
+        };
+        return u;
+    }
     u.tensors.push_back(OutTensor{name, v.dtype, v.shape});
     u.write = [v](std::ostream& out) {
         out.write(static_cast<const char*>(v.data), static_cast<std::streamsize>(v.nbytes()));

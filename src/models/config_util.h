@@ -25,6 +25,10 @@ int64_t get_int_or(const nlohmann::json& obj, const char* key, int64_t fallback,
 // An int or a list of ints (e.g. eos_token_id).
 std::vector<int32_t> get_int_list(const nlohmann::json& obj, const char* key, const std::string& where);
 
+// A checkpoint another tool quantized names its scheme under quantization_config. The one the weight store reads is
+// FP8 with one scale per block of kFp8Block rows and columns (quant/fp8.h); any other is refused by name.
+void check_quantization(const nlohmann::json& config);
+
 // A model's display name: the last component of its directory.
 std::string model_id(const std::filesystem::path& model_dir);
 

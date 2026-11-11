@@ -9,10 +9,11 @@ One repo, one binary: the model code, the engine, the tokenizer, chat templates 
 live here, and the math runs on Intel GPUs through our SYCL backend (our own kernels, oneMKL for large matmuls). Read
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
-**Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8, LFM3) and a robot policy (π0.5), from the original
-checkpoint or a q8 / q4 pack written by `xpu-serve convert`, one request at a time, on Intel GPUs through the SYCL
-backend; speculative decoding with each model's drafter (Qwen's MTP head, Gemma 4's assistant checkpoints, DFlash 2
-and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the code.
+**Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8, LFM3) and a robot policy (π0.5), from the
+original checkpoint, its FP8 release where there is one, or a q8 / q4 pack written by `xpu-serve convert`, one request
+at a time, on Intel GPUs through the SYCL backend; speculative decoding with each model's drafter (Qwen's MTP head,
+Gemma 4's assistant checkpoints, DFlash 2 and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the
+code.
 
 ## Supported models
 
@@ -31,12 +32,13 @@ and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the code
 | Gemma 4 E2B / E4B | `google/gemma-4-E2B-it` (`gemma4`) | Hugging Face fp32 logits, greedy text, image features; its assistant's drafts |
 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` (`gemma4`) | tiny-checkpoint parity of its layout (experts beside the MLP, K = V global layers) |
 | Qwen3.5 4B | `Qwen/Qwen3.5-4B` (`qwen3_5`) | Hugging Face fp32 logits, greedy text |
-| Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B` (`qwen3_5_moe`) | tiny-checkpoint parity; MMLU-Pro (25 questions): 84 % |
-| Qwen3.8-27B | `Qwen/Qwen3.8-27B` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE, its MTP head; DFlash, DFlash 2 and DSpine drafters against their PyTorch code); MMLU-Pro (25 questions): 76 % |
+| Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3.6-35B-A3B-FP8` (`qwen3_5_moe`) | tiny-checkpoint parity; its q4 pack against Hugging Face fp32 logits of the checkpoint (cosine 0.92 to 0.98); MMLU-Pro (25 questions): 80 to 84 % |
+| Qwen3.8-27B | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-27B-FP8` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE, its MTP head; DFlash, DFlash 2 and DSpine drafters against their PyTorch code); MMLU-Pro (25 questions): 76 % |
 | LFM3-1.7B | `LiquidAI/LFM3-1.7B` (`lfm3`) | Hugging Face fp32 logits, greedy text (the checkpoint's own modeling code); MMLU-Pro (25 questions): 60 % |
 | π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 1e-3 (GPU f16) |
 
-Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card; LFM3 thinks by
+Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card, and their FP8
+releases (half the download) load and convert like the originals; LFM3 thinks by
 default (`"chat_template_kwargs": {"enable_thinking": false}` in a request turns it off), was run to 64k tokens
 of context, and is best served from its q8 pack (at q4 its reasoning runs long more often); π0.5 maps camera images, the
 robot state and an instruction to 50 x 32 actions in 10 flow steps, and its q8 pack quantizes the action expert.
@@ -147,6 +149,11 @@ xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q8 --quant q8
 xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --method awq
 xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
 ```
+
+The source can be the model's FP8 release instead of the original (`convert ~/models/Qwen3.8-27B-FP8 --out ...`):
+half the download, the same pack layout and speed, and logits as close to Hugging Face's (numbers:
+[docs/decisions/0014](docs/decisions/0014-fp8-checkpoints.md)). An FP8 checkpoint also serves as it is, as f16 on the
+device like the original, so it fits where the original fits.
 
 `q8` is symmetric int8; `q4` is 4-bit with a scale and bias per group of 32 columns (`--group 128` reads 15% fewer
 bytes: Qwen3.8-27B decodes 13% faster on both the Arc Pro B60 and the Arc B390, and scores 80% on 25 MMLU-Pro questions

@@ -17,6 +17,7 @@
 
 #include "backend/sycl/sycl_kernels.h"
 #include "backend/sycl/sycl_matmul.h"
+#include "quant/quant.h"
 #include "util/error.h"
 #include "util/half.h"
 #include "util/log.h"
@@ -681,7 +682,7 @@ private:
         }
         const auto device_type = [&](size_t i, DType t) {
             if (is_quantized(t)) return t;  // check_ops makes sure only matmuls and gathers read it
-            if (is_float(t)) return DType::F32;
+            if (is_float(t) || t == DType::F8) return DType::F32;  // an fp8 weight is decoded as it is uploaded
             XS_CHECK(t == DType::I32 || t == DType::I64, where(i), ": dtype ", dtype_name(t), " is not supported");
             return t;
         };
@@ -1307,6 +1308,27 @@ private:
         return buf;
     }
 
+    // An FP8 checkpoint's weight, decoded on the way up: its values in `dst` (f16 or f32), a piece of rows at a time.
+    DeviceBuffer upload_fp8(const TensorView& view, DType dst) {
+        const int64_t rows = quant::matrix_rows(view.shape);
+        const int64_t cols = view.shape.back();
+        const size_t width = static_cast<size_t>(cols) * dtype_size(dst);
+        DeviceBuffer buf(q_, std::max<size_t>(static_cast<size_t>(rows) * width, 1));
+        const int64_t piece = std::max<int64_t>(1, (int64_t{64} << 20) / cols);
+        std::vector<float> values(static_cast<size_t>(std::min(rows, piece) * cols));
+        std::vector<uint16_t> halves(dst == DType::F16 ? values.size() : 0);
+        for (int64_t first = 0; first < rows; first += piece) {
+            const int64_t count = std::min(piece, rows - first);
+            const size_t n = static_cast<size_t>(count * cols);
+            quant::read_rows(view, first, count, values.data());
+            if (dst == DType::F16) convert_f32_to_f16(values.data(), halves.data(), n);
+            const void* host = dst == DType::F16 ? static_cast<const void*>(halves.data()) : values.data();
+            q_.memcpy(buf.get() + static_cast<size_t>(first) * width, host, static_cast<size_t>(count) * width).wait();
+        }
+        q_.wait_and_throw();
+        return buf;
+    }
+
     void upload_leaves(const WeightStore& weights) {
         const auto& nodes = graph_.nodes();
         leaf_ptr_.assign(nodes.size(), nullptr);
@@ -1332,7 +1354,9 @@ private:
                 if (is_quantized(view.dtype)) {
                     upload_quantized(i, view);
                 } else {
-                    shared_.weight_buffers.push_back(upload(name, view.data, view.dtype, view.shape, dtype_[i][0]));
+                    shared_.weight_buffers.push_back(
+                        view.dtype == DType::F8 ? upload_fp8(view, dtype_[i][0])
+                                                : upload(name, view.data, view.dtype, view.shape, dtype_[i][0]));
                     leaf_ptr_[i] = shared_.weight_buffers.back().get();
                 }
                 shared_.weights[key] = SharedLeaf{leaf_ptr_[i], leaf_quant_[i]};

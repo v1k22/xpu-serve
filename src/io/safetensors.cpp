@@ -86,8 +86,76 @@ std::unique_ptr<SafetensorsWeights> SafetensorsWeights::open_dir(const std::file
         }
         weights->files_.push_back(std::move(file));
     }
+    weights->pair_fp8();
     if (fs::exists(dir / kPackManifest)) weights->apply_pack_manifest(dir / kPackManifest);
     return weights;
+}
+
+void SafetensorsWeights::pair_fp8() {
+    std::vector<std::string> names;
+    for (const auto& [name, view] : index_) {
+        if (view->dtype == DType::F8) names.push_back(name);
+    }
+    for (const std::string& name : names) {
+        const TensorView& codes = *index_.at(name);
+        const std::string scale_name = name + "_scale_inv";
+        const auto it = index_.find(scale_name);
+        if (codes.shape.size() != 2 || it == index_.end()) {
+            fail("fp8 tensor '", name, "' ", dims_to_string(codes.shape), ": only a matrix beside its scales '",
+                 scale_name, "' is read");
+        }
+        const TensorView& grid = *it->second;
+        const Dims blocks{(codes.shape[0] + kFp8Block - 1) / kFp8Block, (codes.shape[1] + kFp8Block - 1) / kFp8Block};
+        if (!is_float(grid.dtype) || grid.shape != blocks) {
+            fail("fp8 tensor '", name, "' ", dims_to_string(codes.shape), ": its scales '", scale_name, "' are ",
+                 dtype_name(grid.dtype), " ", dims_to_string(grid.shape), ", expected one per block of ", kFp8Block,
+                 " rows and columns, ", dims_to_string(blocks));
+        }
+        const std::vector<float> scales =
+            HostTensor::borrow(grid.dtype, grid.shape, const_cast<void*>(grid.data)).to_f32();
+        fp8_scales_.push_back(std::make_unique<float[]>(scales.size()));
+        std::copy(scales.begin(), scales.end(), fp8_scales_.back().get());
+        const std::vector<Fp8Run>& runs = fp8_runs_[name] = {
+            Fp8Run{static_cast<const uint8_t*>(codes.data), fp8_scales_.back().get(), codes.shape[0]}};
+        TensorView v;
+        v.dtype = DType::F8;
+        v.shape = codes.shape;
+        v.fp8 = runs;
+        index_.erase(it);
+        index_[name] = &(fp8_views_[name] = v);
+    }
+}
+
+void SafetensorsWeights::join_rows(const std::string& name, const std::vector<std::string>& parts, Dims shape) {
+    XS_CHECK(index_.count(name) == 0, "join_rows: '", name, "' exists already");
+    XS_CHECK(shape.size() >= 2 && !parts.empty(), "join_rows: '", name, "' needs parts and at least 2 dims");
+    std::vector<Fp8Run> runs;
+    int64_t rows = 0;
+    for (const std::string& part : parts) {
+        const auto it = fp8_views_.find(part);
+        if (it == fp8_views_.end()) {
+            const TensorView* dense = find(part);
+            if (dense == nullptr) fail("join_rows: '", part, "', a part of '", name, "', is missing");
+            fail("join_rows: '", part, "', a part of '", name, "', is ", dtype_name(dense->dtype),
+                 "; only fp8 tensors are read in pieces (a dense one would have to be copied)");
+        }
+        XS_CHECK(it->second.shape.back() == shape.back(), "join_rows: '", part, "' ", dims_to_string(it->second.shape),
+                 " does not have the ", shape.back(), " columns of '", name, "'");
+        runs.insert(runs.end(), it->second.fp8.begin(), it->second.fp8.end());
+        rows += it->second.shape[0];
+    }
+    XS_CHECK(rows * shape.back() == numel(shape), "join_rows: the parts of '", name, "' have ", rows, " rows of ",
+             shape.back(), ", not the shape ", dims_to_string(shape));
+    for (const std::string& part : parts) {
+        index_.erase(part);
+        fp8_views_.erase(part);
+        fp8_runs_.erase(part);
+    }
+    TensorView v;
+    v.dtype = DType::F8;
+    v.shape = std::move(shape);
+    v.fp8 = fp8_runs_[name] = std::move(runs);
+    index_[name] = &(fp8_views_[name] = v);
 }
 
 void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) {

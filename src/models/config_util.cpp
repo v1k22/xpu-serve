@@ -2,6 +2,7 @@
 
 #include <fstream>
 
+#include "tensor/tensor.h"
 #include "util/error.h"
 
 namespace xs::cfg {
@@ -62,6 +63,30 @@ std::vector<int32_t> get_int_list(const nlohmann::json& obj, const char* key, co
         out.push_back(e.get<int32_t>());
     }
     return out;
+}
+
+void check_quantization(const nlohmann::json& config) {
+    if (!config.contains("quantization_config") || config.at("quantization_config").is_null()) return;
+    const nlohmann::json& q = config.at("quantization_config");
+    const std::string where = "config.json quantization_config";
+    const std::string method = get_string(q, "quant_method", where);
+    if (method != "fp8") {
+        fail(where, ": quant_method '", method, "' is not supported (supported: fp8 with one scale per block of ",
+             kFp8Block, " rows and columns; or the checkpoint this one was quantized from)");
+    }
+    if (q.contains("fmt") && get_string(q, "fmt", where) != "e4m3") {
+        fail(where, ": fmt '", get_string(q, "fmt", where), "' is not supported (supported: e4m3)");
+    }
+    const std::vector<int32_t> block = get_int_list(q, "weight_block_size", where);
+    if (block != std::vector<int32_t>{static_cast<int32_t>(kFp8Block), static_cast<int32_t>(kFp8Block)}) {
+        fail(where, ": weight_block_size must be [", kFp8Block, ", ", kFp8Block, "]");
+    }
+    // "dynamic" has the reference runtime round activations to FP8 as it goes; here they stay unquantized. A static
+    // scheme would bring calibrated activation scales, which nothing reads.
+    if (q.contains("activation_scheme") && get_string(q, "activation_scheme", where) != "dynamic") {
+        fail(where, ": activation_scheme '", get_string(q, "activation_scheme", where),
+             "' is not supported (supported: dynamic)");
+    }
 }
 
 std::string model_id(const std::filesystem::path& model_dir) {
