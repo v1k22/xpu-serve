@@ -186,15 +186,17 @@ assistants run from their bf16 checkpoints.
 | Qwen3.6-35B-A3B | 61.6 | 84.9 (1.84) | 94.1 (2.43) | **94.4** (2.83) | 92.5 (3.09) | 1.53x |
 | Gemma 4 E2B + assistant | 139.9 | **173.7** (1.65) | 169.5 (2.02) | 169.2 (2.27) | 163.1 (2.40) | 1.24x |
 | Gemma 4 26B-A4B + assistant | 67.2 | 83.6 (1.81) | **91.4** (2.41) | 82.6 (2.83) | 82.4 (3.17) | 1.36x |
+| Qwen3.5-9B | 62.1 | 91.8 (1.80) | 101.9 (2.36) | 106.3 (2.71) | **107.7** (2.91) | 1.73x |
 | Qwen3.5-4B | 104.0 | 137.1 (1.79) | **149.1** (2.30) | 142.0 (2.63) | 135.7 (2.77) | 1.43x |
 | Gemma 4 E4B + assistant | 84.2 | 118.5 (1.66) | **126.4** (2.07) | 126.5 (2.33) | 123.2 (2.51) | 1.50x |
 
 tok/s, with tokens per verify in parentheses; they follow the references of section 2. Qwen3.8 at k = 5 / 6: 49.1 /
-48.6 (3.35 / 3.48). The last two rows were added on 2026-11-11; a single run of this bench moves by about 4 %, so the
-best k and its neighbours are medians of three runs there, and E4B's k = 2 and k = 3 are a tie. Greedy output with
-k = 2 equals plain decoding prompt by prompt on Qwen3.8, Qwen3.6 and E2B (6 of 6 each) and on 5 of 6 for 26B-A4B: its
-story diverges after 673 of 902 bytes ("It wasn't painting a perfect circle" / "It wasn't a perfect circle"), the
-kind of near tie a wider verify (another kernel path at f16) can flip (DESIGN.md 10.4; the margin was not measured).
+48.6 (3.35 / 3.48). The last three rows were added on 2026-11-11 (Qwen3.5-9B at k = 5: 99.5); a single run of this
+bench moves by about 4 %, so the best k and its neighbours are medians of three runs there, and E4B's k = 2 and k = 3
+are a tie. Greedy output with k = 2 equals plain decoding prompt by prompt on
+Qwen3.8, Qwen3.6 and E2B (6 of 6 each) and on 5 of 6 for 26B-A4B: its story diverges after 673 of 902 bytes ("It
+wasn't painting a perfect circle" / "It wasn't a perfect circle"), the kind of near tie a wider verify (another
+kernel path at f16) can flip (DESIGN.md 10.4; the margin was not measured).
 
 `bench` prints where a round's time goes (a draft, a verify, a round). Qwen3.8 at k = 4: a draft 2.6 ms, a verify
 53.4 ms, a round 64.6 ms. What the round costs, and what brought it there (each from its own measurement):

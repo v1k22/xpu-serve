@@ -22,6 +22,7 @@ code.
 | Gemma 4 E2B / E4B | language, images | f16, q8, q4 | E2B: 61.5 / 92 tok/s decode (f16 / q8); q4: 140, 174 with its assistant. E4B at q4: 84, 126 with its assistant | Arc Pro B60 |
 | Gemma 4 26B-A4B | language, MoE | q4 | 67 tok/s decode, 91 with its assistant | Arc Pro B60 |
 | Qwen3.5 4B | language | f16, q8, q4 | 43 / 77 / 101 tok/s decode (f16 / q8 / q4); q4: 149 with MTP; 5,000 tok/s prefill | Arc Pro B60 |
+| Qwen3.5 9B | language | f16, q8, q4 | 21 / 38 / 62 tok/s decode (f16 / q8 / q4); q4: 108 with MTP; 3,200 tok/s prefill | Arc Pro B60 |
 | Qwen3.6-35B-A3B | language, MoE | q4 | 62 tok/s decode, 94 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
 | Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
@@ -32,6 +33,7 @@ code.
 | Gemma 4 E2B / E4B | `google/gemma-4-E2B-it` (`gemma4`) | Hugging Face fp32 logits, greedy text, image features; its assistant's drafts |
 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` (`gemma4`) | tiny-checkpoint parity of its layout (experts beside the MLP, K = V global layers) |
 | Qwen3.5 4B | `Qwen/Qwen3.5-4B` (`qwen3_5`) | Hugging Face fp32 logits, greedy text |
+| Qwen3.5 9B | `Qwen/Qwen3.5-9B` (`qwen3_5`) | Hugging Face fp32 logits, greedy text, its MTP head's drafts; MMLU-Pro (25 questions): 72 % |
 | Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3.6-35B-A3B-FP8` (`qwen3_5_moe`) | tiny-checkpoint parity; its q4 pack against Hugging Face fp32 logits of the checkpoint (cosine 0.92 to 0.98); MMLU-Pro (25 questions): 80 to 84 % |
 | Qwen3.8-27B | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-27B-FP8` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE, its MTP head; DFlash, DFlash 2 and DSpine drafters against their PyTorch code); MMLU-Pro (25 questions): 76 % |
 | LFM3-1.7B | `LiquidAI/LFM3-1.7B` (`lfm3`) | Hugging Face fp32 logits, greedy text (the checkpoint's own modeling code); MMLU-Pro (25 questions): 60 % |
@@ -99,6 +101,7 @@ without → with that technique, and the `--spec-k` (drafts per round) that gave
 | Gemma 4 E4B | q4, Arc Pro B60 | 84 → 126, k = 2 | – | – |
 | Gemma 4 26B-A4B | q4, Arc Pro B60 | 67 → 91, k = 2 | – | – |
 | Qwen3.5 4B | q4, Arc Pro B60 | 104 → 149, k = 2 | – | – |
+| Qwen3.5 9B | q4, Arc Pro B60 | 62 → 108, k = 4 | – | – |
 | Qwen3.6-35B-A3B | q4, Arc Pro B60 | 62 → 94, k = 3 | – | – |
 | Qwen3.8-27B | q4, Arc Pro B60 | 22 → 50, k = 4 | 22 → 61, k = 7 | 22 → 51, k = 7 |
 | Qwen3.8-27B | q4, Arc B390 | 6.6 → 18, k = 5 | 6.6 → 20, k = 7 | 6.6 → 17.5, k = 7 |
