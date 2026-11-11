@@ -7,10 +7,11 @@
 // Written against the hardware's DPAS and 2D block load directly (IGC builtins, as Intel's own kernels do): the B
 // operand of a DPAS holds, per lane, one column of 16 consecutive K values packed in pairs, which is a weight row, so
 // each lane dequantizes its own output feature's codes straight into its B register. (joint_matrix cannot build an
-// operand from registers: element access on A and B tiles loses the device.) A sub-group owns 32 output features: a
-// transposed 2D block load gives each lane 32 (q8) or 64 (q4) codes of its feature, and per 16 columns of K every
-// 8-row tile of x (one 2D block load, rows past M read as zero) multiplies both B registers.
-// A work-group owns 32 output features and splits K between its sub-groups, which add their accumulators in local
+// operand from registers: element access on A and B tiles loses the device.) A sub-group owns 32 output features (16
+// past 32 rows, whose accumulators would not fit the registers beside two): a lane loads 64 bytes of codes of each of
+// its features' rows (64 columns of K at q8, 128 at q4), and per 16 columns of K one 2D block load brings 32 rows of x
+// (four 8-row tiles; rows past M read as zero), each tile multiplying every B register.
+// A work-group owns those features and splits K between its sub-groups, which add their accumulators in local
 // memory at the end: enough sub-groups to keep the memory busy without writing partial sums out (at 50 rows a split
 // between work-groups spent as long on them as on the weight).
 
@@ -31,12 +32,12 @@ namespace syclex = sycl::ext::oneapi::experimental;
 namespace intelex = sycl::ext::intel::experimental;
 
 typedef float float8_v __attribute__((ext_vector_type(8)));
+typedef float float8_u __attribute__((ext_vector_type(8), aligned(4)));  // in memory, at any float's address
 typedef short short8_v __attribute__((ext_vector_type(8)));
 typedef int int8_v __attribute__((ext_vector_type(8)));
 typedef int int2_v __attribute__((ext_vector_type(2)));
 typedef unsigned short ushort8_v __attribute__((ext_vector_type(8)));
 typedef unsigned short ushort32_v __attribute__((ext_vector_type(32)));
-typedef unsigned int uint8_v __attribute__((ext_vector_type(8)));
 
 }  // namespace
 }  // namespace xs::sycl_be
@@ -52,20 +53,7 @@ SYCL_EXTERNAL extern "C" xs::sycl_be::ushort8_v __builtin_IB_subgroup_block_read
 // The same for 32 rows: four 8 x 16 tiles, rows 8 j .. 8 j + 7 in elements 8 j .. 8 j + 7.
 SYCL_EXTERNAL extern "C" xs::sycl_be::ushort32_v __builtin_IB_subgroup_block_read_flat_u16_m32k16v1(
     long base, int width_minus_one, int height_minus_one, int pitch_minus_one, xs::sycl_be::int2_v coord);
-// An 8 x 16 tile of 32-bit elements in the same layout: lane l holds column l of each row.
-SYCL_EXTERNAL extern "C" xs::sycl_be::uint8_v __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(
-    long base, int width_minus_one, int height_minus_one, int pitch_minus_one, xs::sycl_be::int2_v coord);
-// 16 rows x 8 dwords at (coord.x dwords, coord.y rows) of a surface, transposed: lane l holds row l's 8 dwords.
-SYCL_EXTERNAL extern "C" xs::sycl_be::uint8_v __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(
-    long base, int width_minus_one, int height_minus_one, int pitch_minus_one, xs::sycl_be::int2_v coord);
 #else
-inline xs::sycl_be::uint8_v __builtin_IB_subgroup_block_read_flat_u32_m8k16v1(long, int, int, int, xs::sycl_be::int2_v) {
-    return {};
-}
-inline xs::sycl_be::uint8_v __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(long, int, int, int,
-                                                                                   xs::sycl_be::int2_v) {
-    return {};
-}
 inline xs::sycl_be::float8_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(xs::sycl_be::float8_v acc,
                                                                           xs::sycl_be::short8_v, xs::sycl_be::int8_v) {
     return acc;
@@ -114,28 +102,22 @@ inline uint32_t dequant_pair_affine(uint32_t pair, _Float16 offset, h2_v scale, 
 
 template <bool Q4, int MT, bool AWQ, typename Y, bool ADD>
 struct QuantGemmKernel {
-    // 16-feature columns per work-group (each lane: kNt output features); 8 row tiles take one, or the accumulators
-    // spill
-    static constexpr int kNt = MT >= 8 ? 1 : 2;
+    // 16-feature columns per sub-group (each lane: kNt output features); past 4 row tiles one, or the accumulators
+    // spill (q4 at 7 tiles ran five times slower with two)
+    static constexpr int kNt = MT > 4 ? 1 : 2;
     static constexpr int kFeatures = kNt * kSg;
-    // Per step, one transposed 2D block load per 16 features brings each lane 8 dwords of its feature's codes:
-    // kStep columns of K (32 at q8, 64 at q4), kSlices DPAS B operands.
-    static constexpr int kStep = Q4 ? 64 : 32;
+    // Per step a lane loads 64 bytes of each of its features' codes (a cache line of its own row): kStep columns of
+    // K (64 at q8, 128 at q4), kSlices DPAS B operands. Every load is a message the sub-group waits for, and a few
+    // rows leave it little else to do, so few and large loads are what makes it fast.
+    static constexpr int kStep = Q4 ? 128 : 64;
     static constexpr int kSlices = kStep / kTk;
-
-    // What one step reads from memory: the codes, and each slice's scale (and bias). A scale is a scattered load (16
-    // lanes, 16 rows), so a slice in the same group as the previous one reuses it. (Requesting the next step's ahead
-    // measured no faster and spilled registers at 7 and 8 row tiles.)
-    struct Step {
-        uint8_v codes[kNt];
-        half scale[kNt][kSlices];
-        half bias[kNt][kSlices];
-    };
+    static constexpr int kBlocks = (MT + 3) / 4;  // 32-row loads of x per slice
+    using Codes = sycl::vec<uint32_t, 16>;
 
     const half* x;
     QuantWeight w;
     Y* y;
-    sycl::local_accessor<float, 1> slm;  // every slice's accumulators: [slice][mt][nt][8 rows][16 lanes]
+    sycl::local_accessor<float, 1> slm;  // every slice's accumulators: [slice][mt][nt][16 lanes][8 rows]
     int64_t m, n, k, k_slice;
     int group_shift;  // log2(w.group): no 64-bit division in the loop (it is emulated, and slow)
 
@@ -156,104 +138,106 @@ struct QuantGemmKernel {
         const int x_width = static_cast<int>(k * 2) - 1;  // x as a [M, K] f16 surface
         const int x_height = static_cast<int>(m) - 1;
         const auto x_base = reinterpret_cast<long>(x);
-        const int c_width = static_cast<int>(row_bytes) - 1;  // the codes as an [N, row_bytes] surface
-        const int c_height = static_cast<int>(n) - 1;
-        const auto c_base = reinterpret_cast<long>(w.codes);
+        const uint8_t* codes[kNt];
         const half* scales[kNt];
         const half* biases[kNt];
         for (int nt = 0; nt < kNt; ++nt) {
-            const int64_t row = n0 + nt * kSg + lane;
+            const int64_t row = n0 + nt * kSg + lane;  // this lane's output feature
+            codes[nt] = w.codes + row * row_bytes;
             scales[nt] = w.scales + row * groups;
             biases[nt] = Q4 ? w.biases + row * groups : nullptr;
         }
-        const auto fetch = [&](int64_t kk, Step& st) {
-            for (int nt = 0; nt < kNt; ++nt) {
-                const int2_v at = {static_cast<int>((Q4 ? kk / 2 : kk) / 4), static_cast<int>(n0 + nt * kSg)};
-                st.codes[nt] = __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(c_base, c_width, c_height,
-                                                                                      c_width, at);
-            }
-            for (int ks = 0; ks < kSlices; ++ks) {
-                const int g = (static_cast<int>(kk) + ks * kTk) >> group_shift;
-                const bool same = ks > 0 && g == ((static_cast<int>(kk) + (ks - 1) * kTk) >> group_shift);
-                for (int nt = 0; nt < kNt; ++nt) {
-                    st.scale[nt][ks] = same ? st.scale[nt][ks - 1] : scales[nt][g];
-                    if constexpr (Q4) st.bias[nt][ks] = same ? st.bias[nt][ks - 1] : biases[nt][g];
-                }
-            }
-        };
 
         float8_v acc[MT][kNt];
         for (int mt = 0; mt < MT; ++mt) {
             for (int nt = 0; nt < kNt; ++nt) acc[mt][nt] = 0.0f;
         }
+        half scale[kNt];
+        half bias[kNt];
+        int group = -1;  // the group `scale` and `bias` belong to
         for (int64_t kk = k_lo; kk < k_hi; kk += kStep) {
-            Step cur;
-            fetch(kk, cur);
-            int8_v b[kNt][kSlices];
-            for (int nt = 0; nt < kNt; ++nt) {
-                const uint8_v c = cur.codes[nt];
-                for (int ks = 0; ks < kSlices; ++ks) {
+            Codes c[kNt];
+            for (int nt = 0; nt < kNt; ++nt) c[nt] = *reinterpret_cast<const Codes*>(codes[nt] + (Q4 ? kk / 2 : kk));
+            #pragma unroll
+            for (int ks = 0; ks < kSlices; ++ks) {
+                const int col = static_cast<int>(kk) + ks * kTk;
+                if (const int g = col >> group_shift; g != group) {  // the same for every lane
+                    group = g;
+                    for (int nt = 0; nt < kNt; ++nt) {
+                        scale[nt] = scales[nt][g];
+                        if constexpr (Q4) bias[nt] = biases[nt][g];
+                    }
+                }
+                int8_v b[kNt];
+                #pragma unroll
+                for (int nt = 0; nt < kNt; ++nt) {
                     if constexpr (Q4) {
                         // 16 columns = 8 bytes = dwords 2 ks, 2 ks + 1; even column in the low nibble. (The packed
                         // trick below measured 2-3x slower here: the compiler's code for it spilled.)
-                        const half sh = cur.scale[nt][ks];
-                        const half bias = cur.bias[nt][ks];
+                        #pragma unroll
                         for (int d = 0; d < 2; ++d) {
-                            const uint32_t word = c[2 * ks + d];
+                            const uint32_t word = c[nt][2 * ks + d];
+                            #pragma unroll
                             for (int i = 0; i < 4; ++i) {
                                 const uint32_t byte = (word >> (8 * i)) & 0xFF;
-                                b[nt][ks][4 * d + i] = pack_half2(sycl::fma(static_cast<half>(byte & 0x0F), sh, bias),
-                                                                  sycl::fma(static_cast<half>(byte >> 4), sh, bias));
+                                b[nt][4 * d + i] =
+                                    pack_half2(sycl::fma(static_cast<half>(byte & 0x0F), scale[nt], bias[nt]),
+                                               sycl::fma(static_cast<half>(byte >> 4), scale[nt], bias[nt]));
                             }
                         }
                     } else {
                         // 16 columns = 16 bytes = dwords 4 ks .. 4 ks + 3; codes biased to unsigned (c + 128)
-                        const _Float16 sf = sycl::bit_cast<_Float16>(cur.scale[nt][ks]);
+                        const _Float16 sf = sycl::bit_cast<_Float16>(scale[nt]);
                         const h2_v s2{sf, sf};
+                        #pragma unroll
                         for (int d = 0; d < 4; ++d) {
-                            const uint32_t w8 = c[4 * ks + d] ^ 0x80808080u;
-                            b[nt][ks][2 * d] = dequant_pair((w8 & 0xFFu) | ((w8 & 0xFF00u) << 8), 1152, s2);
-                            b[nt][ks][2 * d + 1] = dequant_pair(((w8 >> 16) & 0xFFu) | ((w8 >> 8) & 0xFF0000u), 1152, s2);
+                            const uint32_t w8 = c[nt][4 * ks + d] ^ 0x80808080u;
+                            b[nt][2 * d] = dequant_pair((w8 & 0xFFu) | ((w8 & 0xFF00u) << 8), 1152, s2);
+                            b[nt][2 * d + 1] = dequant_pair(((w8 >> 16) & 0xFFu) | ((w8 >> 8) & 0xFF0000u), 1152, s2);
                         }
                     }
                     if constexpr (AWQ) {
+                        #pragma unroll
                         for (int i = 0; i < 8; ++i) {
-                            const int64_t col = kk + ks * kTk + 2 * i;
-                            const auto p = sycl::bit_cast<sycl::vec<half, 2>>(static_cast<uint32_t>(b[nt][ks][i]));
-                            b[nt][ks][i] = pack_half2(static_cast<half>(static_cast<float>(p[0]) * w.input_scales[col]),
-                                                      static_cast<half>(static_cast<float>(p[1]) * w.input_scales[col + 1]));
+                            const int64_t at = col + 2 * i;
+                            const auto p = sycl::bit_cast<sycl::vec<half, 2>>(static_cast<uint32_t>(b[nt][i]));
+                            b[nt][i] = pack_half2(static_cast<half>(static_cast<float>(p[0]) * w.input_scales[at]),
+                                                  static_cast<half>(static_cast<float>(p[1]) * w.input_scales[at + 1]));
                         }
                     }
                 }
-            }
-            for (int ks = 0; ks < kSlices; ++ks) {
-                for (int mt = 0; mt < MT; ++mt) {
-                    const int2_v coord = {static_cast<int>(kk + ks * kTk), mt * kTm};
-                    const ushort8_v a =
-                        __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(x_base, x_width, x_height, x_width, coord);
-                    for (int nt = 0; nt < kNt; ++nt) {
-                        acc[mt][nt] = __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(
-                            acc[mt][nt], __builtin_bit_cast(short8_v, a), b[nt][ks]);
+                // x: 32 rows a load (four A operands; rows past M read as zero)
+                #pragma unroll
+                for (int blk = 0; blk < kBlocks; ++blk) {
+                    const ushort32_v a4 = __builtin_IB_subgroup_block_read_flat_u16_m32k16v1(
+                        x_base, x_width, x_height, x_width, int2_v{col, blk * 4 * kTm});
+                    #pragma unroll
+                    for (int j = 0; j < 4 && blk * 4 + j < MT; ++j) {
+                        ushort8_v a;
+                        #pragma unroll
+                        for (int r = 0; r < kTm; ++r) a[r] = a4[kTm * j + r];
+                        #pragma unroll
+                        for (int nt = 0; nt < kNt; ++nt) {
+                            acc[blk * 4 + j][nt] = __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(
+                                acc[blk * 4 + j][nt], __builtin_bit_cast(short8_v, a), b[nt]);
+                        }
                     }
                 }
             }
         }
-        // The slices add up in local memory, each one finishing the row tiles mt = slice, slice + slices, ...
-        constexpr int kTileFloats = kTm * kSg;
+        // The slices add up in local memory, each one finishing the row tiles mt = slice, slice + slices, ...; a
+        // lane stores and loads its eight rows of a tile at once.
+        const auto tile = [&](int sl, int mt, int nt) {
+            return reinterpret_cast<float8_u*>(&slm[(((sl * MT + mt) * kNt + nt) * kSg + lane) * kTm]);
+        };
         for (int mt = 0; mt < MT; ++mt) {
-            for (int nt = 0; nt < kNt; ++nt) {
-                float* t = &slm[((slice * MT + mt) * kNt + nt) * kTileFloats];
-                for (int r = 0; r < kTm; ++r) t[r * kSg + lane] = acc[mt][nt][r];
-            }
+            for (int nt = 0; nt < kNt; ++nt) *tile(slice, mt, nt) = acc[mt][nt];
         }
         sycl::group_barrier(it.get_group());
         for (int mt = slice; mt < MT; mt += slices) {
             for (int nt = 0; nt < kNt; ++nt) {
                 float8_v sum = 0.0f;
-                for (int s = 0; s < slices; ++s) {
-                    const float* t = &slm[((s * MT + mt) * kNt + nt) * kTileFloats];
-                    for (int r = 0; r < kTm; ++r) sum[r] += t[r * kSg + lane];
-                }
+                for (int s = 0; s < slices; ++s) sum += *tile(s, mt, nt);
                 // element r, lane l: y row mt * 8 + r, feature n0 + nt * 16 + l
                 for (int r = 0; r < kTm; ++r) {
                     const int64_t row = mt * kTm + r;
@@ -270,7 +254,7 @@ template <bool Q4, int MT, bool AWQ, typename Y, bool ADD>
 void quant_gemm_t(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
                   int64_t slices) {
     using K = QuantGemmKernel<Q4, MT, AWQ, Y, ADD>;
-    const int64_t k_slice = ceil_div(ceil_div(k, slices), 64) * 64;  // whole steps (32 or 64 columns)
+    const int64_t k_slice = ceil_div(ceil_div(k, slices), 128) * 128;  // whole steps (64 or 128 columns)
     const auto wgs = static_cast<size_t>(n / K::kFeatures);
     int shift = 0;
     while ((int64_t{1} << shift) < w.group) ++shift;
@@ -667,8 +651,8 @@ bool block_load_aligned(const void* x) {
 }
 
 bool quant_gemm_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w) {
-    // 2D block loads of x: rows of at least 64 bytes and a multiple of 16; of the codes ([N, K] bytes at q8,
-    // [N, K / 2] at q4): a 64-byte aligned base, rows of at least 64 bytes
+    // 2D block loads of x: rows of at least 64 bytes and a multiple of 16. The codes ([N, K] bytes at q8, [N, K / 2]
+    // at q4) are read 64 aligned bytes a lane: a 64-byte aligned base, rows a multiple of 64 bytes
     const bool pow2_group = w.group >= kTk && (w.group & (w.group - 1)) == 0;
     return m > 0 && m <= kQuantGemmMaxRows && n % (2 * kSg) == 0 && k % 128 == 0 && pow2_group &&
            block_load_aligned(w.codes) && k * 2 < (int64_t{1} << 24) && n < (int64_t{1} << 24);
