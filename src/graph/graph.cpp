@@ -462,7 +462,12 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     }
     XS_CHECK(ks[2] == qs[2], "attention head_dim differs: q ", qs[2], ", k ", ks[2]);
     XS_CHECK(qs[1] % ks[1] == 0, "attention heads ", qs[1], " not a multiple of kv heads ", ks[1]);
-    XS_CHECK(attrs.sliding_window >= 0 && attrs.softcap >= 0.0f, "invalid attention attributes");
+    XS_CHECK(attrs.sliding_window >= 0 && attrs.softcap >= 0.0f && attrs.block >= 0, "invalid attention attributes");
+    if (attrs.block > 0) {
+        XS_CHECK(!attrs.causal && attrs.sliding_window == 0 && qs[0] > 0 && ks[0] == qs[0] && qs[0] % attrs.block == 0,
+                 "attention within blocks of ", attrs.block, " takes non-causal q, k and v of one static length, a "
+                 "multiple of the block, without a window; got q ", shape_to_string(qs), " and k ", shape_to_string(ks));
+    }
     return add_node(OpKind::Attention, {q, k_all, v_all}, attrs, {TensorType{DType::F32, qs}}, "attention");
 }
 

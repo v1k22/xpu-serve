@@ -147,6 +147,7 @@ struct AttentionShape {
     int64_t window = 0;
     bool causal = true;
     const float* key_bias = nullptr;  // [N], added to key j's scores (non-causal only); null: none
+    int64_t block = 0;                // > 0: queries see the keys of their own run of `block` tokens (T == N)
 };
 // The per-row kernels cover these head dims; others take the GEMM path.
 inline bool attention_rows_head_dim(int64_t d) {

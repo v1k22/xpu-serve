@@ -25,4 +25,7 @@ TEST_SUITE("cpu-ref policy ops") {
     TEST_CASE("attention with a key bias over static queries, head dims 72, 128 and 256") {
         xs::test::policy_ops::attention_key_bias(cpu_env());
     }
+    TEST_CASE("attention within blocks of tokens, head dims 72 and 256, every path") {
+        xs::test::policy_ops::attention_blocks(cpu_env());
+    }
 }

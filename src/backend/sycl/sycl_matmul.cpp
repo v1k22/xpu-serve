@@ -291,6 +291,23 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
                const AttentionShape& s, const AttentionPlan& plan, const KvSecond& second) {
     XS_CHECK(second.k == nullptr || (!rows_path(s, plan.path) && s.head_dim > 128),
              "sycl attention: keys in two parts take the GEMM path only");
+    bool fused = false;  // the fused matrix-engine kernel runs this shape
+    if constexpr (std::is_same_v<KV, half>) {
+        const bool want = plan.path == AttentionPath::Auto || plan.path == AttentionPath::Flash;
+        fused = want && plan.xmx && second.k == nullptr && !rows_path(s, plan.path) && flash_attention_fits(s, k, v);
+    }
+    if (s.block > 0 && !fused) {  // the fused kernel takes every block in one launch; the other paths one at a time
+        XS_CHECK(second.k == nullptr && s.tokens == s.kv_len, "sycl attention: blocks need as many keys as queries");
+        AttentionShape one = s;
+        one.block = 0;
+        one.tokens = one.kv_len = s.block;
+        for (int64_t b0 = 0; b0 < s.tokens; b0 += s.block) {
+            one.key_bias = s.key_bias != nullptr ? s.key_bias + b0 : nullptr;
+            attention(q, scratch, qp + b0 * s.q_heads * s.head_dim, k + b0 * s.kv_heads * s.head_dim,
+                      v + b0 * s.kv_heads * s.head_dim, out + b0 * s.q_heads * s.head_dim, one, plan);
+        }
+        return;
+    }
     if (rows_path(s, plan.path)) {
         if constexpr (std::is_same_v<QT, float>) {
             attention_by_rows(q, scratch, out, s,
@@ -301,8 +318,7 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
         }
     }
     if constexpr (std::is_same_v<KV, half>) {
-        const bool want = plan.path == AttentionPath::Auto || plan.path == AttentionPath::Flash;
-        if (want && plan.xmx && second.k == nullptr && flash_attention_fits(s, k, v)) {
+        if (fused) {
             const int64_t split = flash_attention_split(s, plan.compute_units);
             float* part = nullptr;
             if (split > 1) {

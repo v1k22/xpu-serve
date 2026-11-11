@@ -34,4 +34,7 @@ TEST_SUITE("device policy ops" * doctest::skip(!dev::enabled())) {
     TEST_CASE("attention with a key bias over static queries, head dims 72, 128 and 256, every path") {
         xs::test::policy_ops::attention_key_bias(device_env());
     }
+    TEST_CASE("attention within blocks of tokens, head dims 72 and 256, every path") {
+        xs::test::policy_ops::attention_blocks(device_env());
+    }
 }

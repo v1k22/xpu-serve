@@ -95,6 +95,23 @@ TEST_CASE("attention that is not causal takes a window only over a step's rows a
     CHECK_THROWS_AS(g.attention(fixed, ka, va, AttentionAttrs{1.0f, 16, 0.0f, false}), xs::Error);
 }
 
+TEST_CASE("attention within blocks takes non-causal operands of one static length, a multiple of the block") {
+    Graph g;
+    AttentionAttrs attrs;
+    attrs.causal = false;
+    attrs.block = 16;
+    const Value q = g.input("q", DType::F32, {48, 4, 8});
+    const Value k = g.input("k", DType::F32, {48, 2, 8});
+    CHECK(g.type(g.attention(q, k, k, attrs)).shape == (xs::Dims{48, 4, 8}));
+    const Value longer = g.input("longer", DType::F32, {64, 2, 8});
+    CHECK_THROWS_AS(g.attention(q, longer, longer, attrs), xs::Error);  // as many keys as queries
+    attrs.block = 20;
+    CHECK_THROWS_AS(g.attention(q, k, k, attrs), xs::Error);  // 48 tokens are no whole number of blocks
+    attrs.block = 16;
+    attrs.causal = true;
+    CHECK_THROWS_AS(g.attention(q, k, k, attrs), xs::Error);
+}
+
 TEST_CASE("prev_row keeps the shape; float rows only") {
     Graph g;
     const Value x = g.input("x", DType::F32, {kT, 3, 5});

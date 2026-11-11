@@ -8,7 +8,8 @@
 // as zero), each tile feeding all MT row tiles; the softmax update on the accumulators (lane = column, element i =
 // row i); P converted to A tiles; O = O * alpha + P V. Any head_dim up to 128 that is a multiple of 8 works: columns
 // of a K or V tile past head_dim belong to the next head, Q's zero padding cancels them in S, and O's columns past
-// head_dim are never written. At 256 the accumulators of 8 rows fill the registers and every tile would feed one
+// head_dim are never written. Attention within blocks of tokens (AttentionShape::block) is the same pass over the
+// keys of the tile's own block, every block in one launch. At 256 the accumulators of 8 rows fill the registers and every tile would feed one
 // DPAS: oneMKL's GEMMs match that, so those shapes take the GEMM path.
 
 #include "backend/sycl/sycl_kernels.h"
@@ -89,6 +90,7 @@ struct FlashArgs {
     int64_t tokens = 0;
     int64_t kv_len = 0;
     int64_t window = 0;
+    int64_t block = 0;
     float scale = 1.0f;
     float softcap = 0.0f;
     bool causal = false;
@@ -161,8 +163,13 @@ struct FlashKernel {
 
         // Row r is token t0 + r; the tile's span of visible keys; its split's share in whole blocks.
         const int64_t last = std::min<int64_t>(a.tokens - 1, t0 + kRows - 1);
-        const int64_t hi = a.causal ? past + last + 1 : a.kv_len;
-        const int64_t lo = a.window > 0 ? std::max<int64_t>(0, past + t0 - a.window + 1) : 0;
+        int64_t hi = a.causal ? past + last + 1 : a.kv_len;
+        int64_t lo = a.window > 0 ? std::max<int64_t>(0, past + t0 - a.window + 1) : 0;
+        if (a.block > 0) {  // the tile's rows share a block (flash_attention_fits): its keys
+            lo = t0 / a.block * a.block;
+            hi = lo + a.block;
+        }
+        const int key_end = static_cast<int>(a.block > 0 ? hi : a.kv_len);
         const int pos0 = static_cast<int>(past + t0);
         const int rows_valid = static_cast<int>(last - t0 + 1);
         const int64_t blocks = ceil_div(hi - lo, BC);
@@ -212,7 +219,7 @@ struct FlashKernel {
                 for (int i = 0; i < kTm; ++i) mb[i] = kNegInf;
                 for (int nt = 0; nt < kKt; ++nt) {
                     const int j = static_cast<int>(kb) + nt * kTn + lane;
-                    const bool key_ok = j < a.kv_len;
+                    const bool key_ok = j < key_end;
                     const float bias = a.key_bias != nullptr && key_ok ? a.key_bias[j] * kLog2e : 0.0f;
                     for_rows(sg, sc[mt][nt], [&](float& x, int i) {
                         float y = x * qk_scale;
@@ -326,6 +333,7 @@ void flash_t(sycl::queue& q, const QT* qp, const half* k, const half* v, float* 
     a.tokens = s.tokens;
     a.kv_len = s.kv_len;
     a.window = s.window;
+    a.block = s.block;
     a.scale = s.scale;
     a.softcap = s.softcap;
     a.causal = s.causal;
@@ -355,7 +363,9 @@ bool xmx_device(const sycl::device& d) {
 }
 
 bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v) {
-    if (flash_config(s.head_dim).dp == 0 || s.head_dim % 8 != 0) return false;
+    const FlashConfig c = flash_config(s.head_dim);
+    if (c.dp == 0 || s.head_dim % 8 != 0) return false;
+    if (s.block % (int64_t{kTm} * c.mt) != 0) return false;  // a sub-group's rows in one block
     // 2D block loads: 64-byte aligned bases, rows of at least 64 bytes, extents below 2^24
     const auto aligned = [](const void* p) { return reinterpret_cast<uintptr_t>(p) % 64 == 0; };
     if (!aligned(k) || !aligned(v)) return false;
@@ -367,7 +377,7 @@ bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v)
 int64_t flash_attention_split(const AttentionShape& s, int64_t compute_units) {
     const FlashConfig c = flash_config(s.head_dim);
     const int64_t tiles = s.q_heads * ceil_div(s.tokens, int64_t{kTm} * c.mt);
-    const int64_t keys = s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
+    const int64_t keys = s.block > 0 ? s.block : s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
     const int64_t blocks = ceil_div(keys, c.bc);
     // about 2.5 sub-groups per execution unit in flight (4 threads each in the large register file)
     const int64_t want = compute_units * 5 / 2 / std::max<int64_t>(tiles, 1);

@@ -191,4 +191,57 @@ inline void attention_key_bias(const Env& env) {
     }
 }
 
+// Attention within blocks of tokens (an encoder over several images): each block's queries see that block's keys
+// only. Head dim 72 (the fused matrix-engine kernel takes every block in one launch) and 256 (one block at a time),
+// operands as inputs and through a reshape, against the blocks attended one by one.
+inline void attention_blocks(const Env& env) {
+    TensorRng rng(45);
+    struct Case {
+        int64_t block, blocks, heads, kv_heads, dim;
+    };
+    for (const Case c : {Case{32, 3, 4, 4, 72}, Case{48, 2, 8, 1, 256}}) {
+        CAPTURE(c.dim);
+        const int64_t tokens = c.block * c.blocks;
+        const HostTensor q = rng.uniform(DType::F32, {tokens, c.heads, c.dim});
+        const HostTensor k = rng.uniform(DType::F32, {tokens, c.kv_heads, c.dim});
+        const HostTensor v = rng.uniform(DType::F32, {tokens, c.kv_heads, c.dim});
+        AttentionAttrs attrs;
+        attrs.causal = false;
+        attrs.scale = 1.0f / std::sqrt(static_cast<float>(c.dim));
+        ref::AttentionSpec spec;
+        spec.scale = attrs.scale;
+        spec.causal = false;
+        Tensor64 expected({tokens, c.heads, c.dim});
+        for (int64_t b = 0; b < c.blocks; ++b) {
+            const auto part = [&](const HostTensor& t) { return to_f64(rows(t, b * c.block, (b + 1) * c.block)); };
+            const Tensor64 one = ref::attention(part(q), part(k), part(v), spec);
+            std::copy(one.data.begin(), one.data.end(),
+                      expected.data.begin() + static_cast<std::ptrdiff_t>(b * c.block * c.heads * c.dim));
+        }
+        const Tensor64 whole = ref::attention(to_f64(q), to_f64(k), to_f64(v), spec);
+        attrs.block = c.block;
+        for (const bool reshaped : {false, true}) {
+            CAPTURE(reshaped);
+            Graph g;
+            const auto operand = [&](const char* name, const Dims& shape) {
+                if (!reshaped) return g.input(name, DType::F32, shape);
+                return g.reshape(g.input(name, DType::F32, {shape[0], shape[1] * shape[2]}), shape);
+            };
+            g.output("out", g.attention(operand("q", {tokens, c.heads, c.dim}), operand("k", {tokens, c.kv_heads, c.dim}),
+                                        operand("v", {tokens, c.kv_heads, c.dim}), attrs));
+            const auto flat = [&](const HostTensor& t) {
+                return reshaped ? t.reshaped({t.shape()[0], t.shape()[1] * t.shape()[2]}) : t.clone();
+            };
+            for (const std::string& impl : env.attention_impls) {
+                CAPTURE(impl);
+                SessionOptions o = env.options();
+                if (impl != "auto") o.extra["attention"] = impl;
+                const HostTensor out = run(env, g, {{"q", flat(q)}, {"k", flat(k)}, {"v", flat(v)}}, o).at("out");
+                CHECK(all_close(out, expected, env.attn_atol, env.attn_rtol));
+                CHECK_FALSE(all_close(out, whole, env.attn_atol, env.attn_rtol));  // planted: the blocks matter
+            }
+        }
+    }
+}
+
 }  // namespace xs::test::policy_ops

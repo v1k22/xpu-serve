@@ -467,8 +467,12 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
         const int64_t t = item / q_heads;
         const int64_t h = item % q_heads;
         const int64_t pos = kv_len - tokens + t;
-        const int64_t first = attrs.sliding_window > 0 ? std::max<int64_t>(0, pos - attrs.sliding_window + 1) : 0;
-        const int64_t last = attrs.causal ? pos : kv_len - 1;
+        int64_t first = attrs.sliding_window > 0 ? std::max<int64_t>(0, pos - attrs.sliding_window + 1) : 0;
+        int64_t last = attrs.causal ? pos : kv_len - 1;
+        if (attrs.block > 0) {  // the keys of the query's own block
+            first = t / attrs.block * attrs.block;
+            last = first + attrs.block - 1;
+        }
         const int64_t offset = (t * q_heads + h) * head_dim;
         attend_one(q.data<float>() + offset, k_all, v_all, h / group, first, last, attrs, bias,
                    out.data<float>() + offset);

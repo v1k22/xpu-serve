@@ -2021,6 +2021,7 @@ private:
                 s.softcap = a.softcap;
                 s.window = a.sliding_window;
                 s.causal = a.causal;
+                s.block = a.block < s.tokens ? a.block : 0;  // one block: every key
                 XS_CHECK(s.causal || s.window == 0 || s.tokens <= s.window, "non-causal attention of ", s.tokens,
                          " queries with a window of ", s.window);
                 if (n.inputs.size() == 4) s.key_bias = in_f32(3);

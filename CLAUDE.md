@@ -130,7 +130,7 @@ area).
 | `src/backend/sycl/sycl_backend.cpp` | SYCL session: device dtypes, fusions, per-T memory plan (one arena), op dispatch, KV and state buffers |
 | `src/backend/sycl/sycl_kernels.cpp` | SYCL kernels: elementwise, norms, RoPE, gather, copies, causal conv, gated delta, decode attention, GEMV, top-k (rows as wide as a vocabulary by blocks), SignMatMul (bit planes and popcounts) |
 | `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond; quantized: `quant_path` picks the GEMV or its matrix-engine version, quant_gemm, quant_gemm_tiled or dequantize + oneMKL per device and shape) and Attention (per-row kernel with split-K, the fused kernel, or GEMMs) |
-| `src/backend/sycl/sycl_flash_attention.cpp` | Fused attention on the matrix engines (joint_matrix; head_dim up to 128) |
+| `src/backend/sycl/sycl_flash_attention.cpp` | Fused attention on the matrix engines (joint_matrix; head_dim up to 128; blocks of tokens in one launch) |
 | `src/backend/sycl/sycl_quant_gemm.cpp` | Quantized matmuls on the matrix engines (DPAS and 2D block load builtins): gemv_quant_xmx (up to 8 rows at about the cost of one: a speculative verify; x in f16 and its group sums from one small launch before), quant_gemm (9 to 64 rows, the weight read once, 64 bytes of codes a lane and 32 rows of x a load; weights that read the same x share a launch) and quant_gemm_tiled (many rows: each weight tile dequantized once per work-group of 512 rows into local memory, no f16 copy of the weight) |
 | `src/engine/engine.cpp` | Generation loop for one sequence; encodes images and splices their rows into prefill chunks; speculative rounds (`spec_round`) |
 | `src/models/model.h` (`Speculation`) | What a model with a drafter adds: prefill, verify and draft programs, and its way of drafting (`ChainDrafting`: a token a run from the target's `hidden`; `BlockDrafting`: a block a run from state the target's programs write) |
@@ -176,8 +176,8 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 - Ops: Input, Weight, Constant, Gather, MatMul, Add, Mul, Div, Scale, Tanh, GeluTanh, Softcap, Sigmoid, Silu, Softplus,
   Clamp, RmsNorm, Softmax, TopK, ReduceSum, Reshape, Slice, Transpose, PrevRow (each row of a step replaced by the row
   before it), Rope (1-D or axial, optionally partial), KvCache, KvRead (another program's KV slot, read only),
-  Attention (causal with optional window, or non-causal: every key, or a step that sees itself whole and a window
-  before it), CausalConv and GatedDelta (stateful, for linear attention),
+  Attention (causal with optional window, or non-causal: every key, the keys of the query's own block of tokens, or
+  a step that sees itself whole and a window before it), CausalConv and GatedDelta (stateful, for linear attention),
   ExpertMatMul (each token's chosen experts from a stacked `[E, N, K]` bank, for mixture of experts), SignMatMul (a
   matmul by a one-bit weight: the cheap score of every row that a shortlist starts from). The exact semantics
   are the comments in `graph.h`.
@@ -225,7 +225,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/model/block_drafter_parity.cpp` | a block drafter (`XS_TEST_DRAFTER_DIR`) over rounds whose context grows by several tokens: drafts, candidates and scores | the drafters' own PyTorch code, from `tests/parity/model/block_drafter_reference.py` (clones of z-lab/dflash and Tencent/DSpine) |
 | `tests/unit/model/block_drafters.cpp` | block drafters on tiny checkpoints the test writes (`tiny_checkpoints.h`): a context fed in chunks or cut back after a verify, a causal block stopping after the drafts asked for, a drafter's pack, config refusals | the same drafter fed differently; its unquantized checkpoint |
 | `tests/unit/model/policy_parity.cpp` | a robot policy end to end: prompt ids and the action chunk, all cameras and one camera (`XS_TEST_POLICY_DIR`, `XS_POLICY_FIXTURES`) | LeRobot fp32 with fixed noise, from `tests/parity/policy/lerobot_reference.py` |
-| `tests/unit/backend/*_policy_ops.cpp` | LayerNorm, Concat, attention with a key bias over static queries (head dims 72, 256) | fp64 references (`policy_ops_cases.h`) |
+| `tests/unit/backend/*_policy_ops.cpp` | LayerNorm, Concat (also of computed values that share a part), attention with a key bias over static queries (head dims 72, 256) and within blocks of tokens | fp64 references (`policy_ops_cases.h`) |
 | `tests/unit/model/gemma4_vision_parity.cpp` | image input: pixels, vision features, expanded prompt, logits, greedy (whole and chunked prefill), prefix reuse by image | Hugging Face fp32, from `tests/parity/model/hf_vision_reference.py` |
 
 - `tests/parity/**/*.py` generate fixtures from Hugging Face (run with a Python venv that has `transformers`,

@@ -154,12 +154,15 @@ struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op'
 // Not causal with a sliding_window (a block drafter: its block sees itself whole, and the window of the cache before
 // it): q is [T, ...], k and v are KvCache outputs and positions are the causal ones; key j is visible to query i iff
 // p_i - j < sliding_window, with T <= sliding_window.
+// Not causal with a block (an encoder over several images at once): q, k and v have one static length, a multiple of
+// `block`, and key j is visible to query i iff both fall in the same run of `block` tokens.
 // scores = scale * q.k (f32); if softcap > 0: scores = softcap * tanh(scores / softcap); softmax in f32.
 struct AttentionAttrs {
     float scale = 1.0f;
     int64_t sliding_window = 0;
     float softcap = 0.0f;
     bool causal = true;
+    int64_t block = 0;
 };
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
