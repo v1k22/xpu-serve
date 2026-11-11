@@ -182,33 +182,29 @@ bool integrated_gpu(const sycl::device& d) {
 #pragma clang diagnostic pop
 }
 
-// How quantized matmuls run on a device. On an integrated GPU (system memory) the matrix-engine kernels that dequantize
-// on the way win: quant_gemm up to kQuantGemmMaxRows rows, quant_gemm_tiled up to kTiledMaxRows (Arc B390, a
-// 17408 x 5120 q4 weight at 512 rows: 3.1 ms against 4.0 for dequantize + GEMM); past that oneMKL's GEMM amortizes the
-// f16 copy of the weight (1,024 rows: 6.3 against 5.2 ms). On a discrete card's faster memory dequantize + GEMM is as
-// fast or faster from 128 rows (Arc Pro B60: 1.5 ms both at 512 rows, 1.1 against 1.5 at 128), and quant_gemm wins
-// only for the fewest rows, a long speculative verify or a short prompt tail (0.9 GB of q4 MLP weights: 6.4 to 7.6 ms
-// at 9 to 32 rows against 17 to 18.5 dequantized, then 58 ms at 40 to 56 rows).
+// How quantized matmuls run on a device. Up to kQuantGemmMaxRows rows quant_gemm, which dequantizes on the way, wins
+// everywhere (Arc Pro B60, 0.9 GB of q4 MLP weights: 5.7 to 10.6 ms at 9 to 64 rows against 17 to 19 dequantized).
+// Past them, on an integrated GPU (system memory) quant_gemm_tiled up to kTiledMaxRows (Arc B390, a 17408 x 5120 q4
+// weight at 512 rows: 3.1 ms against 4.0 for dequantize + GEMM), then oneMKL's GEMM, which amortizes the f16 copy of
+// the weight (1,024 rows: 6.3 against 5.2 ms); on a discrete card's faster memory dequantize + GEMM is as fast or
+// faster from 128 rows (Arc Pro B60: 1.5 ms both at 512 rows, 1.1 against 1.5 at 128).
 constexpr int64_t kTiledMaxRows = 512;
-constexpr int64_t kDiscreteFewRows = 32;
 // From how many rows the GEMV's matrix-engine version (gemv_quant_xmx) wins: its cost is about flat in the rows, the
 // GEMV's grows with them (Arc Pro B60, Qwen3.8-27B q4 decode steps of 1 to 6 tokens: 44.7, 48.0, 52.4, 62.0, 68.5,
 // 78.1 ms; with it from 4 rows 56.0, 56.5, 56.8).
 constexpr int64_t kXmxGemvRows = 4;
 
-// How quantized matmuls run (the GEMV option: auto, vector = the GEMV only, xmx = its matrix-engine version from
-// one row, where it fits).
+// How quantized matmuls run (the GEMV option: auto, vector = the GEMV only, xmx = its matrix-engine version from one
+// row, where it fits; few_rows: the most rows quant_gemm takes, the device's own choice when negative).
 sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::AttentionPlan& attention, DType precision,
-                                    const std::string& gemv) {
+                                    const std::string& gemv, int64_t few_rows) {
     sycl_be::QuantMatmulPlan p;
     p.f32 = precision == DType::F32;
     p.compute_units = attention.compute_units;
     if (attention.xmx && !p.f32 && gemv != "vector") p.xmx_gemv_rows = gemv == "xmx" ? 1 : kXmxGemvRows;
-    if (attention.xmx && integrated_gpu(d)) {
-        p.few_rows = sycl_be::kQuantGemmMaxRows;
-        p.tiled_rows = kTiledMaxRows;
-    } else if (attention.xmx) {
-        p.few_rows = kDiscreteFewRows;
+    if (attention.xmx) {
+        p.few_rows = few_rows >= 0 ? few_rows : sycl_be::kQuantGemmMaxRows;
+        if (integrated_gpu(d)) p.tiled_rows = kTiledMaxRows;
     }
     return p;
 }
@@ -2309,6 +2305,7 @@ public:
                  dtype_name(*options.kv_dtype));
         sycl_be::AttentionPlan attention;
         std::string gemv = "auto";
+        int64_t few_rows = -1;
         for (const auto& [key, value] : options.extra) {
             if (key == "gemv") {
                 if (value != "auto" && value != "vector" && value != "xmx")
@@ -2316,7 +2313,18 @@ public:
                 gemv = value;
                 continue;
             }
-            if (key != "attention") fail("sycl does not know backend option '", key, "' (known: attention, gemv)");
+            if (key == "few_rows") {
+                const bool digits = !value.empty() && value.find_first_not_of("0123456789") == std::string::npos;
+                few_rows = digits && value.size() <= 3 ? std::stoll(value) : -1;
+                if (few_rows < 0 || few_rows > sycl_be::kQuantGemmMaxRows) {
+                    fail("sycl backend option few_rows=", value, " is not a row count of 0 to ",
+                         sycl_be::kQuantGemmMaxRows);
+                }
+                continue;
+            }
+            if (key != "attention") {
+                fail("sycl does not know backend option '", key, "' (known: attention, few_rows, gemv)");
+            }
             if (value == "rows") {
                 attention.path = sycl_be::AttentionPath::Rows;
             } else if (value == "gemm") {
@@ -2349,7 +2357,7 @@ public:
         attention.compute_units = devices_[index].get_info<sycl::info::device::max_compute_units>();
         auto session = std::make_unique<SyclSession>(
             std::make_unique<SyclShared>(it->second, options.max_context, options.rewind_tokens));
-        const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision, gemv);
+        const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision, gemv, few_rows);
         for (const graph::Graph* graph : programs) {
             session->add(std::make_unique<SyclProgram>(*graph, weights, options, session->shared(), attention, quant));
         }
