@@ -77,6 +77,9 @@ struct AttentionPlan {
     AttentionPath path = AttentionPath::Auto;
     bool xmx = false;  // xmx_device(): the matrix-engine kernels run
     int64_t compute_units = 0;
+    // GEMM path: bytes of scores and probabilities that stay in the device's cache between the GEMMs and the softmax
+    // of a chunk of queries; 0 where streaming them through memory costs less than the smaller GEMMs (set per device).
+    int64_t score_cache = 0;
 };
 
 // Keys and values in two parts, k / v holding the first `first_len` (an Attention over Concat(k1, k2) with the

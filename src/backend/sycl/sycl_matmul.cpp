@@ -16,6 +16,7 @@ namespace blas = oneapi::mkl::blas::row_major;
 using oneapi::mkl::transpose;
 
 constexpr int64_t kScoreBudget = int64_t{512} << 20;  // bytes of scores + probabilities per attention chunk
+constexpr int64_t kCacheChunkQueries = 64;            // fewest queries worth a chunk that fits the cache
 constexpr int64_t kTargetWorkGroups = 160;            // decode attention: work-groups to keep the GPU busy
 constexpr int64_t kMinSplitKeys = 512;                // fewest keys worth a split of their own
 
@@ -273,9 +274,12 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
     const int64_t d = s.head_dim;
     const int64_t hkv = s.kv_heads;
     const int64_t past = s.kv_len - s.tokens;
-    const int64_t per_query = s.q_heads * s.kv_len * static_cast<int64_t>(sizeof(float) + sizeof(KV));
-    const int64_t tc = std::clamp<int64_t>(kScoreBudget / std::max<int64_t>(per_query, 1), std::min<int64_t>(16, s.tokens),
-                                           s.tokens);
+    const int64_t per_query =
+        std::max<int64_t>(s.q_heads * s.kv_len * static_cast<int64_t>(sizeof(float) + sizeof(KV)), 1);
+    // Queries a chunk: as many as the scratch budget holds, or, where the device's memory is the bound, as fit its
+    // cache (AttentionPlan::score_cache) when that is a chunk worth its three launches.
+    const int64_t budget = plan.score_cache / per_query >= kCacheChunkQueries ? plan.score_cache : kScoreBudget;
+    const int64_t tc = std::clamp<int64_t>(budget / per_query, std::min<int64_t>(16, s.tokens), s.tokens);
 
     const size_t q_bytes = align_up(static_cast<size_t>(hkv * tc * group * d) * sizeof(KV));
     const size_t s_bytes = align_up(static_cast<size_t>(hkv * tc * group * s.kv_len) * sizeof(float));

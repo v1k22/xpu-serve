@@ -189,6 +189,11 @@ bool integrated_gpu(const sycl::device& d) {
 // the weight (1,024 rows: 6.3 against 5.2 ms); on a discrete card's faster memory dequantize + GEMM is as fast or
 // faster from 128 rows (Arc Pro B60: 1.5 ms both at 512 rows, 1.1 against 1.5 at 128).
 constexpr int64_t kTiledMaxRows = 512;
+// GEMM-path attention on an integrated GPU: a chunk of queries whose scores and probabilities fit here stays in the
+// GPU's cache between its three launches instead of streaming through system memory (Arc B390, pi05's prefix of 928
+// tokens, 18 layers: 225.4 ms a call in one chunk, 226.2 with 2 MiB chunks, 221.3 with 4, 221.6 with 6). On a discrete
+// card the scores stream fast enough that the chunks gain nothing (Arc Pro B60: within its run-to-run spread).
+constexpr int64_t kScoreCacheBytes = int64_t{4} << 20;
 // From how many rows the GEMV's matrix-engine version (gemv_quant_xmx) wins: its cost is about flat in the rows, the
 // GEMV's grows with them (Arc Pro B60, Qwen3.8-27B q4 decode steps of 1 to 6 tokens: 44.7, 48.0, 52.4, 62.0, 68.5,
 // 78.1 ms; with it from 4 rows 56.0, 56.5, 56.8).
@@ -2378,6 +2383,7 @@ public:
         }
         attention.xmx = sycl_be::xmx_device(devices_[index]);
         attention.compute_units = devices_[index].get_info<sycl::info::device::max_compute_units>();
+        if (integrated_gpu(devices_[index])) attention.score_cache = kScoreCacheBytes;
         auto session = std::make_unique<SyclSession>(
             std::make_unique<SyclShared>(it->second, options.max_context, options.rewind_tokens));
         const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision, gemv, few_rows);
