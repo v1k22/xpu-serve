@@ -265,6 +265,12 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       pairs, pairs grouped by expert on the device for prefill
 - [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; vision tower; per-expert
       checkpoint layout (`experts.<e>.gate_proj`)
+- [x] LFM3 (`lfm3`, text): gated short convolutions and gated attention from the shared blocks (a per-head gate added
+      to `blocks::attention`; no new op), its tokenizer and chat template byte-exact, the `qwen3_5` output parser;
+      HF parity on cpu-ref and the B60, q8 / q4 packs (`docs/decisions/0013`)
+- [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`); conv-window snapshots for prefix
+      reuse after a turn with reasoning; the small ops of a q4 decode step (119 norms and 48 residual adds rank
+      right after the matmuls under `XS_SYCL_PROFILE`)
 - [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
 - [ ] Llama 3
 - [ ] Import MLX-affine packs; import GGUF (Q4_0 / Q8_0 / K-quants)
@@ -298,6 +304,7 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 | | Nemotron 3.5 Super (120B-A12B, larger) | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16` | MoE + vision; int4 and two GPUs |
 | 6 | Muse Glimmer 30B | `meta-models/Muse-Glimmer-30B` | |
 | 7 | Gemma 4 12B | `google/gemma-4-12B-it` | |
+| 8 | LFM3-1.7B | `LiquidAI/LFM3-1.7B` | Dense `lfm3` (13 gated short convolutions, 6 full and 5 sliding attention layers). **Runs** (text): HF fp32 parity of the real checkpoint on cpu-ref and the Arc Pro B60 (f32 cosine 1 and greedy exact on six prompts up to 1,770 tokens; f16 max logit error 0.013; int8 KV cosine 0.99998) and of a tiny checkpoint; tokenizer and chat template byte-exact; thinking, tool calls and streaming through the server. Arc Pro B60: decode 99 / 159 / 206 tok/s (f16 / q8 / q4 g32), prefill 13,500 tok/s at 1k tokens, 10,000 at 16k, 5,200 at 64k (decode 68 to 107 tok/s there); packs 3.46 GB to 1.78 (q8) and 1.20 (q4). q8 vs HF fp32 last-token cosine 0.9998, q4 0.98 to 0.995 (AWQ the same). MMLU-Pro (25 q, thinking on): 60 % f16, 64 % q8, 52 % q4, 60 % q4 AWQ, with 1 / 0 / 4 / 5 answers at the 4,096-token cap: q8 is the pack to serve. To do: Panther Lake |
 | 8 | Liquid LFM3-1.7B (main text model) | `LiquidAI/LFM3-1.7B` | small |
 | 9 | Flint | `RecursiveSI/flint` | |
 
