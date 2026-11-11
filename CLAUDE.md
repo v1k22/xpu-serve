@@ -38,6 +38,7 @@ source /opt/intel/oneapi/setvars.sh                       # oneAPI 2026.2: icpx 
 cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx
 cmake --build build
 build/tests/xs_tests                                      # every unit test (doctest); model tests skip without a model
+cmake --install build --prefix ~/.local                   # optional: the binary as ~/.local/bin/xpu-serve
 build/src/xpu-serve info                                  # backends and devices
 build/src/xpu-serve run   <hf-model-dir> --device GPU --prompt "Hi"
 build/src/xpu-serve run   <hf-model-dir> --device GPU --image photo.jpg --prompt "Describe this image."
@@ -73,7 +74,8 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
 
 ```text
 xpu-serve/
-├── CMakeLists.txt          options XS_WITH_SYCL, XS_SYCL_TARGETS, XS_BUILD_TESTS, XS_WERROR; C++20; warnings target
+├── CMakeLists.txt          options XS_WITH_SYCL, XS_SYCL_TARGETS, XS_BUILD_TESTS, XS_WERROR; C++20; warnings target;
+│                           `cmake --install` puts the one binary in <prefix>/bin (src/CMakeLists.txt)
 ├── README.md               user-facing intro and quick start
 ├── CLAUDE.md               this file
 ├── DESIGN.md               the design (why), roadmap, open questions

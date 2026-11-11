@@ -70,3 +70,8 @@ list(REMOVE_ITEM xs_cli_extra ${CMAKE_CURRENT_SOURCE_DIR}/cli/main.cpp)
 target_sources(xpu-serve PRIVATE ${xs_cli_extra})
 target_link_libraries(xpu-serve PRIVATE xs_service xs_server xs_convert xs_policy xs_warnings)
 target_compile_definitions(xpu-serve PRIVATE XS_VERSION="${PROJECT_VERSION}")
+
+# `cmake --install build --prefix <dir>` puts the binary in <dir>/bin. It finds the oneAPI runtime as the build-tree
+# binary does: through the environment setvars.sh sets.
+include(GNUInstallDirs)
+install(TARGETS xpu-serve RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

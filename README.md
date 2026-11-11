@@ -53,8 +53,13 @@ with Level Zero.
 source /opt/intel/oneapi/setvars.sh                      # oneAPI 2026.2
 cmake -S . -B build -G Ninja -DCMAKE_CXX_COMPILER=icpx
 cmake --build build
+cmake --install build --prefix ~/.local                  # the xpu-serve command, in ~/.local/bin
 build/tests/xs_tests                                     # unit tests (XS_DEVICE_TEST_DEVICE=GPU.0 adds the GPU suites)
 ```
+
+The build leaves the binary at `build/src/xpu-serve`; the install step copies it to `<prefix>/bin` (`/usr/local/bin`
+without `--prefix`, which needs `sudo`). With that directory on `PATH` the command is `xpu-serve`, as in the examples
+below. It finds the oneAPI runtime through the environment, so run it in a shell that has sourced `setvars.sh`.
 
 Add `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` to compile the SYCL kernels ahead of time for the Arc Pro B60 (otherwise
 they compile at first use). Without oneAPI, any C++20 compiler (g++ 11 or newer) builds everything but the GPU
@@ -65,11 +70,11 @@ backend: the CPU reference backend, which is the test oracle and far too slow to
 Any Hugging Face directory of a supported model works, e.g. `google/gemma-4-E2B-it` or `Qwen/Qwen3.5-4B`:
 
 ```bash
-build/src/xpu-serve info                                           # backends and devices (the first is the default)
-build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU     # chat in the terminal
-build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --image photo.jpg --prompt "What is in this picture?"
-build/src/xpu-serve serve ~/models/gemma-4-E2B-it --device GPU     # http://127.0.0.1:8080/v1
-build/src/xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1024 --gen-tokens 128
+xpu-serve info                                           # backends and devices (the first is the default)
+xpu-serve run   ~/models/gemma-4-E2B-it --device GPU     # chat in the terminal
+xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --image photo.jpg --prompt "What is in this picture?"
+xpu-serve serve ~/models/gemma-4-E2B-it --device GPU     # http://127.0.0.1:8080/v1
+xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1024 --gen-tokens 128
 ```
 
 Speculative decoding (`--spec` on `run`, `serve` and `bench`) drafts with the model's drafter and verifies the
@@ -91,10 +96,10 @@ whole layer). `bench --prompts file` measures over real prompts, since acceptanc
 where a round's time goes:
 
 ```bash
-build/src/xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4
-build/src/xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 --drafter ~/models/gemma-4-E2B-it-assistant
-build/src/xpu-serve convert ~/models/Qwen3.8-27B-DFlash2 --target ~/models/Qwen3.8-27B-q4 --out ~/models/Qwen3.8-27B-DFlash2-q4
-build/src/xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec dflash --drafter ~/models/Qwen3.8-27B-DFlash2-q4
+xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4
+xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 --drafter ~/models/gemma-4-E2B-it-assistant
+xpu-serve convert ~/models/Qwen3.8-27B-DFlash2 --target ~/models/Qwen3.8-27B-q4 --out ~/models/Qwen3.8-27B-DFlash2-q4
+xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec dflash --drafter ~/models/Qwen3.8-27B-DFlash2-q4
 ```
 
 The server speaks the OpenAI API (`/v1/chat/completions` with streaming, tool calls and images, `/v1/completions`,
@@ -106,8 +111,8 @@ calls on synthetic camera images after a warm-up, for the cameras present and th
 puts it behind the policy API:
 
 ```bash
-build/src/xpu-serve bench ~/models/pi05_base --device GPU.0 --precision f16 --cameras 3 --steps 10 --runs 10
-build/src/xpu-serve serve ~/models/pi05_base --device GPU.0 --cameras 2    # warm up for the first 2 cameras
+xpu-serve bench ~/models/pi05_base --device GPU.0 --precision f16 --cameras 3 --steps 10 --runs 10
+xpu-serve serve ~/models/pi05_base --device GPU.0 --cameras 2    # warm up for the first 2 cameras
 ```
 
 `GET /v1/policy/info` describes the policy (cameras and their sizes, state and action sizes, flow steps);
@@ -122,9 +127,9 @@ answered 409. Requests fail by name (an unknown camera, a wrong state length, an
 takes a pack wherever it takes a model directory; the model code is the same.
 
 ```bash
-build/src/xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q8 --quant q8
-build/src/xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --method awq
-build/src/xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
+xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q8 --quant q8
+xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --method awq
+xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
 ```
 
 `q8` is symmetric int8; `q4` is 4-bit with a scale and bias per group of 32 columns (`--group 128` reads 15% fewer
@@ -142,7 +147,7 @@ a policy's prefix over hundreds of tokens) stay as they are. `--scope all` quant
 smallest pack). For π0.5 the rule picks the action expert, which runs 50 tokens per flow step:
 
 ```bash
-build/src/xpu-serve convert ~/models/pi05_base --out ~/models/pi05_base-q8 --quant q8
+xpu-serve convert ~/models/pi05_base --out ~/models/pi05_base-q8 --quant q8
 ```
 
 On the Arc B390 that pack runs a 3-camera call in 225 ms instead of 239 ms with actions within cosine 0.99999 of
