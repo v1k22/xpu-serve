@@ -325,8 +325,8 @@ private:
         return linear_bias(g, x, kRoot + "paligemma.model.multi_modal_projector.linear.");
     }
 
-    // One Gemma 2B layer over the prefix (bidirectional, padding masked). The last layer's MLP is skipped: only its
-    // keys and values are read.
+    // One Gemma 2B layer over the prefix (bidirectional, padding masked). The expert reads only each layer's keys
+    // and values, so the last layer stops there: its attention and MLP feed nothing.
     Value prefix_layer(Graph& g, int64_t l, Value h, Value positions, Value inv_freq, Value bias,
                        std::vector<std::pair<Value, Value>>& kv) const {
         Graph::Scope s(g, "layers." + std::to_string(l));
@@ -334,18 +334,18 @@ private:
         const GemmaDims& d = cfg_.vlm;
         const int64_t tokens = g.type(h).shape[0];
         const Value x = blocks::rms_norm_one_plus(g, h, *weights_, L + "input_layernorm.weight", kNormEps);
-        const Value q = g.rope(g.reshape(g.matmul(x, weight(g, L + "self_attn.q_proj.weight")), {tokens, d.heads, d.head_dim}),
-                               positions, inv_freq);
         const Value k = g.rope(g.reshape(g.matmul(x, weight(g, L + "self_attn.k_proj.weight")), {tokens, d.kv_heads, d.head_dim}),
                                positions, inv_freq);
         const Value v = g.reshape(g.matmul(x, weight(g, L + "self_attn.v_proj.weight")), {tokens, d.kv_heads, d.head_dim});
         kv.emplace_back(k, v);
+        if (l + 1 == d.depth) return h;
+        const Value q = g.rope(g.reshape(g.matmul(x, weight(g, L + "self_attn.q_proj.weight")), {tokens, d.heads, d.head_dim}),
+                               positions, inv_freq);
         AttentionAttrs attrs;
         attrs.causal = false;
         attrs.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d.head_dim)));
         const Value att = g.reshape(g.attention(q, k, v, bias, attrs), {tokens, d.heads * d.head_dim});
         h = g.add(h, g.matmul(att, weight(g, L + "self_attn.o_proj.weight")));
-        if (l + 1 == d.depth) return h;
         const Value y = blocks::rms_norm_one_plus(g, h, *weights_, L + "post_attention_layernorm.weight", kNormEps);
         return g.add(h, blocks::gated_mlp(g, y, blocks::matmul_by(g, weight(g, L + "mlp.gate_proj.weight")),
                                           blocks::matmul_by(g, weight(g, L + "mlp.up_proj.weight")),
