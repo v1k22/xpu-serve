@@ -516,6 +516,60 @@ multiple of 32 instead (the same actions), so prompts of nearby lengths share a 
 Two GPUs in one box serve two robots, one per GPU. Splitting one call across two GPUs (tensor-parallel prefix) is out
 of scope until the single-GPU path is tuned: PCIe all-reduces at every layer would eat most of the gain.
 
+### 6.1 Second pass (2026-11-11)
+
+Experiments on the Arc Pro B60, then measured on another Arc B390 laptop than the first pass's (there the first
+pass's code takes 227.4 ms at 3 cameras); `bench`, 12 to 20 runs, p50, medians of three to five launches. On the
+laptop a pause of 40 s separates the runs (see "Sustained load" below). The Arc Pro B60 drifts about 1 ms between
+sessions, so its column gives each change against the step before in one session, and the first and last rows the
+absolute times. No change alters the model: the actions match LeRobot as before (cpu-ref f32 max error 4.9e-6; GPU
+f16 6.4e-4 on the Arc B390, 1.1e-3 on the Arc Pro B60).
+
+| Change | Arc B390, 3 cameras | Arc Pro B60, 3 cameras |
+|---|---|---|
+| Start: the first pass and its fusions | 227.4 ms | 124.0 ms |
+| The last prefix layer stops at its keys and values (its attention and output projection fed nothing); a single KV head takes oneMKL's plain GEMM instead of a batch of one | 225.4 | -3.3 |
+| On an integrated GPU the GEMM-path attention runs in chunks of queries whose scores and probabilities fit 4 MiB, so they stay in the GPU's cache between the three launches (41 MB a prefix layer went through system memory) | 221.3 | (one chunk) |
+| SigLIP's biases where they cost no pass over the tokens: the key bias dropped (the softmax cancels it), the value bias folded into the output projection's (W_o b_v), the residual stream's biases added by the layer norms, so each residual update is one GEMM into the stream | 219.2 | -2.8 |
+| RoPE computes an angle's cosine and sine once per token and pair (it did per element and head, behind 64-bit divisions) | (with the next row) | -2.8 |
+| The cameras attend in one launch (attention within blocks of tokens; the fused kernel's sub-groups walk their keys in sequence, so one camera took as long as three) | **215.2** | -2.0: **114.7 ms** |
+
+With the q8 action expert (`convert --quant q8`), on the same machines:
+
+| Change | Arc B390 | Arc Pro B60 |
+|---|---|---|
+| Start | 216.9 ms | 131.2 ms (dequantize + GEMM at 50 rows) |
+| quant_gemm (9 to 64 rows) loads 64 bytes of codes a lane and 32 rows of x a load, builds B a slice at a time, and takes one feature tile past 32 rows (q4 spilled at 7 row tiles); used up to 64 rows on discrete cards too | 212.8 | 123.1 |
+| The lossless changes above, down to the vision biases | 207.0 | 120.3 |
+| Quantized matmuls of one x share a launch (q, k and v; gate and up): 7 launches a layer and flow step become 4 | 203.7 | 117.5 |
+| RoPE and the cameras' one launch | **198.0** | **113.1** |
+
+2 and 1 cameras, f16 / q8: 174.0 / 157.6 and 146.0 / 130.9 ms on the Arc B390, 100.6 / 99.3 and 77.1 / 75.7 ms on the
+Arc Pro B60.
+
+Where the time goes on the Arc B390 (f16, 3 cameras, at 225 ms): vision and prefix 64 %, the action expert 36 %
+(8.1 ms a flow step). The machine is bound by what moves through its memory: a call's time is close to bytes moved /
+105 GB/s plus flops / 61 TFLOPS, and the f16 weights alone are 10.7 GB a call (102 ms). The expert's GEMMs already
+run at that floor, which is why its q8 weights pay there (half the bytes) and hardly on the Arc Pro B60, where a
+launch's fixed cost is what counts.
+
+Tried and dropped: the prefix's gated MLP in column blocks (gate, up, product and down per 2,048 to 8,192 of the
+16,384 intermediate columns, so the intermediates would stay in the cache: 5.5 ms slower on the Arc B390, the
+mid-size GEMMs lose more than the cached products save); the expert's keys and values made in place in one buffer
+with the prefix's (two GEMM launches fewer per attention, within noise on both GPUs); the few-row kernel's scales
+loaded eight groups at a time (no gain, and two feature tiles then spilled at 7 row tiles) and its small-register
+variant (half the fixed launch cost alone, nothing end to end).
+
+Sustained load. The laptop's long-term power limit sets in after about 40 s of back-to-back calls (package power
+45 W to 25 W, GPU clock 2.5 to 1.55 GHz). Past it, over the last 150 of 700 calls, a call takes 264.5 ms at f16
+(274.3 before this pass) and 267.0 ms with the q8 expert (277.9): at the lower clock the q8 kernels' arithmetic
+costs what their smaller weights save. The numbers above are the state before the limit, which a robot calling with
+pauses stays in; a duty cycle near 100 % does not, on this laptop's power settings.
+
+Next: the prefix MLP's intermediates (gate and up each write 30 MB that the product reads back: a GEMM that
+multiplies them in registers would save about a fifth of the prefix), the down projection (30 TFLOPS against 49 for
+gate and up), attention at head_dim 256 without scores in memory, and the fixed cost of a few-row launch.
+
 ## 7. World models (later phases)
 
 They plug into the same structure as a third kind: `models/world_model.h` (interface), `world/` (runtime) and

@@ -322,11 +322,21 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       memory (beta 1; 35 passes over [928, 2048] gone, -4 ms), quant_gemm inputs kept in f16 by their producers (~900
       conversion kernels gone, -2 ms), the expert's K / V concats read in place by the attention GEMMs (about even:
       the copies were cached, the GEMMs doubled). q8 action expert 231 -> 225 ms, f16 244 -> 239 ms
-- [ ] π0.5 latency, next: the prefix down projection's GEMM (~30 TFLOPS against ~50 for gate / up; oneMKL split-K
-      is slower) and the expert's q8 matmuls at 50 rows (~5.4 of each 7.3 ms flow step). Tried and dropped: gate and
-      up in one quant_gemm with the activation, and the gated residual in its epilogue (720 kernels fewer per call,
-      within noise: the Arc B390 pipelines small kernels, under 1 us each unprofiled; XS_SYCL_PROFILE's barriers make
-      them look 10x dearer)
+- [x] π0.5 latency, second pass (design-vla.md §6.1; a second Arc B390 laptop, 3 cameras: f16 227.4 -> 215.2 ms,
+      q8 expert 216.9 -> 198.0; Arc Pro B60: 124.0 -> 114.7 and 131.2 -> 113.1): the last prefix layer stops at its
+      keys and values, a plain GEMM for one KV head, attention in cache-sized chunks of queries on integrated GPUs,
+      SigLIP's biases where they cost no pass (key bias dropped, value bias into the output projection's, residual
+      biases added by the layer norms), RoPE's angle once per token and pair, the cameras' attention in one launch
+      (`AttentionAttrs::block`), and for the q8 expert the few-row kernel's loads and sibling launches. Tried and
+      dropped: gate and up in one quant_gemm with the activation, and the gated residual in its epilogue (720
+      kernels fewer per call, within noise: the Arc B390 pipelines small kernels, under 1 us each unprofiled;
+      XS_SYCL_PROFILE's barriers make them look 10x dearer); the gated MLP in column blocks (5.5 ms slower on the
+      Arc B390); the expert's keys and values made in place beside the prefix's (within noise)
+- [ ] π0.5 latency, next: the prefix MLP's intermediates (gate and up write 30 MB each that the product reads back;
+      a GEMM that multiplies them in registers), its down projection's GEMM (~30 TFLOPS against ~50 for gate / up;
+      oneMKL split-K is slower), attention at head_dim 256 without scores in memory, the fixed cost of a few-row
+      launch (8 to 12 us on the Arc Pro B60). The Arc B390 is bound by bytes moved (about 105 GB/s; the f16 weights
+      are 10.7 GB a call)
 - [x] Generic weight quantization by a graph rule (`convert --scope bandwidth|all`): weights of matmuls with a
       step-dependent row count or at most 64 rows per call; policies convert too. π0.5 q8 (the rule picks the action
       expert): 245 -> 231 ms at 3 cameras on Arc B390, actions cosine 0.99999; q4 misses the 0.999 gate
@@ -336,9 +346,13 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       added in local memory instead of written out), scales loaded once per group, q8 codes to f16 two at a time,
       one 16-feature column at 8 row tiles (no spills): q4 1.1-2.7x, q8 at 64 rows 1.4x, q8 at 9 rows 1.1x. Staging
       x in local memory and prefetching codes a step ahead measured no faster (x tiles were not the limit)
-- [ ] quant_gemm at 50 rows, q8 still near f16 speed (75 us for a 4096 x 1024 weight, 56 GB/s): without dequantizing
-      it runs at 47 us at 9 rows (the memory's speed), so the rest is the DPAS / x side at 7 row tiles (~40% of the
-      DPAS rate); the packed q4 dequantization spilled (2-3x slower) and needs registers freed first
+- [x] quant_gemm, third pass: 64 bytes of codes a lane and 32 rows of x a load, B built a slice at a time, one
+      feature tile past 32 rows (q4 no longer spills at 7 row tiles: 60 -> 8.5 ms for 0.9 GB at 50 rows on the Arc
+      Pro B60; 9 to 32 rows 15 to 18 % faster, q8 8 to 13 %), up to four weights of one x in a launch, and used up to
+      64 rows on discrete cards too (`--backend-opt few_rows=N`)
+- [ ] quant_gemm's arithmetic: at q8 the dequantization (not the loads) bounds a sub-group, about 1 us per 16
+      columns of 32 features on the Arc Pro B60; the GEMV's trick (codes as 1024 + c, scales applied to group sums)
+      would remove most of it. A launch's fixed cost (8 to 12 us) is the other half at a policy's sizes
 - [ ] q4 for policies: AWQ-style calibration on policy activations (or q4 with q8 for the most sensitive matmuls)
 - [ ] Flash attention at head_dim 256 (Gemma): 8 rows per sub-group fill the registers, so every K/V tile feeds one
       DPAS and oneMKL's GEMMs match it; needs K/V or P shared across sub-groups through local memory. Tried on Arc

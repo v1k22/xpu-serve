@@ -24,7 +24,7 @@ and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the code
 | Qwen3.6-35B-A3B | language, MoE | q4 | 62 tok/s decode, 94 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
 | Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
-| π0.5 | robot policy | f16, q8 | 239 / 225 ms per call (f16 / q8) | Arc B390, 3 cameras |
+| π0.5 | robot policy | f16, q8 | 215 / 198 ms per call (f16 / q8); 115 / 113 ms on the Arc Pro B60 | Arc B390, 3 cameras |
 
 | Model | Checkpoint (`model_type`) | Checked against |
 |---|---|---|
@@ -34,7 +34,7 @@ and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the code
 | Qwen3.6-35B-A3B | `Qwen/Qwen3.6-35B-A3B` (`qwen3_5_moe`) | tiny-checkpoint parity; MMLU-Pro (25 questions): 84 % |
 | Qwen3.8-27B | `Qwen/Qwen3.8-27B` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE, its MTP head; DFlash, DFlash 2 and DSpine drafters against their PyTorch code); MMLU-Pro (25 questions): 76 % |
 | LFM3-1.7B | `LiquidAI/LFM3-1.7B` (`lfm3`) | Hugging Face fp32 logits, greedy text (the checkpoint's own modeling code); MMLU-Pro (25 questions): 60 % |
-| π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 2e-3 (GPU f16) |
+| π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 1e-3 (GPU f16) |
 
 Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card; LFM3 thinks by
 default (`"chat_template_kwargs": {"enable_thinking": false}` in a request turns it off), was run to 64k tokens
@@ -166,9 +166,10 @@ smallest pack). For π0.5 the rule picks the action expert, which runs 50 tokens
 xpu-serve convert ~/models/pi05_base --out ~/models/pi05_base-q8 --quant q8
 ```
 
-On the Arc B390 that pack runs a 3-camera call in 225 ms instead of 239 ms with actions within cosine 0.99999 of
-LeRobot's; q4 is faster still (213 ms) but misses the 0.999 accuracy gate (cosine 0.998), so q8 is the setting for
-policies.
+On the Arc B390 that pack runs a 3-camera call in 198 ms instead of 215 ms with actions within cosine 0.99999 of
+LeRobot's; q4 is faster still (194 ms) but misses the 0.999 accuracy gate (cosine 0.998), so q8 is the setting for
+policies. (These are times for calls with pauses between them; a laptop that runs the policy back to back for
+longer than its short-term power budget lasts slows down, see [docs/design-vla.md](docs/design-vla.md) §6.1.)
 
 On the Arc Pro B60, q8 decodes 1.5 to 1.7 times faster than f16 with no measurable quality loss; q4 decodes about
 twice as fast and keeps MMLU-Pro scores, with some loss of logit fidelity on small models (Qwen3.5-4B logits cosine
