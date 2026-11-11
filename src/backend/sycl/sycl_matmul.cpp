@@ -206,6 +206,49 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeigh
     }
 }
 
+template <typename Y>
+bool quant_parts_few_rows(int64_t m, const QuantPart<Y>* parts, int count, int64_t k, const QuantMatmulPlan& plan) {
+    if (count < 2 || count > kQuantGemvParts) return false;
+    for (int j = 0; j < count; ++j) {
+        if (quant_path(m, parts[j].n, k, parts[j].w, plan) != QuantPath::FewRows ||
+            !quant_gemv_parts_match(parts[j].w, parts[0].w))
+            return false;
+    }
+    return true;
+}
+
+template <typename X, typename Y>
+void matmul_quant_parts(sycl::queue& q, Scratch& scratch, const X* x, const QuantPart<Y>* parts, int count, int64_t m,
+                        int64_t k, const QuantMatmulPlan& plan) {
+    XS_CHECK(quant_parts_few_rows(m, parts, count, k, plan), "sycl matmul_quant_parts: the parts do not share a launch");
+    const half* xh = nullptr;
+    if constexpr (std::is_same_v<X, half>) {
+        if (!block_load_aligned(x)) {
+            for (int j = 0; j < count; ++j) matmul_quant(q, scratch, x, parts[j].w, parts[j].y, m, parts[j].n, k, plan);
+            return;
+        }
+        xh = x;
+    } else {
+        auto* conv = static_cast<half*>(scratch.get(static_cast<size_t>(m * k) * sizeof(half)));
+        to_half(q, x, conv, m * k);
+        xh = conv;
+    }
+    int64_t n = 0;
+    for (int j = 0; j < count; ++j) n += parts[j].n;
+    quant_gemm_parts(q, xh, parts, count, m, k, quant_gemm_slices(n, k, plan.compute_units));
+}
+
+template bool quant_parts_few_rows<float>(int64_t, const QuantPart<float>*, int, int64_t, const QuantMatmulPlan&);
+template bool quant_parts_few_rows<half>(int64_t, const QuantPart<half>*, int, int64_t, const QuantMatmulPlan&);
+template void matmul_quant_parts<float, float>(sycl::queue&, Scratch&, const float*, const QuantPart<float>*, int,
+                                               int64_t, int64_t, const QuantMatmulPlan&);
+template void matmul_quant_parts<half, float>(sycl::queue&, Scratch&, const half*, const QuantPart<float>*, int, int64_t,
+                                              int64_t, const QuantMatmulPlan&);
+template void matmul_quant_parts<float, half>(sycl::queue&, Scratch&, const float*, const QuantPart<half>*, int, int64_t,
+                                              int64_t, const QuantMatmulPlan&);
+template void matmul_quant_parts<half, half>(sycl::queue&, Scratch&, const half*, const QuantPart<half>*, int, int64_t,
+                                             int64_t, const QuantMatmulPlan&);
+
 template void matmul_quant<float, float>(sycl::queue&, Scratch&, const float*, const QuantWeight&, float*, int64_t,
                                          int64_t, int64_t, const QuantMatmulPlan&, bool);
 template void matmul_quant<half, float>(sycl::queue&, Scratch&, const half*, const QuantWeight&, float*, int64_t,

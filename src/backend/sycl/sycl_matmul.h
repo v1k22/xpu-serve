@@ -58,6 +58,16 @@ template <typename X, typename Y>
 void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeight& w, Y* y, int64_t m, int64_t n,
                   int64_t k, const QuantMatmulPlan& plan, bool add = false);
 
+// Whether `count` quantized matmuls of one x at m rows all take quant_gemm (QuantPath::FewRows) and so can share a
+// launch (quant_gemm_parts); x assumed 64-byte aligned.
+template <typename Y>
+bool quant_parts_few_rows(int64_t m, const QuantPart<Y>* parts, int count, int64_t k, const QuantMatmulPlan& plan);
+// y_p [M, N_p] = x @ dequant(w_p)^T for such parts in one launch; x in f32 (converted once in scratch) or f16. An f16
+// x that is not 64-byte aligned runs each part by matmul_quant instead.
+template <typename X, typename Y>
+void matmul_quant_parts(sycl::queue& q, Scratch& scratch, const X* x, const QuantPart<Y>* parts, int count, int64_t m,
+                        int64_t k, const QuantMatmulPlan& plan);
+
 // ExpertMatMul over a quantized bank (expert_matmul_quant's contract) through oneMKL, for many (token, slot) pairs
 // (prefill): the pairs are grouped by expert, each expert's input rows gathered, its bank dequantized (to f16, or f32
 // when `f32`) in runs of at most kExpertDequantBytes, and every expert's GEMM runs in one grouped gemm_batch.

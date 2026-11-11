@@ -236,6 +236,52 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
+    TEST_CASE("quantized matmuls that read the same x past the GEMV's rows: one launch, f32 and f16 outputs") {
+        test::TensorRng rng(47);
+        const int64_t k = 512;
+        for (const DType format : {DType::Q8, DType::Q4}) {
+            CAPTURE(dtype_name(format));
+            test::MemoryWeights w;
+            // a, b and c share a launch (N of 96, 64 and 32: runs of work-groups of different lengths; two group
+            // sizes); `next` reads a and b in f16 when x is made by an op
+            for (const auto& [name, n, cols, group] : {std::tuple<const char*, int64_t, int64_t, int64_t>{"a", 96, k, 32},
+                                                       {"b", 64, k, 64},
+                                                       {"c", 32, k, 32},
+                                                       {"na", 32, 96, 32},
+                                                       {"nb", 32, 64, 32},
+                                                       {"nc", 32, 32, 32}}) {
+                const HostTensor dense = rng.uniform(DType::F32, {n, cols}, 1.0f / std::sqrt(static_cast<float>(cols)));
+                w.add_quantized(name, quant::quantize(dense.view(), format, group));
+            }
+            for (const int64_t m : {12, 24, 50, 64}) {
+                CAPTURE(m);
+                const HostTensor xv = rng.uniform(DType::F32, {m, k});
+                const HostTensor zero =
+                    HostTensor::from_vector(DType::F32, {m, k}, std::vector<float>(static_cast<size_t>(m * k), 0.0f));
+                for (const bool chained : {false, true}) {
+                    CAPTURE(chained);
+                    Graph g;
+                    Value x = g.input("x", DType::F32, {m, k});
+                    if (chained) x = g.add(x, g.input("zero", DType::F32, {m, k}));  // made by an op: kept in f16
+                    for (const char* name : {"a", "b", "c"}) {
+                        const Value y = g.matmul(x, g.weight(w, name));
+                        g.output(name, chained ? g.matmul(y, g.weight(w, std::string("n") + name)) : y);
+                    }
+                    TensorMap inputs{{"x", xv}};
+                    if (chained) inputs["zero"] = zero;
+                    const TensorMap out = dev::run(g, w, inputs);
+                    for (const char* name : {"a", "b", "c"}) {
+                        CAPTURE(name);
+                        Tensor64 expected = test::ref::matmul(to_f64(xv), to_f64(w.tensor(name)));
+                        if (chained) expected = test::ref::matmul(expected, to_f64(w.tensor(std::string("n") + name)));
+                        CHECK(dev::close("matmul_quant parts", out.at(name), expected,
+                                         dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+                    }
+                }
+            }
+        }
+    }
+
     TEST_CASE("quantized GEMV on the matrix engines (gemv=xmx) against fp64, alone and with siblings") {
         test::TensorRng rng(44);
         SessionOptions xmx = dev::options();

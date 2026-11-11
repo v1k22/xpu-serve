@@ -13,7 +13,8 @@
 // (four 8-row tiles; rows past M read as zero), each tile multiplying every B register.
 // A work-group owns those features and splits K between its sub-groups, which add their accumulators in local
 // memory at the end: enough sub-groups to keep the memory busy without writing partial sums out (at 50 rows a split
-// between work-groups spent as long on them as on the weight).
+// between work-groups spent as long on them as on the weight). Weights that read the same x can share a launch, each
+// taking a run of the work-groups: a launch alone costs as much as streaming about a megabyte.
 
 #include "backend/sycl/sycl_kernels.h"
 #include "util/error.h"
@@ -100,6 +101,17 @@ inline uint32_t dequant_pair_affine(uint32_t pair, _Float16 offset, h2_v scale, 
     return __builtin_bit_cast(uint32_t, c * scale + bias);
 }
 
+// The weights of one quant_gemm launch and where each one's work-groups start.
+template <typename Y>
+struct GemmParts {
+    QuantWeight w[kQuantGemvParts];
+    Y* y[kQuantGemvParts];
+    int64_t n[kQuantGemvParts];
+    int group_shift[kQuantGemvParts];  // log2(w.group): no 64-bit division in the loop (it is emulated, and slow)
+    int64_t wg_begin[kQuantGemvParts + 1];
+    int count = 0;
+};
+
 template <bool Q4, int MT, bool AWQ, typename Y, bool ADD>
 struct QuantGemmKernel {
     // 16-feature columns per sub-group (each lane: kNt output features); past 4 row tiles one, or the accumulators
@@ -115,11 +127,9 @@ struct QuantGemmKernel {
     using Codes = sycl::vec<uint32_t, 16>;
 
     const half* x;
-    QuantWeight w;
-    Y* y;
+    GemmParts<Y> parts;
     sycl::local_accessor<float, 1> slm;  // every slice's accumulators: [slice][mt][nt][16 lanes][8 rows]
-    int64_t m, n, k, k_slice;
-    int group_shift;  // log2(w.group): no 64-bit division in the loop (it is emulated, and slow)
+    int64_t m, k, k_slice;
 
     auto get(syclex::properties_tag) const {
         return syclex::properties{syclex::sub_group_size<kSg>, intelex::grf_size<256>};
@@ -130,7 +140,23 @@ struct QuantGemmKernel {
         const int lane = static_cast<int>(sg.get_local_linear_id());
         const int slice = static_cast<int>(sg.get_group_linear_id());  // this sub-group's share of K
         const int slices = static_cast<int>(sg.get_group_linear_range());
-        const int64_t n0 = static_cast<int64_t>(it.get_group(0)) * kFeatures;
+        const auto wg = static_cast<int64_t>(it.get_group(0));
+        // this work-group's part (uniform), selected without indexing the argument arrays
+        QuantWeight w = parts.w[0];
+        Y* y = parts.y[0];
+        int64_t n = parts.n[0];
+        int group_shift = parts.group_shift[0];
+        int64_t begin = 0;
+        for (int j = 1; j < kQuantGemvParts; ++j) {
+            if (j < parts.count && wg >= parts.wg_begin[j]) {
+                w = parts.w[j];
+                y = parts.y[j];
+                n = parts.n[j];
+                group_shift = parts.group_shift[j];
+                begin = parts.wg_begin[j];
+            }
+        }
+        const int64_t n0 = (wg - begin) * kFeatures;
         const int64_t k_lo = std::min(k, slice * k_slice);
         const int64_t k_hi = std::min(k, k_lo + k_slice);
         const int64_t groups = k / w.group;
@@ -251,33 +277,35 @@ struct QuantGemmKernel {
 };
 
 template <bool Q4, int MT, bool AWQ, typename Y, bool ADD>
-void quant_gemm_t(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
-                  int64_t slices) {
+void quant_gemm_t(sycl::queue& q, const half* x, GemmParts<Y> parts, int64_t m, int64_t k, int64_t slices) {
     using K = QuantGemmKernel<Q4, MT, AWQ, Y, ADD>;
     const int64_t k_slice = ceil_div(ceil_div(k, slices), 128) * 128;  // whole steps (64 or 128 columns)
-    const auto wgs = static_cast<size_t>(n / K::kFeatures);
-    int shift = 0;
-    while ((int64_t{1} << shift) < w.group) ++shift;
+    parts.wg_begin[0] = 0;
+    for (int j = 0; j < kQuantGemvParts; ++j) {
+        parts.wg_begin[j + 1] = parts.wg_begin[j] + (j < parts.count ? parts.n[j] / K::kFeatures : 0);
+        parts.group_shift[j] = 0;
+        while (j < parts.count && (int64_t{1} << parts.group_shift[j]) < parts.w[j].group) ++parts.group_shift[j];
+    }
+    const auto wgs = static_cast<size_t>(parts.wg_begin[parts.count]);
     const auto slm_floats = static_cast<size_t>(slices * MT * K::kNt * kTm * kSg);
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>(slm_floats), h);
         const auto local = static_cast<size_t>(slices) * kSg;
-        syclex::nd_launch(h, sycl::nd_range<1>(wgs * local, local), K{x, w, y, slm, m, n, k, k_slice, shift});
+        syclex::nd_launch(h, sycl::nd_range<1>(wgs * local, local), K{x, parts, slm, m, k, k_slice});
     });
 }
 
 template <bool Q4, bool AWQ, typename Y, bool ADD>
-void quant_gemm_q(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
-                  int64_t slices) {
+void quant_gemm_q(sycl::queue& q, const half* x, const GemmParts<Y>& parts, int64_t m, int64_t k, int64_t slices) {
     const int64_t mt = ceil_div(m, kTm);
     if (mt <= 2) {
-        quant_gemm_t<Q4, 2, AWQ, Y, ADD>(q, x, w, y, m, n, k, slices);
+        quant_gemm_t<Q4, 2, AWQ, Y, ADD>(q, x, parts, m, k, slices);
     } else if (mt <= 4) {
-        quant_gemm_t<Q4, 4, AWQ, Y, ADD>(q, x, w, y, m, n, k, slices);
+        quant_gemm_t<Q4, 4, AWQ, Y, ADD>(q, x, parts, m, k, slices);
     } else if (mt <= 7) {
-        quant_gemm_t<Q4, 7, AWQ, Y, ADD>(q, x, w, y, m, n, k, slices);
+        quant_gemm_t<Q4, 7, AWQ, Y, ADD>(q, x, parts, m, k, slices);
     } else {
-        quant_gemm_t<Q4, 8, AWQ, Y, ADD>(q, x, w, y, m, n, k, slices);
+        quant_gemm_t<Q4, 8, AWQ, Y, ADD>(q, x, parts, m, k, slices);
     }
 }
 
@@ -669,10 +697,31 @@ int64_t quant_gemm_slices(int64_t n, int64_t k, int64_t compute_units) {
 template <typename Y>
 void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
                 int64_t slices, bool add) {
+    GemmParts<Y> parts;
+    parts.w[0] = w;
+    parts.y[0] = y;
+    parts.n[0] = n;
+    parts.count = 1;
     quant_dispatch(w, [&]<bool Q4, bool AWQ>() {
-        add ? quant_gemm_q<Q4, AWQ, Y, true>(q, x, w, y, m, n, k, slices)
-            : quant_gemm_q<Q4, AWQ, Y, false>(q, x, w, y, m, n, k, slices);
+        add ? quant_gemm_q<Q4, AWQ, Y, true>(q, x, parts, m, k, slices)
+            : quant_gemm_q<Q4, AWQ, Y, false>(q, x, parts, m, k, slices);
     });
+}
+
+template <typename Y>
+void quant_gemm_parts(sycl::queue& q, const half* x, const QuantPart<Y>* parts, int count, int64_t m, int64_t k,
+                      int64_t slices) {
+    XS_CHECK(count >= 1 && count <= kQuantGemvParts, "quant_gemm_parts: ", count, " parts");
+    GemmParts<Y> p;
+    p.count = count;
+    for (int j = 0; j < count; ++j) {
+        XS_CHECK(quant_gemm_fits(m, parts[j].n, k, parts[j].w) && quant_gemv_parts_match(parts[j].w, parts[0].w),
+                 "quant_gemm_parts: part ", j, " (N ", parts[j].n, ", K ", k, ") does not fit beside the first");
+        p.w[j] = parts[j].w;
+        p.y[j] = parts[j].y;
+        p.n[j] = parts[j].n;
+    }
+    quant_dispatch(parts[0].w, [&]<bool Q4, bool AWQ>() { quant_gemm_q<Q4, AWQ, Y, false>(q, x, p, m, k, slices); });
 }
 
 bool gemv_quant_xmx_fits(const QuantGemvPart* parts, int count, int64_t k) {
@@ -758,6 +807,9 @@ template void quant_gemm_tiled<float>(sycl::queue&, const half*, const QuantWeig
 template void quant_gemm_tiled<half>(sycl::queue&, const half*, const QuantWeight&, half*, int64_t, int64_t, int64_t,
                                      bool);
 
+template void quant_gemm_parts<float>(sycl::queue&, const half*, const QuantPart<float>*, int, int64_t, int64_t,
+                                      int64_t);
+template void quant_gemm_parts<half>(sycl::queue&, const half*, const QuantPart<half>*, int, int64_t, int64_t, int64_t);
 template void quant_gemm<float>(sycl::queue&, const half*, const QuantWeight&, float*, int64_t, int64_t, int64_t,
                                 int64_t, bool);
 template void quant_gemm<half>(sycl::queue&, const half*, const QuantWeight&, half*, int64_t, int64_t, int64_t,

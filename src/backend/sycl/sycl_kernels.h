@@ -223,11 +223,13 @@ void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, 
 // Up to kQuantGemvParts weights that read the same x, in one launch: y_p [M, N_p] = x @ dequant(w_p)^T. The parts
 // match in format and in carrying AWQ input scales (quant_gemv_parts_match); groups and N may differ.
 inline constexpr int kQuantGemvParts = 4;
-struct QuantGemvPart {
+template <typename Y>
+struct QuantPart {
     QuantWeight w;
-    float* y = nullptr;
+    Y* y = nullptr;
     int64_t n = 0;
 };
+using QuantGemvPart = QuantPart<float>;
 // Calls f.template operator()<Q4, AWQ>() for w's format and whether it carries AWQ input scales (the kernels'
 // compile-time variants).
 template <typename F>
@@ -263,6 +265,12 @@ int64_t quant_gemm_slices(int64_t n, int64_t k, int64_t compute_units);
 template <typename Y>
 void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
                 int64_t slices, bool add = false);
+// Up to kQuantGemvParts weights that read the same x, in one launch (a launch costs about what streaming a megabyte
+// does, so attention's q, k and v or an MLP's gate and up share one): parts that match as for the GEMV
+// (quant_gemv_parts_match), each fitting quant_gemm; `slices` from quant_gemm_slices of their N together.
+template <typename Y>
+void quant_gemm_parts(sycl::queue& q, const half* x, const QuantPart<Y>* parts, int count, int64_t m, int64_t k,
+                      int64_t slices);
 // The same for any number of rows (needs xmx_device): a work-group dequantizes each weight tile once into local
 // memory for 512 rows, so the weight is read once per 512 rows and never written out in f16.
 bool quant_gemm_tiled_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w);

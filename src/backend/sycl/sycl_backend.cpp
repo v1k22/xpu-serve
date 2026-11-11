@@ -1053,8 +1053,9 @@ private:
         }
         // MatMuls with quantized weights of one format that read the same x (an MLP's gate and up, attention's q, k
         // and v): at decode sizes the first runs them all in one GEMV launch, which fills the device where a small
-        // one alone does not, each output in its own memory, live from there (build_plan). finish_mm_parts drops
-        // the weights the kernel cannot pair once they are on the device.
+        // one alone does not, and at a few rows in one quant_gemm launch (mm_parts_run), each output in its own
+        // memory, live from there (build_plan). finish_mm_parts drops the weights the kernels cannot pair once they
+        // are on the device.
         mm_parts_.assign(nodes.size(), {});
         mm_leader_.assign(nodes.size(), -1);
         std::map<std::pair<int32_t, int32_t>, size_t> filling;  // x -> the MatMul collecting its siblings
@@ -1100,14 +1101,31 @@ private:
     }
 
     // Whether MatMul `lead`'s siblings run in its launch this step: an x of at most kGemvMaxRows rows in f32, f32
-    // outputs.
+    // outputs (the GEMVs), or past those rows when every sibling takes quant_gemm and writes one dtype (mm_parts_few).
     bool mm_parts_run(size_t lead, const Plan& p) const {
+        if (mm_parts_[lead].empty()) return false;
         const Node& n = graph_.nodes()[lead];
         const Dims& x = p.shapes[static_cast<size_t>(n.inputs[0].node)][static_cast<size_t>(n.inputs[0].index)];
-        if (numel(x) / graph_.type(n.inputs[1]).shape[1] > sycl_be::kGemvMaxRows || dt(n.inputs[0]) != DType::F32)
-            return false;
-        return std::all_of(mm_parts_[lead].begin(), mm_parts_[lead].end(),
-                           [&](int32_t m) { return dt(Value{m, 0}) == DType::F32; });
+        if (numel(x) / graph_.type(n.inputs[1]).shape[1] > sycl_be::kGemvMaxRows) return mm_parts_few(lead, p);
+        return dt(n.inputs[0]) == DType::F32 && std::all_of(mm_parts_[lead].begin(), mm_parts_[lead].end(), [&](int32_t m) {
+            return dt(Value{m, 0}) == DType::F32;
+        });
+    }
+    bool mm_parts_few(size_t lead, const Plan& p) const {
+        const Node& n = graph_.nodes()[lead];
+        const Dims& x = p.shapes[static_cast<size_t>(n.inputs[0].node)][static_cast<size_t>(n.inputs[0].index)];
+        const int64_t k = graph_.type(n.inputs[1]).shape[1];
+        const int64_t m = numel(x) / k;
+        if (m <= sycl_be::kGemvMaxRows) return false;
+        sycl_be::QuantPart<float> parts[sycl_be::kQuantGemvParts];
+        const auto count = static_cast<int>(mm_parts_[lead].size());
+        for (int j = 0; j < count; ++j) {
+            const int32_t mj = mm_parts_[lead][static_cast<size_t>(j)];
+            if (dt(Value{mj, 0}) != dt(Value{static_cast<int32_t>(lead), 0})) return false;
+            const Value wj = graph_.nodes()[static_cast<size_t>(mj)].inputs[1];
+            parts[j] = {leaf_quant_[static_cast<size_t>(wj.node)], nullptr, graph_.type(wj).shape[0]};
+        }
+        return sycl_be::quant_parts_few_rows(m, parts, count, k, quant_);
     }
 
     // Values that only GEMM-path matmuls and quantized matmuls past the GEMV (as x) and GEMM-path attention (as q, k,
@@ -1729,7 +1747,29 @@ private:
                 const int64_t k = in_shape(1)[1];
                 const int64_t m = numel(in_shape(0)) / k;
                 if (mm_leader_[i] >= 0 && mm_parts_run(static_cast<size_t>(mm_leader_[i]), p)) return;  // ran there
-                if (!mm_parts_[i].empty() && mm_parts_run(i, p)) {
+                if (mm_parts_run(i, p) && m > sycl_be::kGemvMaxRows) {  // the siblings in one quant_gemm launch
+                    const auto launch_parts = [&]<typename Y>() {
+                        sycl_be::QuantPart<Y> parts[sycl_be::kQuantGemvParts];
+                        const auto count = static_cast<int>(mm_parts_[i].size());
+                        for (int j = 0; j < count; ++j) {
+                            const auto mj = static_cast<size_t>(mm_parts_[i][static_cast<size_t>(j)]);
+                            const Value wj = graph_.nodes()[mj].inputs[1];
+                            parts[j] = {leaf_quant_[static_cast<size_t>(wj.node)],
+                                        reinterpret_cast<Y*>(ptr(p, Value{static_cast<int32_t>(mj), 0})),
+                                        graph_.type(wj).shape[0]};
+                        }
+                        with_value(n.inputs[0], [&](const auto* x) {
+                            sycl_be::matmul_quant_parts(q_, *this, x, parts, count, m, k, quant_);
+                        });
+                    };
+                    if (dt(Value{static_cast<int32_t>(i), 0}) == DType::F16) {
+                        launch_parts.template operator()<half>();
+                    } else {
+                        launch_parts.template operator()<float>();
+                    }
+                    return;
+                }
+                if (mm_parts_run(i, p)) {
                     sycl_be::QuantGemvPart parts[sycl_be::kQuantGemvParts];
                     const auto count = static_cast<int>(mm_parts_[i].size());
                     for (int j = 0; j < count; ++j) {
