@@ -38,9 +38,9 @@ struct Collected {
     }
 };
 
-// The prompt Hugging Face renders for a named case of tests/fixtures/chat/qwen3_5_cases.json.
-std::string rendered_prompt(const std::string& case_name) {
-    std::ifstream in(std::filesystem::path(XS_SOURCE_DIR) / "tests/fixtures/chat/qwen3_5_cases.json");
+// The prompt Hugging Face renders for a named case of tests/fixtures/chat/<set>_cases.json.
+std::string rendered_prompt(const std::string& case_name, const std::string& set = "qwen3_5") {
+    std::ifstream in(std::filesystem::path(XS_SOURCE_DIR) / "tests/fixtures/chat" / (set + "_cases.json"));
     for (const json& c : json::parse(in)) {
         if (c["name"] == case_name) return c["expected"].get<std::string>();
     }
@@ -394,5 +394,60 @@ TEST_SUITE("chat qwen3_5 parser prompt tail") {
         REQUIRE(c.calls.size() == 1);
         CHECK(c.calls[0].first == "get_weather");
         CHECK(c.calls[0].second.dump() == R"({"city":"Paris","unit":"celsius"})");
+    }
+}
+
+// LFM3 writes the same markers, with nothing around the reasoning: "<think>R</think>C".
+TEST_SUITE("chat qwen3_5 parser on LFM3 prompts") {
+    TEST_CASE("Hugging Face prompts with thinking on end inside <think>") {
+        for (const std::string name : {"user_only", "tools_simple", "multi_step_tools_keep_reasoning_after_last_user",
+                                       "tool_response_names_deferred_tools", "preserve_thinking"}) {
+            CAPTURE(name);
+            const std::string prompt = rendered_prompt(name, "lfm3");
+            REQUIRE(prompt.ends_with("<|im_start|>assistant\n<think>"));
+            const Collected c = parse_every_way("Hmm, 12 * 12.</think>It is 144.", prompt);
+            CHECK(c.reasoning == "Hmm, 12 * 12.");
+            CHECK(c.content == "It is 144.");
+        }
+    }
+
+    TEST_CASE("Hugging Face prompts with thinking off start in content") {
+        for (const std::string name :
+             {"thinking_off", "tools_thinking_off", "tool_round_trip_answered_then_new_user"}) {
+            CAPTURE(name);
+            const std::string prompt = rendered_prompt(name, "lfm3");
+            REQUIRE(prompt.ends_with("<|im_start|>assistant\n<think></think>"));
+            const Collected c = parse_every_way("Plain answer.", prompt);
+            CHECK(c.content == "Plain answer.");
+            CHECK(c.reasoning.empty());
+        }
+    }
+
+    TEST_CASE("a parsed reply rendered back by the template is what the model wrote") {
+        // The assistant turn with reasoning, a preamble and a call, and the turn of three calls, as HF rendered them.
+        const auto reply_of = [](const std::string& prompt, const std::string& opener) {
+            const size_t begin = prompt.find(opener) + opener.size();
+            return prompt.substr(begin, prompt.find("<|im_end|>", begin) - begin);
+        };
+        const std::string thinking_on = rendered_prompt("user_only", "lfm3");
+        Collected c = parse_every_way(reply_of(rendered_prompt("tool_call_with_preamble_and_reasoning", "lfm3"),
+                                               "<|im_start|>assistant\n<think>"),
+                                      thinking_on);
+        CHECK(c.reasoning == "Need the tool.");
+        CHECK(c.content == "Let me check.");
+        REQUIRE(c.calls.size() == 1);
+        CHECK(c.calls[0].first == "get_weather");
+        CHECK(c.calls[0].second.dump() == R"({"city":"Paris","unit":"celsius"})");
+
+        c = parse_every_way(reply_of(rendered_prompt("multiple_tool_calls_and_responses", "lfm3"),
+                                     "<|im_start|>assistant\n<think></think>"),
+                            rendered_prompt("thinking_off", "lfm3"));
+        CHECK(c.reasoning.empty());
+        CHECK(c.content == "I will use three tools.");
+        REQUIRE(c.calls.size() == 3);
+        CHECK(c.calls[1].first == "search_docs");
+        CHECK(c.calls[1].second.dump() == R"({"query":"rain \"gear\"","Limit":5,"exact":false,)"
+                                          R"("filters":{"tags":["a","b"],"since":null,"score":0.75},"URL":"x.org"})");
+        CHECK(c.calls[2].second.dump() == R"({"texte":"il pleut","langue":"日本語"})");
     }
 }

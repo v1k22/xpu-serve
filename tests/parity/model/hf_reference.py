@@ -4,11 +4,13 @@
     python -I tests/parity/model/hf_reference.py --model-dir <hf dir> [--out tests/fixtures/generated/<model_type>]
         [--gen 32]
 
-Runs the checkpoint in float32 on the CPU with eager attention and writes, per prompt:
+Runs the checkpoint in float32 on the CPU with eager attention (with the checkpoint's own modeling code when its
+config names one: auto_map) and writes, per prompt:
   * the prompt token ids,
   * the full-vocabulary logits of the last prompt position (float32, <name>.last_logits.bin),
   * the top-5 token ids at every prompt position,
-  * the greedy continuation (--gen tokens, stop tokens included if hit),
+  * the greedy continuation (--gen tokens, stop tokens included if hit; plain argmax, whatever repetition penalty the
+    checkpoint's generation config asks for),
   * with an MTP head (Qwen3.5 mtp.*, wired as vLLM's Qwen3.5 MTP): its logits after the prompt's pairs and the first
     greedy token (<name>.mtp_logits.bin) and the 3 drafts it chains from there;
   * with --assistant <dir> (a Gemma 4 assistant checkpoint): the same for the assistant, as transformers'
@@ -162,9 +164,10 @@ def main():
     args.out = args.out or os.path.join("tests", "fixtures", "generated", model_type)
     os.makedirs(args.out, exist_ok=True)
 
-    tok = AutoTokenizer.from_pretrained(args.model_dir)
+    tok = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=False)
     auto = AutoModelForImageTextToText if "vision_config" in config else AutoModelForCausalLM  # text-only: tiny models
-    model = auto.from_pretrained(args.model_dir, dtype=torch.float32, attn_implementation="eager")
+    model = auto.from_pretrained(args.model_dir, dtype=torch.float32, attn_implementation="eager",
+                                 trust_remote_code="auto_map" in config)
     model.eval()
     if model_type.startswith("gemma4"):
         lm = model.model.language_model if hasattr(model.model, "language_model") else model.model
@@ -182,7 +185,8 @@ def main():
         input_ids = torch.tensor([ids])
         with torch.no_grad():
             logits = model(input_ids=input_ids).logits[0].float()
-            out = model.generate(input_ids=input_ids, max_new_tokens=args.gen, do_sample=False, eos_token_id=eos)
+            out = model.generate(input_ids=input_ids, max_new_tokens=args.gen, do_sample=False, eos_token_id=eos,
+                                 repetition_penalty=1.0)
         greedy = out[0, len(ids):].tolist()
         last = logits[-1].numpy().astype(np.float32)
         last.tofile(os.path.join(args.out, f"{name}.last_logits.bin"))

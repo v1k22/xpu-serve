@@ -2,6 +2,7 @@
 
 #include "models/config_util.h"
 #include "models/gemma4/gemma4.h"
+#include "models/lfm3/lfm3.h"
 #include "models/pi05/pi05.h"
 #include "models/policy.h"
 #include "models/qwen3_5/qwen3_5.h"
@@ -11,7 +12,7 @@
 namespace xs {
 
 std::vector<std::string> supported_model_types() {
-    return {"gemma4", "gemma4_text", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"};
+    return {"gemma4", "gemma4_text", "lfm3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"};
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOptions& options) {
@@ -22,6 +23,7 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
     if (type == "qwen3_5" || type == "qwen3_5_text" || type == "qwen3_5_moe" || type == "qwen3_5_moe_text") {
         return qwen3_5::load(dir, config, options);
     }
+    if (type == "lfm3") return lfm3::load(dir, config, options);
     if (config.contains("dflash_config")) {
         fail("'", dir.string(), "' is a block drafter checkpoint: it drafts for the model it was trained with ",
              "(--drafter beside that model; convert --target)");

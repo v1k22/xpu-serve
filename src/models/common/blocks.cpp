@@ -130,7 +130,9 @@ AttentionOut attention(Graph& g, const AttentionSpec& s, const AttentionParts& p
             r.kv = {k, v};
         }
     }
-    Value o = g.reshape(g.attention(q, r.kv.first, r.kv.second, s.attrs), {kT, s.heads * hd});
+    Value o = g.attention(q, r.kv.first, r.kv.second, s.attrs);
+    if (p.head_gate) o = g.mul(o, g.reshape(g.sigmoid(p.head_gate(x)), {kT, s.heads, 1}));
+    o = g.reshape(o, {kT, s.heads * hd});
     if (gate.valid()) o = g.mul(o, g.sigmoid(gate));
     r.out = p.o(o);
     return r;

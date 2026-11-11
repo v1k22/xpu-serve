@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe --tokenizer-from <dir> --out <dir>
+    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3 --tokenizer-from <dir>
+        --out <dir>
     python -I tests/parity/model/make_tiny.py --drafter dflash|dflash2|dspine --target <tiny dir> --dflash-repo <clone
         of github.com/z-lab/dflash> --out <dir>
 
 The model keeps the real layer pattern and tensor names (Qwen3.5 MoE: three Gated DeltaNet layers then one full
-attention layer, fused gate_up expert banks, a gated shared expert; an MTP head) at a width a CPU runs in seconds. The tokenizer
-files are copied from a real checkpoint, so the vocabulary is the real one. Router weights are scaled up so each
-token's top-k experts win by a clear margin: a near tie could route differently at f16 and fail parity for a reason
-that is not a bug. Then run hf_reference.py on the output.
+attention layer, fused gate_up expert banks, a gated shared expert; an MTP head) at a width a CPU runs in seconds.
+The tokenizer files are copied from a real checkpoint, so the vocabulary is the real one; an architecture
+transformers does not ship (lfm3) is built from the modeling code in that checkpoint, which is copied too. Router
+weights are scaled up so each token's top-k experts win by a clear margin: a near tie could route differently at f16
+and fail parity for a reason that is not a bug. Then run hf_reference.py on the output.
 
 A drafter is a block drafter for a tiny target, in the released checkpoints' layout (config keys and tensor names):
 z-lab's DFlash model, DFlash 2 with its convolutions and candidate selector, or DSpine with its code bridge. Its
@@ -30,7 +32,7 @@ from safetensors.torch import load_file, save_file
 TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "vocab.json", "merges.txt"]
 
 
-def qwen3_5_moe(vocab_size):
+def qwen3_5_moe(vocab_size, source):
     from transformers import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
 
     config = Qwen3_5MoeTextConfig(
@@ -51,7 +53,7 @@ def qwen3_5_moe(vocab_size):
     return model
 
 
-def qwen3_5(vocab_size):
+def qwen3_5(vocab_size, source):
     """Dense, with Qwen3.8-27B's ratios: three linear value heads per key head, six query heads per KV head, gated
     attention output, a quarter of the head rotary with interleaved multimodal sections, an untied head."""
     from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
@@ -69,7 +71,7 @@ def qwen3_5(vocab_size):
     return Qwen3_5ForCausalLM(config)
 
 
-def gemma4_moe(vocab_size):
+def gemma4_moe(vocab_size, source):
     """Gemma 4 26B-A4B's layout: five sliding layers then a full one, experts beside every layer's MLP (a router with
     per-expert scales), global layers with fewer KV heads whose values are the key projection, softcapped logits.
     The sliding window is shorter than the longest prompt, so the masks are exercised."""
@@ -98,7 +100,37 @@ def gemma4_moe(vocab_size):
     return model
 
 
-ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe}
+def lfm3(vocab_size, source):
+    """LFM3-1.7B's layout: gated short convolutions (seven taps) around full and sliding attention layers, four query
+    heads per KV head, sandwich norms, a tied head. The sliding window is shorter than the longest prompt, and the RoPE
+    bases are small: at the released 1e6 the unrotated half of a full-attention head would barely differ from a
+    rotated one within a prompt, and a wrong layout would pass. The head gates are decisive (a constant gate would
+    vanish in the norm after the attention)."""
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    config_cls = get_class_from_dynamic_module("configuration_lfm3.Lfm3Config", source)
+    model_cls = get_class_from_dynamic_module("modeling_lfm3.Lfm3ForCausalLM", source)
+    config = config_cls(
+        vocab_size=vocab_size, hidden_size=64, intermediate_size=96, num_hidden_layers=8, num_attention_heads=4,
+        num_key_value_heads=1, head_dim=32, conv_L_cache=7, sliding_window=16, max_position_embeddings=4096,
+        layer_types=["conv", "conv", "full_attention", "conv", "sliding_attention", "conv", "full_attention", "conv"],
+        norm_eps=1e-5, initializer_range=0.05, tie_word_embeddings=True,
+        rope_parameters={"full_attention": {"rope_type": "default", "rope_theta": 200.0, "partial_rotary_factor": 0.5},
+                         "sliding_attention": {"rope_type": "default", "rope_theta": 50.0}},
+    )
+    model = model_cls(config)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("gate_proj.weight"):
+                p.normal_(0.0, 1.0)
+            elif name.endswith("conv.conv.weight"):
+                p.normal_(0.0, 0.4)
+            elif p.dim() == 1 and "norm" in name:
+                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
+    return model
+
+
+ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3}
 
 
 def mtp_head(model):
@@ -239,8 +271,8 @@ def main():
         ap.error("--arch and --tokenizer-from are required")
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(args.tokenizer_from)
-    model = ARCHS[args.arch](len(tok))
+    tok = AutoTokenizer.from_pretrained(args.tokenizer_from, trust_remote_code=False)
+    model = ARCHS[args.arch](len(tok), args.tokenizer_from)
     model.config.eos_token_id = tok.eos_token_id
     model.generation_config.eos_token_id = tok.eos_token_id
     qwen = args.arch.startswith("qwen")
@@ -251,7 +283,16 @@ def main():
     if qwen:
         save_file({**load_file(weights), **mtp_head(model)}, weights, metadata={"format": "pt"})
     fuse_experts(weights)
-    for f in TOKENIZER_FILES:
+    with open(os.path.join(args.tokenizer_from, "config.json")) as f:
+        auto_map = json.load(f).get("auto_map")
+    code = [f for f in os.listdir(args.tokenizer_from) if f.endswith(".py")] if auto_map else []
+    if auto_map:  # the checkpoint's own modeling code: the tiny model loads with it too
+        with open(os.path.join(args.out, "config.json")) as f:
+            config = json.load(f)
+        config["auto_map"] = auto_map
+        with open(os.path.join(args.out, "config.json"), "w") as f:
+            json.dump(config, f, indent=2)
+    for f in TOKENIZER_FILES + code:
         src = os.path.join(args.tokenizer_from, f)
         if os.path.exists(src):
             shutil.copy(src, os.path.join(args.out, f))

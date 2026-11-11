@@ -23,8 +23,9 @@ How that works:
   conversion step yet; a `convert` command for quantized packs is planned (DESIGN.md section 6).
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
-Status (see TODO.md): Gemma 4 E2B/E4B (text and images), Gemma 4 26B-A4B (text) and the Qwen3.5 family (Qwen3.5,
-Qwen3.6, Qwen3.8; text; a hybrid of Gated DeltaNet linear attention and full attention, dense or mixture of experts),
+Status (see TODO.md): Gemma 4 E2B/E4B (text and images), Gemma 4 26B-A4B (text), the Qwen3.5 family (Qwen3.5,
+Qwen3.6, Qwen3.8; text; a hybrid of Gated DeltaNet linear attention and full attention, dense or mixture of experts)
+and LFM3 (text; a hybrid of gated short convolutions and full or sliding-window attention),
 served end to end on the SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs
 from `convert`; speculative decoding with the model's drafter (`--spec mtp`: Qwen's MTP head, a Gemma 4 assistant
 with `--drafter`; `--spec dflash|dspine`: a block drafter checkpoint for Qwen3.8-27B with `--drafter`;
@@ -55,10 +56,11 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
 - Run one test case: `build/tests/xs_tests -tc='model matches*'`. Environment for the tests that need files:
   `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref` or `sycl`),
   `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`, `XS_PARITY_KV_DTYPE`, `XS_TEST_DRAFTER_DIR` (a
-  drafter checkpoint beside the model); `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for tokenizer parity).
+  drafter checkpoint beside the model); `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for tokenizer parity); `XS_LFM3_DIR`
+  (an LFM3 checkpoint, for its tokenizer and chat template, which are not kept in this repository).
   `tests/parity/model/make_tiny.py` writes a tiny random checkpoint of an architecture (real layer pattern and tensor
-  names), or of a block drafter for one (`--drafter`), to run the reference scripts and the parity tests on in
-  seconds.
+  names; with the checkpoint's own modeling code for one transformers does not ship, like LFM3), or of a block
+  drafter for one (`--drafter`), to run the reference scripts and the parity tests on in seconds.
 - `XS_SYCL_PROFILE=1` logs the SYCL backend's per-op device time per step (barrier timestamps between ops, no host
   round trip; each barrier stalls the GPU briefly, so small ops read high: rank by it, measure with `bench`);
   `XS_SYCL_SYNC=1` waits after
@@ -101,7 +103,7 @@ area).
 | `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop, speculative rounds: draft, verify, accept, roll back), `Sampler` (and rejection sampling of a draft), request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses), `spec/` (the drafter side of speculative decoding: `drafter.h` is what the engine drives and the session's program order; `chain_drafter` feeds a token-a-run drafter the target's hidden states and chains its drafts; `block_drafter` runs a block drafter's program and follows its candidates) |
 | `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `sycl/` |
 | `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
-| `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls), `plain` |
+| `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls; LFM3 writes the same format), `plain` |
 | `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming |
 | `service/` | xs_service | `EngineService`: loads tokenizer + template + model, compiles on a backend, owns the engine thread |
 | `policy/` | xs_policy | `PolicyRunner`: a policy, its tokenizer and one compiled program per call shape; warm-up; per-call timings (`xpu-serve bench <policy-dir>`) |
@@ -118,6 +120,7 @@ area).
 | `src/models/gemma4/gemma4_config.cpp` | Gemma 4 `config.json` parsing; refuses unsupported variants by name |
 | `src/models/gemma4/gemma4_vision.cpp` | Gemma 4 vision: image processor (resize, patches, pooling map) and vision tower graph |
 | `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention; dense MLP or `blocks::moe` (`qwen3_5_moe`: fused gate_up expert banks, gated shared expert); the MTP head (`mtp.*`) as the drafter, built from the same layer builders, or a block drafter checkpoint in its place |
+| `src/models/lfm3/lfm3_model.cpp` | LFM3: gated short convolutions (`causal_conv` between two gates of one projection), attention with q/k norms and a sigmoid gate per head (full layers rotate half of each head, sliding layers all of it within their window), every operator and MLP output normed again before the residual add, the head tied to the embedding |
 | `src/models/drafters/dflash.cpp` | Block drafters (DFlash, DFlash 2, DSpine): their config (refusals by name), the context a target's prefill and verify programs append for them, and the block program (DFlash 2's convolutions and candidate selector, DSpine's code bridge and refined last write) |
 | `src/backend/backend.h` | `Backend::compile(graphs, weights, options) -> Session` (programs sharing weights by name and state slots by label); `Session::run(program, inputs, outputs, only)` (every output, or just the ones asked for), `reset`, `truncate` (inside a step of up to `rewind_tokens` tokens too) |
 | `src/backend/cpu_ref/ops.cpp` | f32/f64 reference kernels, one per op: the accuracy oracle |
@@ -211,11 +214,11 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/backend/*_programs.cpp` | sessions of several programs: KV slots shared by label, KvRead, truncate inside a short step (conv, gated delta, KV) equals never running the dropped tokens; a run asked for some outputs returns those and advances the state all the same | the same session without them (`session_cases.h`) |
 | `tests/unit/engine/` | speculative decoding emits exactly the greedy tokens (a stateful tiny model, a partly wrong drafter that drafts a token a run or a block a run, prefix reuse, stops); the same tokens when greedy decoding reads each row's `argmax` output instead of the logits; rejection sampling draws the target's distribution | plain greedy decoding; exact distributions |
 | `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on cpu-ref and the GPU | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |
-| `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`; tables from `gen_unicode_tables.py`) |
-| `tests/unit/chat/` | template rendering, Gemma 4 and Qwen3.5 output parsing | `apply_chat_template` outputs in `tests/fixtures/chat/` |
+| `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`); whole tokenizers of Gemma 4, Qwen3.5 and LFM3 (`parity_cases.h`; each needs its checkpoint's `tokenizer.json`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`, `gen_lfm3_cases.py`; tables from `gen_unicode_tables.py`) |
+| `tests/unit/chat/` | template rendering (LFM3's template comes from `XS_LFM3_DIR`), Gemma 4 and Qwen3.5 output parsing, the latter on LFM3's prompts too | `apply_chat_template` outputs in `tests/fixtures/chat/` (`tests/parity/chat/gen_cases.py`) |
 | `tests/unit/server/` | request parsing, response format, stop strings, HTTP end to end | a fake `InferenceService` (`fake_service.h`) |
-| `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp` | config parsing and refusals | |
-| `tests/unit/model/model_parity.cpp` | whole model: last-token logits and greedy continuations; its drafter (MTP head, or an assistant with `XS_TEST_DRAFTER_DIR`): logits and chained drafts after each prompt | Hugging Face fp32, from `tests/parity/model/hf_reference.py` (`--assistant` for a Gemma 4 assistant) |
+| `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp`, `lfm3_config.cpp` | config parsing and refusals | |
+| `tests/unit/model/model_parity.cpp` | whole model: last-token logits and greedy continuations; its drafter (MTP head, or an assistant with `XS_TEST_DRAFTER_DIR`): logits and chained drafts after each prompt | Hugging Face fp32, from `tests/parity/model/hf_reference.py` (`--assistant` for a Gemma 4 assistant; a checkpoint that names its own modeling code, like LFM3, runs with it) |
 | `tests/unit/model/block_drafter_parity.cpp` | a block drafter (`XS_TEST_DRAFTER_DIR`) over rounds whose context grows by several tokens: drafts, candidates and scores | the drafters' own PyTorch code, from `tests/parity/model/block_drafter_reference.py` (clones of z-lab/dflash and Tencent/DSpine) |
 | `tests/unit/model/block_drafters.cpp` | block drafters on tiny checkpoints the test writes (`tiny_checkpoints.h`): a context fed in chunks or cut back after a verify, a causal block stopping after the drafts asked for, a drafter's pack, config refusals | the same drafter fed differently; its unquantized checkpoint |
 | `tests/unit/model/policy_parity.cpp` | a robot policy end to end: prompt ids and the action chunk, all cameras and one camera (`XS_TEST_POLICY_DIR`, `XS_POLICY_FIXTURES`) | LeRobot fp32 with fixed noise, from `tests/parity/policy/lerobot_reference.py` |
@@ -243,6 +246,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
      of the logits (the engine asks a run for the outputs it reads, and the backend skips the rest).
      Build layers from `models/common/blocks.h` (`attention`, `gated_mlp`, `moe`, `shortlist_head`, `rms_norm_one_plus`,
      `gated_rms_norm`, `rope_inv_freq`): the model maps its weight names onto a block's projections and norms; the math lives once.
+     `models/lfm3/` is the shortest example of a whole model.
 3. Register the `model_type` in `src/models/registry.cpp` (`load_model` and `supported_model_types`).
 4. If the model needs an op the IR does not have, add the op first (8.2).
 5. Tests: a config test (`tests/unit/model/<arch>_config.cpp`) and a parity test against Hugging Face fp32 modeled
@@ -310,15 +314,18 @@ draft program, and one way of drafting. The engine needs nothing new.
 
 ## 10. Known limitations
 
-- Two model families: Gemma 4 E2B/E4B (text and images) and 26B-A4B (text), and Qwen3.5 dense and MoE (text; its
-  vision tower is not loaded; MoE checkpoints must use fused expert banks, as the released ones do). No audio or video.
+- Three model families: Gemma 4 E2B/E4B (text and images) and 26B-A4B (text), Qwen3.5 dense and MoE (text; its
+  vision tower is not loaded; MoE checkpoints must use fused expert banks, as the released ones do), and LFM3 (text:
+  `lfm3`; the vision and audio variants are other model types and are refused). No audio or video.
   Images only as base64 data: URLs.
 - Speculative decoding drafts greedily (rejection sampling keeps sampled output exact). Drafters: the MTP heads, the
   Gemma 4 assistants, and block drafters for Qwen3.5-family targets (checkpoints exist for Qwen3.8-27B). An MTP head
   picks each draft among 64 tokens (`--draft-shortlist`; a one-bit sketch of the output layer chooses them, the exact
   layer ranks them): a pick the shortlist misses costs a draft. A verify of more than 8 tokens leaves the fast path
   (a block drafter drafts 7 by default).
-- Linear-attention models re-prefill when a new prompt does not extend the cached sequence (no state snapshots).
+- Models with conv or recurrent state (Qwen3.5's linear attention, LFM3's convolutions) re-prefill when a new prompt
+  does not extend the cached sequence (no state snapshots): with thinking on, a template that drops earlier turns'
+  reasoning makes every new user turn such a prompt.
 - Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)
   and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 for oneMKL's GEMM, except
   on integrated GPUs up to 512 rows (quant_gemm / quant_gemm_tiled dequantize on the way; sycl_be::quant_path).

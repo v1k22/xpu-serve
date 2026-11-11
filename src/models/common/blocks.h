@@ -110,6 +110,7 @@ struct AttentionSpec {
 struct AttentionParts {
     Linear q, k, v, o;  // v empty: the values are the key projection's output, before k_norm and RoPE (K = V)
     HeadNorm q_norm, k_norm, v_norm;
+    Linear head_gate;   // x -> [T, heads]: head h's output is scaled by sigmoid(head_gate(x)[h]) (LFM3); empty: none
 };
 
 struct AttentionOut {
@@ -118,7 +119,7 @@ struct AttentionOut {
 };
 
 // Self-attention over x [T, hidden]: projections, per-head norms, RoPE with (pos, inv_freq) when inv_freq is valid,
-// the KV slot, attention, the output gate and the o projection. With `shared_kv` the layer reads that k / v (an
+// the KV slot, attention, the output gates and the o projection. With `shared_kv` the layer reads that k / v (an
 // earlier layer's cache) instead of projecting its own.
 AttentionOut attention(Graph& g, const AttentionSpec& s, const AttentionParts& p, Value x, Value pos, Value inv_freq,
                        const std::pair<Value, Value>* shared_kv = nullptr);

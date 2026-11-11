@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include "chat/chat_template.h"
+#include "test_support.h"
 #include "util/error.h"
 
 namespace fs = std::filesystem;
@@ -78,6 +79,23 @@ TEST_SUITE("chat template") {
     TEST_CASE("qwen3_5 renders byte-identical to Hugging Face") {
         const auto tmpl = xs::chat::ChatTemplate::load(kChatFixtures / "qwen3_5");
         const ordered_json cases = read_ordered_json(kChatFixtures / "qwen3_5_cases.json");
+        REQUIRE(cases.size() >= 35);
+        for (const ordered_json& c : cases) {
+            const std::string name = c["name"].get<std::string>();
+            CAPTURE(name);
+            std::string rendered;
+            CHECK_NOTHROW(
+                rendered = tmpl->render(c["messages"], c["tools"], c["add_generation_prompt"].get<bool>(), c["extra"]));
+            CHECK(rendered == c["expected"].get<std::string>());
+        }
+    }
+
+    // LFM3's template is not kept here: the test reads it from a checkpoint (XS_LFM3_DIR) and skips without one.
+    TEST_CASE("lfm3 renders byte-identical to Hugging Face") {
+        const auto dir = xs::test::lfm3_dir();
+        if (!dir) return;
+        const auto tmpl = xs::chat::ChatTemplate::load(*dir);
+        const ordered_json cases = read_ordered_json(kChatFixtures / "lfm3_cases.json");
         REQUIRE(cases.size() >= 35);
         for (const ordered_json& c : cases) {
             const std::string name = c["name"].get<std::string>();

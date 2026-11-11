@@ -14,6 +14,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "parity_cases.h"
 #include "tokenizer/byte_level.h"
 #include "tokenizer/pre_tokenizer.h"
 #include "tokenizer/tokenizer.h"
@@ -23,6 +24,7 @@
 
 namespace {
 using Ids = std::vector<int32_t>;
+using xs::test::stream_decode;
 
 const nlohmann::json& fixture() {
     static const nlohmann::json j = [] {
@@ -43,18 +45,6 @@ std::optional<std::filesystem::path> qwen35_dir() {
 
 double seconds_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-}
-
-// Streams ids one at a time; every delta must be valid UTF-8 (no character split across deltas).
-std::string stream_decode(const xs::tok::Tokenizer& tok, const Ids& ids, bool skip_special) {
-    xs::tok::StreamDecoder stream(tok, skip_special);
-    std::string text;
-    for (const int32_t id : ids) {
-        const std::string delta = stream.push(id);
-        CHECK(xs::tok::utf8::is_valid(delta));
-        text += delta;
-    }
-    return text + stream.flush();
 }
 
 // A scratch model directory holding one tokenizer.json, removed on destruction.
@@ -264,30 +254,8 @@ TEST_SUITE("tokenizer_parity") {
         const auto start = std::chrono::steady_clock::now();
         const auto tok = xs::tok::Tokenizer::load(*dir);
         MESSAGE("Qwen3.5 tokenizer.json load: " << seconds_since(start) << " s");
-        const nlohmann::json& f = fixture();
-
-        CHECK(tok->vocab_size() == f["vocab_size"].get<int32_t>());
-        CHECK_FALSE(tok->bos_id().has_value());
-        CHECK(tok->eos_id() == f["eos_id"].get<int32_t>());
-        for (const int32_t id : f["special_ids"].get<Ids>()) CHECK(tok->is_special(id));
-
-        for (const auto& c : f["encode_cases"]) {
-            CAPTURE(c["name"].get<std::string>());
-            const std::string text = c["text"].get<std::string>();
-            const Ids expected = c["ids"].get<Ids>();
-            CHECK(tok->encode(text, c["parse_special"].get<bool>()) == expected);
-            CHECK(tok->decode(expected) == c["decoded"].get<std::string>());
-            CHECK(tok->decode(expected, true) == c["decoded_skip_special"].get<std::string>());
-            CHECK(stream_decode(*tok, expected, false) == c["decoded"].get<std::string>());
-            CHECK(stream_decode(*tok, expected, true) == c["decoded_skip_special"].get<std::string>());
-        }
-        for (const auto& c : f["decode_cases"]) {
-            CAPTURE(c["name"].get<std::string>());
-            const Ids ids = c["ids"].get<Ids>();
-            CHECK(tok->decode(ids) == c["decoded"].get<std::string>());
-            CHECK(tok->decode(ids, true) == c["decoded_skip_special"].get<std::string>());
-            CHECK(stream_decode(*tok, ids, false) == c["decoded"].get<std::string>());
-        }
+        REQUIRE(fixture()["bos_id"].is_null());
+        xs::test::check_tokenizer_cases(*tok, fixture());
     }
 
     TEST_CASE("tokenizer parity: a 5k-token Qwen3.5 prompt encodes in milliseconds") {
