@@ -179,7 +179,7 @@ inline void truncate_inside_step(const Env& env) {
         plain->run(after, want);
         outputs_close(out, want, env);
     }
-    // Without rewind_tokens only whole sequences: no count inside a short step either.
+    // Without rewind_tokens a step is kept or dropped whole: no count inside it.
     const auto plain = env.compile(programs, layer.weights, 0);
     TensorMap out;
     plain->run(prefix, out);
@@ -188,6 +188,44 @@ inline void truncate_inside_step(const Env& env) {
     CHECK(plain->num_cached() == 8);
     plain->truncate(0);
     CHECK(plain->num_cached() == 0);
+}
+
+// The last step can be undone whole, whatever its size and without rewind_tokens: what follows is what a session
+// that never ran it gives. Once undone, the step before it cannot be (its state is gone).
+inline void undo_last_step(const Env& env) {
+    const HybridLayer layer;
+    const Graph* programs[] = {&layer.graph};
+    TensorRng rng(43);
+    const TensorMap prefix = HybridLayer::inputs(rng, 5), first = HybridLayer::inputs(rng, 6),
+                    second = HybridLayer::inputs(rng, 3), third = HybridLayer::inputs(rng, 4);
+    const auto session = env.compile(programs, layer.weights, 0);
+    const auto plain = env.compile(programs, layer.weights, 0);
+    TensorMap out, want;
+    session->run(prefix, out);
+    plain->run(prefix, want);
+    // Three tails after one prefix, each read from the prefix's state.
+    for (const TensorMap* tail : {&first, &second, &third}) {
+        session->run(*tail, out);
+        const auto fresh = env.compile(programs, layer.weights, 0);
+        TensorMap prefix_out;
+        fresh->run(prefix, prefix_out);
+        fresh->run(*tail, want);
+        outputs_close(out, want, env);
+        session->truncate(5);
+        CHECK(session->num_cached() == 5);
+        session->truncate(5);  // already there: nothing to do
+    }
+    CHECK_THROWS_AS(session->truncate(3), xs::Error);  // inside the prefix
+    CHECK(session->num_cached() == 5);
+    // Two steps on, only the last can go.
+    session->run(first, out);
+    session->run(second, out);
+    CHECK_THROWS_AS(session->truncate(5), xs::Error);
+    session->truncate(11);
+    session->run(third, out);
+    plain->run(first, want);
+    plain->run(third, want);
+    outputs_close(out, want, env);
 }
 
 // Programs that name the same KV slot share it: two writers extend one sequence, a KvRead reader attends to all of it

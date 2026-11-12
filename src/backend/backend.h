@@ -33,7 +33,7 @@ struct SessionOptions {
     // KV head), rounded as quant::quantize_kv_row_i8.
     std::optional<DType> kv_dtype;
     // Steps of up to this many tokens can be cut back to any point inside them (truncate), conv and recurrent state
-    // included: the verify step of speculative decoding (k + 1 tokens). 0: only whole sequences.
+    // included: the verify step of speculative decoding (k + 1 tokens). 0: a step is kept or dropped whole.
     int64_t rewind_tokens = 0;
     std::map<std::string, std::string> extra;  // backend-specific options, refused by name when unknown
 };
@@ -62,8 +62,9 @@ public:
     // Drops the state of every slot.
     virtual void reset() = 0;
     // Keeps the first `n` tokens of the slots `program` writes (n <= num_cached(program)). Conv and recurrent state
-    // (Graph::has_fixed_state) summarize the sequence: it keeps 0 tokens, all of them, or, after a step of at most
-    // SessionOptions::rewind_tokens tokens, any count from before that step on; anything else throws.
+    // (Graph::has_fixed_state) summarize the sequence: it keeps 0 tokens, all of them, the tokens before the last
+    // step (that step undone whole, whatever its size), or, after a step of at most SessionOptions::rewind_tokens
+    // tokens, any count from before that step on; anything else throws.
     virtual void truncate(size_t program, int64_t n) = 0;
     void truncate(int64_t n) { truncate(0, n); }
 };

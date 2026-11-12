@@ -228,10 +228,12 @@ struct SharedFixed {  // a conv or recurrent slot
     std::string label;
     StateBuffers state;
     int64_t tokens = 0;
-    // The last step, when it had at most rewind_tokens tokens (base >= 0): the state before it is the other buffer
-    // (state.buf[1 - state.cur]) and its op's per-token inputs are kept here, replayed by truncate for a count inside
-    // the step (conv: x; recurrent: k, v, g, beta).
+    // The last step began at `base` tokens (-1: none since a reset); the state before it is the other buffer
+    // (state.buf[1 - state.cur]), so truncate can undo it whole. When it had at most rewind_tokens tokens (`replay`),
+    // its op's per-token inputs are kept here too, replayed by truncate for a count inside the step (conv: x;
+    // recurrent: k, v, g, beta).
     int64_t base = -1;
+    bool replay = false;
     std::vector<DeviceBuffer> inputs;
     std::vector<int64_t> input_row;  // floats per token of each kept input
     int64_t channels = 0, kernel = 0;                                     // conv
@@ -449,7 +451,8 @@ public:
         for (size_t f : fixed_slot_) {
             SharedFixed& st = shared_.fixed[f];
             st.state.cur = 1 - st.state.cur;
-            st.base = rewinding_ ? st.tokens : -1;  // rewinding_: the step's inputs went to st.inputs
+            st.base = st.tokens;
+            st.replay = rewinding_;  // the step's inputs went to st.inputs
             st.tokens += step.tokens;
         }
         if (!marks_.empty()) {
@@ -516,9 +519,9 @@ public:
         XS_CHECK(n >= 0 && n <= have, "cannot truncate to ", n, " tokens; ", have, " are cached");
         for (size_t i : fixed_slot_) {  // checked first: a refusal changes nothing
             const SharedFixed& f = shared_.fixed[i];
-            XS_CHECK(n == f.tokens || n == 0 || (f.base >= 0 && n >= f.base), "cannot truncate to ", n,
-                     " tokens: conv and recurrent state summarize the whole sequence (only a count inside a last step ",
-                     "of up to rewind_tokens tokens is kept)");
+            XS_CHECK(n == f.tokens || n == 0 || (f.base >= 0 && (n == f.base || (f.replay && n > f.base))),
+                     "cannot truncate to ", n, " tokens: conv and recurrent state summarize the whole sequence (the ",
+                     "last step can be undone whole; a count inside it only when it had up to rewind_tokens tokens)");
         }
         if (!reads_kv_) {
             for (size_t k : kv_slot_) shared_.kv[k].len = n;

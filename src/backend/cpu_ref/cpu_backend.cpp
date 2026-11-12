@@ -96,9 +96,11 @@ struct FixedSlotState {  // a conv or recurrent slot
     size_t elements = 0;
     std::vector<float> state;  // committed
     int64_t tokens = 0;        // tokens it summarizes
-    // The last step, when it had at most rewind_tokens tokens (base >= 0): the state before it and its op's inputs
-    // (conv: x, w; recurrent: q, k, v, g, beta), replayed by truncate for a count inside the step.
+    // The last step began at `base` tokens (-1: none since a reset) from the state `before`: truncate can undo it
+    // whole. When it had at most rewind_tokens tokens (`replay`), its op's inputs are kept too (conv: x, w;
+    // recurrent: q, k, v, g, beta), replayed by truncate for a count inside the step.
     int64_t base = -1;
+    bool replay = false;
     std::vector<float> before;
     std::vector<HostTensor> inputs;
     float eps = 0.0f;
@@ -172,8 +174,9 @@ class CpuProgram {
                                 std::vector<std::vector<HostTensor>>& kept) {
             for (size_t j = 0; j < slots.size(); ++j) {
                 FixedSlotState& f = shared_.fixed[slots[j]];
-                f.base = rewindable ? f.tokens : -1;
-                f.before = rewindable ? std::move(f.state) : std::vector<float>();
+                f.base = f.tokens;
+                f.replay = rewindable;
+                f.before = std::move(f.state);
                 f.inputs = rewindable ? std::move(kept[j]) : std::vector<HostTensor>();
                 f.state = std::move(states[j]);
                 f.tokens += step.tokens;
@@ -202,9 +205,10 @@ class CpuProgram {
         for (const std::vector<size_t>* slots : {&conv_, &recurrent_}) {  // checked first: a refusal changes nothing
             for (size_t i : *slots) {
                 const FixedSlotState& f = shared_.fixed[i];
-                XS_CHECK(n == f.tokens || n == 0 || (f.base >= 0 && n >= f.base), "cannot truncate to ", n,
-                         " tokens: conv and recurrent state summarize the whole sequence (only a count inside a last ",
-                         "step of up to rewind_tokens tokens is kept)");
+                XS_CHECK(n == f.tokens || n == 0 || (f.base >= 0 && (n == f.base || (f.replay && n > f.base))),
+                         "cannot truncate to ", n, " tokens: conv and recurrent state summarize the whole sequence ",
+                         "(the last step can be undone whole; a count inside it only when it had up to rewind_tokens ",
+                         "tokens)");
             }
         }
         if (!reads_kv_) {
