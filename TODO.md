@@ -277,7 +277,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       right after the matmuls under `XS_SYCL_PROFILE`)
 - [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
 - [ ] Llama 3
-- [ ] Import MLX-affine packs; import GGUF (Q4_0 / Q8_0 / K-quants)
+- [ ] Import MLX-affine packs
+- [x] Import GGUF files (`convert <file.gguf> <out-dir>`): architecture `qwen35`, tensors kept in their block formats
+- [ ] GGUF: more architectures (`qwen35moe`, Gemma 4, LFM3)
 - [x] Data-aware quantization: AWQ-style scale and clip search in `convert`, calibrated on our own engine
 - [ ] GPTQ; AWQ with the full activation covariance (not per channel); larger calibration sets
 - [ ] Anthropic `/v1/messages`, Ollama `/api/chat` and `/api/generate`
