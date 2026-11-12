@@ -22,6 +22,13 @@ namespace xs::qwen3_5 {
 
 enum class LayerKind { Linear, Full };
 
+// How a checkpoint orders linear attention's value heads, r = value heads / key heads of them per key head, in every
+// tensor indexed by value head (in_proj_qkv's value rows, in_proj_z, in_proj_a, in_proj_b, A_log, dt_bias, the conv's
+// value channels, out_proj's columns). Grouped (Hugging Face): head k * r + s is the s-th of key head k's. Tiled (GGUF
+// files, which llama.cpp's converter writes so): head s * key heads + k is. config.json linear_value_head_order names
+// it ("grouped" when absent).
+enum class ValueHeadOrder : uint8_t { Grouped, Tiled };
+
 struct Config {
     int64_t vocab_size = 0;
     int64_t hidden_size = 0;
@@ -49,6 +56,7 @@ struct Config {
     int64_t linear_key_dim = 0;
     int64_t linear_value_dim = 0;
     int64_t conv_kernel = 0;
+    ValueHeadOrder value_head_order = ValueHeadOrder::Grouped;
     int64_t mtp_layers = 0;  // decoder layers of the MTP head (mtp.layers.<i>); 0: no head
 };
 
