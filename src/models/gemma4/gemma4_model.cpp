@@ -222,13 +222,7 @@ private:
         for (size_t i = 0; i < tokens.size(); ++i) {
             XS_CHECK(tokens[i] < cfg_.ple_vocab_size, "gemma4: token id ", tokens[i], " outside the PLE vocabulary");
             float* dst = out.data<float>() + static_cast<int64_t>(i) * width;
-            if (is_quantized(ple_table_->dtype)) {  // a pack's q8 / q4 table
-                quant::dequantize_rows(*ple_table_, tokens[i], 1, dst);
-            } else {
-                const size_t row_bytes = static_cast<size_t>(width) * dtype_size(ple_table_->dtype);
-                const auto* row = static_cast<const std::byte*>(ple_table_->data) + static_cast<size_t>(tokens[i]) * row_bytes;
-                to_f32(row, ple_table_->dtype, dst, static_cast<size_t>(width));
-            }
+            quant::read_rows(*ple_table_, tokens[i], 1, dst);
             for (int64_t j = 0; j < width; ++j) dst[j] *= ple_scale_;
         }
         return out;

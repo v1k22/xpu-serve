@@ -192,6 +192,30 @@ void SafetensorsWeights::apply_pack_manifest(const std::filesystem::path& path) 
     };
     for (const auto& [name, entry] : manifest.at("tensors").items()) {
         const std::string format = entry.at("format").get<std::string>();
+        if (const std::optional<BlockFormat> block = block_format_from_name(format)) {
+            // A GGUF block format: the weight's rows of blocks as the file stores them, U8 [rows, row bytes].
+            for (const auto& [key, value] : entry.items()) {
+                if (key != "format" && key != "shape") {
+                    fail("pack: tensor '", name, "' (", format, ") has key '", key,
+                         "'; a block format entry has only format and shape");
+                }
+            }
+            const Dims shape = entry.at("shape").get<Dims>();
+            const int64_t weights = block_layout(*block).weights;
+            XS_CHECK(shape.size() >= 2 && std::all_of(shape.begin(), shape.end(), [](int64_t d) { return d > 0; }),
+                     "pack: tensor '", name, "' (", format, ") has shape ", dims_to_string(shape),
+                     "; a block format weight needs at least 2 dims, none empty");
+            XS_CHECK(shape.back() % weights == 0, "pack: tensor '", name, "' (", format, ") has ", shape.back(),
+                     " columns, not a whole number of its blocks of ", weights);
+            const Dims stored{numel(shape) / shape.back(), static_cast<int64_t>(block_row_bytes(*block, shape.back()))};
+            TensorView v;
+            v.dtype = DType::Block;
+            v.shape = shape;
+            v.block = *block;
+            v.data = component(name, DType::U8, stored).data;
+            index_[name] = &(quant_views_[name] = v);
+            continue;
+        }
         const DType dtype = format == "q4" ? DType::Q4 : format == "q8" ? DType::Q8 : DType::F32;
         if (dtype == DType::F32) fail("pack: tensor '", name, "' has unknown format '", format, "'");
         const int64_t group = entry.at("group").get<int64_t>();

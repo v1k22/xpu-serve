@@ -281,6 +281,10 @@ bits or group size from tensor geometry is a known source of silent bugs.
 }
 ```
 
+A weight taken from a GGUF file keeps the file's block format (`tensor/block_format.h`), byte for byte: its entry is
+`{ "format": "Q4_K", "shape": [2048, 1536] }` (the format as GGUF names it, no group) and its tensor is `U8`
+`[rows, row bytes]`, the matrix's rows of blocks (rows: the product of the leading dims).
+
 Only quantized tensors are listed; every other tensor is a plain safetensors tensor. The manifest makes a pack
 reproducible: same source files + same converter version + same options = same bytes (recording the source revision
 and file hashes, and drafters, are still to come).

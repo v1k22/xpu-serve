@@ -38,6 +38,21 @@ class MemoryWeights final : public WeightStore {
         quant::dequantize_rows(views_[name], 0, rows, dense.data<float>());
         tensors_[name] = std::move(dense);
     }
+    // A weight in a GGUF block format, `blocks` its rows of blocks as a file stores them. tensor(name) is its decoded
+    // f32 value.
+    void add_block(const std::string& name, BlockFormat format, Dims shape, std::vector<uint8_t> blocks) {
+        TensorView v;
+        v.dtype = DType::Block;
+        v.shape = std::move(shape);
+        v.block = format;
+        if (blocks.size() != v.nbytes()) throw std::invalid_argument("MemoryWeights::add_block: wrong byte count");
+        blocks_[name] = std::move(blocks);
+        v.data = blocks_[name].data();
+        HostTensor dense(DType::F32, v.shape);
+        quant::read_rows(v, 0, quant::matrix_rows(v.shape), dense.data<float>());
+        views_[name] = std::move(v);
+        tensors_[name] = std::move(dense);
+    }
     const TensorView* find(const std::string& name) const override {
         const auto it = views_.find(name);
         return it == views_.end() ? nullptr : &it->second;
@@ -53,6 +68,7 @@ class MemoryWeights final : public WeightStore {
   private:
     std::map<std::string, HostTensor> tensors_;
     std::map<std::string, quant::Quantized> quantized_;
+    std::map<std::string, std::vector<uint8_t>> blocks_;
     std::map<std::string, TensorView> views_;
 };
 
@@ -99,6 +115,57 @@ class TensorRng {
   private:
     std::mt19937 engine_;
 };
+
+// Byte offsets of the f16 fields of a block of `format` (its scales and minimums). IQ1_M has none: its f16 scale is
+// spread over the top nibbles of its four 16-bit scale words (bytes 49, 51, 53, 55).
+inline std::vector<size_t> block_f16_fields(BlockFormat format) {
+    switch (format) {
+        case BlockFormat::Q4_1:
+        case BlockFormat::Q5_1:
+        case BlockFormat::Q4_K:
+        case BlockFormat::Q5_K:
+            return {0, 2};
+        case BlockFormat::Q2_K:
+            return {80, 82};
+        case BlockFormat::Q3_K:
+            return {108};
+        case BlockFormat::Q6_K:
+            return {208};
+        case BlockFormat::IQ1_M:
+            return {};
+        default:
+            return {0};
+    }
+}
+
+// `count` blocks of `format` of random bits (every code path of a decoder), with each f16 field a random value of
+// magnitude in [2^-10, 2^-4) and either sign: finite, and small enough that a weight stays well inside the f16 range.
+inline std::vector<uint8_t> random_blocks(BlockFormat format, int64_t count, uint32_t seed) {
+    std::mt19937 rng(seed);
+    const BlockLayout layout = block_layout(format);
+    std::vector<uint8_t> bytes(static_cast<size_t>(count * layout.bytes));
+    for (uint8_t& b : bytes)
+        b = static_cast<uint8_t>(rng() & 0xFF);
+    std::uniform_real_distribution<float> exponent(-10.0f, -4.0f);
+    const auto scale = [&] {
+        const float v = std::exp2(exponent(rng));
+        return f32_to_f16((rng() & 1) != 0 ? -v : v);
+    };
+    for (int64_t i = 0; i < count; ++i) {
+        uint8_t* block = bytes.data() + i * layout.bytes;
+        for (const size_t at : block_f16_fields(format)) {
+            const uint16_t h = scale();
+            block[at] = static_cast<uint8_t>(h & 0xFF);
+            block[at + 1] = static_cast<uint8_t>(h >> 8);
+        }
+        if (format == BlockFormat::IQ1_M) {
+            const uint16_t h = scale();
+            for (int k = 0; k < 4; ++k)
+                block[49 + 2 * k] = static_cast<uint8_t>((block[49 + 2 * k] & 0x0F) | (((h >> (4 * k)) & 0xF) << 4));
+        }
+    }
+    return bytes;
+}
 
 template <typename T>
 HostTensor make_tensor(DType dtype, Dims shape, const std::vector<T>& values) {

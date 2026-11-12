@@ -45,7 +45,9 @@ inline constexpr int kPackVersion = 1;
 
 // All safetensors files of a model directory: either model.safetensors.index.json + shards, or every *.safetensors
 // file in the directory. Tensor names must be unique across files. In a pack (a directory with xpu_pack.json) each
-// quantized weight appears under its own name as one Q8 / Q4 view over its codes, `.scales` and `.biases` tensors.
+// quantized weight appears under its own name as one Q8 / Q4 view over its codes, `.scales` and `.biases` tensors,
+// and each weight in a GGUF block format (a manifest entry {"format": "Q4_K", "shape": [..., cols]}, the format named
+// as block_format_name does) as one Block view of that shape over its U8 tensor [rows, block_row_bytes(cols)].
 // In an FP8 checkpoint (quant/fp8.h) each F8_E4M3 matrix appears as one F8 view over its codes and its
 // `<name>_scale_inv` tensor.
 class SafetensorsWeights final : public WeightStore {
