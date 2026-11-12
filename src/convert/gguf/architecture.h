@@ -39,6 +39,9 @@ struct ImportPlan {
     // Tensors the converter computed from the config (not the checkpoint's), which the architecture checked against
     // the config it writes: not imported, since the model code computes them from config.json.
     std::vector<const gguf::TensorInfo*> derived;
+    // A drafter beside a target model: it is served with the target's tokenizer, chat template and stop tokens, so its
+    // pack holds config.json and the weights only.
+    bool drafter = false;
 };
 
 class Architecture {
@@ -52,6 +55,7 @@ public:
 
 const Architecture& qwen35();
 const Architecture& gemma4();
+const Architecture& gemma4_assistant();
 
 // The importer of general.architecture `name`; a named error listing the supported ones otherwise.
 const Architecture& find_architecture(std::string_view name);

@@ -12,7 +12,8 @@
 // the memory map: a file of any size never sits in memory.
 //
 // The architecture (general.architecture) decides names, config and transforms (convert/gguf/architecture.h); one
-// it does not know is refused by name.
+// it does not know is refused by name. A drafter's pack (a Gemma 4 assistant, for --drafter) is config.json, the
+// weights and the manifest: the target's pack has the tokenizer and chat template.
 
 #include <cstdint>
 #include <filesystem>

@@ -4,9 +4,14 @@
 // the file passes the Gemma 4 tokenizer parity cases and matches the checkpoint's token by token; config.json gives the
 // model code what the checkpoint's does; the file's chat template renders thinking, tools and a tool round trip; the
 // imported pack loads and answers. Each case skips unless both variables are set and the file is a gemma4 one.
+//
+// A real gemma4-assistant GGUF (XS_GGUF_DRAFTER_FILE, e.g. MTP/mtp-gemma-4-E2B-it-Q8_0.gguf) against the assistant
+// checkpoint (XS_GEMMA4_ASSISTANT_DIR: its config.json): the config fields the model code reads; beside the target
+// above, the imported drafter loads and drafts.
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -21,6 +26,7 @@
 #include "convert/gguf/tokenizer.h"
 #include "convert/import_test_util.h"
 #include "convert/real_gguf.h"
+#include "engine/spec/chain_drafter.h"
 #include "io/gguf.h"
 #include "model/tiny_checkpoints.h"
 #include "models/config_util.h"
@@ -46,6 +52,14 @@ std::string merge_text(const nlohmann::json& m) {
 
 std::set<int32_t> as_set(const std::vector<int32_t>& v) {
     return {v.begin(), v.end()};
+}
+
+// XS_GGUF_DRAFTER_FILE, when it is set and a gemma4-assistant file.
+std::optional<fs::path> drafter_file() {
+    const char* d = std::getenv("XS_GGUF_DRAFTER_FILE");
+    if (d == nullptr || *d == '\0') return std::nullopt;
+    if (gguf::File(d).get_string("general.architecture") != "gemma4-assistant") return std::nullopt;
+    return fs::path(d);
 }
 
 }  // namespace
@@ -291,5 +305,72 @@ TEST_SUITE("gguf real file") {
         MESSAGE("answer: '" << answer << "'");
         CHECK(answer.find("Paris") != std::string::npos);
         CHECK(end != tokens.end());
+
+        // The imported drafter beside it: it loads (its shapes fit this target) and drafts after the prompt.
+        const auto drafter_gguf = drafter_file();
+        if (!drafter_gguf) return;
+        xs::test::import_into(*drafter_gguf, work.path / "drafter");
+        const auto both = load_model(
+            work.path / "pack",
+            LoadOptions{.vision = false, .speculation = true, .drafter = work.path / "drafter", .draft_shortlist = 0});
+        const Speculation* spec = both->speculation();
+        REQUIRE(spec != nullptr);
+        const graph::Graph* programs[] = {&both->graph(), &spec->prefill_graph(), &spec->verify_graph(),
+                                          &spec->draft_graph()};
+        SessionOptions options = xs::test::f32_session();
+        options.rewind_tokens = 4;
+        const auto session = make_cpu_ref_backend()->compile(programs, both->weights(), options);
+        const std::vector<int32_t> ids = tokenizer->encode(prompt);
+        TensorMap inputs, outputs;
+        both->prepare_inputs(ids, 0, {}, inputs);
+        session->run(spec::kPrefill, inputs, outputs);
+        spec::ChainDrafter chain(*spec, *session);
+        chain.add(TensorMap{{"hidden", outputs.at("hidden")}}, outputs.at("hidden").dim(0), 0, ids);
+        const std::vector<int32_t> drafted = chain.propose(tokens[0], 3);
+        REQUIRE(drafted.size() == 3);
+        MESSAGE("after '" << tokenizer->decode(std::vector<int32_t>{tokens[0]}) << "' the drafter proposes '"
+                          << tokenizer->decode(drafted) << "'; the target continues '"
+                          << tokenizer->decode(std::vector<int32_t>(tokens.begin() + 1, tokens.end())) << "'");
+        CHECK(drafted[0] == tokens[1]);
+    }
+
+    TEST_CASE("config: what the model code reads from a real gemma4-assistant GGUF equals the assistant's config") {
+        const auto drafter_gguf = drafter_file();
+        const char* dir = std::getenv("XS_GEMMA4_ASSISTANT_DIR");
+        if (!drafter_gguf || dir == nullptr || *dir == '\0') return;
+        const gguf::File file(*drafter_gguf);
+        const gguf_import::ImportPlan plan = gguf_import::find_architecture("gemma4-assistant").plan(file);
+        CHECK(plan.drafter);
+        const gemma4::AssistantConfig a = gemma4::parse_assistant_config(nlohmann::json::parse(plan.config.dump()));
+        const gemma4::AssistantConfig b = gemma4::parse_assistant_config(cfg::read_json(fs::path(dir) / "config.json"));
+        CHECK(a.backbone_hidden_size == b.backbone_hidden_size);
+        CHECK(a.text.checkpoint_dtype == b.text.checkpoint_dtype);
+        CHECK(a.text.vocab_size == b.text.vocab_size);
+        CHECK(a.text.hidden_size == b.text.hidden_size);
+        CHECK(a.text.intermediate_size == b.text.intermediate_size);
+        CHECK(a.text.num_layers == b.text.num_layers);
+        CHECK(a.text.num_heads == b.text.num_heads);
+        CHECK(a.text.num_kv_heads == b.text.num_kv_heads);
+        CHECK(a.text.num_global_kv_heads == b.text.num_global_kv_heads);
+        CHECK(a.text.head_dim == b.text.head_dim);
+        CHECK(a.text.global_head_dim == b.text.global_head_dim);
+        CHECK(a.text.sliding_window == b.text.sliding_window);
+        CHECK(a.text.num_kv_shared_layers == b.text.num_kv_shared_layers);
+        CHECK(a.text.rms_norm_eps == b.text.rms_norm_eps);
+        CHECK(a.text.final_logit_softcap == b.text.final_logit_softcap);
+        CHECK(a.text.max_position == b.text.max_position);
+        CHECK(a.text.layer_kinds == b.text.layer_kinds);
+        for (const auto& [x, y] :
+             {std::pair{a.text.rope_sliding, b.text.rope_sliding}, std::pair{a.text.rope_full, b.text.rope_full}}) {
+            CHECK(x.theta == y.theta);
+            CHECK(x.proportional == y.proportional);
+            CHECK(x.partial_rotary_factor == y.partial_rotary_factor);
+        }
+        // What differs, by construction: the file has no centroid head, and llama.cpp scores the whole vocabulary.
+        CHECK_FALSE(a.ordered_embeddings);
+        if (b.ordered_embeddings) {
+            MESSAGE("the checkpoint's head: " << b.num_centroids << " centroids, top " << b.centroid_top_k
+                                              << "; the file's: the whole vocabulary");
+        }
     }
 }

@@ -225,7 +225,8 @@ TEST_SUITE("gguf import") {
                 w.drop_value("general.architecture").string("general.architecture", name);
             });
         };
-        CHECK(architecture("llama").find("GGUF architecture 'llama' is not supported (supported: qwen35, gemma4)") !=
+        CHECK(architecture("llama").find(
+                  "GGUF architecture 'llama' is not supported (supported: qwen35, gemma4, gemma4-assistant)") !=
               std::string::npos);
         CHECK(architecture("qwen35moe").find("'qwen35moe' (Qwen3.5 mixture of experts) is not supported yet") !=
               std::string::npos);

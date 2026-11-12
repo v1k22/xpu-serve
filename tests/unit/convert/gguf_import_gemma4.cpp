@@ -2,10 +2,12 @@
 // (tiny_gemma4_gguf.h: per-layer embeddings, KV-shared layers with a double-wide MLP, sliding and full-attention layers
 // of their own head sizes and KV heads, q / k / v fused in one layer, rope_freqs, Q8_0 / Q4_0 / F16 / BF16 / F32
 // tensors, a Gemma-style BPE vocabulary with byte fallback) imports as the model its blocks decode to: the same
-// weights, logits and greedy tokens as its twin checkpoint on cpu-ref, the same tokenizer as the original; and what the
-// importer does not implement is refused by name.
+// weights, logits and greedy tokens as its twin checkpoint on cpu-ref, the same tokenizer as the original; a tiny
+// gemma4-assistant GGUF imports as the drafter its blocks decode to, the same drafts over the imported target; and what
+// the importer does not implement is refused by name.
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -16,6 +18,7 @@
 #include "convert/gguf/gguf_import.h"
 #include "convert/import_test_util.h"
 #include "convert/tiny_gemma4_gguf.h"
+#include "engine/spec/chain_drafter.h"
 #include "models/model.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
@@ -41,6 +44,48 @@ std::vector<std::vector<float>> step_logits(const Model& model) {
 template <typename Change>
 std::string refusal(const fs::path& dir, Change change) {
     return xs::test::refusal(dir, [](const fs::path& src) { return xs::test::build_tiny_gemma4_gguf(src, 7); }, change);
+}
+
+template <typename Change>
+std::string assistant_refusal(const fs::path& dir, Change change) {
+    return xs::test::refusal(
+        dir, [](const fs::path& src) { return xs::test::build_tiny_gemma4_assistant_gguf(src, 9); }, change);
+}
+
+// The drafter after a prefill of kPrompt: its logits for (the first greedy token, the prompt's last hidden row), and
+// the three drafts it chains from them.
+struct Drafts {
+    std::vector<float> logits;
+    std::vector<int32_t> tokens;
+};
+Drafts drafts(const Model& model) {
+    const Speculation* spec = model.speculation();
+    REQUIRE(spec != nullptr);
+    REQUIRE(spec->chain() != nullptr);
+    SessionOptions options = xs::test::f32_session();
+    options.rewind_tokens = 4;
+    const graph::Graph* programs[] = {&model.graph(), &spec->prefill_graph(), &spec->verify_graph(),
+                                      &spec->draft_graph()};
+    const auto session = make_cpu_ref_backend()->compile(programs, model.weights(), options);
+    TensorMap inputs, outputs;
+    model.prepare_inputs(kPrompt, 0, {}, inputs);
+    session->run(spec::kPrefill, inputs, outputs);
+    const HostTensor hidden = std::move(outputs.at("hidden"));
+    const HostTensor& l = outputs.at("logits");
+    const auto first =
+        static_cast<int32_t>(std::max_element(l.data<float>(), l.data<float>() + l.numel()) - l.data<float>());
+    const std::span<const float> rows(hidden.data<float>(), static_cast<size_t>(hidden.numel()));
+    inputs.clear();
+    spec->chain()->prepare_draft(std::vector<int32_t>{first}, rows.last(static_cast<size_t>(hidden.dim(1))),
+                                 static_cast<int64_t>(kPrompt.size()) - 1, 0, inputs);
+    session->run(spec::kDraft, inputs, outputs);
+    Drafts out;
+    out.logits.assign(outputs.at("logits").data<float>(),
+                      outputs.at("logits").data<float>() + outputs.at("logits").numel());
+    spec::ChainDrafter drafter(*spec, *session);
+    drafter.add(TensorMap{{"hidden", hidden}}, hidden.dim(0), 0, kPrompt);
+    out.tokens = drafter.propose(first, 3);
+    return out;
 }
 
 // `error` names `text`; else it is shown.
@@ -197,6 +242,86 @@ TEST_SUITE("gguf import gemma4") {
         CHECK(model->vision() == nullptr);
     }
 
+    TEST_CASE("a tiny gemma4-assistant GGUF imports as the drafter its blocks decode to") {
+        const TempDir work("xs_gguf_gemma4_assistant_test");
+        xs::test::build_tiny_gemma4_gguf(work.path, 7).write(work.path / "tiny.gguf");
+        xs::test::build_tiny_gemma4_assistant_gguf(work.path, 9).write(work.path / "assistant.gguf");
+        import_into(work.path / "tiny.gguf", work.path / "pack");
+        const gguf_import::ImportReport report = import_into(work.path / "assistant.gguf", work.path / "drafter");
+        CHECK(report.architecture == "gemma4-assistant");
+        // A drafter is served with the target's tokenizer and chat template: its pack holds none.
+        std::vector<std::string> files;
+        for (const auto& e : fs::directory_iterator(work.path / "drafter"))
+            files.push_back(e.path().filename().string());
+        std::sort(files.begin(), files.end());
+        CHECK(files == std::vector<std::string>{"config.json", "model.safetensors", kPackManifest});
+        const nlohmann::json config = nlohmann::json::parse(std::ifstream(work.path / "drafter" / "config.json"));
+        const nlohmann::json original =
+            nlohmann::json::parse(std::ifstream(work.path / "hf-assistant" / "config.json"));
+        for (const char* key :
+             {"model_type", "dtype", "backbone_hidden_size", "use_ordered_embeddings", "tie_word_embeddings"}) {
+            CAPTURE(key);
+            CHECK(config[key] == original[key]);
+        }
+        for (const auto& [key, value] : original["text_config"].items()) {
+            CAPTURE(key);
+            CHECK(config["text_config"][key] == value);
+        }
+
+        const auto pack =
+            load_model(work.path / "pack", LoadOptions{.speculation = true, .drafter = work.path / "drafter"});
+        const auto twin =
+            load_model(work.path / "twin", LoadOptions{.speculation = true, .drafter = work.path / "twin-assistant"});
+        CHECK(pack->weights().names() == twin->weights().names());
+        for (const std::string& name : twin->weights().names()) {
+            CAPTURE(name);
+            CHECK(values(pack->weights().get(name)) == values(twin->weights().get(name)));
+        }
+        CHECK(pack->weights().get("assistant.pre_projection.weight").dtype == DType::Block);
+        const Drafts ours = drafts(*pack), theirs = drafts(*twin);
+        CHECK(ours.logits == theirs.logits);
+        CHECK(ours.tokens == theirs.tokens);
+        MESSAGE("drafts over the imported target: " << ours.tokens[0] << " " << ours.tokens[1] << " "
+                                                    << ours.tokens[2]);
+
+        // Planted: the drafter's full-attention RoPE read wrong is another drafter.
+        nlohmann::json rope = config;
+        rope["text_config"]["rope_parameters"]["full_attention"]["partial_rotary_factor"] = 0.5;
+        std::ofstream(work.path / "drafter" / "config.json") << rope.dump(1);
+        const auto planted =
+            load_model(work.path / "pack", LoadOptions{.speculation = true, .drafter = work.path / "drafter"});
+        CHECK(drafts(*planted).logits != theirs.logits);
+    }
+
+    TEST_CASE("gemma4-assistant: refusals name what is wrong") {
+        const TempDir work("xs_gguf_gemma4_assistant_refusal_test");
+        CHECK(assistant_refusal(work.path, [](GgufWriter&) {}).empty());
+        CHECK(has(assistant_refusal(work.path,
+                                    [](GgufWriter& w) {
+                                        w.drop_value("gemma4-assistant.attention.shared_kv_layers")
+                                            .u32("gemma4-assistant.attention.shared_kv_layers", 1);
+                                    }),
+                  "gemma4-assistant.attention.shared_kv_layers is 1; an assistant's 2 layers all draft over the "
+                  "target's KV"));
+        CHECK(has(assistant_refusal(work.path,
+                                    [](GgufWriter& w) {
+                                        w.drop_value("gemma4-assistant.embedding_length_per_layer_input")
+                                            .u32("gemma4-assistant.embedding_length_per_layer_input", 32);
+                                    }),
+                  "gemma4-assistant: embedding_length_per_layer_input is 32"));
+        CHECK(has(assistant_refusal(work.path, [](GgufWriter& w) { w.drop_tensor("nextn.post_projection.weight"); }),
+                  "no tensor for 'post_projection.weight' (the model's)"));
+        // The centroid head llama.cpp's converter leaves out has no place in the pack.
+        CHECK(has(assistant_refusal(work.path,
+                                    [](GgufWriter& w) {
+                                        w.f32_tensor("masked_embd_centroids.weight", {64, 16},
+                                                     std::vector<float>(1024));
+                                    }),
+                  "tensor 'masked_embd_centroids.weight' has no counterpart in the model"));
+        CHECK(has(assistant_refusal(work.path, [](GgufWriter& w) { w.u32("gemma4-assistant.expert_count", 4); }),
+                  "mixture-of-experts Gemma 4 (26B-A4B) is not supported yet"));
+    }
+
     TEST_CASE("gemma4: refusals name what is wrong") {
         const TempDir work("xs_gguf_gemma4_refusal_test");
         CHECK(refusal(work.path, [](GgufWriter&) {}).empty());
@@ -265,10 +390,5 @@ TEST_SUITE("gguf import gemma4") {
                               w.drop_value("tokenizer.ggml.unknown_token_id").u32("tokenizer.ggml.unknown_token_id", 4);
                           }),
                   "tokenizer.ggml.unknown_token_id is '<mask>', which disagrees"));
-        CHECK(has(refusal(work.path,
-                          [](GgufWriter& w) {
-                              w.drop_value("general.architecture").string("general.architecture", "gemma4-assistant");
-                          }),
-                  "'gemma4-assistant' (a Gemma 4 assistant, the drafter) is not supported yet"));
     }
 }

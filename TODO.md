@@ -284,8 +284,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       every tensor of unsloth's BF16 file
 - [x] GGUF block formats on the GPU: all 19, kept in the file's bits (decision 0016); every file of
       unsloth/Qwen3.5-4B-GGUF runs at its size
-- [ ] GGUF: more architectures (`qwen35moe`, Gemma 4 26B-A4B (`gemma4` with experts), the Gemma 4 assistant
-      (`gemma4-assistant`), LFM3)
+- [x] GGUF: the Gemma 4 assistant (`gemma4-assistant`) as a drafter, with the whole-vocabulary head llama.cpp
+      computes (the file has no centroid head)
+- [ ] GGUF: more architectures (`qwen35moe`, Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
 - [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
 - [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)
 - [ ] GGUF: a matrix-engine GEMV over block formats (a speculative verify of several rows runs at a third of a

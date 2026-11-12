@@ -197,7 +197,7 @@ std::vector<float> float_rows(const gguf::TensorInfo& t, int64_t first, int64_t 
 }
 
 const Architecture& find_architecture(std::string_view name) {
-    const std::vector<const Architecture*> all{&qwen35(), &gemma4()};
+    const std::vector<const Architecture*> all{&qwen35(), &gemma4(), &gemma4_assistant()};
     std::string list;
     for (const Architecture* a : all) {
         if (a->name() == name) return *a;
@@ -205,10 +205,6 @@ const Architecture& find_architecture(std::string_view name) {
     }
     if (name == "qwen35moe") {
         fail("GGUF architecture 'qwen35moe' (Qwen3.5 mixture of experts) is not supported yet (supported: ", list, ")");
-    }
-    if (name == "gemma4-assistant") {
-        fail("GGUF architecture 'gemma4-assistant' (a Gemma 4 assistant, the drafter) is not supported yet ",
-             "(supported: ", list, ")");
     }
     fail("GGUF architecture '", name, "' is not supported (supported: ", list, ")");
 }
@@ -221,11 +217,18 @@ ImportReport import_gguf(const ImportOptions& o) {
     check_general(file);
     const std::string architecture(file.get_string("general.architecture"));
     ImportPlan plan = find_architecture(architecture).plan(file);
-    const TokenizerFiles tokenizer = tokenizer_files(file);
-    const std::string chat = chat_template(file);
-    const std::optional<nlohmann::ordered_json> generation = generation_config(file);
-    plan.config["eos_token_id"] = tokenizer.stop_ids.size() == 1 ? nlohmann::ordered_json(tokenizer.stop_ids[0])
-                                                                 : nlohmann::ordered_json(tokenizer.stop_ids);
+    // A language model's tokenizer, chat template and sampling defaults (a drafter has the target's).
+    std::optional<TokenizerFiles> tokenizer;
+    std::string chat;
+    std::optional<nlohmann::ordered_json> generation;
+    if (!plan.drafter) {
+        tokenizer = tokenizer_files(file);
+        chat = chat_template(file);
+        generation = generation_config(file);
+        const std::vector<int32_t>& stops = tokenizer->stop_ids;
+        plan.config["eos_token_id"] =
+            stops.size() == 1 ? nlohmann::ordered_json(stops[0]) : nlohmann::ordered_json(stops);
+    }
     check_coverage(file, plan);
 
     std::sort(plan.tensors.begin(), plan.tensors.end(),
@@ -245,17 +248,18 @@ ImportReport import_gguf(const ImportOptions& o) {
     log::info("gguf: writing ", units.size(), " tensors to ", (o.output / "model.safetensors").string());
     write_safetensors(o.output / "model.safetensors", units, {{"format", "pt"}});
     write_json(o.output / "config.json", plan.config, 2);
-    write_json(o.output / "tokenizer.json", tokenizer.tokenizer, -1);
-    write_json(o.output / "tokenizer_config.json", tokenizer.config, 2);
-    if (generation) write_json(o.output / "generation_config.json", *generation, 2);
-    {
+    if (tokenizer) {
+        write_json(o.output / "tokenizer.json", tokenizer->tokenizer, -1);
+        write_json(o.output / "tokenizer_config.json", tokenizer->config, 2);
+        if (generation) write_json(o.output / "generation_config.json", *generation, 2);
         std::ofstream out(o.output / "chat_template.jinja", std::ios::binary);
         out << chat;
         if (!out) fail("gguf import: writing chat_template.jinja failed");
+        out.close();
+        // The tokenizer as the engine will load it: one whose merges do not fit its vocabulary is refused now rather
+        // than when the pack is served.
+        tok::Tokenizer::load(o.output);
     }
-    // The tokenizer as the engine will load it: one whose merges do not fit its vocabulary is refused now rather than
-    // when the pack is served.
-    tok::Tokenizer::load(o.output);
 
     nlohmann::ordered_json manifest;
     manifest["pack_version"] = kPackVersion;

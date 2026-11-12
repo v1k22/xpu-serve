@@ -10,7 +10,7 @@
 // control; every score -1000.
 //
 // And its twin: the Hugging Face checkpoint those bytes stand for, every weight as the f32 values the file's blocks
-// decode to.
+// decode to. The same for a tiny assistant drafting for it (gemma4-assistant).
 
 #include <filesystem>
 #include <fstream>
@@ -281,6 +281,99 @@ inline GgufWriter build_tiny_gemma4_gguf(const std::filesystem::path& dir, uint3
     for (const char* name : {"tokenizer.json", "tokenizer_config.json", "chat_template.jinja"}) {
         fs::copy_file(dir / "hf" / name, dir / "twin" / name, fs::copy_options::overwrite_existing);
     }
+    return w;
+}
+
+// The tiny assistant's GGUF, as Gemma4AssistantModel writes one: gemma4-assistant.* metadata (every layer drafting
+// over the target's KV), the tokenizer without a chat template, nextn.*_projection, no centroid head. Writes, under
+// `dir`: hf-assistant/ (the checkpoint) and twin-assistant/ (the checkpoint the GGUF stands for).
+inline GgufWriter build_tiny_gemma4_assistant_gguf(const std::filesystem::path& dir, uint32_t seed) {
+    namespace fs = std::filesystem;
+    const TinyGemma4 target = tiny_gemma4_gguf_model();
+    const TinyGemma4Assistant a;
+    write_tiny_gemma4_assistant(dir / "hf-assistant", a, target, seed);
+    const auto layers = static_cast<int64_t>(a.layers.size());
+    const int64_t h = a.hidden;
+    const auto full = [&](int64_t i) { return a.layers[static_cast<size_t>(i)] == "full_attention"; };
+    std::vector<int32_t> kv;
+    std::vector<bool> sliding;
+    for (int64_t i = 0; i < layers; ++i) {
+        kv.push_back(static_cast<int32_t>(full(i) ? target.global_kv_heads : target.kv_heads));
+        sliding.push_back(!full(i));
+    }
+    const std::string A = "gemma4-assistant.";
+    GgufWriter w;
+    w.string("general.architecture", "gemma4-assistant")
+        .string("general.type", "model")
+        .string("general.name", "Tiny Gemma 4 assistant")
+        .u32("general.file_type", 7)
+        .u32("general.quantization_version", 2)
+        .u32(A + "block_count", static_cast<uint32_t>(layers))
+        .u32(A + "context_length", 4096)
+        .u32(A + "embedding_length", static_cast<uint32_t>(h))
+        .u32(A + "feed_forward_length", static_cast<uint32_t>(a.ffn))
+        .u32(A + "attention.head_count", static_cast<uint32_t>(a.heads))
+        .i32s(A + "attention.head_count_kv", kv)
+        .f32(A + "rope.freq_base", 1e6f)
+        .f32(A + "rope.freq_base_swa", 1e4f)
+        .f32(A + "attention.layer_norm_rms_epsilon", 1e-6f)
+        .u32(A + "attention.key_length", static_cast<uint32_t>(target.global_head_dim))
+        .u32(A + "attention.value_length", static_cast<uint32_t>(target.global_head_dim))
+        .u32(A + "attention.sliding_window", static_cast<uint32_t>(target.window))
+        .u32(A + "attention.shared_kv_layers", static_cast<uint32_t>(layers))
+        .u32(A + "embedding_length_per_layer_input", 0)
+        .bools(A + "attention.sliding_window_pattern", sliding)
+        .u32(A + "attention.key_length_swa", static_cast<uint32_t>(target.head_dim))
+        .u32(A + "attention.value_length_swa", static_cast<uint32_t>(target.head_dim))
+        .u32(A + "rope.dimension_count", static_cast<uint32_t>(target.global_head_dim))
+        .u32(A + "rope.dimension_count_swa", static_cast<uint32_t>(target.head_dim))
+        .u32(A + "embedding_length_out", static_cast<uint32_t>(target.hidden))
+        .u32(A + "nextn_predict_layers", static_cast<uint32_t>(layers));
+    add_gemma4_tokenizer_metadata(w, tiny_gemma4_tokenizer_json());
+    w.drop_value("tokenizer.chat_template")
+        .drop_value("tokenizer.ggml.eos_token_id")
+        .u32("tokenizer.ggml.eos_token_id", 1);
+
+    const auto source = SafetensorsWeights::open_dir(dir / "hf-assistant");
+    const auto values = [&](const std::string& name) {
+        const TensorView& v = source->get(name);
+        std::vector<float> out(static_cast<size_t>(v.numel()));
+        quant::read_rows(v, 0, quant::matrix_rows(v.shape), out.data());
+        return out;
+    };
+    const auto same = [](const std::vector<float>& v) { return v; };
+    TinyGgufBuilder b(w);
+    int matrices = 0;
+    const auto next_block = [&] { return matrices++ % 2 == 0 ? Storage::Q8_0 : Storage::Q4_0; };
+    const auto tensor = [&](const std::string& gguf, const std::string& hf, const Dims& shape, Storage s) {
+        b.put(gguf, shape, values(hf), s, same, {{hf, shape}});
+    };
+    tensor("token_embd.weight", "model.embed_tokens.weight", {target.vocab, h}, Storage::Q8_0);
+    tensor("output_norm.weight", "model.norm.weight", {h}, Storage::F32);
+    tensor("nextn.pre_projection.weight", "pre_projection.weight", {h, 2 * target.hidden}, Storage::Q8_0);
+    tensor("nextn.post_projection.weight", "post_projection.weight", {target.hidden, h}, Storage::Q4_0);
+    std::vector<float> factors(static_cast<size_t>(target.global_head_dim / 2), 1e30f);
+    std::fill_n(factors.begin(), target.global_head_dim / 8, 1.0f);
+    w.f32_tensor("rope_freqs.weight", {target.global_head_dim / 2}, factors);
+    for (int64_t i = 0; i < layers; ++i) {
+        const std::string B = "blk." + std::to_string(i) + ".", L = "model.layers." + std::to_string(i) + ".";
+        const int64_t hd = full(i) ? target.global_head_dim : target.head_dim;
+        tensor(B + "attn_norm.weight", L + "input_layernorm.weight", {h}, Storage::F32);
+        tensor(B + "attn_q.weight", L + "self_attn.q_proj.weight", {a.heads * hd, h}, next_block());
+        tensor(B + "attn_q_norm.weight", L + "self_attn.q_norm.weight", {hd}, Storage::F32);
+        tensor(B + "attn_output.weight", L + "self_attn.o_proj.weight", {h, a.heads * hd}, next_block());
+        tensor(B + "post_attention_norm.weight", L + "post_attention_layernorm.weight", {h}, Storage::F32);
+        tensor(B + "ffn_norm.weight", L + "pre_feedforward_layernorm.weight", {h}, Storage::F32);
+        tensor(B + "ffn_gate.weight", L + "mlp.gate_proj.weight", {a.ffn, h}, next_block());
+        tensor(B + "ffn_up.weight", L + "mlp.up_proj.weight", {a.ffn, h}, next_block());
+        tensor(B + "ffn_down.weight", L + "mlp.down_proj.weight", {h, a.ffn}, i == 1 ? Storage::BF16 : next_block());
+        tensor(B + "post_ffw_norm.weight", L + "post_feedforward_layernorm.weight", {h}, Storage::F32);
+        tensor(B + "layer_output_scale.weight", L + "layer_scalar", {1}, Storage::F32);
+    }
+    fs::create_directories(dir / "twin-assistant");
+    write_safetensors(dir / "twin-assistant" / "model.safetensors", b.twin_units());
+    fs::copy_file(dir / "hf-assistant" / "config.json", dir / "twin-assistant" / "config.json",
+                  fs::copy_options::overwrite_existing);
     return w;
 }
 
