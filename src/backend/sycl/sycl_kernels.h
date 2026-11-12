@@ -211,6 +211,9 @@ void gemv(sycl::queue& q, const float* x, const W* w, float* y, int64_t m, int64
 
 // A quantized weight [N, K] on the device (pack formats, tensor.h QuantParams): Q8 codes int8 [N, K]; Q4 codes
 // [N, K / 2] with the even column in the low nibble; f16 scales and (Q4) biases [N, K / group]; group >= 32.
+// Or, with `block` set, a weight in a GGUF block format (sycl_block_kernels.h) and none of the other fields: the
+// GEMV, dequantize and gather below read it through the block kernels, and no other kernel takes it.
+struct BlockWeight;
 struct QuantWeight {
     bool q4 = true;
     const uint8_t* codes = nullptr;
@@ -218,6 +221,7 @@ struct QuantWeight {
     const half* biases = nullptr;
     const float* input_scales = nullptr;  // AWQ: [K], multiplies column k of the dequantized weight; or null
     int64_t group = 0;
+    const BlockWeight* block = nullptr;  // on the host; kernels never follow it
 };
 // y [M, N] = x [M, K] @ dequant(w)^T for M <= kGemvMaxRows; K a multiple of 32.
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k);

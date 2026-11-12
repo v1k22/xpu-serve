@@ -8,6 +8,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 
+#include "backend/sycl/sycl_block_kernels.h"
 #include "util/error.h"
 
 namespace xs::sycl_be {
@@ -1710,6 +1711,7 @@ size_t expert_grouping_bytes(int64_t pairs, int64_t experts) {
 template <typename I>
 void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const QuantWeight& w, const I* idx, float* out,
                          int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping) {
+    XS_CHECK(w.block == nullptr, "sycl expert_matmul_quant: an expert bank in a GGUF block format");
     const int64_t pairs = tokens * slots;
     if (pairs <= kExpertPairsDirect || grouping == nullptr) {
         quant_dispatch(w, [&]<bool Q4, bool AWQ>() {
@@ -1871,7 +1873,8 @@ void gemv(sycl::queue& q, const float* x, const W* w, float* y, int64_t m, int64
 }
 
 bool quant_gemv_parts_match(const QuantWeight& a, const QuantWeight& b) {
-    return a.q4 == b.q4 && (a.input_scales == nullptr) == (b.input_scales == nullptr);
+    return a.block == nullptr && b.block == nullptr && a.q4 == b.q4 &&
+           (a.input_scales == nullptr) == (b.input_scales == nullptr);
 }
 
 void gemv_quant_parts(sycl::queue& q, const float* x, const QuantGemvPart* parts, int count, int64_t m, int64_t k) {
@@ -1890,6 +1893,7 @@ void gemv_quant_parts(sycl::queue& q, const float* x, const QuantGemvPart* parts
 }
 
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k) {
+    if (w.block != nullptr) return gemv_block(q, x, *w.block, y, m, n, k);
     const QuantGemvPart part{w, y, n};
     gemv_quant_parts(q, x, &part, 1, m, k);
 }
@@ -1925,6 +1929,7 @@ void dequantize_t(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64
 
 template <typename T>
 void dequantize(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k) {
+    if (w.block != nullptr) return dequantize_block(q, *w.block, out, n, k);
     if (w.q4) {
         dequantize_t<T, true>(q, w, out, n, k);
     } else {
@@ -1937,6 +1942,7 @@ template void dequantize<float>(sycl::queue&, const QuantWeight&, float*, int64_
 
 template <typename I>
 void gather_quant(sycl::queue& q, const QuantWeight& table, const I* ids, float* out, int64_t count, int64_t width) {
+    if (table.block != nullptr) return gather_block(q, *table.block, ids, out, count, width);
     const QuantWeight t = table;
     syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(count), static_cast<size_t>(width)), [=](sycl::item<2> it) {
         const int64_t i = static_cast<int64_t>(it[0]);

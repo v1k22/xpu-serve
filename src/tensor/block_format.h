@@ -13,25 +13,30 @@ namespace xs {
 // (DType::Block; TensorView::block names the format) and decodes blocks where it reads them: quant/block_decode.h on
 // the host, the backends' kernels on a device. The value of every weight is the one ggml's dequantization gives.
 enum class BlockFormat : uint8_t {
+    // 32 weights: codes of 4, 5 or 8 bits under one scale (and, _1, one minimum)
     Q4_0,
     Q4_1,
     Q5_0,
     Q5_1,
-    Q8_0,  // 32 weights: codes of 4, 5 or 8 bits, one scale (and, _1, one minimum)
+    Q8_0,
+    // 256 weights in sub-blocks of 16 or 32 with small scales under one f16
     Q2_K,
     Q3_K,
     Q4_K,
     Q5_K,
-    Q6_K,  // 256 weights in sub-blocks of 16 or 32 with small scales under one f16
+    Q6_K,
+    // 256 weights: indexes into tables of 8 magnitudes, signs apart
     IQ1_S,
     IQ1_M,
     IQ2_XXS,
     IQ2_XS,
-    IQ2_S,  // 256 weights: indexes into tables of 8 magnitudes, signs apart
+    IQ2_S,
+    // 256 weights: indexes into tables of 4 magnitudes, signs apart
     IQ3_XXS,
-    IQ3_S,  // 256 weights: indexes into tables of 4 magnitudes, signs apart
+    IQ3_S,
+    // 32 / 256 weights: 4-bit indexes into 16 unevenly spaced values
     IQ4_NL,
-    IQ4_XS,  // 32 / 256 weights: 4-bit indexes into 16 unevenly spaced values
+    IQ4_XS,
 };
 inline constexpr int kBlockFormats = 19;
 

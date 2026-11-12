@@ -37,7 +37,7 @@ void matmul_half_y(sycl::queue& q, Scratch& scratch, const X* x, const half* w, 
 // version (gemv_quant_xmx, whose cost hardly grows with the rows: a speculative verify); beyond, a matrix-engine kernel
 // that dequantizes the weight on the way (quant_gemm for a few rows, quant_gemm_tiled for many) or, past those, the
 // weight dequantized once to f16 (f32 in f32 precision) and multiplied by oneMKL's GEMM. The paths past the GEMVs
-// read x in f16.
+// read x in f16. A GGUF block format takes the GEMV or the dequantized weight.
 enum class QuantPath : uint8_t { Gemv, GemvXmx, FewRows, Tiled, Dequant };
 struct QuantMatmulPlan {  // what the device favours, set once per session
     bool f32 = false;           // f32 precision: the GEMV, else dequantize to f32 and oneMKL
@@ -45,6 +45,7 @@ struct QuantMatmulPlan {  // what the device favours, set once per session
     int64_t few_rows = 0;       // quant_gemm up to this many rows, at most kQuantGemmMaxRows (0: never)
     int64_t tiled_rows = 0;     // quant_gemm_tiled up to this many rows (0: never)
     int64_t compute_units = 0;  // the matrix-engine kernels' split of K
+    bool block_float = false;   // GGUF block-format weights are decoded to floats as they are uploaded
 };
 // The path for these shapes and this weight (x assumed 64-byte aligned; matmul_quant falls back to Dequant if not).
 QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const QuantMatmulPlan& plan);

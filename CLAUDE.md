@@ -54,7 +54,8 @@ build/src/xpu-serve run   <decision-model-dir> --device GPU --request request.js
   of time for the Arc Pro B60. Any other C++20 compiler builds only the CPU reference backend (the test oracle).
 - Useful flags: `--backend sycl|cpu-ref` (default: sycl when built), `--device GPU|GPU.0|GPU.1`, `--precision f16|f32`,
   `--kv-dtype auto|i8`, `--ctx N`, `--prefill-chunk N`, `--backend-opt attention=auto|rows|gemm`,
-  `--backend-opt gemv=auto|vector|xmx`, `--backend-opt few_rows=N`, `--spec mtp|dflash|dspine --spec-k N`,
+  `--backend-opt gemv=auto|vector|xmx`, `--backend-opt few_rows=N`, `--backend-opt block=auto|f16`,
+  `--spec mtp|dflash|dspine --spec-k N`,
   `--readout letters|openjev` (a language model served as a decision model),
   `--drafter <dir>`,
   `--draft-shortlist N`, `--no-vision`,
@@ -147,6 +148,8 @@ area).
 | `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond; quantized: `quant_path` picks the GEMV or its matrix-engine version, quant_gemm, quant_gemm_tiled or dequantize + oneMKL per device and shape) and Attention (per-row kernel with split-K, the fused kernel, or GEMMs) |
 | `src/backend/sycl/sycl_flash_attention.cpp` | Fused attention on the matrix engines (joint_matrix; head_dim up to 128; blocks of tokens in one launch) |
 | `src/backend/sycl/sycl_quant_gemm.cpp` | Quantized matmuls on the matrix engines (DPAS and 2D block load builtins): gemv_quant_xmx (up to 8 rows at about the cost of one: a speculative verify; x in f16 and its group sums from one small launch before), quant_gemm (9 to 64 rows, the weight read once, 64 bytes of codes a lane and 32 rows of x a load; weights that read the same x share a launch) and quant_gemm_tiled (many rows: each weight tile dequantized once per work-group of 512 rows into local memory, no f16 copy of the weight) |
+| `src/backend/sycl/sycl_block_layout.cpp` | GGUF block-format weights for the device: a block's fields regrouped into aligned streams with codes in column order (the same bits, nothing re-encoded); Q4_0, Q4_1 and Q8_0 rewritten as a pack's q4 / q8 with a group of 32 (the same values), which the pack kernels then read |
+| `src/backend/sycl/sycl_block_kernels.cpp` | Kernels over those streams, one decoder per format (`Fmt<F>`: K-quants read their codes without an int-to-float conversion, codebook formats look their magnitudes up in a table on the device): the GEMV (up to 8 rows, each weight read once), the weight written out as f16 / f32 for a GEMM, rows gathered by id. `QuantWeight::block` routes a weight to them through the pack kernels' entry points |
 | `src/engine/engine.cpp` | Generation loop for one sequence; encodes images and splices their rows into prefill chunks; speculative rounds (`spec_round`) |
 | `src/models/model.h` (`Speculation`) | What a model with a drafter adds: prefill, verify and draft programs, and its way of drafting (`ChainDrafting`: a token a run from the target's `hidden`; `BlockDrafting`: a block a run from state the target's programs write) |
 | `src/service/engine_service.cpp` | Wiring from a model directory to a ready service |
@@ -232,7 +235,7 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 | Backend | Status | Notes |
 |---|---|---|
 | `cpu-ref` | test oracle | f32 values, f64 accumulation, threaded matmul. Slow by design; correctness only |
-| `sycl` | main GPU backend, the default when built (icpx turns it on) | Runs the graph op by op on an in-order Level Zero queue with its own kernels; oneMKL for prefill GEMMs. Weights and KV f16 (f32 at f32 precision), activations f32; `--kv-dtype i8` stores KV as int8 with an f32 scale per (token, KV head): decode attention reads the codes, prefill dequantizes the keys in view to f16 for its GEMMs. Memory: one arena per step, planned per T from value lifetimes; KV slots grow by doubling; conv/recurrent state double-buffered so a failed step changes nothing. Fuses act(x)*gate and conv+SiLU. Decode attention reads only the sliding window and splits long caches across work-groups. Options `attention=auto|rows|gemm`, `gemv=auto|vector|xmx` (quantized matmuls of up to 8 rows: the GEMV, or its matrix-engine version from 4 rows), `few_rows=N` (quantized matmuls of 9 to N rows on quant_gemm, 64 by default; 0: dequantize + GEMM). See docs/decisions/0007 |
+| `sycl` | main GPU backend, the default when built (icpx turns it on) | Runs the graph op by op on an in-order Level Zero queue with its own kernels; oneMKL for prefill GEMMs. Weights and KV f16 (f32 at f32 precision), activations f32; `--kv-dtype i8` stores KV as int8 with an f32 scale per (token, KV head): decode attention reads the codes, prefill dequantizes the keys in view to f16 for its GEMMs. Memory: one arena per step, planned per T from value lifetimes; KV slots grow by doubling; conv/recurrent state double-buffered so a failed step changes nothing. Fuses act(x)*gate and conv+SiLU. Decode attention reads only the sliding window and splits long caches across work-groups. Options `attention=auto|rows|gemm`, `gemv=auto|vector|xmx` (quantized matmuls of up to 8 rows: the GEMV, or its matrix-engine version from 4 rows), `few_rows=N` (quantized matmuls of 9 to N rows on quant_gemm, 64 by default; 0: dequantize + GEMM). GGUF block formats keep the file's bits, regrouped for aligned loads (`block=f16` decodes them to f16 instead: the reference the kernels are tested against). See docs/decisions/0007 |
 
 ## 7. Tests (`tests/`)
 
@@ -255,6 +258,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/quant/test_block_decode.cpp` | every GGUF block format decoded on the host, on random and edge blocks; the block layouts and codebook tables; planted wrong layouts | ggml's own `dequantize_row_*`, bit for bit, in `tests/fixtures/quant/blocks/` (`tests/parity/quant/gen_block_cases.py`) |
 | `tests/unit/quant/test_block_weights.cpp` | weights in GGUF block formats: rows read whole, in part and of 3-D banks, a pack's block format entries and their refusals, the sign sketch of one | values written from the formats' fields; the same weight decoded whole |
 | `tests/unit/backend/cpu_block_ops.cpp` | MatMul, Gather and ExpertMatMul reading block format weights on cpu-ref | the same graph over the decoded f32 weights, bit for bit |
+| `tests/unit/backend/device_block_ops.cpp` | MatMul (every row count the GEMV's variants take, and past them through a GEMM, with a residual folded in) and Gather reading block format weights on the GPU, and the same with `block=f16`; timing by format with `XS_DEVICE_BENCH=1` (`device_block_timing.cpp`) | fp64 over the values the host decodes; blocks of random bytes |
 | `tests/unit/test_fp8.cpp` | FP8 checkpoints: the E4M3 code table, codes paired with their block scales, tensors joined row-wise, rows read whole and in part, refusals | values written from the codes' fields and the blocks' indices; planted swapped grid |
 | `tests/unit/model/fp8_checkpoint.cpp` | a tiny Qwen3.5 (dense; mixture of experts stored expert by expert) written the way an FP8 release stores it: weights, logits (cpu-ref and GPU) and `convert`'s packs; `quantization_config` refusals | the same checkpoint with the decoded values in the usual layout (`tiny_checkpoints.h`) |
 | `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp`, `lfm3_config.cpp` | config parsing and refusals | |
@@ -401,7 +405,12 @@ draft program, and one way of drafting. The engine needs nothing new.
   reference runtime does. It is half the download; `convert` makes the pack that is smaller and faster to serve.
   Other quantized checkpoints (bitsandbytes, AWQ, GPTQ, GGUF) are refused by name.
 - A pack can hold weights in GGUF's block formats (`DType::Block`, kept as the file stores them): the host decodes all
-  19 as ggml does, so cpu-ref runs them; the SYCL backend refuses them.
+  19 as ggml does, so cpu-ref runs them. The SYCL backend has kernels for 14 (Q4_0, Q4_1, Q8_0, Q2_K to Q6_K, IQ4_NL,
+  IQ4_XS, IQ3_XXS, IQ3_S, IQ2_XXS, IQ2_S) and refuses Q5_0, Q5_1, IQ1_S, IQ1_M and IQ2_XS by name, as it does an
+  expert bank in any of them; `--backend-opt block=f16` decodes block formats to f16 as it uploads them (any format,
+  at f16's size). Up to 8 rows a block format's matmul is a GEMV whose cost grows with the rows (no matrix-engine
+  version: a speculative verify over such weights is slow), past them the weight is dequantized for a GEMM. Q4_0
+  takes a ninth more device memory than its file (its q4 form stores a bias per group).
 - Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)
   and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 for oneMKL's GEMM, except
   on integrated GPUs up to 512 rows (quant_gemm / quant_gemm_tiled dequantize on the way; sycl_be::quant_path).

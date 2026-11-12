@@ -120,6 +120,7 @@ bool xmx_gemv(int64_t m, const QuantGemvPart* parts, int count, int64_t k, const
 }
 
 QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const QuantMatmulPlan& plan) {
+    if (w.block != nullptr) return m <= kGemvMaxRows ? QuantPath::Gemv : QuantPath::Dequant;
     if (m <= kGemvMaxRows) {
         const QuantGemvPart part{w, nullptr, n};
         return xmx_gemv(m, &part, 1, k, plan) ? QuantPath::GemvXmx : QuantPath::Gemv;

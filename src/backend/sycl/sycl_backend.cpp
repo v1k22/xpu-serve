@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -15,6 +16,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "backend/sycl/sycl_block_kernels.h"
 #include "backend/sycl/sycl_kernels.h"
 #include "backend/sycl/sycl_matmul.h"
 #include "quant/quant.h"
@@ -203,9 +205,10 @@ constexpr int64_t kXmxGemvRows = 4;
 // How quantized matmuls run (the GEMV option: auto, vector = the GEMV only, xmx = its matrix-engine version from one
 // row, where it fits; few_rows: the most rows quant_gemm takes, the device's own choice when negative).
 sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::AttentionPlan& attention, DType precision,
-                                    const std::string& gemv, int64_t few_rows) {
+                                    const std::string& gemv, int64_t few_rows, bool block_float) {
     sycl_be::QuantMatmulPlan p;
     p.f32 = precision == DType::F32;
+    p.block_float = block_float;
     p.compute_units = attention.compute_units;
     if (attention.xmx && !p.f32 && gemv != "vector") p.xmx_gemv_rows = gemv == "xmx" ? 1 : kXmxGemvRows;
     if (attention.xmx) {
@@ -244,6 +247,12 @@ struct SharedLeaf {
     char* ptr = nullptr;
     sycl_be::QuantWeight quant;
 };
+
+// A weight the device keeps quantized: a pack's q8 / q4, or a GGUF block format (unless the session decodes those
+// to floats as it uploads them, in which case no value has the dtype).
+bool device_quantized(DType t) {
+    return is_quantized(t) || t == DType::Block;
+}
 
 class SyclShared final : public sycl_be::Scratch {
 public:
@@ -298,6 +307,8 @@ public:
     std::vector<SharedFixed> fixed;
     std::map<std::pair<std::string, DType>, SharedLeaf> weights;  // uploaded weights by name and device dtype
     std::vector<DeviceBuffer> weight_buffers;
+    std::vector<std::unique_ptr<sycl_be::BlockWeight>> block_weights;  // what a QuantWeight::block points at
+    std::map<BlockFormat, const uint32_t*> block_grids;                // codebook tables, uploaded once each
     DeviceBuffer arena;
     GrowingScratch kv_scratch{q};  // the int8 KV cache dequantized for prefill attention
 
@@ -684,7 +695,8 @@ private:
                 consumers[static_cast<size_t>(nodes[i].inputs[k].node)].emplace_back(i, k);
         }
         const auto device_type = [&](size_t i, DType t) {
-            if (is_quantized(t)) return t;  // check_ops makes sure only matmuls and gathers read it
+            if (t == DType::Block && quant_.block_float) return DType::F32;  // decoded as it is uploaded
+            if (device_quantized(t)) return t;  // check_ops makes sure only matmuls and gathers read it
             if (is_float(t) || t == DType::F8) return DType::F32;  // an fp8 weight is decoded as it is uploaded
             XS_CHECK(t == DType::I32 || t == DType::I64, where(i), ": dtype ", dtype_name(t), " is not supported");
             return t;
@@ -765,7 +777,7 @@ private:
             const auto is_fp = [&](size_t k) { return dt(n.inputs[k]) == DType::F32 || dt(n.inputs[k]) == DType::F16; };
             // A quantized weight is read straight from its Weight node (no views) by a matmul or a gather.
             const auto is_packed = [&](size_t k) {
-                return is_quantized(dt(n.inputs[k])) && graph_.node(n.inputs[k]).kind == OpKind::Weight;
+                return device_quantized(dt(n.inputs[k])) && graph_.node(n.inputs[k]).kind == OpKind::Weight;
             };
             switch (n.kind) {
                 case OpKind::Input:
@@ -775,15 +787,16 @@ private:
                 case OpKind::Reshape:
                 case OpKind::Slice:
                 case OpKind::Transpose:
-                    need(0, !is_quantized(dt(n.inputs[0])), "an unquantized tensor");
+                    need(0, !device_quantized(dt(n.inputs[0])), "an unquantized tensor");
                     break;
                 case OpKind::Gather:
-                    need(0, is_fp(0) || is_packed(0) || dt(n.inputs[0]) == DType::I32, "f16, f32, q8, q4 or i32");
+                    need(0, is_fp(0) || is_packed(0) || dt(n.inputs[0]) == DType::I32,
+                         "f16, f32, q8, q4, a GGUF block format or i32");
                     need(1, is_int(1), "i32 or i64");
                     break;
                 case OpKind::MatMul: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8 or q4");
+                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8, q4 or a GGUF block format");
                     const int64_t k = graph_.type(n.inputs[1]).shape[1];
                     XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized weight needs a multiple of 32 "
                              "columns, got ", k);
@@ -792,11 +805,13 @@ private:
                 case OpKind::Concat:
                     for (size_t k = 1; k < n.inputs.size(); ++k)
                         need(k, dt(n.inputs[k]) == dt(n.inputs[0]), "the dtype of input 0");
-                    need(0, !is_quantized(dt(n.inputs[0])), "an unquantized tensor");
+                    need(0, !device_quantized(dt(n.inputs[0])), "an unquantized tensor");
                     break;
                 case OpKind::ExpertMatMul: {
                     need(0, is_f32(0), "f32");
                     need(1, is_fp(1) || is_packed(1), "f16, f32, q8 or q4");
+                    XS_CHECK(dt(n.inputs[1]) != DType::Block, where(i), ": an expert bank in a GGUF block format is "
+                             "not supported yet (--backend-opt block=f16 decodes block formats to f16)");
                     need(2, is_int(2), "i32 or i64");
                     const int64_t k = graph_.type(n.inputs[1]).shape[2];
                     XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized expert bank needs a multiple of 32 "
@@ -1012,7 +1027,7 @@ private:
                 const Node& m = nodes[mm];
                 if (m.kind != OpKind::MatMul || readers[mm] != 1 || fused_[mm] != Fused::No) continue;
                 const DType wt = dt(m.inputs[1]);
-                if ((wt != DType::F16 && !is_quantized(wt)) || graph_.type(n.inputs[k]).shape != out) continue;
+                if ((wt != DType::F16 && !device_quantized(wt)) || graph_.type(n.inputs[k]).shape != out) continue;
                 const Dims& x = graph_.type(m.inputs[0]).shape;
                 if (std::any_of(x.begin(), x.end(), [](int64_t v) { return v == kT || v == kL; }) ||
                     numel(x) / x.back() <= sycl_be::kGemvMaxRows)
@@ -1065,7 +1080,7 @@ private:
         std::map<std::pair<int32_t, int32_t>, size_t> filling;  // x -> the MatMul collecting its siblings
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
-            if (n.kind != OpKind::MatMul || fused_[i] != Fused::No || !is_quantized(dt(n.inputs[1])) ||
+            if (n.kind != OpKind::MatMul || fused_[i] != Fused::No || !device_quantized(dt(n.inputs[1])) ||
                 nodes[static_cast<size_t>(n.inputs[1].node)].kind != OpKind::Weight)
                 continue;
             const auto x = std::make_pair(n.inputs[0].node, n.inputs[0].index);
@@ -1162,7 +1177,7 @@ private:
         // a quantized matmul past the GEMV's rows: every path there reads x in f16 (sycl_be::QuantPath)
         const auto quant_matmul = [&](size_t m) {
             const Node& n = nodes[m];
-            if (n.kind != OpKind::MatMul || !is_quantized(dt(n.inputs[1]))) return false;
+            if (n.kind != OpKind::MatMul || !device_quantized(dt(n.inputs[1]))) return false;
             const Dims& x = graph_.type(n.inputs[0]).shape;
             return static_shape(x) && numel(x) / x.back() > sycl_be::kGemvMaxRows;
         };
@@ -1269,6 +1284,54 @@ private:
         leaf_quant_[node] = w;
     }
 
+    // A GGUF block-format weight: as a pack's q8 / q4 where that is the same values (the pack kernels then read
+    // it), else in the block kernels' layout.
+    void upload_block(size_t node, const std::string& name, const TensorView& view) {
+        const int64_t cols = view.shape.back();
+        const int64_t rows = numel(view.shape) / cols;
+        const auto* blocks = static_cast<const uint8_t*>(view.data);
+        const auto copy = [&](const void* src, size_t bytes) {
+            shared_.weight_buffers.emplace_back(q_, std::max<size_t>(bytes, 1));
+            q_.memcpy(shared_.weight_buffers.back().get(), src, bytes).wait();
+            return shared_.weight_buffers.back().get();
+        };
+        sycl_be::QuantWeight w;
+        if (sycl_be::block_as_pack(view.block)) {
+            const sycl_be::PackImage image = sycl_be::block_pack_image(view.block, blocks, rows, cols);
+            w.q4 = image.q4;
+            w.group = 32;
+            w.codes = reinterpret_cast<const uint8_t*>(copy(image.codes.data(), image.codes.size()));
+            w.scales = reinterpret_cast<const half*>(copy(image.scales.data(), image.scales.size() * sizeof(uint16_t)));
+            if (w.q4) {
+                w.biases =
+                    reinterpret_cast<const half*>(copy(image.biases.data(), image.biases.size() * sizeof(uint16_t)));
+            }
+        } else {
+            XS_CHECK(sycl_be::block_on_device(view.block), "sycl: weight '", name, "' is in the GGUF block format ",
+                     block_format_name(view.block), ", which no kernel reads yet (--backend-opt block=f16 decodes "
+                     "block formats to f16 on the device)");
+            const sycl_be::BlockImage image = sycl_be::block_image(view.block, blocks, rows, cols);
+            const auto* base = reinterpret_cast<const uint8_t*>(copy(image.bytes.data(), image.bytes.size()));
+            XS_CHECK(reinterpret_cast<uintptr_t>(base) % 64 == 0, "sycl: a device allocation is not 64-byte aligned");
+            auto block = std::make_unique<sycl_be::BlockWeight>();
+            block->format = view.block;
+            for (int s = 0; s < image.streams; ++s) block->s[s] = base + image.offset[s];
+            if (const auto grid = sycl_be::block_grid(view.block); !grid.empty()) {
+                const auto it = shared_.block_grids.find(view.block);
+                block->grid = it != shared_.block_grids.end()
+                                  ? it->second
+                                  : (shared_.block_grids[view.block] = reinterpret_cast<const uint32_t*>(
+                                         copy(grid.data(), grid.size() * sizeof(uint32_t))));
+            }
+            w.q4 = false;
+            w.codes = base;
+            w.block = block.get();
+            shared_.block_weights.push_back(std::move(block));
+        }
+        leaf_ptr_[node] = const_cast<char*>(reinterpret_cast<const char*>(w.codes));
+        leaf_quant_[node] = w;
+    }
+
     DeviceBuffer upload(const std::string& name, const void* data, DType src, const Dims& shape, DType dst) {
         const size_t n = static_cast<size_t>(numel(shape));
         DeviceBuffer buf(q_, std::max<size_t>(n * dtype_size(dst), 1));
@@ -1356,6 +1419,13 @@ private:
                 const size_t before = shared_.weight_buffers.size();
                 if (is_quantized(view.dtype)) {
                     upload_quantized(i, view);
+                } else if (view.dtype == DType::Block && !quant_.block_float) {
+                    upload_block(i, name, view);
+                } else if (view.dtype == DType::Block) {  // the values ggml's dequantization gives, as floats
+                    std::vector<float> values(static_cast<size_t>(view.numel()));
+                    quant::read_rows(view, 0, quant::matrix_rows(view.shape), values.data());
+                    shared_.weight_buffers.push_back(upload(name, values.data(), DType::F32, view.shape, dtype_[i][0]));
+                    leaf_ptr_[i] = shared_.weight_buffers.back().get();
                 } else {
                     shared_.weight_buffers.push_back(
                         view.dtype == DType::F8 ? upload_fp8(view, dtype_[i][0])
@@ -1732,7 +1802,7 @@ private:
             case OpKind::Gather: {
                 const int64_t width = in_shape(0)[1];
                 const int64_t count = numel(in_shape(1));
-                if (is_quantized(in_dt(0))) {
+                if (device_quantized(in_dt(0))) {
                     const sycl_be::QuantWeight& t = leaf_quant_[static_cast<size_t>(n.inputs[0].node)];
                     if (in_dt(1) == DType::I32) {
                         sycl_be::gather_quant(q_, t, reinterpret_cast<const int32_t*>(in_ptr(1)), out, count, width);
@@ -1820,7 +1890,7 @@ private:
                     sycl_be::gemv_quant_parts(q_, x, parts, count, m, k);
                     return;
                 }
-                if (is_quantized(in_dt(1))) {  // plan_half_values: x and y in f16 or f32
+                if (device_quantized(in_dt(1))) {  // plan_half_values: x and y in f16 or f32
                     const sycl_be::QuantWeight& w = leaf_quant_[static_cast<size_t>(n.inputs[1].node)];
                     with_value(n.inputs[0], [&](const auto* x) {
                         with_out([&](auto* y) { sycl_be::matmul_quant(q_, *this, x, w, y, m, rows, k, quant_); });
@@ -1854,7 +1924,7 @@ private:
                              "sycl: a residual GEMM in f16");
                     const int64_t m = out_n / ws[0];
                     if (p.in_place[i] == 0) q_.memcpy(out, ptr(p, a), static_cast<size_t>(out_n) * sizeof(float));
-                    if (is_quantized(dt(reads_[i][2]))) {
+                    if (device_quantized(dt(reads_[i][2]))) {
                         const sycl_be::QuantWeight& qw = leaf_quant_[static_cast<size_t>(reads_[i][2].node)];
                         with_value(x, [&](const auto* xp) {
                             sycl_be::matmul_quant(q_, *this, xp, qw, out, m, ws[0], ws[1], quant_, true);
@@ -2165,7 +2235,7 @@ private:
                 const Dims& ws = in_shape(1);
                 const Dims& is = in_shape(2);
                 const bool per_slot = in_shape(0).size() == 3;
-                if (is_quantized(in_dt(1))) {
+                if (device_quantized(in_dt(1))) {
                     const sycl_be::QuantWeight& w = leaf_quant_[static_cast<size_t>(n.inputs[1].node)];
                     const int64_t pairs = is[0] * is[1];
                     if (pairs >= sycl_be::kExpertPairsGemm) {
@@ -2404,7 +2474,14 @@ public:
         sycl_be::AttentionPlan attention;
         std::string gemv = "auto";
         int64_t few_rows = -1;
+        bool block_float = false;
         for (const auto& [key, value] : options.extra) {
+            if (key == "block") {
+                if (value != "auto" && value != "f16")
+                    fail("sycl backend option block=", value, " is not one of auto, f16");
+                block_float = value == "f16";
+                continue;
+            }
             if (key == "gemv") {
                 if (value != "auto" && value != "vector" && value != "xmx")
                     fail("sycl backend option gemv=", value, " is not one of auto, vector, xmx");
@@ -2421,7 +2498,7 @@ public:
                 continue;
             }
             if (key != "attention") {
-                fail("sycl does not know backend option '", key, "' (known: attention, few_rows, gemv)");
+                fail("sycl does not know backend option '", key, "' (known: attention, block, few_rows, gemv)");
             }
             if (value == "rows") {
                 attention.path = sycl_be::AttentionPath::Rows;
@@ -2456,7 +2533,7 @@ public:
         if (integrated_gpu(devices_[index])) attention.score_cache = kScoreCacheBytes;
         auto session = std::make_unique<SyclSession>(
             std::make_unique<SyclShared>(it->second, options.max_context, options.rewind_tokens));
-        const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision, gemv, few_rows);
+        const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision, gemv, few_rows, block_float);
         for (const graph::Graph* graph : programs) {
             session->add(std::make_unique<SyclProgram>(*graph, weights, options, session->shared(), attention, quant));
         }
