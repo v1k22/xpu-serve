@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <optional>
-#include <set>
 #include <string_view>
 
 #include "util/error.h"
@@ -37,42 +36,115 @@ std::string token_type_name(int64_t t) {
 constexpr std::string_view kByteLevel =
     R"json({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})json";
 
-// What a tokenizer.ggml.pre value stands for: the parts of the original tokenizer.json the file does not hold.
-struct PreTokenizer {
-    std::string_view name;
+// A tokenizer llama.cpp's converter writes: the parts of the original tokenizer.json the file does not hold, and how
+// the file's token types read back as the original's vocabulary and added tokens.
+struct TokenizerKind {
+    std::string_view model;  // tokenizer.ggml.model
+    std::string_view pre;    // tokenizer.ggml.pre; empty when the model implies it (llama.cpp then ignores the key)
     std::string_view normalizer, pre_tokenizer, post_processor, decoder;  // JSON
-    bool nfc;  // the normalizer is NFC; a file's tokenizer.ggml.normalizer.nfc, when present, must agree
-    // Added tokens llama.cpp's converter types control although the original does not mark them special: it types
-    // every added token that looks like <|...|> so.
-    std::vector<std::string_view> not_special;
+    std::string_view bpe;  // the BPE model's settings (JSON, without vocab and merges)
+    bool nfc;              // the normalizer is NFC; a file's tokenizer.ggml.normalizer.nfc, when present, must agree
+    // Added tokens are also pieces of the BPE vocabulary.
+    bool added_in_vocab;
+    // Control tokens the original does not mark special.
+    std::vector<std::string_view> control_not_special;
+    // User-defined tokens the original marks special.
+    std::vector<std::string_view> user_defined_special;
+    // Normal tokens the original adds as special tokens.
+    std::vector<std::string_view> normal_special;
+    // Tokens that end a reply besides the file's eos (and eot, eom) token: those llama.cpp ends generation at by text
+    // for this tokenizer, which the original names in generation_config.json.
+    std::vector<std::string_view> end_of_generation;
+
+    std::string name() const { return std::string(pre.empty() ? model : pre); }
 };
 
-const std::vector<PreTokenizer>& pre_tokenizers() {
-    static const std::vector<PreTokenizer> table = {
-        // Qwen3.5, Qwen3.6, Qwen3.8: Qwen/Qwen3.5-4B's tokenizer.json.
-        {"qwen35",
+bool listed(const std::vector<std::string_view>& list, std::string_view text) {
+    return std::find(list.begin(), list.end(), text) != list.end();
+}
+
+const std::vector<TokenizerKind>& tokenizer_kinds() {
+    static const std::vector<TokenizerKind> table = {
+        // Qwen3.5, Qwen3.6, Qwen3.8: Qwen/Qwen3.5-4B's tokenizer.json. The converter types every added token that
+        // looks like <|...|> control.
+        {"gpt2",
+         "qwen35",
          R"json({"type": "NFC"})json",
          R"json({"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false}, {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}]})json",
          kByteLevel,
          kByteLevel,
+         R"json({"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "", "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": false})json",
          true,
-         {"<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"}},
+         false,
+         {"<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"},
+         {},
+         {},
+         {}},
+        // Gemma 4: google/gemma-4-E2B-it's tokenizer.json (BPE over the text with spaces as U+2581, byte fallback;
+        // every id in model.vocab, the added tokens included). The converter (Gemma4Model.set_vocab) types the
+        // markers a chat parser reads user-defined so that llama.cpp prints them, and types control only the tokens
+        // the publisher's tokenizer_config.json names: <eos> is typed normal when it names <turn|> as eos_token.
+        // llama.cpp ends generation at <eos>, <turn|> and <|tool_response>, the original's generation_config.json
+        // eos_token_id.
+        {"gemma4",
+         "",
+         R"json({"type": "Replace", "pattern": {"String": " "}, "content": "▁"})json",
+         R"json({"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false})json",
+         R"json({"type": "TemplateProcessing", "single": [{"Sequence": {"id": "A", "type_id": 0}}], "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}], "special_tokens": {}})json",
+         R"json({"type": "Sequence", "decoders": [{"type": "Replace", "pattern": {"String": "▁"}, "content": " "}, {"type": "ByteFallback"}, {"type": "Fuse"}]})json",
+         R"json({"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false})json",
+         false,
+         true,
+         {},
+         {"<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>", "<|tool_response>", "<tool_response|>", "<|\"|>"},
+         {"<eos>"},
+         {"<eos>", "<turn|>", "<|tool_response>"}},
     };
     return table;
 }
 
-const PreTokenizer& find_pre_tokenizer(std::string_view name) {
-    std::string known;
-    for (const PreTokenizer& p : pre_tokenizers()) {
-        if (p.name == name) return p;
-        known += str_cat(known.empty() ? "" : ", ", p.name);
+// The table's tokenizer models, or its pre-tokenizer names, as a list for an error.
+std::string supported(bool models) {
+    std::vector<std::string_view> names;
+    for (const TokenizerKind& k : tokenizer_kinds()) {
+        const std::string_view name = models ? k.model : k.pre;
+        if (!name.empty() && !listed(names, name)) names.push_back(name);
     }
-    fail("GGUF tokenizer.ggml.pre '", name, "' is not supported (supported: ", known,
+    std::string out;
+    for (const std::string_view name : names)
+        out += str_cat(out.empty() ? "" : ", ", name);
+    return out;
+}
+
+// The kind of the file's tokenizer: by tokenizer.ggml.model, and for a model that does not imply its pre-tokenizer,
+// by tokenizer.ggml.pre.
+const TokenizerKind& find_kind(const gguf::File& file) {
+    const std::string_view model = file.get_string("tokenizer.ggml.model");
+    const gguf::Value* pre = file.find("tokenizer.ggml.pre");
+    bool model_known = false;
+    for (const TokenizerKind& k : tokenizer_kinds()) {
+        if (k.model != model) continue;
+        model_known = true;
+        if (k.pre.empty()) {
+            if (pre != nullptr && pre->as_string() != model) {
+                fail("GGUF tokenizer.ggml.pre '", pre->as_string(), "' disagrees with tokenizer.ggml.model '", model,
+                     "', which implies its pre-tokenizer");
+            }
+            return k;
+        }
+        if (pre == nullptr)
+            fail("GGUF tokenizer.ggml.model '", model, "' needs a tokenizer.ggml.pre; the file has none");
+        if (k.pre == pre->as_string()) return k;
+    }
+    if (!model_known) {
+        fail("GGUF tokenizer.ggml.model '", model, "' is not supported (supported: ", supported(true), ")");
+    }
+    fail("GGUF tokenizer.ggml.pre '", pre->as_string(), "' is not supported (supported: ", supported(false),
          "); the file does not hold its pre-tokenizer, only that name");
 }
 
 // tokenizer.ggml.* keys the import reads or knows to change nothing it writes; any other is refused by name.
-constexpr std::array<std::string_view, 30> kKnownKeys = {
+constexpr std::array<std::string_view, 31> kKnownKeys = {
     "model",
     "pre",
     "tokens",
@@ -90,6 +162,7 @@ constexpr std::array<std::string_view, 30> kKnownKeys = {
     "add_bos_token",
     "add_eos_token",
     "add_sep_token",
+    "add_space_prefix",
     "fim_pre_token_id",
     "fim_suf_token_id",
     "fim_mid_token_id",
@@ -109,7 +182,7 @@ bool starts_with(std::string_view s, std::string_view prefix) {
     return s.substr(0, prefix.size()) == prefix;
 }
 
-void check_keys(const gguf::File& file, const PreTokenizer& pre) {
+void check_keys(const gguf::File& file, const TokenizerKind& kind) {
     for (const gguf::Value& v : file.metadata()) {
         const std::string_view key = v.key();
         if (starts_with(key, "tokenizer.ggml.")) {
@@ -121,18 +194,25 @@ void check_keys(const gguf::File& file, const PreTokenizer& pre) {
             }
         } else if (starts_with(key, "tokenizer.") && !starts_with(key, "tokenizer.chat_template") &&
                    key != "tokenizer.huggingface.json") {
-            fail("GGUF metadata '", key, "' is not read by this importer (a tokenizer other than gpt2)");
+            fail("GGUF metadata '", key, "' is not read by this importer (a tokenizer it does not read)");
         }
     }
     const auto agree = [&](std::string_view key, bool table) {
         if (const gguf::Value* v = file.find(key); v != nullptr && v->as_bool() != table) {
-            fail("GGUF ", key, " is ", v->as_bool() ? "true" : "false", ", which disagrees with the tokenizer ",
-                 "tokenizer.ggml.pre '", pre.name, "' stands for");
+            fail("GGUF ", key, " is ", v->as_bool() ? "true" : "false", ", which disagrees with the tokenizer '",
+                 kind.name(), "' stands for");
         }
     };
-    agree("tokenizer.ggml.normalizer.nfc", pre.nfc);
+    agree("tokenizer.ggml.normalizer.nfc", kind.nfc);
     agree("tokenizer.ggml.normalizer.lowercase", false);
     agree("tokenizer.ggml.normalizer.strip_accents", false);
+    agree("tokenizer.ggml.add_space_prefix", false);
+}
+
+// "<0xXX>": a byte fallback piece.
+bool is_byte_piece(std::string_view text) {
+    const auto hex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'); };
+    return text.size() == 6 && starts_with(text, "<0x") && hex(text[3]) && hex(text[4]) && text[5] == '>';
 }
 
 nlohmann::json parse(std::string_view text) {
@@ -142,44 +222,58 @@ nlohmann::json parse(std::string_view text) {
 }  // namespace
 
 TokenizerFiles tokenizer_files(const gguf::File& file) {
-    const std::string_view model = file.get_string("tokenizer.ggml.model");
-    if (model != "gpt2") fail("GGUF tokenizer.ggml.model '", model, "' is not supported (supported: gpt2)");
-    const PreTokenizer& pre = find_pre_tokenizer(file.get_string("tokenizer.ggml.pre"));
-    check_keys(file, pre);
+    const TokenizerKind& kind = find_kind(file);
+    check_keys(file, kind);
+    nlohmann::json bpe = parse(kind.bpe);
 
     const std::vector<std::string_view> tokens = file.get("tokenizer.ggml.tokens").strings();
     const std::vector<int64_t> types = file.get("tokenizer.ggml.token_type").ints();
     if (types.size() != tokens.size()) {
         fail("GGUF tokenizer.ggml.token_type has ", types.size(), " entries for ", tokens.size(), " tokens");
     }
-    const std::set<std::string_view> not_special(pre.not_special.begin(), pre.not_special.end());
 
     TokenizerFiles out;
     nlohmann::json vocab = nlohmann::json::object();
     nlohmann::json added = nlohmann::json::array();
     nlohmann::ordered_json decoder = nlohmann::ordered_json::object();
     std::vector<bool> present(tokens.size(), false);
+    const auto add_piece = [&](const std::string& text, size_t id) {
+        if (vocab.contains(text)) {
+            fail("GGUF tokenizer: token '", text, "' is both id ", vocab.at(text).get<int64_t>(), " and ", id);
+        }
+        vocab[text] = id;
+    };
+    const auto add_token = [&](const std::string& text, size_t id, bool special) {
+        added.push_back({{"id", id},
+                         {"content", text},
+                         {"single_word", false},
+                         {"lstrip", false},
+                         {"rstrip", false},
+                         {"normalized", false},
+                         {"special", special}});
+        decoder[std::to_string(id)] = {{"content", text}, {"lstrip", false},      {"normalized", false},
+                                       {"rstrip", false}, {"single_word", false}, {"special", special}};
+    };
     for (size_t id = 0; id < tokens.size(); ++id) {
         const std::string text(tokens[id]);
         switch (types[id]) {
             case kNormal:
-                if (vocab.contains(text)) {
-                    fail("GGUF tokenizer: token '", text, "' is both id ", vocab.at(text).get<int64_t>(), " and ", id);
+                add_piece(text, id);
+                if (listed(kind.normal_special, text)) add_token(text, id, true);
+                break;
+            case kByte:
+                if (!bpe.value("byte_fallback", false) || !is_byte_piece(text)) {
+                    fail("GGUF tokenizer: token ", id, " '", text, "' has type byte, which the tokenizer '",
+                         kind.name(), "' does not have");
                 }
-                vocab[text] = id;
+                add_piece(text, id);
                 break;
             case kControl:
             case kUserDefined: {
-                const bool special = types[id] == kControl && !not_special.contains(tokens[id]);
-                added.push_back({{"id", id},
-                                 {"content", text},
-                                 {"single_word", false},
-                                 {"lstrip", false},
-                                 {"rstrip", false},
-                                 {"normalized", false},
-                                 {"special", special}});
-                decoder[std::to_string(id)] = {{"content", text}, {"lstrip", false},      {"normalized", false},
-                                               {"rstrip", false}, {"single_word", false}, {"special", special}};
+                const bool special = types[id] == kControl ? !listed(kind.control_not_special, text)
+                                                           : listed(kind.user_defined_special, text);
+                add_token(text, id, special);
+                if (kind.added_in_vocab) add_piece(text, id);
                 break;
             }
             case kUnused:
@@ -190,7 +284,7 @@ TokenizerFiles tokenizer_files(const gguf::File& file) {
                 continue;
             default:
                 fail("GGUF tokenizer: token ", id, " '", text, "' has type ", token_type_name(types[id]),
-                     ", which a gpt2 tokenizer does not have");
+                     ", which the tokenizer '", kind.name(), "' does not have");
         }
         present[id] = true;
     }
@@ -203,25 +297,6 @@ TokenizerFiles tokenizer_files(const gguf::File& file) {
         }
         merges.push_back(std::string(merge));
     }
-
-    out.tokenizer = {{"version", "1.0"},
-                     {"truncation", nullptr},
-                     {"padding", nullptr},
-                     {"added_tokens", std::move(added)},
-                     {"normalizer", parse(pre.normalizer)},
-                     {"pre_tokenizer", parse(pre.pre_tokenizer)},
-                     {"post_processor", parse(pre.post_processor)},
-                     {"decoder", parse(pre.decoder)}};
-    out.tokenizer["model"] = {{"type", "BPE"},
-                              {"dropout", nullptr},
-                              {"unk_token", nullptr},
-                              {"continuing_subword_prefix", ""},
-                              {"end_of_word_suffix", ""},
-                              {"fuse_unk", false},
-                              {"byte_fallback", false},
-                              {"ignore_merges", false}};
-    out.tokenizer["model"]["vocab"] = std::move(vocab);
-    out.tokenizer["model"]["merges"] = std::move(merges);
 
     // A special token's text, from its id; `required` ones must be a token of the vocabulary.
     const auto token_text = [&](std::string_view key, bool required) -> std::optional<std::string> {
@@ -238,6 +313,24 @@ TokenizerFiles tokenizer_files(const gguf::File& file) {
         log::warn("gguf: ", key, " ", id, " is not a token of the vocabulary; left out");
         return std::nullopt;
     };
+    if (const auto unk = token_text("tokenizer.ggml.unknown_token_id", false);
+        unk && bpe["unk_token"].is_string() && bpe["unk_token"] != *unk) {
+        fail("GGUF tokenizer.ggml.unknown_token_id is '", *unk, "', which disagrees with the tokenizer '", kind.name(),
+             "' stands for (", bpe["unk_token"].get<std::string>(), ")");
+    }
+
+    out.tokenizer = {{"version", "1.0"},
+                     {"truncation", nullptr},
+                     {"padding", nullptr},
+                     {"added_tokens", std::move(added)},
+                     {"normalizer", parse(kind.normalizer)},
+                     {"pre_tokenizer", parse(kind.pre_tokenizer)},
+                     {"post_processor", parse(kind.post_processor)},
+                     {"decoder", parse(kind.decoder)}};
+    bpe["vocab"] = std::move(vocab);
+    bpe["merges"] = std::move(merges);
+    out.tokenizer["model"] = std::move(bpe);
+
     out.config["added_tokens_decoder"] = std::move(decoder);
     const auto bos = token_text("tokenizer.ggml.bos_token_id", false);
     out.config["bos_token"] = bos ? nlohmann::ordered_json(*bos) : nlohmann::ordered_json(nullptr);
@@ -253,12 +346,16 @@ TokenizerFiles tokenizer_files(const gguf::File& file) {
         if (const gguf::Value* v = file.find(str_cat("tokenizer.ggml.", key))) out.config[name] = v->as_bool();
     }
 
-    out.stop_ids.push_back(static_cast<int32_t>(file.get_int("tokenizer.ggml.eos_token_id")));
+    const auto add_stop = [&](int32_t id) {
+        if (std::find(out.stop_ids.begin(), out.stop_ids.end(), id) == out.stop_ids.end()) out.stop_ids.push_back(id);
+    };
+    add_stop(static_cast<int32_t>(file.get_int("tokenizer.ggml.eos_token_id")));
     for (const char* key : {"tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"}) {
-        if (const auto text = token_text(key, false)) {
-            const auto id = static_cast<int32_t>(file.get_int(key));
-            if (std::find(out.stop_ids.begin(), out.stop_ids.end(), id) == out.stop_ids.end())
-                out.stop_ids.push_back(id);
+        if (token_text(key, false)) add_stop(static_cast<int32_t>(file.get_int(key)));
+    }
+    for (const std::string_view text : kind.end_of_generation) {
+        for (size_t id = 0; id < tokens.size(); ++id) {
+            if (present[id] && tokens[id] == text) add_stop(static_cast<int32_t>(id));
         }
     }
     return out;

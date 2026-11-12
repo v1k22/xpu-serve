@@ -225,7 +225,7 @@ TEST_SUITE("gguf import") {
                 w.drop_value("general.architecture").string("general.architecture", name);
             });
         };
-        CHECK(architecture("llama").find("GGUF architecture 'llama' is not supported (supported: qwen35)") !=
+        CHECK(architecture("llama").find("GGUF architecture 'llama' is not supported (supported: qwen35, gemma4)") !=
               std::string::npos);
         CHECK(architecture("qwen35moe").find("'qwen35moe' (Qwen3.5 mixture of experts) is not supported yet") !=
               std::string::npos);
@@ -255,13 +255,13 @@ TEST_SUITE("gguf import") {
               }).find("has shape") != std::string::npos);
         CHECK(refusal(work.path, [](GgufWriter& w) {
                   w.drop_value("tokenizer.ggml.model").string("tokenizer.ggml.model", "llama");
-              }).find("tokenizer.ggml.model 'llama' is not supported (supported: gpt2)") != std::string::npos);
+              }).find("tokenizer.ggml.model 'llama' is not supported (supported: gpt2, gemma4)") != std::string::npos);
         CHECK(refusal(work.path, [](GgufWriter& w) {
                   w.drop_value("tokenizer.ggml.pre").string("tokenizer.ggml.pre", "llama-bpe");
               }).find("tokenizer.ggml.pre 'llama-bpe' is not supported (supported: qwen35)") != std::string::npos);
-        CHECK(refusal(work.path, [](GgufWriter& w) {
-                  w.boolean("tokenizer.ggml.add_space_prefix", true);
-              }).find("'tokenizer.ggml.add_space_prefix' is not read") != std::string::npos);
+        CHECK(refusal(work.path, [](GgufWriter& w) { w.boolean("tokenizer.ggml.add_space_prefix", true); })
+                  .find("tokenizer.ggml.add_space_prefix is true, which disagrees with the tokenizer 'qwen35'") !=
+              std::string::npos);
         CHECK(refusal(work.path, [](GgufWriter& w) {
                   w.boolean("tokenizer.ggml.normalizer.nfc", false);
               }).find("tokenizer.ggml.normalizer.nfc is false") != std::string::npos);

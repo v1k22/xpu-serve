@@ -4,11 +4,12 @@
 // chat template.
 //
 // The file holds the vocabulary, each token's type, the merges and the special tokens' ids; the normalizer and
-// pre-tokenizer are not in it, only a name for them (tokenizer.ggml.pre), so they come from a table of the names this
-// importer knows. Token types: normal tokens are the BPE vocabulary; control tokens are added special tokens and
-// user-defined ones added tokens that are not special (Qwen's <think> and <tool_call> stay non-special, so the output
-// parser sees them); unused ones are the converter's [PAD<id>] placeholders for ids the original tokenizer does not
-// have, and are left out.
+// pre-tokenizer are not in it, only a name for them (tokenizer.ggml.model, and for a byte-level BPE tokenizer
+// tokenizer.ggml.pre), so they come from a table of the tokenizers this importer knows. Token types: normal and byte
+// tokens are the BPE vocabulary; control tokens are added special tokens and user-defined ones added tokens that are
+// not special (Qwen's <think> and <tool_call> stay non-special, so the output parser sees them), each with the
+// exceptions the table names where the converter's typing departs from the original's; unused ones are the
+// converter's [PAD<id>] placeholders for ids the original tokenizer does not have, and are left out.
 
 #include <cstdint>
 #include <string>
@@ -23,11 +24,13 @@ namespace xs::gguf_import {
 struct TokenizerFiles {
     nlohmann::json tokenizer;       // tokenizer.json
     nlohmann::ordered_json config;  // tokenizer_config.json: added_tokens_decoder and the named special tokens
-    std::vector<int32_t> stop_ids;  // eos, then eot and eom when the file names them: config.json's eos_token_id
+    // config.json's eos_token_id: eos, then eot and eom when the file names them, then the tokens the table says end a
+    // reply for this tokenizer.
+    std::vector<int32_t> stop_ids;
 };
 
-// Refuses by name a tokenizer model other than gpt2 (byte-level BPE), a tokenizer.ggml.pre it has no table entry for,
-// tokenizer.ggml.* keys it does not know, token types gpt2 does not have, and special-token ids outside the
+// Refuses by name a tokenizer model or pre-tokenizer the table does not have, tokenizer.ggml.* keys it does not know
+// or that disagree with the table, token types the tokenizer does not have, and special-token ids outside the
 // vocabulary.
 TokenizerFiles tokenizer_files(const gguf::File& file);
 

@@ -316,11 +316,12 @@ xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M    
 xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
 ```
 
-The architecture comes from the file (`general.architecture`): `qwen35`, the Qwen3.5 / Qwen3.6 / Qwen3.8 dense text
-models, is supported; others are refused by name. config.json, the tokenizer and the chat template are written from
-the file's metadata (on Qwen3.5-4B the tokenizer equals the original's token by token), and the template is the
-file's, which a publisher may have changed from the original checkpoint's. Thinking, tool calls and streaming work as
-with the original checkpoint. The quantization options do not apply.
+The architecture comes from the file (`general.architecture`). Supported: `qwen35`, the Qwen3.5 / Qwen3.6 / Qwen3.8
+dense text models, and `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
+images need the original checkpoint); others are refused by name. config.json, the tokenizer and the chat template are
+written from the file's metadata (on Qwen3.5-4B and Gemma 4 E2B the tokenizer equals the original's token by token),
+and the template is the file's, which a publisher may have changed from the original checkpoint's. Thinking, tool
+calls and streaming work as with the original checkpoint. The quantization options do not apply.
 
 Both backends read all 19 of GGUF's block formats (Q4_0 to Q8_0, the K-quants, IQ1 to IQ4), each decoded to the
 values llama.cpp's own code gives (checked bit for bit on the host). A file is usually a mix of them: `Q4_K_M` of

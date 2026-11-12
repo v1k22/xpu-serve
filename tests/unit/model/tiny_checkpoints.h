@@ -1,8 +1,9 @@
 #pragma once
 
 // Tiny random checkpoints written to disk for tests that need a model directory without downloading one: a Qwen3.5
-// target (dense or mixture of experts) and block drafters for it (DFlash, DFlash 2, DSpine), in the released
-// checkpoints' layout (config keys and tensor names); and a checkpoint rewritten the way an FP8 release stores it.
+// target (dense or mixture of experts), block drafters for it (DFlash, DFlash 2, DSpine) and a Gemma 4 of the E-series
+// layout, in the released checkpoints' layout (config keys and tensor names); and a checkpoint rewritten the way an
+// FP8 release stores it.
 
 #include <algorithm>
 #include <cmath>
@@ -147,6 +148,95 @@ inline void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t see
             add(A + "q_norm.weight", {m.head_dim});
             add(A + "k_norm.weight", {m.head_dim});
         }
+    }
+    write_random(dir / "model.safetensors", specs, seed);
+}
+
+// A Gemma 4 of the E-series layout (Gemma4ForCausalLM, names under model.): sliding and full-attention layers with
+// head sizes and KV heads of their own, per-layer embeddings, and KV-shared layers at the end with a double-wide MLP.
+// The window is shorter than a test's prompt.
+struct TinyGemma4 {
+    int64_t vocab = 256, hidden = 128, ffn = 256, heads = 4, kv_heads = 1, global_kv_heads = 2;
+    int64_t head_dim = 64, global_head_dim = 128, ple = 32, window = 8, shared = 2;
+    std::vector<std::string> layers{"sliding_attention", "sliding_attention", "sliding_attention",
+                                    "full_attention",    "sliding_attention", "full_attention"};
+    int64_t first_shared() const { return static_cast<int64_t>(layers.size()) - shared; }
+};
+
+// Writes config.json (a text-only config, bf16) and model.safetensors (bf16, random) for `m` into `dir`.
+inline void write_tiny_gemma4(const fs::path& dir, const TinyGemma4& m, uint32_t seed) {
+    fs::create_directories(dir);
+    const auto layers = static_cast<int64_t>(m.layers.size());
+    nlohmann::json config = {
+        {"architectures", {"Gemma4ForCausalLM"}},
+        {"model_type", "gemma4_text"},
+        {"dtype", "bfloat16"},
+        {"vocab_size", m.vocab},
+        {"vocab_size_per_layer_input", m.vocab},
+        {"hidden_size", m.hidden},
+        {"intermediate_size", m.ffn},
+        {"use_double_wide_mlp", true},
+        {"num_hidden_layers", layers},
+        {"layer_types", m.layers},
+        {"num_attention_heads", m.heads},
+        {"num_key_value_heads", m.kv_heads},
+        {"num_global_key_value_heads", m.global_kv_heads},
+        {"head_dim", m.head_dim},
+        {"global_head_dim", m.global_head_dim},
+        {"attention_k_eq_v", false},
+        {"attention_bias", false},
+        {"enable_moe_block", false},
+        {"hidden_activation", "gelu_pytorch_tanh"},
+        {"sliding_window", m.window},
+        {"num_kv_shared_layers", m.shared},
+        {"hidden_size_per_layer_input", m.ple},
+        {"rms_norm_eps", 1e-6},
+        {"final_logit_softcapping", 30.0},
+        {"max_position_embeddings", 4096},
+        {"tie_word_embeddings", true},
+        {"bos_token_id", 2},
+        {"pad_token_id", 0},
+        {"eos_token_id", 1},
+        {"rope_parameters",
+         {{"full_attention", {{"partial_rotary_factor", 0.25}, {"rope_theta", 1e6}, {"rope_type", "proportional"}}},
+          {"sliding_attention", {{"rope_theta", 1e4}, {"rope_type", "default"}}}}}};
+    std::ofstream(dir / "config.json") << config.dump(1);
+
+    // Matrices at 1/sqrt(fan-in); norms and the layer scalars around 1, as Gemma 4's multiply by the weight itself.
+    std::vector<TinyTensor> specs;
+    const auto matrix = [&](const std::string& name, Dims shape) {
+        const float range = 1.0f / std::sqrt(static_cast<float>(shape.back()));
+        specs.push_back(TinyTensor{"model." + name, std::move(shape), -range, range});
+    };
+    const auto norm = [&](const std::string& name, int64_t width) {
+        specs.push_back(TinyTensor{"model." + name, {width}, 0.5f, 1.5f});
+    };
+    matrix("embed_tokens.weight", {m.vocab, m.hidden});
+    specs.push_back(TinyTensor{"model.embed_tokens_per_layer.weight", {m.vocab, layers * m.ple}, -0.1f, 0.1f});
+    matrix("per_layer_model_projection.weight", {layers * m.ple, m.hidden});
+    norm("per_layer_projection_norm.weight", m.ple);
+    norm("norm.weight", m.hidden);
+    for (int64_t i = 0; i < layers; ++i) {
+        const std::string L = "layers." + std::to_string(i) + ".";
+        const bool full = m.layers[static_cast<size_t>(i)] == "full_attention";
+        const int64_t hd = full ? m.global_head_dim : m.head_dim, kv = full ? m.global_kv_heads : m.kv_heads;
+        const int64_t ffn = i >= m.first_shared() ? 2 * m.ffn : m.ffn;
+        for (const char* n : {"input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm",
+                              "post_feedforward_layernorm", "post_per_layer_input_norm"}) {
+            norm(L + n + ".weight", m.hidden);
+        }
+        matrix(L + "self_attn.q_proj.weight", {m.heads * hd, m.hidden});
+        matrix(L + "self_attn.k_proj.weight", {kv * hd, m.hidden});
+        matrix(L + "self_attn.v_proj.weight", {kv * hd, m.hidden});
+        matrix(L + "self_attn.o_proj.weight", {m.hidden, m.heads * hd});
+        norm(L + "self_attn.q_norm.weight", hd);
+        norm(L + "self_attn.k_norm.weight", hd);
+        matrix(L + "mlp.gate_proj.weight", {ffn, m.hidden});
+        matrix(L + "mlp.up_proj.weight", {ffn, m.hidden});
+        matrix(L + "mlp.down_proj.weight", {m.hidden, ffn});
+        matrix(L + "per_layer_input_gate.weight", {m.ple, m.hidden});
+        matrix(L + "per_layer_projection.weight", {m.hidden, m.ple});
+        specs.push_back(TinyTensor{"model." + L + "layer_scalar", {1}, 0.5f, 1.0f});
     }
     write_random(dir / "model.safetensors", specs, seed);
 }

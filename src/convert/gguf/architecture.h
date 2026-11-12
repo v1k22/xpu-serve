@@ -1,10 +1,10 @@
 #pragma once
 
-// What a GGUF architecture's importer provides (one file per architecture, e.g. qwen35.cpp): from the file's metadata
-// the config.json the model code reads, and for every tensor of the file the pack tensors it becomes, under the names
-// the model code reads. The import driver (gguf_import.cpp) writes them: a tensor in a block format byte for byte, a
-// float tensor as stored or through a value-by-value transform. A quantized tensor is never decoded, re-encoded or
-// reordered; it can only be cut into runs of whole rows.
+// What a GGUF architecture's importer provides (one file per architecture: qwen35.cpp, gemma4.cpp): from the file's
+// metadata the config.json the model code reads, and for every tensor of the file the pack tensors it becomes, under
+// the names the model code reads. The import driver (gguf_import.cpp) writes them: a tensor in a block format byte for
+// byte, a float tensor as stored or through a value-by-value transform. A quantized tensor is never decoded, re-encoded
+// or reordered; it can only be cut into runs of whole rows.
 
 #include <string>
 #include <string_view>
@@ -51,6 +51,7 @@ public:
 };
 
 const Architecture& qwen35();
+const Architecture& gemma4();
 
 // The importer of general.architecture `name`; a named error listing the supported ones otherwise.
 const Architecture& find_architecture(std::string_view name);
