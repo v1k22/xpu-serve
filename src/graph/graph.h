@@ -78,6 +78,7 @@ enum class OpKind : uint8_t {
     Concat,     // (x0, x1, ...) joined along AxisAttrs::axis (static there); the other dims and the dtype agree
     KvRead,     // () -> (k_all [L, Hkv, D], v_all [L, Hkv, D]): a KV slot another program of the session writes, read
                 // without appending; L is that slot's length (a graph either appends to its KV slots or only reads)
+    Gelu,       // 0.5 x (1 + erf(x / sqrt(2))): the exact GELU (torch.nn.GELU)
 };
 
 // CausalConv: with x' = [the slot's K-1 previous inputs (zeros at the start), x], out[t, c] = sum_j w[c, j] x'[t + j, c];
@@ -224,6 +225,7 @@ public:
     Value scale(Value x, float factor);
     Value tanh(Value x);
     Value gelu_tanh(Value x);
+    Value gelu(Value x);
     Value softcap(Value x, float cap);
     Value sigmoid(Value x);
     Value silu(Value x);

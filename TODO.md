@@ -374,6 +374,25 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 - [ ] Policy API next: msgpack bodies (no base64), the openpi-compatible WebSocket, RTC (previous chunk + delay)
 - [ ] More policies: π0, SmolVLA, GR00T N1.6 / N1.7, π0-FAST (through the language engine), OpenVLA-OFT
 
+## Decision models (the System One API) — docs/decisions/0015
+
+- [x] `DecisionModel` as a third model kind; the runtime runs the steps a model names (`src/decision/`)
+- [x] `POST /v1/systemone` (TypeSafe's System One, OpenAPI 0.2.0): noul, choice, score; the API's 422 / 400 bodies;
+      `GET /v1/models` in its shape and OpenAI's; `Server-Timing`
+- [x] Clef-Flash (`Cloudflare/clef-flash`, Qwen3.5-9B + a joint schema head): its prompt token for token, the head as
+      four programs of the decoder's session; parity with its Python code (tiny and released checkpoints), 25 test
+      decisions end to end on the Arc Pro B60
+- [x] `run --request`, `bench` (latency, `--state-tokens`), `tests/e2e/systemone_eval.py`
+- [ ] pplx-decider-flash-v1.2 (Qwen3.5-4B, whole-prompt attention in the full-attention layers, a read-out at a
+      marker per question)
+- [ ] OpenJev (Qwen3.8-27B: the output layer's rows of the option letters, one prompt per question)
+- [ ] Images (`assets`, box questions): needs the Qwen3.5 vision tower
+- [ ] Packs of decision checkpoints (`convert`)
+- [ ] Batching several requests into one step
+- **Done when:** each model answers as its reference code does and a System One client cannot tell the servers apart.
+
+---
+
 ## World models
 
 - [ ] `WorldModel` kind and `world/` runtime; first model: V-JEPA 2-AC (planning, batch axis) or Matrix-Game

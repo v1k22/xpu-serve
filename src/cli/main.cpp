@@ -14,9 +14,12 @@
 #include "chat/output_parser.h"
 #include "cli/args.h"
 #include "convert/convert.h"
+#include "decision/runner.h"
+#include "decision/service.h"
 #include "models/policy.h"
 #include "policy/runner.h"
 #include "policy/service.h"
+#include "server/decision_handlers.h"
 #include "server/server.h"
 #include "service/engine_service.h"
 #include "tokenizer/tokenizer.h"
@@ -34,9 +37,9 @@ const char* kUsage =
     "xpu-serve " XS_VERSION " - LLM serving on Intel GPUs\n"
     "\n"
     "usage:\n"
-    "  xpu-serve serve <model-dir> [options]   OpenAI-compatible server\n"
+    "  xpu-serve serve <model-dir> [options]   OpenAI-compatible server (a decision model: the System One API)\n"
     "  xpu-serve run   <model-dir> [options]   chat in the terminal (--prompt for one shot)\n"
-    "  xpu-serve bench <model-dir> [options]   prefill / decode speed\n"
+    "  xpu-serve bench <model-dir> [options]   prefill / decode speed, or a decision model's latency\n"
     "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--method rtn|awq]   quantized pack\n"
     "  xpu-serve info                          backends and devices\n"
     "\n"
@@ -116,6 +119,17 @@ ServiceOptions service_options(const Args& a) {
         o.session.extra[kv.substr(0, eq)] = kv.substr(eq + 1);
         pos = comma + 1;
     }
+    return o;
+}
+
+DecisionRunnerOptions decision_options(const ServiceOptions& so) {
+    DecisionRunnerOptions o;
+    o.backend = so.backend;
+    o.session = so.session;
+    o.session.max_context = so.engine.max_context;
+    o.chunk_tokens = so.engine.prefill_chunk;
+    o.model_id = so.model_id;
+    if (!so.spec.empty()) fail("--spec is for language models: a decision model generates no text");
     return o;
 }
 
@@ -237,6 +251,13 @@ int cmd_serve(const std::vector<std::string>& argv) {
         srv.run();
         return 0;
     }
+    if (model_kind(dir) == ModelKind::Decision) {  // the System One API
+        auto decisions = DecisionService::create(DecisionRunner::create(dir, decision_options(so)));
+        server::Server srv(*decisions, opts);
+        log::info("serving decision model ", decisions->spec().id, " on http://", opts.host, ":", opts.port);
+        srv.run();
+        return 0;
+    }
     auto service = EngineService::create(dir, so);
     server::Server srv(*service, opts);
     log::info("serving ", service->model().id, " on http://", opts.host, ":", opts.port);
@@ -315,6 +336,37 @@ std::vector<uint8_t> read_file(const std::string& path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+// A System One request body from a file ("model" may be left out here).
+DecisionRequest read_decision_request(const std::string& path) {
+    std::ifstream in(path);
+    XS_CHECK(in.good(), "cannot read '", path, "'");
+    nlohmann::ordered_json body = nlohmann::ordered_json::parse(in, nullptr, false);
+    XS_CHECK(body.is_object(), "'", path, "' is not a JSON object");
+    if (!body.contains("model")) body["model"] = "";
+    try {
+        return server::parse_systemone_request(body);
+    } catch (const server::SystemOneInvalid& e) {
+        std::string where;
+        for (const std::string& part : e.loc())
+            where += (where.empty() ? "" : ".") + part;
+        fail("'", path, "': ", where, ": ", e.what());
+    }
+}
+
+// One request through a decision model: the answers on stdout, tokens and timings on stderr.
+int run_decision(const Args& a, const std::string& dir) {
+    XS_CHECK(a.has("request"), "a decision model answers a request: --request <file with {\"state\", \"questions\"}>");
+    const DecisionRequest request = read_decision_request(a.get("request"));
+    auto runner = DecisionRunner::create(dir, decision_options(service_options(a)));
+    const DecisionResult r = runner->decide(request);
+    std::printf("%s\n", server::systemone_response(request, r, runner->spec().id).dump(2).c_str());
+    std::fflush(stdout);
+    std::fprintf(stderr, "[%lld tokens in %d sequence(s), %d steps: %.1f ms (prompt %.1f, device %.1f)]\n",
+                 static_cast<long long>(r.input_tokens), r.sequences, r.steps, r.timing.total_ms, r.timing.prompt_ms,
+                 r.timing.device_ms);
+    return 0;
+}
+
 int cmd_run(const std::vector<std::string>& argv) {
     Args a;
     add_engine_options(a);
@@ -326,11 +378,15 @@ int cmd_run(const std::vector<std::string>& argv) {
         .value("top-p", "top-p (default: the model's)")
         .value("seed", "sampling seed")
         .value("image", "image file(s) for the first message, comma-separated (PNG, JPEG, BMP, GIF)")
+        .value("request",
+               "decision models: a file holding a System One request ({\"state\", \"questions\"}); its "
+               "answers are printed as the API returns them")
         .flag("think", "enable the model's thinking mode")
         .flag("raw", "feed --prompt to the model as is, without the chat template");
     a.parse(argv);
     if (wants_help(a, "run", "<model-dir> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
+    if (model_kind(model_dir_arg(a, "run")) == ModelKind::Decision) return run_decision(a, model_dir_arg(a, "run"));
     auto service = EngineService::create(model_dir_arg(a, "run"), service_options(a));
     const SamplingParams sampling = sampling_from(a, service->model().default_sampling);
     const int max_tokens = a.get_int("max-tokens");
@@ -434,6 +490,58 @@ int bench_policy(const Args& a, const std::string& dir) {
     return 0;
 }
 
+// Latency of a decision model: timed requests after the runner's warm-up. The request is the one in --request, or
+// the runtime's sample; --state-tokens swaps its state for filler text of that many tokens.
+int bench_decision(const Args& a, const std::string& dir) {
+    const ServiceOptions so = service_options(a);
+    auto runner = DecisionRunner::create(dir, decision_options(so));
+    DecisionRequest request = a.has("request") ? read_decision_request(a.get("request")) : sample_decision_request();
+    if (const int want = a.get_int("state-tokens"); want > 0) {
+        const auto tokens = [&] { return static_cast<int>(runner->tokens(request).front().size()); };
+        std::string state;
+        int line = 0;
+        const auto grow = [&](int lines) {
+            for (int i = 0; i < lines; ++i) {
+                state +=
+                    str_cat("Entry ", ++line,
+                            ": the order shipped on time, the invoice matched and the customer confirmed receipt.\n");
+            }
+            request.state = state;
+        };
+        grow(0);
+        for (int have = tokens(); have < want; have = tokens())
+            grow(1 + (want - have) / 24);  // a line is about 20 tokens
+        for (int have = tokens(); have > want && state.size() > 8; have = tokens()) {
+            state.resize(state.size() - std::max<size_t>(1, static_cast<size_t>(have - want) * 3));
+            request.state = state;
+        }
+    }
+    std::vector<double> total, device, prompt;
+    DecisionResult last;
+    for (int run = 0; run < a.get_int("runs"); ++run) {
+        last = runner->decide(request);
+        total.push_back(last.timing.total_ms);
+        device.push_back(last.timing.device_ms);
+        prompt.push_back(last.timing.prompt_ms);
+        if (a.has("verbose")) {
+            std::printf("run %d: %.2f ms (prompt %.2f, device %.2f)\n", run, last.timing.total_ms,
+                        last.timing.prompt_ms, last.timing.device_ms);
+        }
+    }
+    size_t options = 0;
+    for (const DecisionQuestion& q : request.questions)
+        options += q.options.size();
+    std::printf("%s: %zu question(s) with %zu options, %lld tokens in %d sequence(s), %d steps, %s %s %s\n",
+                runner->spec().id.c_str(), request.questions.size(), options, static_cast<long long>(last.input_tokens),
+                last.sequences, last.steps, so.backend.c_str(),
+                so.session.device.empty() ? "default" : so.session.device.c_str(),
+                std::string(dtype_name(so.session.precision)).c_str());
+    std::printf("latency over %zu runs: p50 %.2f ms, p90 %.2f, min %.2f, max %.2f | device p50 %.2f, prompt p50 %.2f\n",
+                total.size(), percentile(total, 0.5), percentile(total, 0.9), percentile(total, 0.0),
+                percentile(total, 1.0), percentile(device, 0.5), percentile(prompt, 0.5));
+    return 0;
+}
+
 // Greedy decode speed over real prompts (what speculative decoding is measured on: its acceptance depends on the text).
 int bench_prompts(EngineService& service, const std::string& path, int n_gen, int runs) {
     std::ifstream in(path);
@@ -494,12 +602,20 @@ int cmd_bench(const std::vector<std::string>& argv) {
         .value("cameras", "policies: cameras present, the first N (default: all)", "0")
         .value("steps", "policies: flow steps (default: the checkpoint's)", "0")
         .value("warmup", "policies: untimed runs after compiling", "3")
-        .flag("verbose", "policies: print every run");
+        .value("request",
+               "decision models: a file holding a System One request (default: a short sample of each "
+               "question type)")
+        .value("state-tokens",
+               "decision models: replace the request's state with filler so the prompt has this many "
+               "tokens",
+               "0")
+        .flag("verbose", "policies and decision models: print every run");
     a.parse(argv);
     if (wants_help(a, "bench", "<model-dir> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
     const std::string dir = model_dir_arg(a, "bench");
     if (model_kind(dir) == ModelKind::Policy) return bench_policy(a, dir);
+    if (model_kind(dir) == ModelKind::Decision) return bench_decision(a, dir);
     auto service = EngineService::create(dir, service_options(a));
     const int n_gen = a.get_int("gen-tokens");
     if (!a.get("prompts").empty()) return bench_prompts(*service, a.get("prompts"), n_gen, a.get_int("runs"));

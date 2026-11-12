@@ -368,6 +368,8 @@ class CpuProgram {
                 return {cpu_ref::tanh(f32(0))};
             case OpKind::GeluTanh:
                 return {cpu_ref::gelu_tanh(f32(0))};
+            case OpKind::Gelu:
+                return {cpu_ref::gelu(f32(0))};
             case OpKind::Softcap:
                 return {cpu_ref::softcap(f32(0), std::get<graph::SoftcapAttrs>(n.attrs).cap)};
             case OpKind::Sigmoid:

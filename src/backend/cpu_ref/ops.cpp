@@ -208,6 +208,13 @@ HostTensor gelu_tanh(const HostTensor& x) {
     });
 }
 
+HostTensor gelu(const HostTensor& x) {
+    return map_unary(x, [](float v) {
+        const double d = v;
+        return static_cast<float>(0.5 * d * (1.0 + std::erf(d / std::numbers::sqrt2)));
+    });
+}
+
 HostTensor softcap(const HostTensor& x, float cap) {
     return map_unary(x, [cap](float v) {
         return static_cast<float>(static_cast<double>(cap) * std::tanh(static_cast<double>(v) / cap));

@@ -12,6 +12,7 @@
 #include <httplib/httplib.h>
 
 #include "server/completion_handlers.h"
+#include "server/decision_handlers.h"
 #include "server/openai_format.h"
 #include "server/openai_request.h"
 #include "server/policy_handlers.h"
@@ -54,16 +55,24 @@ struct Server::Impl {
         policy_handlers.emplace(p);
         install_routes();
     }
+    Impl(DecisionService& d, ServerOptions opts) : decisions(&d), options(std::move(opts)) {
+        decision_handlers.emplace(d);
+        install_routes();
+    }
 
     void install_routes();
     bool authorized(const httplib::Request& req) const;
-    std::string model_id() const { return service != nullptr ? service->model().id : policy->spec().id; }
+    std::string model_id() const {
+        return service != nullptr ? service->model().id : policy != nullptr ? policy->spec().id : decisions->spec().id;
+    }
 
-    InferenceService* service = nullptr;  // one of the two
+    InferenceService* service = nullptr;  // one of the three
     PolicyService* policy = nullptr;
+    DecisionService* decisions = nullptr;
     const ServerOptions options;
     std::optional<CompletionHandlers> handlers;
     std::optional<PolicyHandlers> policy_handlers;
+    std::optional<DecisionHandlers> decision_handlers;
     const int64_t started_at = unix_seconds_now();
     httplib::Server http;
     std::mutex bind_mutex;  // orders bind against stop(), so a stop() before run() is not lost
@@ -111,6 +120,14 @@ void Server::Impl::install_routes() {
                   }));
         return;
     }
+    if (decision_handlers) {  // its errors have the System One API's bodies, written by the handler
+        http.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
+            decision_handlers->models(req, res, started_at);
+        });
+        http.Post("/v1/systemone",
+                  [this](const httplib::Request& req, httplib::Response& res) { decision_handlers->decide(req, res); });
+        return;
+    }
     http.Get("/v1/models", [this](const httplib::Request&, httplib::Response& res) {
         res.set_content(model_list_json(service->model(), started_at).dump(), "application/json");
     });
@@ -125,6 +142,9 @@ Server::Server(InferenceService& service, ServerOptions options)
 
 Server::Server(PolicyService& policy, ServerOptions options)
     : impl_(std::make_unique<Impl>(policy, std::move(options))) {}
+
+Server::Server(DecisionService& decisions, ServerOptions options)
+    : impl_(std::make_unique<Impl>(decisions, std::move(options))) {}
 
 Server::~Server() = default;
 

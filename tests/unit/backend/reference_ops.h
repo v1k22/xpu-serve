@@ -75,6 +75,10 @@ inline double gelu_tanh(double x) {
     return 0.5 * x * (1.0 + std::tanh(std::sqrt(2.0 / std::numbers::pi) * (x + 0.044715 * x * x * x)));
 }
 
+inline double gelu(double x) {
+    return 0.5 * x * (1.0 + std::erf(x / std::numbers::sqrt2));
+}
+
 inline Tensor64 rms_norm(const Tensor64& x, const Tensor64* weight, double eps) {
     const int64_t d = x.shape.back();
     Tensor64 out(x.shape);

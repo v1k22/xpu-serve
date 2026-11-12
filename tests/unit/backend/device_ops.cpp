@@ -359,7 +359,7 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
-    TEST_CASE("scale, tanh, gelu_tanh and softcap") {
+    TEST_CASE("scale, tanh, gelu, gelu_tanh and softcap") {
         test::TensorRng rng(3);
         const HostTensor x = rng.uniform(DType::F32, {3, 50}, 8.0f);
         const Tensor64 x64 = to_f64(x);
@@ -372,6 +372,7 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
             {"scale", [](Graph& g, Value v) { return g.scale(v, 0.125f); }, [](double v) { return v * 0.125; }},
             {"tanh", [](Graph& g, Value v) { return g.tanh(v); }, [](double v) { return std::tanh(v); }},
             {"gelu_tanh", [](Graph& g, Value v) { return g.gelu_tanh(v); }, test::ref::gelu_tanh},
+            {"gelu", [](Graph& g, Value v) { return g.gelu(v); }, test::ref::gelu},
             {"softcap", [](Graph& g, Value v) { return g.softcap(v, 3.0f); },
              [](double v) { return 3.0 * std::tanh(v / 3.0); }},
         };

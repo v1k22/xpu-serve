@@ -15,7 +15,7 @@ using half = sycl::half;
 
 inline constexpr int kMaxRank = 6;
 
-enum class UnaryOp : uint8_t { Scale, Tanh, GeluTanh, Softcap, Sigmoid, Silu, Softplus, Clamp };
+enum class UnaryOp : uint8_t { Scale, Tanh, GeluTanh, Softcap, Sigmoid, Silu, Softplus, Clamp, Gelu };
 // y = op(x); `a` is the scale factor, softcap or lower bound, `b` the upper bound.
 // Elementwise and norm kernels write f32 or f16 (Y = float or half): an f16 output feeds a GEMM directly.
 template <typename Y>

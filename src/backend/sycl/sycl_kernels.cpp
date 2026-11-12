@@ -36,6 +36,8 @@ inline float apply_unary(float x, float a, float b) {
         // product with the gate is a large pass), absolute error near 1e-7.
         const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
         return x * (1.0f - 1.0f / (sycl::native::exp(2.0f * inner) + 1.0f));
+    } else if constexpr (Op == UnaryOp::Gelu) {
+        return 0.5f * x * (1.0f + sycl::erf(x * 0.7071067811865476f));
     } else if constexpr (Op == UnaryOp::Softcap) {
         return a * sycl::tanh(x / a);
     } else if constexpr (Op == UnaryOp::Sigmoid) {
@@ -948,6 +950,7 @@ void unary(sycl::queue& q, UnaryOp op, const float* x, Y* y, int64_t n, float a,
         case UnaryOp::Silu: return unary_t<UnaryOp::Silu, Y>(q, x, y, n, a, b);
         case UnaryOp::Softplus: return unary_t<UnaryOp::Softplus, Y>(q, x, y, n, a, b);
         case UnaryOp::Clamp: return unary_t<UnaryOp::Clamp, Y>(q, x, y, n, a, b);
+        case UnaryOp::Gelu: return unary_t<UnaryOp::Gelu, Y>(q, x, y, n, a, b);
     }
 }
 

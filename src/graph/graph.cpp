@@ -38,6 +38,7 @@ std::string_view op_name(OpKind kind) {
         case OpKind::Scale: return "Scale";
         case OpKind::Tanh: return "Tanh";
         case OpKind::GeluTanh: return "GeluTanh";
+        case OpKind::Gelu: return "Gelu";
         case OpKind::Softcap: return "Softcap";
         case OpKind::Sigmoid: return "Sigmoid";
         case OpKind::Silu: return "Silu";
@@ -279,6 +280,7 @@ Value Graph::elementwise_unary(OpKind kind, Value x, Attrs attrs) {
 Value Graph::scale(Value x, float factor) { return elementwise_unary(OpKind::Scale, x, ScaleAttrs{factor}); }
 Value Graph::tanh(Value x) { return elementwise_unary(OpKind::Tanh, x, {}); }
 Value Graph::gelu_tanh(Value x) { return elementwise_unary(OpKind::GeluTanh, x, {}); }
+Value Graph::gelu(Value x) { return elementwise_unary(OpKind::Gelu, x, {}); }
 
 Value Graph::softcap(Value x, float cap) {
     XS_CHECK(cap > 0.0f, "softcap must be positive, got ", cap);

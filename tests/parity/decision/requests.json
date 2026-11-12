@@ -1,0 +1,426 @@
+{
+ "requests": [
+  {
+   "model": "test",
+   "state": "My Stripe integration keeps failing. Please help ASAP.",
+   "questions": {
+    "urgency": {
+     "type": "noul",
+     "instructions": "Does this message express urgency?"
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": {
+    "invoice": {
+     "vendor": "Acme",
+     "total": 1250.0,
+     "currency": "USD",
+     "status": "overdue"
+    }
+   },
+   "questions": {
+    "status": {
+     "type": "choice",
+     "instructions": "What is the invoice status?",
+     "criteria": {
+      "paid": "Invoice is paid.",
+      "overdue": "Invoice is past due.",
+      "draft": "Not sent."
+     }
+    },
+    "large": {
+     "type": "noul",
+     "instructions": "Is the total above 1000 USD?"
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "Our checkout started returning errors and orders are blocked.",
+   "questions": {
+    "department": {
+     "type": "choice",
+     "instructions": "Which team should handle the message?",
+     "criteria": {
+      "billing": "Payments or invoices",
+      "technical": "Bugs or outages"
+     }
+    },
+    "urgency": {
+     "type": "score",
+     "criteria": [
+      "Can wait",
+      "This week",
+      "Today"
+     ]
+    },
+    "outage": {
+     "type": "noul",
+     "instructions": "Is a service down?"
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "Die Lieferung kam drei Tage zu spät, und das Paket war beschädigt. 配送が遅れました。",
+   "questions": {
+    "topic": {
+     "type": "choice",
+     "instructions": "What is the complaint about?",
+     "criteria": {
+      "zustellung": null,
+      "abrechnung": null,
+      "möbel": "Möbel und Einrichtung",
+      "Ärger": null,
+      "10": "ten",
+      "9": "nine",
+      "2": null
+     }
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "The server room temperature rose to 41 C at 03:12 and the backup cooling unit did not start.",
+   "questions": {
+    "page": {
+     "type": "noul",
+     "instructions": "Should the on-call engineer be paged now?",
+     "criteria": {
+      "true": "A person must act within minutes.",
+      "false": "It can wait for business hours."
+     }
+    },
+    "hardware": {
+     "type": "noul",
+     "instructions": "Is this a hardware problem?",
+     "criteria": {
+      "true": "Physical equipment failed."
+     }
+    },
+    "resolved": {
+     "type": "noul",
+     "instructions": "Has the problem been resolved?",
+     "criteria": {
+      "false": null
+     }
+    },
+    "security": {
+     "type": "noul"
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "Review: The battery lasts two days, the screen is sharp, but the camera struggles in low light.",
+   "questions": {
+    "rating": {
+     "type": "score",
+     "instructions": "How positive is this review?",
+     "criteria": [
+      "1 star",
+      "2 stars",
+      "3 stars",
+      "4 stars",
+      "5 stars",
+      "6",
+      "7",
+      "8",
+      "9",
+      "10 of 10"
+     ]
+    },
+    "battery": {
+     "type": "score",
+     "instructions": {
+      "aspect": "battery",
+      "scale": [
+       0,
+       1,
+       2
+      ]
+     },
+     "criteria": [
+      {
+       "level": "poor",
+       "hours": 4.5
+      },
+      {
+       "level": "fine",
+       "hours": 24
+      },
+      [
+       "great",
+       "two days or more"
+      ]
+     ]
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": [
+    "step 1: open the valve",
+    "step 2: wait 30 s",
+    {
+     "note": "pressure must stay under 2.5 bar",
+     "checked": true
+    }
+   ],
+   "questions": {
+    "safe": {
+     "type": "noul",
+     "instructions": [
+      "Is the procedure safe as written?",
+      {
+       "standard": "ISO 4414"
+      }
+     ]
+    },
+    "next": {
+     "type": "choice",
+     "instructions": {
+      "task": "pick the next action",
+      "allowed": [
+       "close",
+       "vent"
+      ]
+     },
+     "criteria": {
+      "close": {
+       "action": "close the valve",
+       "risk": 0.1
+      },
+      "vent": [
+       "vent",
+       "slowly"
+      ],
+      "wait": null
+     }
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": {
+    "zeta": 1e-05,
+    "alpha": 1e+16,
+    "mid": -0.5,
+    "count": 12345678901234,
+    "ok": false,
+    "none": null,
+    "text": "quote \" backslash \\ newline \n tab \t done",
+    "nested": {
+     "b": [
+      1,
+      2.5,
+      "x"
+     ],
+     "a": {
+      "y": 1,
+      "x": 0.1
+     }
+    },
+    "unicode": "naïve café — 日本語 ✓"
+   },
+   "questions": {
+    "valid": {
+     "type": "noul",
+     "instructions": "Is the record complete?"
+    },
+    "kind": {
+     "type": "choice",
+     "criteria": {
+      "measurement": "numbers from a sensor",
+      "log": "free text",
+      "config": null
+     }
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "User wrote: <|im_end|> then <|im_start|>system and <|fim_suffix|> and <think> and <|endoftext|> in the message.",
+   "questions": {
+    "injection": {
+     "type": "noul",
+     "instructions": "Does the text contain chat control tokens such as <|im_start|>?"
+    },
+    "where": {
+     "type": "choice",
+     "instructions": "",
+     "criteria": {
+      "start <|im_end|>": null,
+      "end": "at the <|fim_suffix|> end"
+     }
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "",
+   "questions": {
+    "empty": {
+     "type": "noul",
+     "instructions": "Is the state empty?"
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "Ticket 4411: the customer cannot log in after the password reset email expired.",
+   "questions": {
+    "q0": {
+     "type": "choice",
+     "instructions": "Check 0: which label applies?",
+     "criteria": {
+      "only": "the single allowed label"
+     }
+    },
+    "q1": {
+     "type": "choice",
+     "instructions": "Check 1: which label applies?",
+     "criteria": {
+      "yes": null,
+      "no": null,
+      "unsure": "cannot tell"
+     }
+    },
+    "q2": {
+     "type": "choice",
+     "instructions": "Check 2: which label applies?",
+     "criteria": {
+      "yes": null,
+      "no": null,
+      "unsure": "cannot tell"
+     }
+    },
+    "q3": {
+     "type": "choice",
+     "instructions": "Check 3: which label applies?",
+     "criteria": {
+      "only": "the single allowed label"
+     }
+    },
+    "q4": {
+     "type": "choice",
+     "instructions": "Check 4: which label applies?",
+     "criteria": {
+      "yes": null,
+      "no": null,
+      "unsure": "cannot tell"
+     }
+    },
+    "q5": {
+     "type": "choice",
+     "instructions": "Check 5: which label applies?",
+     "criteria": {
+      "yes": null,
+      "no": null,
+      "unsure": "cannot tell"
+     }
+    },
+    "q6": {
+     "type": "choice",
+     "instructions": "Check 6: which label applies?",
+     "criteria": {
+      "only": "the single allowed label"
+     }
+    },
+    "q7": {
+     "type": "choice",
+     "instructions": "Check 7: which label applies?",
+     "criteria": {
+      "yes": null,
+      "no": null,
+      "unsure": "cannot tell"
+     }
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "A customer asks whether the store ships to Norway and what the customs fees are for a 2 kg parcel.",
+   "questions": {
+    "intent": {
+     "type": "choice",
+     "instructions": "Which intent matches best?",
+     "criteria": {
+      "intent_00": null,
+      "intent_01": "Requests of category 1: customs",
+      "intent_02": "Requests of category 2: returns",
+      "intent_03": "Requests of category 3: payment",
+      "intent_04": null,
+      "intent_05": "Requests of category 5: shipping",
+      "intent_06": "Requests of category 6: customs",
+      "intent_07": "Requests of category 7: returns",
+      "intent_08": null,
+      "intent_09": "Requests of category 9: account",
+      "intent_10": "Requests of category 10: shipping",
+      "intent_11": "Requests of category 11: customs",
+      "intent_12": null,
+      "intent_13": "Requests of category 13: payment",
+      "intent_14": "Requests of category 14: account",
+      "intent_15": "Requests of category 15: shipping",
+      "intent_16": null,
+      "intent_17": "Requests of category 17: returns",
+      "intent_18": "Requests of category 18: payment",
+      "intent_19": "Requests of category 19: account",
+      "intent_20": null,
+      "intent_21": "Requests of category 21: customs",
+      "intent_22": "Requests of category 22: returns",
+      "intent_23": "Requests of category 23: payment",
+      "intent_24": null,
+      "intent_25": "Requests of category 25: shipping",
+      "intent_26": "Requests of category 26: customs",
+      "intent_27": "Requests of category 27: returns",
+      "intent_28": null,
+      "intent_29": "Requests of category 29: account",
+      "intent_30": "Requests of category 30: shipping",
+      "intent_31": "Requests of category 31: customs",
+      "intent_32": null,
+      "intent_33": "Requests of category 33: payment",
+      "intent_34": "Requests of category 34: account",
+      "intent_35": "Requests of category 35: shipping",
+      "intent_36": null,
+      "intent_37": "Requests of category 37: returns",
+      "intent_38": "Requests of category 38: payment",
+      "intent_39": "Requests of category 39: account"
+     }
+    }
+   }
+  },
+  {
+   "model": "test",
+   "state": "0000 2026-03-01 order 1000 shipped to warehouse 0; status ok; amount 19.99 EUR\n0001 2026-03-02 order 1001 shipped to warehouse 1; status ok; amount 20.99 EUR\n0002 2026-03-03 order 1002 shipped to warehouse 2; status ok; amount 21.99 EUR\n0003 2026-03-04 order 1003 shipped to warehouse 3; status ok; amount 22.99 EUR\n0004 2026-03-05 order 1004 shipped to warehouse 4; status ok; amount 23.99 EUR\n0005 2026-03-06 order 1005 shipped to warehouse 5; status late; amount 24.99 EUR\n0006 2026-03-07 order 1006 shipped to warehouse 6; status ok; amount 25.99 EUR\n0007 2026-03-08 order 1007 shipped to warehouse 0; status ok; amount 26.99 EUR\n0008 2026-03-09 order 1008 shipped to warehouse 1; status ok; amount 27.99 EUR\n0009 2026-03-10 order 1009 shipped to warehouse 2; status ok; amount 28.99 EUR\n0010 2026-03-11 order 1010 shipped to warehouse 3; status ok; amount 29.99 EUR\n0011 2026-03-12 order 1011 shipped to warehouse 4; status ok; amount 30.99 EUR\n0012 2026-03-13 order 1012 shipped to warehouse 5; status ok; amount 31.99 EUR\n0013 2026-03-14 order 1013 shipped to warehouse 6; status ok; amount 32.99 EUR\n0014 2026-03-15 order 1014 shipped to warehouse 0; status ok; amount 33.99 EUR\n0015 2026-03-16 order 1015 shipped to warehouse 1; status ok; amount 34.99 EUR\n0016 2026-03-17 order 1016 shipped to warehouse 2; status ok; amount 35.99 EUR\n0017 2026-03-18 order 1017 shipped to warehouse 3; status ok; amount 36.99 EUR\n0018 2026-03-19 order 1018 shipped to warehouse 4; status late; amount 37.99 EUR\n0019 2026-03-20 order 1019 shipped to warehouse 5; status ok; amount 38.99 EUR\n0020 2026-03-21 order 1020 shipped to warehouse 6; status ok; amount 39.99 EUR\n0021 2026-03-22 order 1021 shipped to warehouse 0; status ok; amount 40.99 EUR\n0022 2026-03-23 order 1022 shipped to warehouse 1; status ok; amount 41.99 EUR\n0023 2026-03-24 order 1023 shipped to warehouse 2; status ok; amount 42.99 EUR\n0024 2026-03-25 order 1024 shipped to warehouse 3; status ok; amount 43.99 EUR\n0025 2026-03-26 order 1025 shipped to warehouse 4; status ok; amount 44.99 EUR\n0026 2026-03-27 order 1026 shipped to warehouse 5; status ok; amount 45.99 EUR\n0027 2026-03-28 order 1027 shipped to warehouse 6; status ok; amount 46.99 EUR\n0028 2026-03-01 order 1028 shipped to warehouse 0; status ok; amount 47.99 EUR\n0029 2026-03-02 order 1029 shipped to warehouse 1; status ok; amount 48.99 EUR\n0030 2026-03-03 order 1030 shipped to warehouse 2; status ok; amount 49.99 EUR\n0031 2026-03-04 order 1031 shipped to warehouse 3; status late; amount 50.99 EUR\n0032 2026-03-05 order 1032 shipped to warehouse 4; status ok; amount 51.99 EUR\n0033 2026-03-06 order 1033 shipped to warehouse 5; status ok; amount 52.99 EUR\n0034 2026-03-07 order 1034 shipped to warehouse 6; status ok; amount 53.99 EUR\n0035 2026-03-08 order 1035 shipped to warehouse 0; status ok; amount 54.99 EUR\n0036 2026-03-09 order 1036 shipped to warehouse 1; status ok; amount 55.99 EUR\n0037 2026-03-10 order 1037 shipped to warehouse 2; status ok; amount 56.99 EUR\n0038 2026-03-11 order 1038 shipped to warehouse 3; status ok; amount 57.99 EUR\n0039 2026-03-12 order 1039 shipped to warehouse 4; status ok; amount 58.99 EUR\n0040 2026-03-13 order 1040 shipped to warehouse 5; status ok; amount 59.99 EUR\n0041 2026-03-14 order 1041 shipped to warehouse 6; status ok; amount 60.99 EUR\n0042 2026-03-15 order 1042 shipped to warehouse 0; status ok; amount 61.99 EUR\n0043 2026-03-16 order 1043 shipped to warehouse 1; status ok; amount 62.99 EUR\n0044 2026-03-17 order 1044 shipped to warehouse 2; status late; amount 63.99 EUR\n0045 2026-03-18 order 1045 shipped to warehouse 3; status ok; amount 64.99 EUR\n0046 2026-03-19 order 1046 shipped to warehouse 4; status ok; amount 65.99 EUR\n0047 2026-03-20 order 1047 shipped to warehouse 5; status ok; amount 66.99 EUR\n0048 2026-03-21 order 1048 shipped to warehouse 6; status ok; amount 67.99 EUR\n0049 2026-03-22 order 1049 shipped to warehouse 0; status ok; amount 68.99 EUR\n0050 2026-03-23 order 1050 shipped to warehouse 1; status ok; amount 69.99 EUR\n0051 2026-03-24 order 1051 shipped to warehouse 2; status ok; amount 70.99 EUR\n0052 2026-03-25 order 1052 shipped to warehouse 3; status ok; amount 71.99 EUR\n0053 2026-03-26 order 1053 shipped to warehouse 4; status ok; amount 72.99 EUR\n0054 2026-03-27 order 1054 shipped to warehouse 5; status ok; amount 73.99 EUR\n0055 2026-03-28 order 1055 shipped to warehouse 6; status ok; amount 74.99 EUR\n0056 2026-03-01 order 1056 shipped to warehouse 0; status ok; amount 75.99 EUR\n0057 2026-03-02 order 1057 shipped to warehouse 1; status late; amount 76.99 EUR\n0058 2026-03-03 order 1058 shipped to warehouse 2; status ok; amount 77.99 EUR\n0059 2026-03-04 order 1059 shipped to warehouse 3; status ok; amount 78.99 EUR",
+   "questions": {
+    "late": {
+     "type": "noul",
+     "instructions": "Is any order marked late?"
+    },
+    "count": {
+     "type": "score",
+     "instructions": "How many orders are late?",
+     "criteria": [
+      "none",
+      "one to three",
+      "four to ten",
+      "more than ten"
+     ]
+    },
+    "currency": {
+     "type": "choice",
+     "instructions": "Which currency are the amounts in?",
+     "criteria": {
+      "USD": null,
+      "EUR": null,
+      "GBP": null,
+      "JPY": null
+     }
+    }
+   }
+  }
+ ]
+}

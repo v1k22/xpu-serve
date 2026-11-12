@@ -1,0 +1,474 @@
+{
+ "description": "25 decisions with one accepted answer each: 12 choice, 8 noul, 5 score (the most likely level). One question a request; tests/e2e/systemone_eval.py sends them to a server.",
+ "requests": [
+  {
+   "model": "decision-model",
+   "state": "Customer message: I was charged twice for my order last week and nobody has replied to my emails.",
+   "questions": {
+    "route": {
+     "type": "choice",
+     "instructions": "Which team should handle this message?",
+     "criteria": {
+      "shipping": "Delivery, tracking and lost parcels",
+      "billing": "Charges, refunds and invoices",
+      "technical": "Bugs, errors and login problems",
+      "sales": "Questions before buying"
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "User: I forgot my password and the reset email never arrives.",
+   "questions": {
+    "intent": {
+     "type": "choice",
+     "instructions": "What does the user need?",
+     "criteria": {
+      "cancel_subscription": null,
+      "account_access": null,
+      "change_address": null,
+      "product_question": null
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Review: The headphones sound fantastic, the battery lasts all week and they are comfortable for hours.",
+   "questions": {
+    "sentiment": {
+     "type": "choice",
+     "instructions": "What is the sentiment of the review?",
+     "criteria": {
+      "negative": null,
+      "neutral": null,
+      "positive": null
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Entschuldigung, wo ist der nächste Bahnhof?",
+   "questions": {
+    "language": {
+     "type": "choice",
+     "instructions": "Which language is the text written in?",
+     "criteria": {
+      "french": null,
+      "german": null,
+      "spanish": null,
+      "dutch": null,
+      "italian": null
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": {
+    "user": "What will the weather be like in Paris tomorrow afternoon?"
+   },
+   "questions": {
+    "tool": {
+     "type": "choice",
+     "instructions": "Which tool should the assistant call?",
+     "criteria": {
+      "send_email": "Send an email to a recipient",
+      "search_flights": "Find flights between two cities",
+      "get_weather": "Weather forecast for a city and date",
+      "create_calendar_event": "Add an event to the calendar"
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "The central bank raised its benchmark interest rate by 25 basis points on Thursday, citing persistent inflation.",
+   "questions": {
+    "topic": {
+     "type": "choice",
+     "instructions": "What is the article about?",
+     "criteria": {
+      "sports": null,
+      "economy": null,
+      "science": null,
+      "entertainment": null,
+      "travel": null
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Question: What is the capital city of Australia?",
+   "questions": {
+    "capital": {
+     "type": "choice",
+     "instructions": "Pick the correct answer.",
+     "criteria": {
+      "Sydney": null,
+      "Melbourne": null,
+      "Canberra": null,
+      "Perth": null
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Compute: 17 multiplied by 6.",
+   "questions": {
+    "arithmetic": {
+     "type": "choice",
+     "instructions": "Which result is correct?",
+     "criteria": {
+      "92": null,
+      "102": null,
+      "112": null,
+      "96": null
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": {
+    "premise": "A man is playing a guitar on a stage in front of a crowd.",
+    "hypothesis": "A person is performing music."
+   },
+   "questions": {
+    "inference": {
+     "type": "choice",
+     "instructions": "How does the hypothesis relate to the premise?",
+     "criteria": {
+      "contradiction": "The hypothesis cannot be true if the premise is",
+      "neutral": "The premise does not settle it",
+      "entailment": "The hypothesis follows from the premise"
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "2026-03-14 02:11:09 FATAL db-primary: connection pool exhausted, all writes failing, service shutting down",
+   "questions": {
+    "severity": {
+     "type": "choice",
+     "instructions": "How severe is this log line?",
+     "criteria": {
+      "info": null,
+      "warning": null,
+      "critical": null
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": {
+    "goal": "Log in to the account",
+    "page": "Sign in",
+    "elements": [
+     {
+      "id": 1,
+      "tag": "input",
+      "label": "Email",
+      "value": "ana@example.com"
+     },
+     {
+      "id": 2,
+      "tag": "input",
+      "label": "Password",
+      "value": "********"
+     },
+     {
+      "id": 3,
+      "tag": "button",
+      "text": "Sign in"
+     },
+     {
+      "id": 4,
+      "tag": "a",
+      "text": "Create an account"
+     }
+    ]
+   },
+   "questions": {
+    "next_action": {
+     "type": "choice",
+     "instructions": "Both fields are filled in. What should the agent do next?",
+     "criteria": {
+      "type_email": "Type into the Email field",
+      "click_create_account": "Open the registration page",
+      "click_sign_in": "Press the Sign in button",
+      "done": "The task is complete"
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "INVOICE No. 2026-0412\nBill to: Northwind Traders\nItem: 40 x office chair  Unit price: 85.00  Total due: 3,400.00 EUR\nPayment terms: 30 days net",
+   "questions": {
+    "document": {
+     "type": "choice",
+     "instructions": "What kind of document is this?",
+     "criteria": {
+      "contract": null,
+      "resume": null,
+      "invoice": null,
+      "meeting_notes": null
+     }
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "CONGRATULATIONS!!! You have been selected to win $1,000,000. Click the link now and enter your bank details to claim your prize!",
+   "questions": {
+    "spam": {
+     "type": "noul",
+     "instructions": "Is this message spam?"
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Hi, my name is Jordan Lee, my social security number is 123-45-6789 and my card ends in 4421.",
+   "questions": {
+    "pii": {
+     "type": "noul",
+     "instructions": "Does the text contain personal identifying information?"
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": {
+    "context": "The Eiffel Tower in Paris is 330 metres tall and was completed in 1889.",
+    "claim": "The Eiffel Tower is more than 300 metres tall."
+   },
+   "questions": {
+    "supported": {
+     "type": "noul",
+     "instructions": "Is the claim supported by the context?"
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": {
+    "context": "The Eiffel Tower in Paris is 330 metres tall and was completed in 1889.",
+    "claim": "The Eiffel Tower stands in Berlin."
+   },
+   "questions": {
+    "unsupported": {
+     "type": "noul",
+     "instructions": "Is the claim supported by the context?"
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "No rush at all on this one. Whenever you get a chance in the next month or two is completely fine.",
+   "questions": {
+    "urgent": {
+     "type": "noul",
+     "instructions": "Does the message ask for immediate attention?"
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Thank you so much for your help today, I really appreciate it. Have a wonderful weekend!",
+   "questions": {
+    "toxic": {
+     "type": "noul",
+     "instructions": "Is the message rude or abusive?"
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "The number under consideration is 97.",
+   "questions": {
+    "prime": {
+     "type": "noul",
+     "instructions": "Is the number a prime number?"
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Please cancel my subscription and return the money you took from my card yesterday.",
+   "questions": {
+    "refund": {
+     "type": "noul",
+     "instructions": "Is the customer asking for a refund?"
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "ALERT: the production payment database is down and no customer can complete a purchase right now.",
+   "questions": {
+    "urgency": {
+     "type": "score",
+     "instructions": "How urgent is this?",
+     "criteria": [
+      "can wait",
+      "this week",
+      "today",
+      "right now"
+     ]
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Review: Terrible. It broke after one day, the seller never answered and I want my money back.",
+   "questions": {
+    "stars_low": {
+     "type": "score",
+     "instructions": "How many stars does the reviewer give?",
+     "criteria": [
+      "1 star",
+      "2 stars",
+      "3 stars",
+      "4 stars",
+      "5 stars"
+     ]
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "Review: Absolutely perfect. It exceeded every expectation and I have already ordered a second one.",
+   "questions": {
+    "stars_high": {
+     "type": "score",
+     "instructions": "How many stars does the reviewer give?",
+     "criteria": [
+      "1 star",
+      "2 stars",
+      "3 stars",
+      "4 stars",
+      "5 stars"
+     ]
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": "hey dude, wanna grab pizza l8r? lol",
+   "questions": {
+    "formality": {
+     "type": "score",
+     "instructions": "How formal is the writing?",
+     "criteria": [
+      "very informal",
+      "neutral",
+      "very formal"
+     ]
+    }
+   }
+  },
+  {
+   "model": "decision-model",
+   "state": {
+    "first": "The cat sat on the mat.",
+    "second": "A cat was sitting on the mat."
+   },
+   "questions": {
+    "similarity": {
+     "type": "score",
+     "instructions": "How close in meaning are the two sentences?",
+     "criteria": [
+      "unrelated",
+      "related",
+      "same meaning"
+     ]
+    }
+   }
+  }
+ ],
+ "expected": [
+  {
+   "route": "billing"
+  },
+  {
+   "intent": "account_access"
+  },
+  {
+   "sentiment": "positive"
+  },
+  {
+   "language": "german"
+  },
+  {
+   "tool": "get_weather"
+  },
+  {
+   "topic": "economy"
+  },
+  {
+   "capital": "Canberra"
+  },
+  {
+   "arithmetic": "102"
+  },
+  {
+   "inference": "entailment"
+  },
+  {
+   "severity": "critical"
+  },
+  {
+   "next_action": "click_sign_in"
+  },
+  {
+   "document": "invoice"
+  },
+  {
+   "spam": true
+  },
+  {
+   "pii": true
+  },
+  {
+   "supported": true
+  },
+  {
+   "unsupported": false
+  },
+  {
+   "urgent": false
+  },
+  {
+   "toxic": false
+  },
+  {
+   "prime": true
+  },
+  {
+   "refund": true
+  },
+  {
+   "urgency": 3
+  },
+  {
+   "stars_low": 0
+  },
+  {
+   "stars_high": 4
+  },
+  {
+   "formality": 0
+  },
+  {
+   "similarity": 2
+  }
+ ]
+}

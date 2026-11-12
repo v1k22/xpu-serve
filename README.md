@@ -9,7 +9,8 @@ One repo, one binary: the model code, the engine, the tokenizer, chat templates 
 live here, and the math runs on Intel GPUs through our SYCL backend (our own kernels, oneMKL for large matmuls). Read
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
-**Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8, LFM3) and a robot policy (π0.5), from the
+**Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8, LFM3), a robot policy (π0.5) and decision
+models (Clef-Flash, behind the System One API), from the
 original checkpoint, its FP8 release where there is one, or a q8 / q4 pack written by `xpu-serve convert`, one request
 at a time, on Intel GPUs through the SYCL backend; speculative decoding with each model's drafter (Qwen's MTP head,
 Gemma 4's assistant checkpoints, DFlash 2 and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the
@@ -27,6 +28,7 @@ code.
 | Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
 | π0.5 | robot policy | f16, q8 | 215 / 198 ms per call (f16 / q8); 115 / 113 ms on the Arc Pro B60 | Arc B390, 3 cameras |
+| Clef-Flash | decision | f16 | 89 ms per decision (p50; 96 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
 
 | Model | Checkpoint (`model_type`) | Checked against |
 |---|---|---|
@@ -38,6 +40,7 @@ code.
 | Qwen3.8-27B | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-27B-FP8` (`qwen3_5`) | tiny-checkpoint parity (its head ratios and RoPE, its MTP head; DFlash, DFlash 2 and DSpine drafters against their PyTorch code); MMLU-Pro (25 questions): 76 % |
 | LFM3-1.7B | `LiquidAI/LFM3-1.7B` (`lfm3`) | Hugging Face fp32 logits, greedy text (the checkpoint's own modeling code); MMLU-Pro (25 questions): 60 % |
 | π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 1e-3 (GPU f16) |
+| Clef-Flash | `Cloudflare/clef-flash` (`qwen3_5` with a joint schema head) | its own Python code in fp32: the same prompt tokens, probabilities within 0.0007 (GPU f16); 25 of 25 test decisions right and equal to that code's |
 
 Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card, and their FP8
 releases (half the download) load and convert like the originals; LFM3 thinks by
@@ -46,7 +49,8 @@ of context, and is best served from its q8 pack (at q4 its reasoning runs long m
 robot state and an instruction to 50 x 32 actions in 10 flow steps, and its q8 pack quantizes the action expert.
 
 A model is added in `src/models/<arch>/` (language models: [CLAUDE.md](CLAUDE.md); policies:
-[docs/design-vla.md](docs/design-vla.md)); these tables list what has been enabled and measured.
+[docs/design-vla.md](docs/design-vla.md); decision models:
+[docs/decisions/0015](docs/decisions/0015-decision-models.md)); these tables list what has been enabled and measured.
 
 ## Build
 
@@ -145,6 +149,64 @@ seed, the flow steps or fixed noise) and returns the action chunk with per-stage
 warmed up. Calls run one at a time and the latest observation wins: a call still waiting when a newer one arrives is
 answered 409. Requests fail by name (an unknown camera, a wrong state length, an image of the wrong size).
 
+## Decision models (the System One API)
+
+A decision model answers typed questions about a state instead of writing text: a yes / no (`noul`), a `choice`
+among options you name, or a `score` on levels you order, each as probabilities read off the model in one pass, with
+nothing to parse. `serve` puts one behind TypeSafe's System One API, which clients written for Jev, Clef or vLLM's
+`/v1/systemone` already speak:
+
+```bash
+xpu-serve serve ~/models/clef-flash --device GPU --ctx 16384
+curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' -d '{
+  "model": "clef-flash",
+  "state": "Customer message: I was charged twice for my order last week and nobody has replied.",
+  "questions": {
+    "route":   {"type": "choice", "instructions": "Which team should handle this?",
+                "criteria": {"billing": "Charges and refunds", "shipping": "Delivery and tracking", "technical": null}},
+    "angry":   {"type": "noul", "instructions": "Is the customer angry?"},
+    "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["can wait", "this week", "today"]}
+  }
+}'
+```
+
+```json
+{"model": "clef-flash",
+ "answers": {
+  "route":   {"type": "choice", "choice": "billing", "confidence": 0.966,
+              "probabilities": {"billing": 0.977, "shipping": 0.014, "technical": 0.009}},
+  "angry":   {"type": "noul", "noul": 0.423},
+  "urgency": {"type": "score", "score": 1.621, "confidence": 0.431, "legend": {"0": "can wait", "1": "this week", "2": "today"},
+              "probabilities": {"0": 0.048, "1": 0.284, "2": 0.669}}},
+ "usage": {"input_tokens": 320, "output_tokens": 0}}
+```
+
+(Clef-Flash's answer, rounded here to three digits; it took 117 ms on an Arc Pro B60.) The `state` and every
+`instructions` and
+description may be a string or any JSON. `confidence` follows the API's formulas for every model; probabilities are
+not rounded. A body that does not follow the schema gets the API's 422 with the path of the field, one longer than
+`--ctx` its 400 (`max_tokens_exceeded`): nothing is cut to fit. Each response has its timings in a `Server-Timing`
+header. Images (`assets`, box questions) are refused by name: the Qwen3.5 vision tower is not loaded yet.
+
+| Model | Checkpoint | How it decides | On the Arc Pro B60 (f16) |
+|---|---|---|---|
+| Clef-Flash | `Cloudflare/clef-flash` (9B) | every question of a request in one pass; a transformer head scores the options | 15.2 GiB; 89 ms per decision at about 180 tokens |
+
+Latency is the time to read the prompt, so it grows with the state (Clef-Flash, three questions):
+
+| Prompt tokens | 320 | 512 | 1,024 | 2,048 | 4,096 | 8,192 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| Latency p50 | 118 ms | 165 ms | 323 ms | 644 ms | 1.31 s | 2.74 s | 5.86 s |
+
+Without a server, `run` answers one request file and `bench` times one (its own sample by default, `--state-tokens N`
+to grow the state):
+
+```bash
+xpu-serve run   ~/models/clef-flash --device GPU --request request.json
+xpu-serve bench ~/models/clef-flash --device GPU --ctx 16384 --state-tokens 4096 --runs 7
+python3 tests/e2e/systemone_eval.py --url http://127.0.0.1:8080      # 25 decisions: answers, API shape, latency
+```
+
 ## Quantize (`convert`)
 
 `convert` writes a pack: the checkpoint with its matmul weights quantized, everything else copied. Every command
@@ -209,6 +271,8 @@ Every layer is tested against a reference:
 | Whole model (Gemma 4, Qwen3.5, LFM3) | Hugging Face fp32 logits and greedy output | `tests/unit/model/model_parity.cpp` |
 | Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/gemma4_vision_parity.cpp` |
 | Robot policy (π0.5) | LeRobot fp32 actions and prompt token ids, 3 cameras and 1 | `tests/unit/model/policy_parity.cpp` |
+| Decision model (Clef-Flash) | the checkpoint's own Python code in fp32: prompt token ids and every option's probability | `tests/unit/model/decision_parity.cpp` |
+| System One API | the API's schema and error bodies; 25 decisions with accepted answers through a running server | `tests/unit/server/test_systemone_http.cpp`, `tests/e2e/` |
 
 The model parity test needs the model and generated fixtures:
 

@@ -26,6 +26,8 @@ How that works:
 Status (see TODO.md): Gemma 4 E2B/E4B (text and images), Gemma 4 26B-A4B (text), the Qwen3.5 family (Qwen3.5,
 Qwen3.6, Qwen3.8; text; a hybrid of Gated DeltaNet linear attention and full attention, dense or mixture of experts)
 and LFM3 (text; a hybrid of gated short convolutions and full or sliding-window attention),
+and decision models behind the System One API (`POST /v1/systemone`: Clef-Flash, a Qwen3.5 decoder with a joint
+schema head; docs/decisions/0015),
 served end to end on the SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs
 from `convert`; speculative decoding with the model's drafter (`--spec mtp`: Qwen's MTP head, a Gemma 4 assistant
 with `--drafter`; `--spec dflash|dspine`: a block drafter checkpoint for Qwen3.8-27B with `--drafter`;
@@ -44,6 +46,7 @@ build/src/xpu-serve run   <hf-model-dir> --device GPU --prompt "Hi"
 build/src/xpu-serve run   <hf-model-dir> --device GPU --image photo.jpg --prompt "Describe this image."
 build/src/xpu-serve serve <hf-model-dir> --device GPU     # http://127.0.0.1:8080/v1
 build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen-tokens 128
+build/src/xpu-serve run   <decision-model-dir> --device GPU --request request.json   # a System One request's answers
 ```
 
 - icpx turns the SYCL backend on (`XS_WITH_SYCL`); `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` compiles its kernels ahead
@@ -59,7 +62,9 @@ build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen
   `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref` or `sycl`),
   `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`, `XS_PARITY_KV_DTYPE`, `XS_TEST_DRAFTER_DIR` (a
   drafter checkpoint beside the model); `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for tokenizer parity); `XS_LFM3_DIR`
-  (an LFM3 checkpoint, for its tokenizer and chat template, which are not kept in this repository).
+  (an LFM3 checkpoint, for its tokenizer and chat template, which are not kept in this repository);
+  `XS_TEST_DECISION_DIR` (a decision model) with `XS_DECISION_FIXTURES` (its reference answers) and
+  `XS_DECISION_CHUNK` (tokens a step feeds).
   `tests/parity/model/make_tiny.py` writes a tiny random checkpoint of an architecture (real layer pattern and tensor
   names; with the checkpoint's own modeling code for one transformers does not ship, like LFM3), or of a block
   drafter for one (`--drafter`), to run the reference scripts and the parity tests on in seconds.
@@ -102,14 +107,15 @@ area).
 | `convert/` | xs_core | `convert_model`: checkpoint (language model, policy, or a drafter beside its model with `--target`) -> pack; the model's own graphs decide which weights to quantize (`plan_graph_formats`: bandwidth-bound matmuls, or all with `--scope all`) |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
-| `models/` | xs_core | `model.h` (the `Model` interface: language models), `policy.h` (the `Policy` interface: robot policies, one static program per call shape: camera subset, step count, padded prompt length), `registry.cpp` (model_type / LeRobot type -> code, `model_kind`), `config_util` (checked JSON readers), `common/blocks` (the shared building blocks: gated MLPs, mixture of experts, RMSNorm variants, RoPE frequencies, attention, a drafter's head over a shortlist), one folder per architecture (`pi05/`: π0.5), `drafters/dflash` (block drafters that serve any target they were trained for: DFlash, DFlash 2, DSpine) |
+| `models/` | xs_core | `model.h` (the `Model` interface: language models), `policy.h` (the `Policy` interface: robot policies, one static program per call shape: camera subset, step count, padded prompt length), `decision.h` (the `DecisionModel` interface: decision models, which lay out a request's prompt and name the steps to run), `registry.cpp` (model_type / LeRobot type / a head beside the decoder -> code, `model_kind`), `config_util` (checked JSON readers), `common/blocks` (the shared building blocks: gated MLPs, mixture of experts, RMSNorm variants, RoPE frequencies, attention, a drafter's head over a shortlist), `common/py_text` (a JSON value as Python's `json.dumps` and `str` write it: what reference code puts in a prompt), one folder per architecture (`pi05/`: π0.5; `clef/`: Clef, a decision model on the Qwen3.5 decoder), `drafters/dflash` (block drafters that serve any target they were trained for: DFlash, DFlash 2, DSpine) |
 | `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop, speculative rounds: draft, verify, accept, roll back), `Sampler` (and rejection sampling of a draft), request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses), `spec/` (the drafter side of speculative decoding: `drafter.h` is what the engine drives and the session's program order; `chain_drafter` feeds a token-a-run drafter the target's hidden states and chains its drafts; `block_drafter` runs a block drafter's program and follows its candidates) |
 | `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `sycl/` |
 | `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
 | `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls; LFM3 writes the same format), `plain` |
-| `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming |
+| `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming; the policy API; the System One API (`decision_handlers`) |
 | `service/` | xs_service | `EngineService`: loads tokenizer + template + model, compiles on a backend, owns the engine thread |
 | `policy/` | xs_policy | `PolicyRunner`: a policy, its tokenizer and one compiled program per call shape; warm-up; per-call timings (`xpu-serve bench <policy-dir>`) |
+| `decision/` | xs_decision | `DecisionRunner`: a decision model, its tokenizer and chat template (`PromptTools`), its programs in one session, a request's steps run as the model names them; `answers` (probabilities -> choice, score, confidence); `DecisionService` (one device thread, requests in arrival order) |
 | `cli/` | (exe) | `main.cpp` (commands serve, run, bench, convert, info), `args` (flag parser) |
 
 ### 4.1 Files that matter most
@@ -123,6 +129,11 @@ area).
 | `src/models/gemma4/gemma4_config.cpp` | Gemma 4 `config.json` parsing; refuses unsupported variants by name |
 | `src/models/gemma4/gemma4_vision.cpp` | Gemma 4 vision: image processor (resize, patches, pooling map) and vision tower graph |
 | `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention; dense MLP or `blocks::moe` (`qwen3_5_moe`: fused gate_up expert banks, or an FP8 release's per-expert tensors joined at load; gated shared expert); the MTP head (`mtp.*`) as the drafter, built from the same layer builders, or a block drafter checkpoint in its place |
+| `src/models/qwen3_5/qwen3_5_decoder.cpp` | `qwen3_5::Decoder`: the decoder's layer builders over one checkpoint's weights, shared by the language model and the decision models built on it; full-attention layers causal through a KV slot, or over the whole step |
+| `src/models/decision.h` | What a decision model provides: `spec()`, `programs()`, `weights()`, and `start(request, tools, limits)` -> a `DecisionRun` that hands the runtime one step at a time and ends with each question's probabilities |
+| `src/models/clef/` | Clef: `clef_prompt.cpp` (the reference's record encoding: token ids and the spans of each instruction and option), `clef_model.cpp` (the encode program, which keeps what the head's attentions read of the sequence in KV slots, the route, fields and score programs, and the host work between them) |
+| `src/decision/runner.cpp` | Wiring from a decision model directory to answers: compiles the programs, runs a request's steps, times them |
+| `src/server/decision_handlers.cpp` | `POST /v1/systemone`: the request schema (422 bodies naming the field), the answers, `Server-Timing` |
 | `src/models/lfm3/lfm3_model.cpp` | LFM3: gated short convolutions (`causal_conv` between two gates of one projection), attention with q/k norms and a sigmoid gate per head (full layers rotate half of each head, sliding layers all of it within their window), every operator and MLP output normed again before the residual add, the head tied to the embedding |
 | `src/models/drafters/dflash.cpp` | Block drafters (DFlash, DFlash 2, DSpine): their config (refusals by name), the context a target's prefill and verify programs append for them, and the block program (DFlash 2's convolutions and candidate selector, DSpine's code bridge and refined last write) |
 | `src/backend/backend.h` | `Backend::compile(graphs, weights, options) -> Session` (programs sharing weights by name and state slots by label); `Session::run(program, inputs, outputs, only)` (every output, or just the ones asked for), `reset`, `truncate` (inside a step of up to `rewind_tokens` tokens too) |
@@ -164,6 +175,21 @@ HTTP POST /v1/chat/completions                                     server/comple
 Threads: HTTP threads parse, render and tokenize; one engine thread owns the device and runs generations one at a
 time in arrival order.
 
+A decision model's request is shorter:
+
+```text
+HTTP POST /v1/systemone                                            server/decision_handlers.cpp
+  -> parse + validate the body (422 names the field) -> DecisionRequest (the client's key order kept)
+  -> DecisionService::decide (queues to the device thread)         decision/service.cpp
+       DecisionRunner::decide                                      decision/runner.cpp
+         DecisionModel::start(request, tools, limits)              models/<arch>/: prompt layout and tokens
+         until the run has no step left:
+           DecisionRun::next(outputs of the step before) -> program, inputs      models/<arch>/
+           Session::run(program, inputs) -> outputs                backend/<name>/
+         DecisionRun::probabilities() -> make_answer per question  decision/answers.cpp
+  -> answers as JSON, timings in Server-Timing                     server/decision_handlers.cpp
+```
+
 ## 6. The step graph and the backends
 
 **The step graph** (`src/graph/graph.h`) describes one engine step (a prefill chunk or one decode token) for one
@@ -173,7 +199,7 @@ sequence. Model code builds it once at load time; a backend compiles it once.
   are static. No batch dim.
 - Values are logically f32; weights keep their stored dtype and backends choose the compute precision.
 - MatMul weights use the Hugging Face layout `[out, in]`: `matmul(x, w) = x @ w^T`.
-- Ops: Input, Weight, Constant, Gather, MatMul, Add, Mul, Div, Scale, Tanh, GeluTanh, Softcap, Sigmoid, Silu, Softplus,
+- Ops: Input, Weight, Constant, Gather, MatMul, Add, Mul, Div, Scale, Tanh, GeluTanh, Gelu, Softcap, Sigmoid, Silu, Softplus,
   Clamp, RmsNorm, Softmax, TopK, ReduceSum, Reshape, Slice, Transpose, PrevRow (each row of a step replaced by the row
   before it), Rope (1-D or axial, optionally partial), KvCache, KvRead (another program's KV slot, read only),
   Attention (causal with optional window, or non-causal: every key, the keys of the query's own block of tokens, or
@@ -229,6 +255,12 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/model/policy_parity.cpp` | a robot policy end to end: prompt ids and the action chunk, all cameras and one camera (`XS_TEST_POLICY_DIR`, `XS_POLICY_FIXTURES`) | LeRobot fp32 with fixed noise, from `tests/parity/policy/lerobot_reference.py` |
 | `tests/unit/backend/*_policy_ops.cpp` | LayerNorm, Concat (also of computed values that share a part), attention with a key bias over static queries (head dims 72, 256) and within blocks of tokens | fp64 references (`policy_ops_cases.h`) |
 | `tests/unit/model/gemma4_vision_parity.cpp` | image input: pixels, vision features, expanded prompt, logits, greedy (whole and chunked prefill), prefix reuse by image | Hugging Face fp32, from `tests/parity/model/hf_vision_reference.py` |
+| `tests/unit/model/decision_parity.cpp` | a decision model (`XS_TEST_DECISION_DIR`): each request's prompt tokens and every option's probability | the checkpoint's own Python code in fp32, from `tests/parity/decision/reference.py` over `requests.json` (`make_tiny.py` writes a tiny checkpoint in a released one's layout) |
+| `tests/unit/model/decision_models.cpp` | decision models on tiny checkpoints the test writes (`decision_test_util.h`): a prompt fed in steps, a choice's options reordered, questions decided jointly, a request over the limit refused, the GPU against cpu-ref | the same model run differently |
+| `tests/unit/model/py_text.cpp` | Python's text for a JSON value: `json.dumps` (key order kept or sorted, both separators), `str()`, float `repr` | what Python wrote |
+| `tests/unit/decision/` | answers from probabilities: the API's confidence formulas, each question type | the API's documented example and formulas |
+| `tests/unit/server/test_systemone_http.cpp` | the System One API: the schema refused field by field (422 bodies), answers of each type, 400 / 500, concurrent clients | a fake decision function |
+| `tests/e2e/` | a running decision server: 25 decisions with one accepted answer each (`decisions25.json`), the API's shape, latency (`systemone_eval.py`, also against reference answers) | accepted answers; the model's reference code |
 
 - `tests/parity/**/*.py` generate fixtures from Hugging Face (run with a Python venv that has `transformers`,
   `torch`). Small fixtures are committed; large ones go to `tests/fixtures/generated/` (gitignored).
@@ -304,6 +336,25 @@ draft program, and one way of drafting. The engine needs nothing new.
 - Tests: the engine's equivalence tests cover every drafter; add the drafter's parity against its reference
   (`model_parity.cpp` or `block_drafter_parity.cpp`, fixtures from `tests/parity/model/`).
 
+### 8.6 Add a decision model
+
+1. Read the checkpoint's reference code: how a request becomes a prompt (to the token), what is read off the decoder
+   and where, how scores become probabilities.
+2. `src/models/<arch>/`: a class implementing `DecisionModel` (`models/decision.h`). Build its programs once, from
+   the decoder's builders (`qwen3_5::Decoder` for a Qwen3.5 decoder) plus the read-out. `start()` lays out the prompt
+   with `PromptTools` (the tokenizer and chat template) and returns a `DecisionRun` whose `next()` names each step:
+   the program, its inputs, the outputs to bring back, and how much of the sequence's state to keep. Rows whose
+   count varies per request (options, questions) are a program's `kT`; what has a per-request shape beyond that is
+   host work between steps. Refuse what the model cannot take with `DecisionRefused` (the client sees the message).
+   `models/clef/` is the example.
+3. Write prompts exactly as the reference does (`models/common/py_text.h` for JSON the Python way), and give
+   probabilities in `DecisionQuestion::options` order whatever order the prompt uses.
+4. Register it in `registry.cpp` (`model_kind`, `load_decision_model`, `supported_decision_models`).
+5. Tests: `tests/parity/decision/reference.py` learns to run the checkpoint's code, `make_tiny.py` to write a tiny
+   one; `decision_parity.cpp` then checks tokens and probabilities, on cpu-ref and the GPU; invariants on a tiny
+   checkpoint the test writes go in `decision_models.cpp`. End to end: `tests/e2e/systemone_eval.py --reference`.
+6. Update TODO.md, this file's map and the README's decision models table.
+
 ## 9. Conventions
 
 - **Correctness first, measured against a reference.** Every op has an fp64 reference and every model a Hugging Face
@@ -340,5 +391,7 @@ draft program, and one way of drafting. The engine needs nothing new.
 - Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)
   and vision towers stay bf16 in a pack. Prefill dequantizes each quantized weight to f16 for oneMKL's GEMM, except
   on integrated GPUs up to 512 rows (quant_gemm / quant_gemm_tiled dequantize on the way; sycl_be::quant_path).
+- Decision models: text states only (`assets`, `images` and box questions are refused by name); no packs yet
+  (`convert` takes language models, policies and drafters); a decision's latency is the prefill of its prompt.
 - One sequence at a time; no batching.
 - Sliding-window layers keep every key in memory (the kernels read only the window; memory still grows with context).

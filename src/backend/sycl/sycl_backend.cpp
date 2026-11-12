@@ -1178,7 +1178,7 @@ private:
         for (size_t i = 0; i < count; ++i) {
             const OpKind k = nodes[i].kind;
             const bool producer = k == OpKind::RmsNorm || k == OpKind::LayerNorm || k == OpKind::Add ||
-                                  k == OpKind::Mul || k == OpKind::GeluTanh || k == OpKind::Silu ||
+                                  k == OpKind::Mul || k == OpKind::GeluTanh || k == OpKind::Gelu || k == OpKind::Silu ||
                                   k == OpKind::Rope || k == OpKind::Reshape || k == OpKind::Slice ||
                                   k == OpKind::Transpose || k == OpKind::Concat ||
                                   (k == OpKind::MatMul && (gemm_matmul(i) || quant_matmul(i)));
@@ -1939,6 +1939,8 @@ private:
                 return unary(UnaryOp::Tanh);
             case OpKind::GeluTanh:
                 return unary(UnaryOp::GeluTanh);
+            case OpKind::Gelu:
+                return unary(UnaryOp::Gelu);
             case OpKind::Softcap:
                 return unary(UnaryOp::Softcap, std::get<graph::SoftcapAttrs>(n.attrs).cap);
             case OpKind::Sigmoid:

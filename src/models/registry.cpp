@@ -1,12 +1,14 @@
 #include <algorithm>
 
+#include "models/clef/clef.h"
 #include "models/config_util.h"
+#include "models/decision.h"
 #include "models/gemma4/gemma4.h"
 #include "models/lfm3/lfm3.h"
+#include "models/model.h"
 #include "models/pi05/pi05.h"
 #include "models/policy.h"
 #include "models/qwen3_5/qwen3_5.h"
-#include "models/model.h"
 #include "util/error.h"
 
 namespace xs {
@@ -37,7 +39,30 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
 ModelKind model_kind(const std::filesystem::path& dir) {
     const auto config = cfg::read_json(dir / "config.json");
     // LeRobot policies name their type under "type"; Hugging Face models under "model_type".
-    return config.contains("type") && !config.contains("model_type") ? ModelKind::Policy : ModelKind::Language;
+    if (config.contains("type") && !config.contains("model_type")) return ModelKind::Policy;
+    // A decision model's config.json is its decoder's: the head beside it tells.
+    return clef::is_checkpoint(dir) ? ModelKind::Decision : ModelKind::Language;
+}
+
+const char* question_type_name(QuestionType type) {
+    switch (type) {
+        case QuestionType::Noul: return "noul";
+        case QuestionType::Choice: return "choice";
+        case QuestionType::Score: return "score";
+    }
+    return "?";
+}
+
+std::vector<std::string> supported_decision_models() { return {"clef"}; }
+
+std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& dir) {
+    if (!std::filesystem::is_directory(dir)) fail("model directory '", dir.string(), "' does not exist");
+    const auto config = cfg::read_json(dir / "config.json");
+    cfg::check_quantization(config);
+    if (clef::is_checkpoint(dir)) return clef::load(dir, config);
+    std::string list;
+    for (const auto& t : supported_decision_models()) list += (list.empty() ? "" : ", ") + t;
+    fail("'", dir.string(), "' is not a decision model this build serves (", list, ")");
 }
 
 std::vector<std::string> supported_policy_types() { return {"pi05"}; }

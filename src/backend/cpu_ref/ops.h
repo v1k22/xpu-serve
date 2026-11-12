@@ -20,6 +20,7 @@ HostTensor mul(const HostTensor& a, const HostTensor& b);
 HostTensor scale(const HostTensor& x, float factor);
 HostTensor tanh(const HostTensor& x);
 HostTensor gelu_tanh(const HostTensor& x);
+HostTensor gelu(const HostTensor& x);
 HostTensor softcap(const HostTensor& x, float cap);
 HostTensor sigmoid(const HostTensor& x);
 HostTensor silu(const HostTensor& x);

@@ -74,7 +74,7 @@ TEST_SUITE("cpu-ref ops") {
         }
     }
 
-    TEST_CASE("scale, tanh, gelu_tanh and softcap") {
+    TEST_CASE("scale, tanh, gelu, gelu_tanh and softcap") {
         test::TensorRng rng(3);
         const HostTensor x = rng.uniform(DType::F32, {3, 50}, 8.0f);
         const Tensor64 x64 = to_f64(x);
@@ -87,6 +87,7 @@ TEST_SUITE("cpu-ref ops") {
             {"scale", [](Graph& g, Value v) { return g.scale(v, 0.125f); }, [](double v) { return v * 0.125; }},
             {"tanh", [](Graph& g, Value v) { return g.tanh(v); }, [](double v) { return std::tanh(v); }},
             {"gelu_tanh", [](Graph& g, Value v) { return g.gelu_tanh(v); }, test::ref::gelu_tanh},
+            {"gelu", [](Graph& g, Value v) { return g.gelu(v); }, test::ref::gelu},
             {"softcap", [](Graph& g, Value v) { return g.softcap(v, 3.0f); },
              [](double v) { return 3.0 * std::tanh(v / 3.0); }},
         };
@@ -106,6 +107,17 @@ TEST_SUITE("cpu-ref ops") {
                                            0.34571400982793533,    0.8411919906082768,   2.996362607918227};
         Graph g;
         g.output("out", g.gelu_tanh(g.input("x", DType::F32, {7})));
+        const HostTensor x = test::make_tensor<float>(DType::F32, {7}, {-3.f, -1.f, -0.5f, 0.f, 0.5f, 1.f, 3.f});
+        const HostTensor out = run_single_output(g, test::MemoryWeights{}, {{"x", x}});
+        CHECK(test::all_close(out, Tensor64{{7}, expected}, 1e-6, 1e-6));
+    }
+
+    TEST_CASE("gelu is the erf form") {
+        // 0.5 * x * (1 + math.erf(x / math.sqrt(2))) in Python, for x in [-3, -1, -0.5, 0, 0.5, 1, 3]
+        const std::vector<double> expected{-0.00404969409489031, -0.15865525393145707, -0.15426876936299344, 0.0,
+                                           0.34573123063700656,  0.8413447460685429,   2.99595030590511};
+        Graph g;
+        g.output("out", g.gelu(g.input("x", DType::F32, {7})));
         const HostTensor x = test::make_tensor<float>(DType::F32, {7}, {-3.f, -1.f, -0.5f, 0.f, 0.5f, 1.f, 3.f});
         const HostTensor out = run_single_output(g, test::MemoryWeights{}, {{"x", x}});
         CHECK(test::all_close(out, Tensor64{{7}, expected}, 1e-6, 1e-6));
