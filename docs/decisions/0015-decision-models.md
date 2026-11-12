@@ -101,7 +101,7 @@ as a q4 pack (g32, round to nearest) against the float32 answers of the checkpoi
 
 | Model | On the device | Accepted answer | Same answer as its reference | Largest probability difference | Latency p50 / p95 | The same state again, p50 | Prompt |
 |---|---|---|---|---|---|---|---|
-| Clef-Flash | 15.2 GiB | 25 of 25 | 25 of 25 | 0.00005 | 89 / 109 ms | 89 ms | 150 to 262 tokens |
+| Clef-Flash | 15.0 GiB | 25 of 25 | 25 of 25 | 0.00005 | 89 / 109 ms | 89 ms | 150 to 262 tokens |
 | pplx-decider-flash-v1.2 | 7.8 GiB | 25 of 25 | 25 of 25 | 0.00006 | 39 / 57 ms | 39 ms | 92 to 230 tokens |
 | OpenJev, q4 | 16.2 GiB | 25 of 25 | 25 of 25 | 0.0095 | 266 / 478 ms | 143 ms | 67 to 198 tokens |
 
@@ -128,6 +128,40 @@ OpenJev's q4 pack reads a new state at 900 to 950 tokens a second (the engine's 
 then answers each question in about 145 ms; when the request before read the state, three questions take 0.43 to
 0.52 s whatever its length, up to 16,000 tokens.
 
+**Packs of the two flash models** (`convert`, round to nearest, q4 in groups of 32; the head's matrices are quantized
+with the decoder's, the output layer Clef reads rows of at q8), Arc Pro B60. The harder set is 300 MMLU-Pro test
+questions (`tests/e2e/make_mmlu_pro.py`, seed 0: one choice of up to ten options each), each pack compared with the
+f16 run of the same checkpoint, which gets 198 (Clef-Flash; its card reports 65.3 % on the whole test) and 192 right:
+
+| | Clef-Flash q8 | Clef-Flash q4 | pplx-decider q8 | pplx-decider q4 |
+|---|---|---|---|---|
+| Pack; on the device (f16: 15.0 and 7.8 GiB) | 10.3 GB; 7.7 GiB | 7.5 GB; 5.1 GiB | 5.0 GB; 4.0 GiB | 3.6 GB; 2.7 GiB |
+| Latency p50, 25 test decisions (f16: 89 and 39 ms) | 145 ms | 138 ms | 66 ms | 62 ms |
+| 25 test decisions: same answer as the reference; largest probability difference | 25; 0.003 | 25; 0.037 | 25; 0.002 | 25; 0.049 |
+| 14 parity requests (33 questions) against the reference: top option differs; largest difference | 0; 0.077 | 4; 0.43 | 0; 0.025 | 3; 0.35 |
+| 300 questions: right | 194 | 193 | 193 | 184 |
+| 300 questions: same answer as f16 | 292 | 262 | 298 | 265 |
+| right at f16 and wrong in the pack; the reverse | 5; 1 | 12; 7 | 0; 1 | 17; 9 |
+| f16's probability of its answer where the pack's answer differs, median (elsewhere: 0.63 to 0.84) | 0.25 | 0.26 | 0.20 | 0.45 |
+| changed among the answers f16 gives 0.9 or more | 0 of 41 | 0 of 41 | 0 of 119 | 3 of 119 |
+| largest change of a probability per question: mean; 95th percentile | 0.005; 0.019 | 0.063; 0.20 | 0.007; 0.023 | 0.085; 0.31 |
+
+q8 is close to lossless: what changes is a handful of answers the model is unsure of. q4 is not: one answer in eight
+changes on questions this hard, and probabilities move by 0.06 to 0.08 on average; answers held with 0.9 or more
+survive it (all but 3 of 160). The count of right answers falls by 5 and 8 of 300, which this sample cannot tell from
+no change (12 lost against 7 gained, 17 against 9). Where the loss comes from, on pplx-decider: with the attention
+weights at q8 and the MLPs at q4, 21 answers change (mean shift 0.052); the other way round, 24 (0.064); all at q4, 35
+(0.085). No family of weights carries it. Clef's head does not either: with the head unquantized, 38 answers change
+as with it at q4.
+
+An AWQ search for the decoder's q4 weights was tried without new code, by converting the decoder as a language model
+(calibrated on the built-in text) and putting the head back beside it: the weighted error falls 25 % (pplx-decider)
+and 39 % (Clef-Flash) below round to nearest, the mean shift from 0.085 to 0.064 and from 0.065 to 0.043, and the
+changed answers from 35 to 31 and from 38 to 34. Better, and still not q8.
+
+A pack is slower than f16 here for the reason a language model's prefill is: every step dequantizes each quantized
+weight to f16 for its GEMMs.
+
 ## Consequences
 
 - A decision model needs no flags: `serve`, `run --request` and `bench` take its directory. A language model read
@@ -135,8 +169,9 @@ then answers each question in about 145 ms; when the request before read the sta
   language model). Its weights are licensed CC BY-NC 4.0, unlike the two Apache-2.0 flash models.
 - A decision's latency on a device is the device's prefill time for the prompt; a faster prefill is the way to a
   faster decision. Requests run one at a time.
-- Packs (`convert`) of decision checkpoints are not written yet: the two that have a head fit a 24 GB card at f16,
-  and a prefill does not get faster from quantized weights on a discrete GPU.
+- `convert` takes a decision checkpoint: its programs decide the formats as a language model's graphs do, and the
+  pack holds the head beside the decoder. On a discrete GPU a pack buys memory, not time; f16 is the setting where
+  it fits, q8 where it does not, and q4 costs answers the model is unsure of.
 - pplx-decider's long prompts are the place to gain: its single step is slower per token past a few thousand
   tokens, and nothing of a state can be kept for the next request.
 - The letter read-out keeps the state of the last request, so an agent that asks question after question about one

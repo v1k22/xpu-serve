@@ -186,14 +186,17 @@ std::unique_ptr<DecisionModel> load(const std::filesystem::path& dir, const nloh
     Config decision =
         parse_config(cfg::read_json(dir / "decision_config.json"), cfg::read_json(dir / "joint_config.json"),
                      cfg::read_json(dir / "tokenizer_config.json"));
-    const std::filesystem::path readout = dir / "readout.safetensors";
-    XS_CHECK(std::filesystem::exists(readout), "pplx_decider: ", readout.string(), " is missing");
     DecisionSpec spec;
     spec.id = cfg::model_id(dir);
     spec.arch = "pplx_decider";
     spec.max_tokens = cfg.max_position;
-    auto weights = std::make_unique<JoinedWeights>(SafetensorsWeights::open_dir(dir),
-                                                   SafetensorsWeights::open_file(readout), kReadout);
+    // A checkpoint keeps the read-out in a file of its own; a pack holds it beside the decoder.
+    std::unique_ptr<WeightStore> weights = SafetensorsWeights::open_dir(dir);
+    if (!weights->contains(std::string(kReadout) + "weight")) {
+        const std::filesystem::path readout = dir / "readout.safetensors";
+        XS_CHECK(std::filesystem::exists(readout), "pplx_decider: ", readout.string(), " is missing");
+        weights = std::make_unique<JoinedWeights>(std::move(weights), SafetensorsWeights::open_file(readout), kReadout);
+    }
     return std::make_unique<PplxModel>(std::move(cfg), std::move(decision), std::move(spec), std::move(weights));
 }
 

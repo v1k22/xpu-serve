@@ -120,6 +120,9 @@ public:
     virtual const WeightStore& weights() const = 0;
     // The programs of one session, in the order DecisionRun::Step::program counts them.
     virtual std::vector<const graph::Graph*> programs() const = 0;
+    // Weights the model reads on the host one row at a time (they appear in no program, so convert asks for them
+    // here; they may be Q8 / Q4 in a pack).
+    virtual std::vector<std::string> host_tables() const { return {}; }
     // Lays out the request's prompt and starts its run. Throws DecisionRefused for a request the model cannot take.
     virtual std::unique_ptr<DecisionRun> start(const DecisionRequest& request, const PromptTools& tools,
                                                const DecisionLimits& limits) const = 0;

@@ -2,7 +2,8 @@
 """Sends a file of decisions to a System One server and scores the answers (standard library only).
 
     python3 tests/e2e/systemone_eval.py --url http://127.0.0.1:8080 [--questions tests/e2e/decisions25.json]
-        [--reference <reference.py output for the same file>] [--repeat 3] [--json <report>]
+        [--reference <reference.py output for the same file, or another run's --save>] [--save <answers>]
+        [--repeat 3] [--json <report>]
 
 Checks, per request: the response follows the API (model, answers keyed by the question names, usage; each answer's
 fields for its type, probabilities over exactly the request's options summing to 1, the choice being the most likely
@@ -11,6 +12,8 @@ with --reference, every probability against the model's own Python code. Latency
 request: of the first send, which follows another request's state, and the median of the --repeat - 1 sends after it,
 which ask about the state just read (a model that keeps a state's prefix answers those faster). The server's own
 split comes from its Server-Timing header.
+--save keeps every probability of the run in the reference's format, so that a later run (other weights, another
+precision) can be compared with it through --reference: answers that changed, and how far probabilities moved.
 Exit status 1 when a response breaks the API or (with --reference) a probability is off by more than --tolerance.
 """
 
@@ -93,6 +96,8 @@ def main():
     ap.add_argument("--reference")
     ap.add_argument("--tolerance", type=float, default=0.02, help="--reference: the largest probability difference accepted")
     ap.add_argument("--repeat", type=int, default=3)
+    ap.add_argument("--save", help="write every answer's probabilities, in the format --reference reads")
+    ap.add_argument("--quiet", action="store_true", help="print the summary only")
     ap.add_argument("--json")
     args = ap.parse_args()
     with open(args.questions) as f:
@@ -103,8 +108,9 @@ def main():
             reference = json.load(f)["cases"]
         assert len(reference) == len(data["requests"]), "the reference is for another file"
 
-    rows, broken, off = [], 0, 0
+    rows, broken, off, saved = [], 0, 0, []
     for index, request in enumerate(data["requests"]):
+        saved.append({"probabilities": {}})
         sends = [post(args.url, request) for _ in range(args.repeat)]
         response, first, timing = sends[0]
         again = sends[1:] or sends
@@ -120,6 +126,7 @@ def main():
                    "device_ms": statistics.median(server_ms(t, "device") for _, _, t in again),
                    "server_ms": statistics.median(server_ms(t, "total") for _, _, t in again), "problems": problems}
             if p:
+                saved[-1]["probabilities"][name] = p
                 row["answer"] = given(question, p)
                 row["p"] = max(p.values()) if question["type"] != "noul" else p["true"]
                 if "expected" in data:
@@ -132,9 +139,13 @@ def main():
             rows.append(row)
         broken += bool(problems)
 
-    print(f"{'question':14s} {'type':7s} {'tokens':>6s} {'answer':>16s} {'p':>6s} {'ok':>3s} {'|dp| ref':>9s} "
-          f"{'first ms':>9s} {'again ms':>9s} {'device':>8s}")
-    for r in rows:
+    if args.save:
+        with open(args.save, "w") as f:
+            json.dump({"kind": "server", "cases": saved}, f)
+    if not args.quiet:
+        print(f"{'question':14s} {'type':7s} {'tokens':>6s} {'answer':>16s} {'p':>6s} {'ok':>3s} {'|dp| ref':>9s} "
+              f"{'first ms':>9s} {'again ms':>9s} {'device':>8s}")
+    for r in [] if args.quiet else rows:
         ok = "" if "expected" not in r else ("yes" if r.get("answer") == r["expected"] else "NO")
         diff = f"{r['diff']:.4f}" if "diff" in r else ""
         print(f"{r['name']:14s} {r['type']:7s} {r['tokens']!s:>6s} {str(r.get('answer')):>16s} {r.get('p', float('nan')):6.3f} {ok:>3s} "
@@ -154,8 +165,13 @@ def main():
     if "expected" in data:
         summary["correct"] = sum(r.get("answer") == r["expected"] for r in rows)
     if reference is not None:
-        summary["max_probability_difference"] = max(r.get("diff", 0) for r in rows)
+        diffs = sorted(r.get("diff", 0) for r in rows)
+        summary["max_probability_difference"] = diffs[-1]
+        summary["mean_probability_difference"] = statistics.fmean(diffs)
+        summary["p95_probability_difference"] = diffs[min(len(diffs) - 1, int(0.95 * len(diffs)))]
         summary["same_answer_as_reference"] = sum(r.get("answer") == r.get("reference") for r in rows)
+        if "expected" in data:
+            summary["reference_correct"] = sum(r.get("reference") == r["expected"] for r in rows)
         summary["off_by_more_than_tolerance"] = off
     print(json.dumps(summary))
     if args.json:

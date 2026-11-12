@@ -7,6 +7,7 @@
 #include <cmath>
 
 #include "../backend/device_test_support.h"
+#include "convert/convert.h"
 #include "decision_test_util.h"
 #include "models/clef/clef.h"
 #include "models/letter_readout/letter_readout.h"
@@ -378,6 +379,56 @@ TEST_SUITE("decision models") {
             const auto gpu_model = load(lr::Settings{});
             const auto gpu = dev::backend().compile(gpu_model->programs(), gpu_model->weights(), dev::options());
             CHECK(max_diff(p, xs::test::decide(*gpu_model, *gpu, ticket(), whole)) < (dev::is_f16() ? 2e-2 : 1e-4));
+        }
+    }
+    TEST_CASE("decision checkpoints convert to packs that answer alike") {
+        struct Kind {
+            const char* name;
+            void (*write)(const xs::test::fs::path&, uint32_t);
+            const char* head_file;  // the checkpoint's file a pack no longer needs
+        };
+        const Kind kinds[] = {
+            {"clef", [](const xs::test::fs::path& d, uint32_t seed) { xs::test::write_tiny_clef(d, seed); },
+             "joint_head.safetensors"},
+            {"pplx_decider", [](const xs::test::fs::path& d, uint32_t seed) { xs::test::write_tiny_pplx(d, seed); },
+             "readout.safetensors"}};
+        for (const Kind& kind : kinds) {
+            CAPTURE(kind.name);
+            const xs::test::TempDir dir(std::string("xs_tiny_src_") + kind.name),
+                out(std::string("xs_tiny_pack_") + kind.name);
+            kind.write(dir.path, 21);
+            const DecisionLimits whole{4096, 4096};
+            const auto answers = [&](const xs::test::fs::path& from) {
+                const auto model = xs::load_decision_model(from);
+                const auto session = xs::make_backend("cpu-ref")->compile(
+                    model->programs(), model->weights(), xs::SessionOptions{.precision = xs::DType::F32});
+                return xs::test::decide(*model, *session, ticket(), whole);
+            };
+            const auto p = answers(dir.path);
+
+            xs::ConvertOptions o;
+            o.source = dir.path;
+            o.output = out.path;
+            o.format = xs::DType::Q8;
+            o.group = 32;
+            o.min_elements = 1024;  // the tiny model's matrices are small
+            const xs::ConvertReport report = xs::convert_model(o);
+            CHECK(report.q8 > 20);  // the decoder's projections, and the head's where it has some
+            CHECK(report.output_bytes < report.source_bytes);
+            CHECK(!xs::test::fs::exists(out.path / kind.head_file));  // the head is in the pack's shards
+            CHECK(xs::model_kind(out.path) == xs::ModelKind::Decision);
+            CHECK(xs::load_decision_model(out.path)->spec().arch == kind.name);
+
+            const auto q = answers(out.path);
+            CHECK(max_diff(p, q) > 0);     // rounded weights
+            CHECK(max_diff(p, q) < 0.05);  // and nearly the same answers at q8
+            // An AWQ search needs a language model to calibrate on.
+            xs::ConvertOptions awq = o;
+            const xs::test::TempDir other(std::string("xs_tiny_pack_awq_") + kind.name);
+            awq.output = other.path;
+            awq.format = xs::DType::Q4;
+            awq.method = xs::QuantMethod::Awq;
+            CHECK_THROWS_WITH(xs::convert_model(awq), doctest::Contains("round to nearest"));
         }
     }
 }

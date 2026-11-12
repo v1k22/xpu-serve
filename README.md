@@ -28,8 +28,8 @@ code.
 | Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
 | π0.5 | robot policy | f16, q8 | 215 / 198 ms per call (f16 / q8); 115 / 113 ms on the Arc Pro B60 | Arc B390, 3 cameras |
-| Clef-Flash | decision | f16 | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
-| pplx-decider-flash-v1.2 | decision | f16 | 39 ms per decision (p50; 57 ms p95) on prompts of 92 to 230 tokens; 214 ms at 1,024 tokens | Arc Pro B60 |
+| Clef-Flash | decision | f16, q8, q4 | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
+| pplx-decider-flash-v1.2 | decision | f16, q8, q4 | 39 ms per decision (p50; 57 ms p95) on prompts of 92 to 230 tokens; 214 ms at 1,024 tokens | Arc Pro B60 |
 | OpenJev | decision (a language model read at the option letters) | q4 | 266 ms per decision (p50; 478 ms p95) on prompts of 67 to 198 tokens, 143 ms for another question about the state just read; 1.46 s for three questions on a 1,024-token prompt | Arc Pro B60 |
 
 | Model | Checkpoint (`model_type`) | Checked against |
@@ -194,7 +194,7 @@ header. Images (`assets`, box questions) are refused by name: the Qwen3.5 vision
 
 | Model | Checkpoint | How it decides | On the Arc Pro B60 |
 |---|---|---|---|
-| Clef-Flash | `Cloudflare/clef-flash` (9B) | every question of a request in one pass; a transformer head scores the options | f16, 15.2 GiB; 89 ms per decision at about 180 tokens |
+| Clef-Flash | `Cloudflare/clef-flash` (9B) | every question of a request in one pass; a transformer head scores the options | f16, 15.0 GiB; 89 ms per decision at about 180 tokens |
 | pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (4B) | every question of a request in one pass, each read at a marker after its options; calibrated with the checkpoint's temperature | f16, 7.8 GiB; 39 ms per decision at about 110 tokens |
 | OpenJev | `openjev/openjev` (27B, a tuned Qwen3.8-27B; weights CC BY-NC 4.0) | a prompt per question; the output layer's scores of the option letters at the first output position, calibrated as its helper does | q4 pack, 16.2 GiB; 266 ms per decision at about 90 tokens, 143 ms for another question about the same state |
 
@@ -228,6 +228,28 @@ questions are three prompts, also the time when the state was read by the reques
 | pplx-decider-flash-v1.2 | 46 ms (170 tokens) | 104 ms | 214 ms | 456 ms | 1.07 s | 2.53 s | 7.31 s |
 | OpenJev (q4), a new state | 538 ms (84 tokens) | 1.03 s | 1.46 s | 2.54 s | 4.75 s | 9.47 s | 19.6 s |
 | OpenJev (q4), the same state again | 429 ms | 434 ms | 434 ms | 440 ms | 455 ms | 475 ms | 523 ms |
+
+`convert` writes packs of the two flash checkpoints as of any model (`convert ~/models/clef-flash --out ... --quant
+q8`). On this card a pack saves memory, not time: reading a prompt from quantized weights dequantizes them at every
+step. What a pack changes in the answers, on 300 MMLU-Pro questions (one choice of up to ten options each, which the
+models get right about two times in three) against the f16 answers:
+
+| | Clef-Flash f16 | q8 | q4 | pplx-decider f16 | q8 | q4 |
+|---|---|---|---|---|---|---|
+| On the device | 15.0 GiB | 7.7 GiB | 5.1 GiB | 7.8 GiB | 4.0 GiB | 2.7 GiB |
+| Latency p50, the 25 test decisions | 89 ms | 145 ms | 138 ms | 39 ms | 66 ms | 62 ms |
+| Right, of 300 | 198 | 194 | 193 | 192 | 193 | 184 |
+| Same answer as f16, of 300 | | 292 | 262 | | 298 | 265 |
+| Changed among answers f16 gives 0.9 or more | | 0 of 41 | 0 of 41 | | 0 of 119 | 3 of 119 |
+| Largest change of a probability per question: mean, 95th percentile | | 0.005, 0.02 | 0.06, 0.20 | | 0.007, 0.02 | 0.08, 0.31 |
+
+q8 keeps the answers: the few that change are ones the model itself is unsure of. q4 (groups of 32, round to
+nearest) moves one answer in eight on questions this hard and shifts probabilities by 0.06 to 0.08 on average, though
+answers the model is confident of stay; on the 25 easy test decisions every pack gives the f16 answers (probabilities
+within 0.003 at q8, 0.05 at q4). So f16 where it fits, q8 where memory is short, and q4 only where an unsure answer
+is treated as unsure anyway. An AWQ-calibrated q4 of the decoder narrows the shift by a quarter to a third and
+changes four fewer answers of the 300: better, not q8
+([docs/decisions/0015](docs/decisions/0015-decision-models.md)).
 
 Without a server, `run` answers one request file and `bench` times one (its own sample by default, `--state-tokens N`
 to grow the state):

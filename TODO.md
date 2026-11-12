@@ -395,7 +395,10 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 - [ ] OpenJev's question parts of 65 to about 200 tokens take about 345 ms on the Arc Pro B60 where parts of up to
       64 take about 140 ms: above `few_rows` (64 at most) a q4 step dequantizes every weight for its GEMMs
 - [ ] Images (`assets`, box questions): needs the Qwen3.5 vision tower
-- [ ] Packs of decision checkpoints (`convert`)
+- [x] Packs of decision checkpoints (`convert`): q8 keeps the answers, q4 changes one in eight on 300 MMLU-Pro
+      questions (answers the model is unsure of); slower than f16 on the Arc Pro B60
+- [ ] AWQ for decision checkpoints (calibrating on decision prompts): tried through the language-model path, a
+      quarter to a third less probability shift at q4
 - [ ] Batching several requests into one step
 - **Done when:** each model answers as its reference code does and a System One client cannot tell the servers apart.
 

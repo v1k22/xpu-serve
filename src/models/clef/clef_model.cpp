@@ -181,6 +181,7 @@ public:
     const DecisionSpec& spec() const override { return spec_; }
     const WeightStore& weights() const override { return *weights_; }
     std::vector<const graph::Graph*> programs() const override { return {&encode_, &route_, &fields_, &score_}; }
+    std::vector<std::string> host_tables() const override { return {dec_.lm_head_name()}; }  // lexical()
 
     std::unique_ptr<DecisionRun> start(const DecisionRequest& request, const PromptTools& tools,
                                        const DecisionLimits& limits) const override {
@@ -573,14 +574,18 @@ std::unique_ptr<DecisionModel> load(const std::filesystem::path& dir, const nloh
     qwen3_5::Config cfg = qwen3_5::parse_config(config_json);
     XS_CHECK(cfg.num_experts == 0, "clef: a mixture-of-experts decoder is not supported");
     const HeadConfig head = parse_head_config(cfg::read_json(dir / "joint_head_config.json"));
-    const std::filesystem::path head_file = dir / "joint_head.safetensors";
-    XS_CHECK(std::filesystem::exists(head_file), "clef: ", head_file.string(), " is missing");
     DecisionSpec spec;
     spec.id = cfg::model_id(dir);
     spec.arch = "clef";
     spec.max_tokens = cfg.max_position;
-    auto weights = std::make_unique<JoinedWeights>(SafetensorsWeights::open_dir(dir),
-                                                   std::make_unique<HeadWeights>(head_file), kHead);
+    // A checkpoint keeps the head in a file of its own; a pack holds it beside the decoder, under the names the
+    // programs read.
+    std::unique_ptr<WeightStore> weights = SafetensorsWeights::open_dir(dir);
+    if (!weights->contains(std::string(kHead) + "hidden_norm.weight")) {
+        const std::filesystem::path head_file = dir / "joint_head.safetensors";
+        XS_CHECK(std::filesystem::exists(head_file), "clef: ", head_file.string(), " is missing");
+        weights = std::make_unique<JoinedWeights>(std::move(weights), std::make_unique<HeadWeights>(head_file), kHead);
+    }
     return std::make_unique<ClefModel>(std::move(cfg), head, std::move(spec), std::move(weights));
 }
 

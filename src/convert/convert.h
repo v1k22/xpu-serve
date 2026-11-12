@@ -1,7 +1,7 @@
 #pragma once
 
-// `xpu-serve convert`: a Hugging Face checkpoint (or a LeRobot policy) in, an xpu-serve pack out (DESIGN.md section
-// 6). File to file: the model's own step graphs decide what to quantize, by one rule for every model: a matmul weight
+// `xpu-serve convert`: a Hugging Face checkpoint (a language or decision model, or a LeRobot policy) in, an xpu-serve
+// pack out (DESIGN.md section 6). File to file: the model's own step graphs decide what to quantize, by one rule for every model: a matmul weight
 // takes the requested format when every matmul reading it is bandwidth-bound (a step-dependent number of rows, as in
 // decode, or at most kBandwidthRows rows per call, as in a policy's action expert), because a smaller weight is then a
 // faster matmul; weights of compute-bound matmuls (an image encoder, a policy's prefix) stay as they are unless the

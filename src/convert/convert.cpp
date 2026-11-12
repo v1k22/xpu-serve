@@ -17,6 +17,7 @@
 #include "io/safetensors.h"
 #include "io/safetensors_writer.h"
 #include "models/config_util.h"
+#include "models/decision.h"
 #include "models/model.h"
 #include "models/policy.h"
 #include "quant/quant.h"
@@ -179,6 +180,18 @@ std::map<std::string, DType> plan_formats(const Policy& policy, const ConvertOpt
     return plan;
 }
 
+// A decision model: every program at the requested format (they read a prompt, or a row per option or question: a
+// step-dependent number of rows), and the tables the model reads on the host at q8.
+std::map<std::string, DType> plan_formats(const DecisionModel& model, const ConvertOptions& o) {
+    std::map<std::string, DType> plan;
+    for (const graph::Graph* g : model.programs())
+        plan_graph(*g, model.weights(), o.format, o.scope, o, plan);
+    for (const std::string& name : model.host_tables()) {
+        if (const auto f = fitting(name, model.weights().get(name), DType::Q8, o)) plan[name] = *f;
+    }
+    return plan;
+}
+
 // A tensor the pack keeps: its bytes as they are; an FP8 checkpoint's weight as its f32 values (a pack holds no f8,
 // and the weights that matter for size are quantized).
 OutUnit copy_unit(const std::string& name, const TensorView& v) {
@@ -273,16 +286,22 @@ ConvertReport convert_model(const ConvertOptions& o) {
     if (fs::exists(o.output) && fs::equivalent(o.source, o.output)) fail("convert: the output is the source");
 
     const bool drafter = !o.target.empty();
-    const bool policy = !drafter && model_kind(o.source) == ModelKind::Policy;
+    const ModelKind kind = drafter ? ModelKind::Language : model_kind(o.source);
+    const bool policy = kind == ModelKind::Policy, decision = kind == ModelKind::Decision;
     XS_CHECK(!policy || o.method == QuantMethod::Rtn, "convert: AWQ calibrates on text; policies take round to nearest");
     XS_CHECK(!drafter || o.method == QuantMethod::Rtn, "convert: AWQ calibrates a model; a drafter takes round to nearest");
+    XS_CHECK(!decision || o.method == QuantMethod::Rtn,
+             "convert: AWQ calibrates a language model on text; a decision model takes round to nearest");
     std::unique_ptr<Model> model;
     std::unique_ptr<Policy> policy_model;
+    std::unique_ptr<DecisionModel> decision_model;
     // What is written: the model's weights, or a drafter's own tensors, which the model holds under `prefix`.
     std::unique_ptr<WeightStore> drafter_weights;
     std::string prefix;
     if (policy) {
         policy_model = load_policy(o.source);
+    } else if (decision) {
+        decision_model = load_decision_model(o.source);
     } else if (drafter) {
         model = load_model(o.target, LoadOptions{.vision = false, .speculation = true, .drafter = o.source});
         const Speculation* spec = model->speculation();
@@ -293,9 +312,14 @@ ConvertReport convert_model(const ConvertOptions& o) {
     } else {
         model = load_model(o.source, LoadOptions{.vision = true, .speculation = true});
     }
-    const WeightStore& weights = drafter ? *drafter_weights : policy ? policy_model->weights() : model->weights();
-    const std::map<std::string, DType> plan =
-        policy ? plan_formats(*policy_model, o) : drafter ? plan_drafter_formats(*model, o) : plan_formats(*model, o);
+    const WeightStore& weights = drafter    ? *drafter_weights
+                                 : policy   ? policy_model->weights()
+                                 : decision ? decision_model->weights()
+                                            : model->weights();
+    const std::map<std::string, DType> plan = policy     ? plan_formats(*policy_model, o)
+                                              : decision ? plan_formats(*decision_model, o)
+                                              : drafter  ? plan_drafter_formats(*model, o)
+                                                         : plan_formats(*model, o);
 
     ConvertReport report;
     // AWQ: activation statistics for the text decoder's q4 weights.
