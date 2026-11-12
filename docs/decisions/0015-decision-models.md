@@ -178,8 +178,8 @@ else differs.
 | 1,024 tokens (one step) | 321 ms | 381 ms | 370 ms |
 | 4,096 tokens (four steps) | 1.33 s | 1.60 s | 1.56 s |
 
-50 to 65 ms a step: most of a short decision's time, a sixth of a 1,024-token one. Quantized weights pay back where
-few rows read a whole weight (a language model's decode); a decision model never does that.
+50 to 65 ms a step: 40 to 50 % on top of a short decision, 15 to 20 % on a 1,024-token one. Quantized weights pay
+back where few rows read a whole weight (a language model's decode); a decision model never does that.
 
 ## Consequences
 
