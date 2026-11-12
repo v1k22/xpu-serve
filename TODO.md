@@ -399,6 +399,8 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       questions (answers the model is unsure of); slower than f16 on the Arc Pro B60
 - [ ] AWQ for decision checkpoints (calibrating on decision prompts): tried through the language-model path, a
       quarter to a third less probability shift at q4
+- [ ] A prefill from quantized weights that does not dequantize every weight each step: it costs a Clef-Flash pack
+      50 to 65 ms a step on the Arc Pro B60, which makes packs of decision models slower than f16
 - [ ] Batching several requests into one step
 - **Done when:** each model answers as its reference code does and a System One client cannot tell the servers apart.
 

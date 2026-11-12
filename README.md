@@ -231,7 +231,7 @@ questions are three prompts, also the time when the state was read by the reques
 
 `convert` writes packs of the two flash checkpoints as of any model (`convert ~/models/clef-flash --out ... --quant
 q8`). On this card a pack saves memory, not time: reading a prompt from quantized weights dequantizes them at every
-step. What a pack changes in the answers, on 300 MMLU-Pro questions (one choice of up to ten options each, which the
+step, 50 to 65 ms a step for Clef-Flash, which a language model wins back in decode and a decision model never does. What a pack changes in the answers, on 300 MMLU-Pro questions (one choice of up to ten options each, which the
 models get right about two times in three) against the f16 answers:
 
 | | Clef-Flash f16 | q8 | q4 | pplx-decider f16 | q8 | q4 |
@@ -249,7 +249,9 @@ answers the model is confident of stay; on the 25 easy test decisions every pack
 within 0.003 at q8, 0.05 at q4). So f16 where it fits, q8 where memory is short, and q4 only where an unsure answer
 is treated as unsure anyway. An AWQ-calibrated q4 of the decoder narrows the shift by a quarter to a third and
 changes four fewer answers of the 300: better, not q8
-([docs/decisions/0015](docs/decisions/0015-decision-models.md)).
+([docs/decisions/0015](docs/decisions/0015-decision-models.md)). OpenJev's q4 pack, the form a 24 GB card takes it
+in, against its checkpoint's float32 answers on the same questions: 265 of 300 the same and 218 right against 222, with
+1 of the 138 answers held at 0.9 or more changed.
 
 Without a server, `run` answers one request file and `bench` times one (its own sample by default, `--state-tokens N`
 to grow the state):

@@ -159,8 +159,27 @@ An AWQ search for the decoder's q4 weights was tried without new code, by conver
 and 39 % (Clef-Flash) below round to nearest, the mean shift from 0.085 to 0.064 and from 0.065 to 0.043, and the
 changed answers from 35 to 31 and from 38 to 34. Better, and still not q8.
 
-A pack is slower than f16 here for the reason a language model's prefill is: every step dequantizes each quantized
-weight to f16 for its GEMMs.
+OpenJev fits the card only as a q4 pack, so its comparison is with the checkpoint's float32 answers from the helper
+over transformers on the CPU, on the same 300 questions: 222 right in float32 and 218 from the pack (13 lost, 9
+gained); 265 answers the same; where they differ the reference held its answer at 0.28 (median; 0.91 elsewhere), and 1
+of its 138 answers at 0.9 or more changes; the largest change of a probability per question is 0.059 on average, 0.22
+at the 95th percentile. The same picture as the two smaller models at q4, on a decoder three to seven times larger.
+
+**Why a pack is slower than f16 here.** A decision is one read of the prompt, hundreds of rows a step, and on a
+discrete GPU a matmul of that many rows from a quantized weight first dequantizes the weight to f16 and then runs the
+GEMM f16 runs (`sycl_be::quant_path`; the quantized kernels that skip this serve up to 64 rows, a decode step). So a
+pack does f16's work plus a pass over every weight, once a step whatever the step's length. Clef-Flash, per-op device
+time of a 325-token prompt: the four large matmul shapes take 83 ms at f16 and 135 ms from the q4 pack, and nothing
+else differs.
+
+| Clef-Flash, three questions, p50 | f16 | q8 | q4 |
+|---|---|---|---|
+| 325 tokens (one step) | 123 ms | 181 ms | 175 ms |
+| 1,024 tokens (one step) | 321 ms | 381 ms | 370 ms |
+| 4,096 tokens (four steps) | 1.33 s | 1.60 s | 1.56 s |
+
+50 to 65 ms a step: most of a short decision's time, a sixth of a 1,024-token one. Quantized weights pay back where
+few rows read a whole weight (a language model's decode); a decision model never does that.
 
 ## Consequences
 
