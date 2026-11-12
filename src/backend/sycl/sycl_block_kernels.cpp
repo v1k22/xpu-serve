@@ -576,6 +576,27 @@ int64_t ceil_div(int64_t a, int64_t b) {
     return (a + b - 1) / b;
 }
 
+// Whether a format's GEMV with m inputs takes a unit a quarter at a time (8 decoded values live at once instead of
+// 32) or whole: whichever read more weights a second on an Arc Pro B60. The difference is the registers a decoder
+// leaves free: Q5_K gains a third from quarters at one input, the K-quants lose a seventh with several.
+constexpr bool by_quarters(BlockFormat f, int m) {
+    switch (f) {
+        case BlockFormat::Q4_K:
+        case BlockFormat::Q5_K:
+            return m == 1;
+        case BlockFormat::IQ4_NL:
+        case BlockFormat::IQ4_XS:
+        case BlockFormat::IQ3_XXS:
+        case BlockFormat::IQ2_XXS:
+        case BlockFormat::IQ2_XS:
+        case BlockFormat::IQ2_S:
+        case BlockFormat::IQ1_S:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // A sub-group takes kRows rows; a lane takes units lane, lane + 16, ... of each, so a unit's x loads once for the
 // rows and its codes decode once for the M inputs. Over a half unit dot(w, x) = a dot(wv, x) + b sum(x).
 template <BlockFormat F, int M>
@@ -599,35 +620,70 @@ void gemv_block_t(sycl::queue& q, const float* x, const Streams& w, float* y, in
                 xs[mm] = x + std::min(mm, inputs - 1) * k;  // unused inputs repeat the last
             float acc[kRows][M] = {};
             for (int32_t u = lane; u < units; u += kSubGroup) {
-                float wv[kRows][kUnit];
                 float a[kRows][2];
                 float b[kRows][2];
-                for (int r = 0; r < kRows; ++r) {
-                    const auto f = Fmt<F>::fields(rp[r], u);
-                    for (int t = 0; t < 4; ++t)
-                        fast_quarter<F>(f, w.grid, t, &wv[r][8 * t]);
-                    fast_affine<F>(f, a[r], b[r]);
-                }
-                for (int mm = 0; mm < M; ++mm) {
-                    float xv[kUnit];
-                    const auto* xp =
-                        reinterpret_cast<const sycl::vec<float, 4>*>(xs[mm] + static_cast<int64_t>(u) * kUnit);
-                    for (int i = 0; i < kUnit / 4; ++i) {
-                        const sycl::vec<float, 4> v = xp[i];
-                        for (int j = 0; j < 4; ++j)
-                            xv[4 * i + j] = v[j];
-                    }
-                    float xsum[2] = {0.0f, 0.0f};
-                    if constexpr (Fmt<F>::kTrick) {
-                        for (int i = 0; i < kUnit; ++i)
-                            xsum[i >> 4] += xv[i];
+                if constexpr (by_quarters(F, M)) {
+                    float dot[kRows][M][2] = {};
+                    float xsum[M][2] = {};
+                    const typename Fmt<F>::Fields f[kRows] = {Fmt<F>::fields(rp[0], u), Fmt<F>::fields(rp[1], u)};
+                    for (int r = 0; r < kRows; ++r)
+                        fast_affine<F>(f[r], a[r], b[r]);
+                    for (int t = 0; t < 4; ++t) {
+                        float wv[kRows][8];
+                        for (int r = 0; r < kRows; ++r)
+                            fast_quarter<F>(f[r], w.grid, t, wv[r]);
+                        for (int mm = 0; mm < M; ++mm) {
+                            const auto* xp = reinterpret_cast<const sycl::vec<float, 4>*>(
+                                xs[mm] + static_cast<int64_t>(u) * kUnit + 8 * t);
+                            const sycl::vec<float, 4> x0 = xp[0];
+                            const sycl::vec<float, 4> x1 = xp[1];
+                            if constexpr (Fmt<F>::kTrick) {
+                                xsum[mm][t >> 1] +=
+                                    ((x0[0] + x0[1]) + (x0[2] + x0[3])) + ((x1[0] + x1[1]) + (x1[2] + x1[3]));
+                            }
+                            for (int r = 0; r < kRows; ++r) {
+                                float d = 0.0f;
+                                for (int i = 0; i < 4; ++i)
+                                    d += wv[r][i] * x0[i] + wv[r][4 + i] * x1[i];
+                                dot[r][mm][t >> 1] += d;
+                            }
+                        }
                     }
                     for (int r = 0; r < kRows; ++r) {
-                        float dot[2] = {0.0f, 0.0f};
-                        for (int i = 0; i < kUnit; ++i)
-                            dot[i >> 4] += wv[r][i] * xv[i];
-                        acc[r][mm] += a[r][0] * dot[0] + a[r][1] * dot[1];
-                        if constexpr (Fmt<F>::kTrick) acc[r][mm] += b[r][0] * xsum[0] + b[r][1] * xsum[1];
+                        for (int mm = 0; mm < M; ++mm) {
+                            acc[r][mm] += a[r][0] * dot[r][mm][0] + a[r][1] * dot[r][mm][1];
+                            if constexpr (Fmt<F>::kTrick) acc[r][mm] += b[r][0] * xsum[mm][0] + b[r][1] * xsum[mm][1];
+                        }
+                    }
+                } else {
+                    float wv[kRows][kUnit];
+                    for (int r = 0; r < kRows; ++r) {
+                        const auto f = Fmt<F>::fields(rp[r], u);
+                        for (int t = 0; t < 4; ++t)
+                            fast_quarter<F>(f, w.grid, t, &wv[r][8 * t]);
+                        fast_affine<F>(f, a[r], b[r]);
+                    }
+                    for (int mm = 0; mm < M; ++mm) {
+                        float xv[kUnit];
+                        const auto* xp =
+                            reinterpret_cast<const sycl::vec<float, 4>*>(xs[mm] + static_cast<int64_t>(u) * kUnit);
+                        for (int i = 0; i < kUnit / 4; ++i) {
+                            const sycl::vec<float, 4> v = xp[i];
+                            for (int j = 0; j < 4; ++j)
+                                xv[4 * i + j] = v[j];
+                        }
+                        float sum[2] = {0.0f, 0.0f};
+                        if constexpr (Fmt<F>::kTrick) {
+                            for (int i = 0; i < kUnit; ++i)
+                                sum[i >> 4] += xv[i];
+                        }
+                        for (int r = 0; r < kRows; ++r) {
+                            float d[2] = {0.0f, 0.0f};
+                            for (int i = 0; i < kUnit; ++i)
+                                d[i >> 4] += wv[r][i] * xv[i];
+                            acc[r][mm] += a[r][0] * d[0] + a[r][1] * d[1];
+                            if constexpr (Fmt<F>::kTrick) acc[r][mm] += b[r][0] * sum[0] + b[r][1] * sum[1];
+                        }
                     }
                 }
             }
