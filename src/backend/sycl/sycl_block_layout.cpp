@@ -86,6 +86,16 @@ Streams streams_of(BlockFormat f, int64_t k) {
             return {2, {K / 4, 2 * B}};
         case BlockFormat::IQ2_S:
             return {5, {K / 8, K / 8, K / 32, K / 32, 2 * B}};
+        case BlockFormat::IQ2_XS:
+            return {3, {K / 4, K / 32, 2 * B}};
+        case BlockFormat::IQ1_S:
+            return {3, {K / 8, K / 16, 2 * B}};
+        case BlockFormat::IQ1_M:
+            return {3, {K / 8, K / 16, 8 * B}};
+        case BlockFormat::Q5_0:
+            return {3, {K / 2, K / 8, K / 16}};
+        case BlockFormat::Q5_1:
+            return {3, {K / 2, K / 8, K / 8}};
         default:
             return {};
     }
@@ -213,6 +223,31 @@ BlockImage block_image(BlockFormat f, const uint8_t* blocks, int64_t rows, int64
                     std::memcpy(out[1] + 32 * b, in + 34, 32);
                     std::memcpy(out[2] + 8 * b, in + 66, 8);
                     std::memcpy(out[3] + 8 * b, in + 74, 8);
+                    break;
+                case BlockFormat::IQ2_XS:  // d, qs u16[32], scales[8]
+                    std::memcpy(out[2] + 2 * b, in, 2);
+                    std::memcpy(out[0] + 64 * b, in + 2, 64);
+                    std::memcpy(out[1] + 8 * b, in + 66, 8);
+                    break;
+                case BlockFormat::IQ1_S:  // d, qs[32], qh u16[8]
+                    std::memcpy(out[2] + 2 * b, in, 2);
+                    std::memcpy(out[0] + 32 * b, in + 2, 32);
+                    std::memcpy(out[1] + 16 * b, in + 34, 16);
+                    break;
+                case BlockFormat::IQ1_M:  // qs[32], qh[16], scales u16[4]
+                    std::memcpy(out[0] + 32 * b, in, 32);
+                    std::memcpy(out[1] + 16 * b, in + 32, 16);
+                    std::memcpy(out[2] + 8 * b, in + 48, 8);
+                    break;
+                case BlockFormat::Q5_0:  // d, qh u32, qs[16]
+                    std::memcpy(out[2] + 2 * b, in, 2);
+                    std::memcpy(out[1] + 4 * b, in + 2, 4);
+                    put_split_nibbles(out[0], c0, in + 6);
+                    break;
+                case BlockFormat::Q5_1:  // d, m, qh u32, qs[16]
+                    std::memcpy(out[2] + 4 * b, in, 4);
+                    std::memcpy(out[1] + 4 * b, in + 4, 4);
+                    put_split_nibbles(out[0], c0, in + 8);
                     break;
                 default:
                     break;

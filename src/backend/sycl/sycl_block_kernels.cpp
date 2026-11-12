@@ -386,6 +386,144 @@ struct Fmt<BlockFormat::IQ2_S> {
     }
 };
 
+template <>
+struct Fmt<BlockFormat::IQ2_XS> {
+    static constexpr bool kTrick = false;
+    static constexpr bool kMin = false;
+    static constexpr int kGroups = 2;
+    struct Fields {
+        sycl::vec<uint32_t, 2> q;  // four u16: a 9-bit index under a 7-bit sign code
+        uint32_t scales;           // 4 bits a half
+        float d;
+    };
+    static Fields fields(const RowPtr& r, int32_t u) {
+        return {load<sycl::vec<uint32_t, 2>>(r.p[0] + 8 * u), r.p[1][u], f16_at(r.p[2] + 2 * (u >> 3))};
+    }
+    static void levels(const Fields& f, const uint32_t* grid, int t, float* lv) {
+        const uint32_t q = (f.q[t >> 1] >> (16 * (t & 1))) & 0xFFFFu;
+        const uint32_t signs = signs_of(q >> 9);
+        const auto g = load<sycl::vec<uint32_t, 2>>(reinterpret_cast<const uint8_t*>(grid) + 8 * (q & 511u));
+        for (int h = 0; h < 2; ++h) {
+            for (int i = 0; i < 4; ++i)
+                lv[4 * h + i] = signed_float((g[h] >> (8 * i)) & 255u, (signs >> (4 * h + i)) & 1u);
+        }
+    }
+    static Affine affine(const Fields& f, int g) {
+        return {f.d * (0.5f + static_cast<float>((f.scales >> (4 * g)) & 15u)) * 0.25f, 0.0f};
+    }
+};
+
+// IQ1: a grid value is -1, 0 or 1, and a group of 8 adds or subtracts an eighth to all of its own.
+inline void iq1_levels(const uint32_t* grid, uint32_t index, bool minus, float* lv) {
+    const auto g = load<sycl::vec<uint32_t, 2>>(reinterpret_cast<const uint8_t*>(grid) + 8 * index);
+    const float delta = minus ? -quant::kIq1Delta : quant::kIq1Delta;
+    for (int h = 0; h < 2; ++h) {
+        for (int i = 0; i < 4; ++i)
+            lv[4 * h + i] = static_cast<float>(static_cast<int8_t>(g[h] >> (8 * i))) + delta;
+    }
+}
+
+template <>
+struct Fmt<BlockFormat::IQ1_S> {
+    static constexpr bool kTrick = false;
+    static constexpr bool kMin = false;
+    static constexpr int kGroups = 1;
+    struct Fields {
+        uint32_t idx;
+        uint32_t qh;  // four 3-bit index tops, the 3-bit scale, the shift's sign
+        float d;
+    };
+    static Fields fields(const RowPtr& r, int32_t u) {
+        return {load<uint32_t>(r.p[0] + 4 * u), load<uint16_t>(r.p[1] + 2 * u), f16_at(r.p[2] + 2 * (u >> 3))};
+    }
+    static void levels(const Fields& f, const uint32_t* grid, int t, float* lv) {
+        iq1_levels(grid, ((f.idx >> (8 * t)) & 255u) | (((f.qh >> (3 * t)) & 7u) << 8), (f.qh & 0x8000u) != 0, lv);
+    }
+    static Affine affine(const Fields& f, int) {
+        return {f.d * static_cast<float>(2 * static_cast<int32_t>((f.qh >> 12) & 7u) + 1), 0.0f};
+    }
+};
+
+template <>
+struct Fmt<BlockFormat::IQ1_M> {
+    static constexpr bool kTrick = false;
+    static constexpr bool kMin = false;
+    static constexpr int kGroups = 2;
+    struct Fields {
+        uint32_t idx;
+        uint32_t qh;      // a nibble a quarter: three index tops and the shift's sign
+        uint32_t scales;  // 3 bits a half
+        float d;
+    };
+    static Fields fields(const RowPtr& r, int32_t u) {
+        // the block's f16 scale is spread over the top nibbles of its four u16 of scales
+        const auto sc = load<sycl::vec<uint16_t, 4>>(r.p[2] + 8 * (u >> 3));
+        const auto bits =
+            static_cast<uint16_t>((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+        const int j = u & 7;
+        return {load<uint32_t>(r.p[0] + 4 * u), load<uint16_t>(r.p[1] + 2 * u),
+                (static_cast<uint32_t>(sc[j >> 1]) >> (6 * (j & 1))) & 63u,
+                static_cast<float>(sycl::bit_cast<half>(bits))};
+    }
+    static void levels(const Fields& f, const uint32_t* grid, int t, float* lv) {
+        const uint32_t nibble = f.qh >> (4 * t);
+        iq1_levels(grid, ((f.idx >> (8 * t)) & 255u) | ((nibble & 7u) << 8), (nibble & 8u) != 0, lv);
+    }
+    static Affine affine(const Fields& f, int g) {
+        return {f.d * static_cast<float>(2 * static_cast<int32_t>((f.scales >> (3 * g)) & 7u) + 1), 0.0f};
+    }
+};
+
+template <>
+struct Fmt<BlockFormat::Q5_0> {
+    static constexpr bool kTrick = true;
+    static constexpr int kBits = 5;
+    static constexpr int kOff = 16;
+    static constexpr bool kMin = false;
+    static constexpr int kGroups = 1;
+    struct Fields {
+        sycl::vec<uint32_t, 4> lo;
+        uint32_t hi;
+        float d;
+    };
+    static Fields fields(const RowPtr& r, int32_t u) {
+        return {load<sycl::vec<uint32_t, 4>>(r.p[0] + 16 * u), load<uint32_t>(r.p[1] + 4 * u), f16_at(r.p[2] + 2 * u)};
+    }
+    static void codes(const Fields& f, int t, uint32_t* c) {
+        const uint32_t w = f.lo[t];
+        const uint32_t h = f.hi >> (8 * t);
+        for (int i = 0; i < 8; ++i)
+            c[i] = ((w >> (4 * i)) & 15u) | (((h >> i) & 1u) << 4);
+    }
+    static Affine affine(const Fields& f, int) { return {f.d, 0.0f}; }
+};
+
+template <>
+struct Fmt<BlockFormat::Q5_1> {
+    static constexpr bool kTrick = true;
+    static constexpr int kBits = 5;
+    static constexpr int kOff = 0;
+    static constexpr bool kMin = true;
+    static constexpr int kGroups = 1;
+    struct Fields {
+        sycl::vec<uint32_t, 4> lo;
+        uint32_t hi;
+        float d;
+        float m;
+    };
+    static Fields fields(const RowPtr& r, int32_t u) {
+        return {load<sycl::vec<uint32_t, 4>>(r.p[0] + 16 * u), load<uint32_t>(r.p[1] + 4 * u), f16_at(r.p[2] + 4 * u),
+                f16_at(r.p[2] + 4 * u + 2)};
+    }
+    static void codes(const Fields& f, int t, uint32_t* c) {
+        const uint32_t w = f.lo[t];
+        const uint32_t h = f.hi >> (8 * t);
+        for (int i = 0; i < 8; ++i)
+            c[i] = ((w >> (4 * i)) & 15u) | (((h >> i) & 1u) << 4);
+    }
+    static Affine affine(const Fields& f, int) { return {f.d, -f.m}; }  // w = d code + m
+};
+
 // Quarter t of a unit for the GEMV: wv with a and b (per half) such that weight = a * wv + b.
 template <BlockFormat F>
 inline void fast_quarter(const typename Fmt<F>::Fields& f, const uint32_t* grid, int t, float* wv) {
@@ -579,6 +717,16 @@ void dispatch(BlockFormat format, Fn&& f) {
             return f.template operator()<BlockFormat::IQ2_XXS>();
         case BlockFormat::IQ2_S:
             return f.template operator()<BlockFormat::IQ2_S>();
+        case BlockFormat::IQ2_XS:
+            return f.template operator()<BlockFormat::IQ2_XS>();
+        case BlockFormat::IQ1_S:
+            return f.template operator()<BlockFormat::IQ1_S>();
+        case BlockFormat::IQ1_M:
+            return f.template operator()<BlockFormat::IQ1_M>();
+        case BlockFormat::Q5_0:
+            return f.template operator()<BlockFormat::Q5_0>();
+        case BlockFormat::Q5_1:
+            return f.template operator()<BlockFormat::Q5_1>();
         default:
             fail("sycl: no kernel reads the block format ", block_format_name(format));
     }
@@ -606,6 +754,11 @@ std::span<const uint32_t> block_grid(BlockFormat f) {
             return words(quant::iq2xxs_grid);
         case BlockFormat::IQ2_S:
             return words(quant::iq2s_grid);
+        case BlockFormat::IQ2_XS:
+            return words(quant::iq2xs_grid);
+        case BlockFormat::IQ1_S:
+        case BlockFormat::IQ1_M:
+            return words(quant::iq1s_grid);
         default:
             return {};
     }

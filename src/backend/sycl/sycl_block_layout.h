@@ -26,12 +26,17 @@ namespace xs::sycl_be {
 //   IQ3_S    indexes [K/4]   signs [K/8]         index bit 8 [K/32]    scales [K/64]   d f16 [2 B]
 //   IQ2_XXS  indexes and signs: 8 bytes a unit [K/4]     d f16 [2 B]
 //   IQ2_S    indexes [K/8]   signs [K/8]         index bits 8-9 [K/32] scales [K/32]   d f16 [2 B]
+//   IQ2_XS   index and signs u16 [K/4]           scales [K/32]         d f16 [2 B]
+//   IQ1_S    indexes [K/8]   index bits 8-10, scale and shift u16 [K/16]               d f16 [2 B]
+//   IQ1_M    indexes [K/8]   index bits 8-10 and shifts [K/16]         scales u16[4] [8 B]
+//   Q5_0     nibbles [K/2]   bit 4 [K/8]         d f16 [2 U]
+//   Q5_1     nibbles [K/2]   bit 4 [K/8]         d, m f16 [4 U]
 //
 // Codes are in column order: nibble, bit pair or bit c of a row's stream is column c's (the low nibble of a byte the
 // even column), where a block scatters them by halves and quarters. Scales keep the block's own encoding.
 inline constexpr int kBlockStreams = 5;
 
-// Whether the block kernels read `f` (the formats listed above).
+// Whether the block kernels read `f` (the formats listed above: all but the three a pack's kernels take).
 bool block_on_device(BlockFormat f);
 // Bytes a row of `cols` columns takes in each stream (0 past the format's last).
 void block_stream_rows(BlockFormat f, int64_t cols, int64_t out[kBlockStreams]);

@@ -21,10 +21,12 @@ using test::to_f64;
 namespace {
 
 constexpr BlockFormat kFormats[] = {
-    BlockFormat::Q4_0,    BlockFormat::Q4_1,  BlockFormat::Q8_0,    BlockFormat::Q2_K,   BlockFormat::Q3_K,
-    BlockFormat::Q4_K,    BlockFormat::Q5_K,  BlockFormat::Q6_K,    BlockFormat::IQ4_NL, BlockFormat::IQ4_XS,
-    BlockFormat::IQ3_XXS, BlockFormat::IQ3_S, BlockFormat::IQ2_XXS, BlockFormat::IQ2_S,
+    BlockFormat::Q4_0,    BlockFormat::Q4_1,  BlockFormat::Q5_0,    BlockFormat::Q5_1,   BlockFormat::Q8_0,
+    BlockFormat::Q2_K,    BlockFormat::Q3_K,  BlockFormat::Q4_K,    BlockFormat::Q5_K,   BlockFormat::Q6_K,
+    BlockFormat::IQ1_S,   BlockFormat::IQ1_M, BlockFormat::IQ2_XXS, BlockFormat::IQ2_XS, BlockFormat::IQ2_S,
+    BlockFormat::IQ3_XXS, BlockFormat::IQ3_S, BlockFormat::IQ4_NL,  BlockFormat::IQ4_XS,
 };
+static_assert(sizeof(kFormats) / sizeof(kFormats[0]) == kBlockFormats);
 
 std::vector<uint8_t> blocks(BlockFormat f, const Dims& shape, uint32_t seed) {
     return test::random_blocks(f, numel(shape) / block_layout(f).weights, seed);

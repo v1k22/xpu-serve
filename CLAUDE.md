@@ -405,10 +405,9 @@ draft program, and one way of drafting. The engine needs nothing new.
   reference runtime does. It is half the download; `convert` makes the pack that is smaller and faster to serve.
   Other quantized checkpoints (bitsandbytes, AWQ, GPTQ, GGUF) are refused by name.
 - A pack can hold weights in GGUF's block formats (`DType::Block`, kept as the file stores them): the host decodes all
-  19 as ggml does, so cpu-ref runs them. The SYCL backend has kernels for 14 (Q4_0, Q4_1, Q8_0, Q2_K to Q6_K, IQ4_NL,
-  IQ4_XS, IQ3_XXS, IQ3_S, IQ2_XXS, IQ2_S) and refuses Q5_0, Q5_1, IQ1_S, IQ1_M and IQ2_XS by name, as it does an
-  expert bank in any of them; `--backend-opt block=f16` decodes block formats to f16 as it uploads them (any format,
-  at f16's size). Up to 8 rows a block format's matmul is a GEMV whose cost grows with the rows (no matrix-engine
+  19 as ggml does, so cpu-ref runs them. The SYCL backend has kernels for all of them, but refuses an expert bank in one by
+  name; `--backend-opt block=f16` decodes block formats to f16 as it uploads them (also an expert bank, at f16's
+  size). Up to 8 rows a block format's matmul is a GEMV whose cost grows with the rows (no matrix-engine
   version: a speculative verify over such weights is slow), past them the weight is dequantized for a GEMM. Q4_0
   takes a ninth more device memory than its file (its q4 form stores a bias per group).
 - Quantization is round-to-nearest only (no AWQ / GPTQ yet). Gemma 4's per-layer embedding table (read on the host)

@@ -53,7 +53,8 @@ TEST_SUITE("device timing" * doctest::skip(!dev::enabled())) {
         const int pairs = std::stoi(env("XS_BENCH_PAIRS", "8"));
         const std::vector<std::string> formats =
             list_of(env("XS_BENCH_BLOCK",
-                        "q4,q8,Q4_0,Q4_1,Q8_0,Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,IQ4_NL,IQ4_XS,IQ3_XXS,IQ3_S,IQ2_XXS,IQ2_S"));
+                        "q4,q8,Q4_0,Q4_1,Q5_0,Q5_1,Q8_0,Q2_K,Q3_K,Q4_K,Q5_K,Q6_K,IQ1_S,IQ1_M,IQ2_XXS,IQ2_XS,IQ2_S,IQ3_"
+                        "XXS,IQ3_S,IQ4_NL,IQ4_XS"));
         std::vector<int64_t> rows;
         for (const std::string& item : list_of(env("XS_BENCH_ROWS", "1,4,8")))
             rows.push_back(std::stoll(item));
