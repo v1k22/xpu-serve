@@ -101,6 +101,23 @@ public:
         return tensor(std::move(name), std::move(dims), kGgmlF32, pod_bytes(values));
     }
 
+    // Leaves out the value or the tensor of that name (a test's variant of a valid file).
+    GgufWriter& drop_value(std::string_view key) {
+        std::erase_if(kvs_, [&](const Kv& kv) { return kv.key == key; });
+        return *this;
+    }
+    GgufWriter& drop_tensor(std::string_view name) {
+        std::erase_if(tensors_, [&](const Tensor& t) { return t.name == name; });
+        return *this;
+    }
+    // A string value's text (the first of that key), for a test that rewrites it.
+    std::string string_value(std::string_view key) const {
+        for (const Kv& kv : kvs_) {
+            if (kv.key == key) return kv.payload.substr(8);
+        }
+        return "";
+    }
+
     std::string bytes(uint32_t version = 3) const {
         std::string out = "GGUF" + pod_bytes(version) + pod_bytes(static_cast<uint64_t>(tensors_.size())) +
                           pod_bytes(static_cast<uint64_t>(kvs_.size()));

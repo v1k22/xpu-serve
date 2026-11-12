@@ -63,7 +63,7 @@ build/src/xpu-serve run   <decision-model-dir> --device GPU --request request.js
 - Run one test case: `build/tests/xs_tests -tc='model matches*'`. Environment for the tests that need files:
   `XS_TEST_MODEL_DIR` (a Hugging Face model directory), `XS_PARITY_BACKEND` (`cpu-ref` or `sycl`),
   `XS_PARITY_DEVICE`, `XS_PARITY_PRECISION`, `XS_PARITY_FIXTURES`, `XS_PARITY_KV_DTYPE`, `XS_TEST_DRAFTER_DIR` (a
-  drafter checkpoint beside the model); `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for tokenizer parity); `XS_LFM3_DIR`
+  drafter checkpoint beside the model); `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for tokenizer parity; with `XS_GGUF_FILE`, a qwen35 GGUF of it, for the GGUF import's real-file checks); `XS_LFM3_DIR`
   (an LFM3 checkpoint, for its tokenizer and chat template, which are not kept in this repository);
   `XS_TEST_DECISION_DIR` (a decision model) with `XS_DECISION_FIXTURES` (its reference answers) and
   `XS_DECISION_CHUNK` (tokens a step feeds).
@@ -106,7 +106,7 @@ area).
 | `tensor/` | xs_core | `DType` (incl. `Q8` / `Q4` pack weights, `F8`, an FP8 checkpoint's weight, and `Block`, a weight in one of GGUF's block formats kept as the file stores it), `block_format` (those formats: names, bytes and weights per block), `TensorView` (non-owning, e.g. into an mmap; `quant` points at a pack weight's scales and biases, `fp8` at an FP8 weight's runs of rows, `block` names a Block weight's format), `HostTensor` (owning), `TensorMap` (name -> HostTensor) |
 | `io/` | xs_core | `safetensors`: `WeightStore` interface, `SafetensorsWeights::open_dir` (single file or sharded index, mmapped; a pack's quantized weights appear as one Q8 / Q4 view each, or one Block view over their U8 rows of blocks, an FP8 checkpoint's `F8_E4M3` matrices as one F8 view each over codes and block scales; `join_rows` shows F8 tensors stored in pieces as one weight, without a copy; `open_file` for a head kept in a file of its own); `safetensors_writer` (streamed writing); `joined_weights` (a drafter checkpoint's weights under a prefix beside the target's); `gguf` (a GGUF file read in place: metadata of every type, the tensor table, each tensor's bytes; refusals by name) |
 | `quant/` | xs_core | round-to-nearest quantization into the pack formats (DESIGN.md 6.3) and dequantization; a tensor `[..., K]` is a matrix of `numel / K` rows (expert banks `[E, N, K]` included); `read_rows`, a float weight's rows whatever it is stored as (what backends and `convert` read through); `fp8` (the E4M3 codes and block scales of FP8 checkpoints); `block_decode` (GGUF block formats decoded on the host, value for value as ggml decodes them); `sign_sketch`, the one-bit copy of a weight a drafter's shortlist scores with |
-| `convert/` | xs_core | `convert_model`: checkpoint (language model, decision model, policy, or a drafter beside its model with `--target`) -> pack; the model's own graphs decide which weights to quantize (`plan_graph_formats`: bandwidth-bound matmuls, or all with `--scope all`) |
+| `convert/` | xs_core | `convert_model`: checkpoint (language model, decision model, policy, or a drafter beside its model with `--target`) -> pack; the model's own graphs decide which weights to quantize (`plan_graph_formats`: bandwidth-bound matmuls, or all with `--scope all`); `gguf/`: `import_gguf`, a GGUF file -> pack (`gguf_import.cpp`: block format tensors copied byte for byte, float tensors as stored or through a transform, streamed; config.json, tokenizer, chat template, manifest), `architecture.h` (what an architecture's importer provides: config.json from the metadata, the tensor name map, float transforms), one file per architecture (`qwen35.cpp`), `tokenizer` (tokenizer.json and tokenizer_config.json from the file's vocabulary and merges, the normalizer and pre-tokenizer from a table keyed by `tokenizer.ggml.pre`) |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
 | `models/` | xs_core | `model.h` (the `Model` interface: language models), `policy.h` (the `Policy` interface: robot policies, one static program per call shape: camera subset, step count, padded prompt length), `decision.h` (the `DecisionModel` interface: decision models, which lay out a request's prompt and name the steps to run), `registry.cpp` (model_type / LeRobot type / a head beside the decoder -> code, `model_kind`), `config_util` (checked JSON readers), `common/blocks` (the shared building blocks: gated MLPs, mixture of experts, RMSNorm variants, RoPE frequencies, attention, a drafter's head over a shortlist), `common/py_text` (a JSON value as Python's `json.dumps` and `str` write it: what reference code puts in a prompt), one folder per architecture (`pi05/`: π0.5; `clef/` and `pplx_decider/`: decision models on the Qwen3.5 decoder), `letter_readout/` (any language model as a decision model: OpenJev), `drafters/dflash` (block drafters that serve any target they were trained for: DFlash, DFlash 2, DSpine) |
@@ -132,6 +132,7 @@ area).
 | `src/models/gemma4/gemma4_vision.cpp` | Gemma 4 vision: image processor (resize, patches, pooling map) and vision tower graph |
 | `src/models/qwen3_5/qwen3_5_model.cpp` | Qwen3.5: Gated DeltaNet layers (causal conv + gated delta rule) and gated full attention; dense MLP or `blocks::moe` (`qwen3_5_moe`: fused gate_up expert banks, or an FP8 release's per-expert tensors joined at load; gated shared expert); the MTP head (`mtp.*`) as the drafter, built from the same layer builders, or a block drafter checkpoint in its place |
 | `src/models/qwen3_5/qwen3_5_decoder.cpp` | `qwen3_5::Decoder`: the decoder's layer builders over one checkpoint's weights, shared by the language model and the decision models built on it; full-attention layers causal through a KV slot, or over the whole step; linear attention's value heads in the checkpoint's order (`linear_value_head_order`: grouped as Hugging Face stores them, or tiled as GGUF files do, moved to the recurrence's order and back around GatedDelta) |
+| `src/convert/gguf/qwen35.cpp` | GGUF import of the Qwen3.5 family: metadata -> config.json, `blk.<i>.*` -> Hugging Face names, the converter's transforms undone on float tensors (norms stored as 1 + w, `ssm_a` = -exp(A_log)), value heads left tiled (`linear_value_head_order`), merged input projections cut by rows, the MTP block -> `mtp.*` |
 | `src/models/decision.h` | What a decision model provides: `spec()`, `programs()`, `weights()`, and `start(request, tools, limits)` -> a `DecisionRun` that hands the runtime one step at a time and ends with each question's probabilities |
 | `src/models/clef/` | Clef: `clef_prompt.cpp` (the reference's record encoding: token ids and the spans of each instruction and option), `clef_model.cpp` (the encode program, which keeps what the head's attentions read of the sequence in KV slots, the route, fields and score programs, and the host work between them) |
 | `src/models/pplx_decider/` | pplx-decider (protocol version 3): `pplx_prompt.cpp` (the chat-template prompt with answer codes and a marker per question, special tokens in user text neutralized, a long request split by question), `pplx_model.cpp` (one program: the decoder with whole-step full attention and the read-out on every row; temperature and softmax on the host) |
@@ -255,6 +256,8 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/io/gguf_reader.cpp` | the GGUF reader: every metadata value type, nested arrays, a vocabulary-sized string array, tensors at the file's alignment, versions 2 and 3; refusals (big-endian, split files, tensor types it does not read, truncation, misalignment) | files written by `gguf_test_util.h` (which also encodes Q8_0 and Q4_0 blocks as ggml does) |
 | `tests/unit/quant/test_block_weights.cpp` | weights in GGUF block formats: rows read whole, in part and of 3-D banks, a pack's block format entries and their refusals, the sign sketch of one | values written from the formats' fields; the same weight decoded whole |
 | `tests/unit/backend/cpu_block_ops.cpp` | MatMul, Gather and ExpertMatMul reading block format weights on cpu-ref | the same graph over the decoded f32 weights, bit for bit |
+| `tests/unit/convert/gguf_import.cpp` | GGUF import end to end: a tiny qwen35 GGUF written as llama.cpp's converter writes one (`tiny_gguf.h`: Q8_0 / Q4_0 / F16 / BF16 / F32 tensors, tiled value heads, merged input projections, an MTP head, a byte-level BPE vocabulary): its weights, logits over prefill and decode steps, greedy tokens and drafts on cpu-ref, its tokenizer, chat template, stop token and sampling defaults; refusals by name | the twin checkpoint its blocks decode to, in the Hugging Face layout; the original tokenizer; planted: the pack read in the grouped head order |
+| `tests/unit/convert/gguf_real_file.cpp` | a real qwen35 GGUF (`XS_GGUF_FILE`) against its checkpoint (`XS_QWEN35_DIR`): tokenizer parity (`parity_cases.h`) and token-by-token equality, the config fields the model code reads, the chat template renders, the import loads | Hugging Face's tokenizer and config.json |
 | `tests/unit/test_fp8.cpp` | FP8 checkpoints: the E4M3 code table, codes paired with their block scales, tensors joined row-wise, rows read whole and in part, refusals | values written from the codes' fields and the blocks' indices; planted swapped grid |
 | `tests/unit/model/fp8_checkpoint.cpp` | a tiny Qwen3.5 (dense; mixture of experts stored expert by expert) written the way an FP8 release stores it: weights, logits (cpu-ref and GPU) and `convert`'s packs; `quantization_config` refusals | the same checkpoint with the decoded values in the usual layout (`tiny_checkpoints.h`) |
 | `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp`, `lfm3_config.cpp` | config parsing and refusals | |
@@ -365,6 +368,32 @@ draft program, and one way of drafting. The engine needs nothing new.
    one; `decision_parity.cpp` then checks tokens and probabilities, on cpu-ref and the GPU; invariants on a tiny
    checkpoint the test writes go in `decision_models.cpp`. End to end: `tests/e2e/systemone_eval.py --reference`.
 6. Update TODO.md, this file's map and the README's decision models table.
+
+### 8.7 Add a GGUF architecture
+
+`xpu-serve convert <file.gguf> <out-dir>` imports the file into a pack for a model the engine already serves from
+Hugging Face safetensors (8.1 first, if it does not).
+
+1. Read llama.cpp's converter for the architecture (`convert_hf_to_gguf.py` and the `conversion/` class registered for
+   the Hugging Face architecture) and its graph (`src/models/<arch>.cpp`): the metadata keys it writes, the tensor
+   names, and every transform it applies to a tensor (a reshape, a value transform, a reordering of rows or columns).
+2. Add `src/convert/gguf/<arch>.cpp`: a class implementing `gguf_import::Architecture` (`architecture.h`) and a
+   function returning it, listed in `find_architecture` (`gguf_import.cpp`). `plan()` refuses `<arch>.*` metadata keys
+   it does not know, writes the config.json the model's config parser reads (the Hugging Face fields, numbers stored
+   as f32 through `config_number`), and maps every tensor of the file to the pack tensors it becomes, with the shape
+   the metadata implies; an unknown tensor name is an error, never dropped. `qwen35.cpp` is the example.
+3. Transforms: a float tensor can go through a `FloatMap` (value by value, written as F32). A tensor in a block format
+   is never decoded, re-encoded or reordered (a K-quant block spans 256 columns): it can only be cut into runs of whole
+   rows. When the converter reordered a quantized weight's rows or columns, the model code computes in the file's
+   order instead, behind a config.json key the importer writes (as `linear_value_head_order` for Qwen3.5); add that
+   key to the model's config parser and graph first, with a test that a reordered checkpoint gives the same logits.
+4. The tokenizer: a `tokenizer.ggml.pre` the table in `convert/gguf/tokenizer.cpp` does not have needs an entry with
+   the original tokenizer.json's normalizer, pre-tokenizer, post-processor and decoder, and the added tokens the
+   converter types control although the original does not mark them special.
+5. Tests: a tiny GGUF of the architecture written as the converter writes one, imported and compared with the
+   checkpoint its blocks decode to (modeled on `tests/unit/convert/gguf_import.cpp`), with a planted control for every
+   reordering; real-file checks behind an environment variable (`gguf_real_file.cpp`).
+6. Update this file (map, tests, section 10) and the README's GGUF line.
 
 ## 9. Conventions
 
