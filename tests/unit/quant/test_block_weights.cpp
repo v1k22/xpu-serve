@@ -1,5 +1,5 @@
 // Weights in GGUF block formats (DType::Block) on the host: read_rows over a Block view, a pack's manifest entries for
-// them, and the sign sketch of one. The decoders' bit-exactness against ggml is test_block_decode.cpp.
+// them, and the sign sketch of one. The decoders' values against ggml's, bit for bit: test_block_decode.cpp.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -124,19 +124,21 @@ TEST_SUITE("block formats") {
     }
 
     TEST_CASE("read_rows: any rows of a block weight as the whole decode has them; 3-D shapes are matrices of rows") {
-        for (const BlockFormat f :
-             {BlockFormat::Q4_0, BlockFormat::Q4_1, BlockFormat::Q5_0, BlockFormat::Q5_1, BlockFormat::Q8_0}) {
+        for (int i = 0; i < kBlockFormats; ++i) {
+            const auto f = static_cast<BlockFormat>(i);
             CAPTURE(block_format_name(f));
+            const int64_t k = 2 * block_layout(f).weights;  // 2 blocks a row
             const std::vector<uint8_t> bytes = test::random_blocks(f, 2 * 3 * 2, 5);
-            std::vector<float> all(2 * 3 * 64);
+            std::vector<float> all(static_cast<size_t>(2 * 3 * k));
             quant::decode_blocks(f, bytes.data(), 12, all.data());
-            const TensorView bank = block_view(f, {2, 3, 64}, bytes);
+            const TensorView bank = block_view(f, {2, 3, k}, bytes);
             CHECK(bank.nbytes() == bytes.size());
             CHECK(rows_of(bank, 0, 6) == all);
-            CHECK(rows_of(bank, 2, 3) == std::vector<float>(all.begin() + 2 * 64, all.begin() + 5 * 64));
-            CHECK(rows_of(block_view(f, {6, 64}, bytes), 5, 1) == std::vector<float>(all.end() - 64, all.end()));
+            CHECK(rows_of(bank, 2, 3) == std::vector<float>(all.begin() + 2 * k, all.begin() + 5 * k));
+            CHECK(rows_of(block_view(f, {6, k}, bytes), 5, 1) == std::vector<float>(all.end() - k, all.end()));
             CHECK(refuses([&] { rows_of(bank, 5, 2); }, {std::string(block_format_name(f)), "rows 5 to 7"}));
-            CHECK(refuses([&] { rows_of(block_view(f, {4, 48}, bytes), 0, 1); }, {"48 columns", "whole blocks of 32"}));
+            CHECK(refuses([&] { rows_of(block_view(f, {4, k - 16}, bytes), 0, 1); },
+                          {std::to_string(k - 16) + " columns", "whole blocks of " + std::to_string(k / 2)}));
         }
     }
 
