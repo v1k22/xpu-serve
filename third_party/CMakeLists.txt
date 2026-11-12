@@ -9,6 +9,10 @@ target_link_libraries(xs_httplib INTERFACE Threads::Threads)
 add_library(xs_doctest INTERFACE)
 target_include_directories(xs_doctest SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
+# ggml's quantization tables (data only; see ggml/PROVENANCE.md), included through src/quant/block_tables.h.
+add_library(xs_ggml_tables INTERFACE)
+target_include_directories(xs_ggml_tables SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+
 # Jinja engine for chat templates (vendored sources; see third_party/README.md).
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/jinja_cpp/CMakeLists.txt)
   add_subdirectory(jinja_cpp)
