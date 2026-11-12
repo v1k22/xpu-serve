@@ -305,6 +305,23 @@ On the Arc Pro B60, q8 decodes 1.5 to 1.7 times faster than f16 with no measurab
 twice as fast and keeps MMLU-Pro scores, with some loss of logit fidelity on small models (Qwen3.5-4B logits cosine
 0.90 to 0.96 at groups of 32, 0.92 to 0.96 with AWQ). Numbers: [docs/decisions/0009](docs/decisions/0009-quantized-packs.md).
 
+### From a GGUF file
+
+`convert` also imports a GGUF file (llama.cpp's format) into a pack. Each quantized tensor stays exactly as the file
+stores it (Q4_K, Q6_K, IQ2_XS, ...: nothing is decoded or quantized again), so the pack holds the file's weights at
+the file's size:
+
+```bash
+xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M
+xpu-serve run ~/models/Qwen3.5-4B-Q4_K_M --backend cpu-ref --prompt "Hi"
+```
+
+The architecture comes from the file (`general.architecture`): `qwen35`, the Qwen3.5 / Qwen3.6 / Qwen3.8 dense text
+models, is supported; others are refused by name. config.json, the tokenizer and the chat template are written from
+the file's metadata (on Qwen3.5-4B the tokenizer equals the original's token by token), and the template is the
+file's, which a publisher may have changed from the original checkpoint's. The quantization options do not apply.
+The CPU reference backend reads every block format; the GPU backend does not read them yet.
+
 ## Long context: int8 KV cache
 
 `--kv-dtype i8` (on `serve`, `run` and `bench`) stores the KV cache as int8 with one scale per token and KV head,

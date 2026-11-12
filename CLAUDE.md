@@ -20,7 +20,8 @@ How that works:
 - **Model code is C++ in this repo** (`src/models/<arch>/`). It reads the Hugging Face `config.json`, and builds a
   backend-neutral **step graph** out of ~20 ops (matmul, rms_norm, rope, attention, ...).
 - **Weights are read from Hugging Face safetensors at load time** (memory-mapped): the original checkpoint, an FP8
-  release of it, or a q8 / q4 pack written by `convert` (DESIGN.md section 6). There is no exported IR.
+  release of it, or a q8 / q4 pack written by `convert` (DESIGN.md section 6), or a pack `convert` imported from a
+  GGUF file (its tensors in GGUF's block formats, byte for byte). There is no exported IR.
 - **A backend compiles the step graph** for a device and runs it. Backends know nothing about models.
 
 Status (see TODO.md): Gemma 4 E2B/E4B (text and images), Gemma 4 26B-A4B (text), the Qwen3.5 family (Qwen3.5,
@@ -434,7 +435,14 @@ Hugging Face safetensors (8.1 first, if it does not).
 - An FP8 checkpoint (`quantization_config`: fp8, e4m3, one scale per 128 x 128 block) is the float model its codes
   decode to: weights go to the device as f16, like the original's, and activations are not rounded to FP8 as the
   reference runtime does. It is half the download; `convert` makes the pack that is smaller and faster to serve.
-  Other quantized checkpoints (bitsandbytes, AWQ, GPTQ, GGUF) are refused by name.
+  Other quantized checkpoints (bitsandbytes, AWQ, GPTQ) are refused by name.
+- GGUF files are imported, not served as they are: `convert <file.gguf> <out-dir>` writes a pack whose tensors keep
+  the file's block formats byte for byte. Architecture `qwen35` only (the Qwen3.5 family's dense text models;
+  `qwen35moe` and every other architecture are refused by name), byte-level BPE tokenizers (`tokenizer.ggml.model`
+  gpt2) with a `tokenizer.ggml.pre` of the importer's table (`qwen35`). The pack's chat template and stop token are
+  the file's: a publisher's changed template is what it renders, and a stop token only the original checkpoint's
+  config names (Qwen3.5's `<|endoftext|>`) is not one. A file that is one part of a split model, or holds tensor
+  types beyond F32, F16, BF16 and the block formats, is refused by name.
 - A pack can hold weights in GGUF's block formats (`DType::Block`, kept as the file stores them): the host decodes all
   19 as ggml does, so cpu-ref runs them. The SYCL backend has kernels for all of them, but refuses an expert bank in one by
   name; `--backend-opt block=f16` decodes block formats to f16 as it uploads them (also an expert bank, at f16's

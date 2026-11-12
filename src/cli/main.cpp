@@ -1,7 +1,9 @@
 // xpu-serve command line: serve | run | bench | convert | info.
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -14,8 +16,10 @@
 #include "chat/output_parser.h"
 #include "cli/args.h"
 #include "convert/convert.h"
+#include "convert/gguf/gguf_import.h"
 #include "decision/runner.h"
 #include "decision/service.h"
+#include "io/gguf.h"
 #include "models/letter_readout/letter_readout.h"
 #include "models/policy.h"
 #include "policy/runner.h"
@@ -42,10 +46,11 @@ const char* kUsage =
     "  xpu-serve run   <model-dir> [options]   chat in the terminal (--prompt for one shot)\n"
     "  xpu-serve bench <model-dir> [options]   prefill / decode speed, or a decision model's latency\n"
     "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--method rtn|awq]   quantized pack\n"
+    "  xpu-serve convert <file.gguf> <out-dir>  a GGUF file as a pack, its tensors as the file stores them\n"
     "  xpu-serve info                          backends and devices\n"
     "\n"
     "<model-dir> is a Hugging Face model directory (config.json, *.safetensors, tokenizer.json) or a pack that\n"
-    "'xpu-serve convert' wrote from one.\n"
+    "'xpu-serve convert' wrote from one or from a GGUF file.\n"
     "Run 'xpu-serve <command> --help' for the options of a command.\n";
 
 std::string default_backend() {
@@ -184,6 +189,43 @@ bool wants_help(const Args& a, const char* command, const char* summary) {
     return true;
 }
 
+bool is_gguf_name(const std::filesystem::path& path) {
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
+    return ext == ".gguf";
+}
+
+// `convert <file.gguf> <out-dir>` (or `--out <dir>`): the file's tensors go into the pack as it stores them, so the
+// quantization options have nothing to choose and are refused by name.
+int convert_gguf(const Args& a) {
+    for (const char* flag :
+         {"target", "quant", "group", "q8", "scope", "method", "calib", "calib-tokens", "backend", "device"}) {
+        if (a.has(flag)) {
+            fail("convert: --", flag, " does not apply to a GGUF file: its tensors are kept as the file stores them");
+        }
+    }
+    const std::vector<std::string>& pos = a.positionals();
+    if (pos.size() > 2 || (pos.size() == 2) == a.has("out")) fail("usage: xpu-serve convert <file.gguf> <out-dir>");
+    gguf_import::ImportOptions o;
+    o.source = pos[0];
+    o.output = pos.size() == 2 ? pos[1] : a.get("out");
+    if (!std::filesystem::is_regular_file(o.source)) fail("convert: '", pos[0], "' is not a file");
+    if (!gguf::has_gguf_magic(o.source)) fail("convert: '", pos[0], "' ends in .gguf but is not a GGUF file");
+    o.converter = std::string("xpu-serve ") + XS_VERSION;
+    const gguf_import::ImportReport r = gguf_import::import_gguf(o);
+    const std::string named = r.model_name.empty() ? r.architecture : r.architecture + " (" + r.model_name + ")";
+    std::printf("imported %s: %s, %lld tensors\n", o.source.filename().string().c_str(), named.c_str(),
+                static_cast<long long>(r.tensors));
+    for (const gguf_import::FormatShare& f : r.formats) {
+        std::printf("  %-8s %5lld tensors  %5.1f %% of the weights  %7.3f GB\n", f.format.c_str(),
+                    static_cast<long long>(f.tensors),
+                    r.weights > 0 ? 100.0 * static_cast<double>(f.weights) / static_cast<double>(r.weights) : 0.0,
+                    static_cast<double>(f.bytes) / 1e9);
+    }
+    std::printf("wrote %s: %.2f GB\n", o.output.string().c_str(), static_cast<double>(r.output_bytes) / 1e9);
+    return 0;
+}
+
 int cmd_convert(const std::vector<std::string>& argv) {
     Args a;
     a.value("out", "output directory for the pack (must not exist or be empty)")
@@ -201,10 +243,20 @@ int cmd_convert(const std::vector<std::string>& argv) {
         .value("log-level", "debug | info | warn | error", "info")
         .flag("help", "show this help");
     a.parse(argv);
-    if (wants_help(a, "convert", "<model-dir> --out <dir> [options]")) return 0;
+    if (wants_help(
+            a, "convert",
+            "<model-dir> --out <dir> [options]\n"
+            "       xpu-serve convert <file.gguf> <out-dir>   (a GGUF file, its tensors as the file stores them: "
+            "of the options, only --out and --log-level apply)")) {
+        return 0;
+    }
     log::set_level(log::parse_level(a.get("log-level")));
+    if (!a.positionals().empty() && is_gguf_name(a.positionals()[0])) return convert_gguf(a);
     ConvertOptions o;
     o.source = model_dir_arg(a, "convert");
+    if (std::filesystem::is_regular_file(o.source)) {
+        fail("convert: '", o.source.string(), "' is a file; the source is a model directory or a .gguf file");
+    }
     o.target = a.get("target");
     o.output = a.get("out");
     if (o.output.empty()) fail("usage: xpu-serve convert <model-dir> --out <dir> [options]");
