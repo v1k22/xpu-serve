@@ -14,15 +14,16 @@
 //   mapped to mtp.*.
 
 #include <cmath>
-#include <map>
 #include <set>
 
 #include "convert/gguf/architecture.h"
+#include "convert/gguf/layout.h"
 #include "util/error.h"
 
 namespace xs::gguf_import {
 namespace {
 
+constexpr std::string_view kArch = "qwen35";
 const std::string kPrefix = "model.";  // a text-only checkpoint's decoder, as Qwen3_5ForCausalLM names it
 
 float minus_one(float x) {
@@ -67,24 +68,6 @@ struct Dimensions {
     int64_t value_width() const { return value_heads * value_dim; }
     int64_t conv_width() const { return 2 * key_width() + value_width(); }
 };
-
-// What one tensor of the file becomes: its stored shape (row-major), and the pack tensors it holds, in row order.
-struct Piece {
-    std::string name;
-    Dims shape;
-    const FloatMap* map = nullptr;
-};
-struct Entry {
-    Dims stored;
-    std::vector<Piece> pieces;
-    bool optional = false;
-};
-using Entries = std::map<std::string, Entry, std::less<>>;  // by the name after "blk.<i>." (or the whole name)
-
-Entry one(Dims stored, std::string name, const FloatMap* map = nullptr) {
-    Dims shape = stored;
-    return Entry{std::move(stored), {Piece{std::move(name), std::move(shape), map}}};
-}
 
 // A decoder layer of either kind: the norms and the MLP.
 void add_layer_common(Entries& e, const Dimensions& d, const std::string& L) {
@@ -146,24 +129,12 @@ Entries mtp_layer(const Dimensions& d, int64_t i) {
     return e;
 }
 
-int64_t positive(const gguf::File& f, const std::string& key) {
-    const int64_t v = f.get_int(key);
-    if (v <= 0) fail("qwen35: ", key, " is ", v);
-    return v;
-}
-
 class Qwen35 final : public Architecture {
 public:
-    std::string_view name() const override { return "qwen35"; }
+    std::string_view name() const override { return kArch; }
 
     ImportPlan plan(const gguf::File& f) const override {
-        for (const gguf::Value& v : f.metadata()) {
-            const std::string_view key = v.key();
-            if (key.substr(0, 7) == "qwen35." && !kKnownKeys.contains(key.substr(7))) {
-                fail("qwen35: metadata '", key, "' is not read by this importer; a key it does not know may change ",
-                     "the model, so the file is refused");
-            }
-        }
+        refuse_unknown_keys(f, kArch, kKnownKeys);
         if (const gguf::Value* s = f.find("qwen35.rope.scaling.type"); s != nullptr && s->as_string() != "none") {
             fail("qwen35: qwen35.rope.scaling.type '", s->as_string(), "' is not supported (supported: none)");
         }
@@ -172,21 +143,21 @@ public:
         if (embed == nullptr) fail("qwen35: the file has no token_embd.weight");
         Dimensions d{};
         d.vocab = embed->rows();
-        d.hidden = positive(f, "qwen35.embedding_length");
-        d.ffn = positive(f, "qwen35.feed_forward_length");
-        d.heads = positive(f, "qwen35.attention.head_count");
-        d.kv_heads = positive(f, "qwen35.attention.head_count_kv");
-        d.head_dim =
-            f.find("qwen35.attention.key_length") ? positive(f, "qwen35.attention.key_length") : d.hidden / d.heads;
+        d.hidden = positive(f, kArch, "qwen35.embedding_length");
+        d.ffn = positive(f, kArch, "qwen35.feed_forward_length");
+        d.heads = positive(f, kArch, "qwen35.attention.head_count");
+        d.kv_heads = positive(f, kArch, "qwen35.attention.head_count_kv");
+        d.head_dim = f.find("qwen35.attention.key_length") ? positive(f, kArch, "qwen35.attention.key_length")
+                                                           : d.hidden / d.heads;
         if (f.find("qwen35.attention.value_length") && f.get_int("qwen35.attention.value_length") != d.head_dim) {
             fail("qwen35: attention.value_length ", f.get_int("qwen35.attention.value_length"), " differs from ",
                  "key_length ", d.head_dim);
         }
-        d.key_heads = positive(f, "qwen35.ssm.group_count");
-        d.value_heads = positive(f, "qwen35.ssm.time_step_rank");
-        d.key_dim = positive(f, "qwen35.ssm.state_size");
-        d.conv_kernel = positive(f, "qwen35.ssm.conv_kernel");
-        const int64_t inner = positive(f, "qwen35.ssm.inner_size");
+        d.key_heads = positive(f, kArch, "qwen35.ssm.group_count");
+        d.value_heads = positive(f, kArch, "qwen35.ssm.time_step_rank");
+        d.key_dim = positive(f, kArch, "qwen35.ssm.state_size");
+        d.conv_kernel = positive(f, kArch, "qwen35.ssm.conv_kernel");
+        const int64_t inner = positive(f, kArch, "qwen35.ssm.inner_size");
         if (inner % d.value_heads != 0 || d.value_heads % d.key_heads != 0) {
             fail("qwen35: ssm.inner_size ", inner, ", time_step_rank ", d.value_heads, " and group_count ", d.key_heads,
                  " are not whole value heads per key head");
@@ -200,7 +171,7 @@ public:
                  " embedding rows");
         }
 
-        const int64_t blocks = positive(f, "qwen35.block_count");
+        const int64_t blocks = positive(f, kArch, "qwen35.block_count");
         const int64_t mtp = f.find("qwen35.nextn_predict_layers") ? f.get_int("qwen35.nextn_predict_layers") : 0;
         if (mtp < 0 || mtp >= blocks) fail("qwen35: nextn_predict_layers ", mtp, " of ", blocks, " blocks");
         const int64_t layers = blocks - mtp;
@@ -221,14 +192,14 @@ public:
             }
         } else {
             const int64_t interval =
-                f.find("qwen35.full_attention_interval") ? positive(f, "qwen35.full_attention_interval") : 4;
+                f.find("qwen35.full_attention_interval") ? positive(f, kArch, "qwen35.full_attention_interval") : 4;
             for (int64_t i = 0; i < layers; ++i)
                 linear[static_cast<size_t>(i)] = (i + 1) % interval != 0;
         }
 
         ImportPlan plan;
         plan.config = config(f, d, layers, mtp, linear);
-        plan.tensors = tensors(f, d, layers, blocks, linear);
+        map_tensors(f, kArch, layout(d, layers, blocks, linear), plan);
         return plan;
     }
 
@@ -262,9 +233,9 @@ private:
         c["linear_conv_kernel_dim"] = d.conv_kernel;
         c["linear_value_head_order"] = "tiled";
         c["rms_norm_eps"] = config_number(f.get("qwen35.attention.layer_norm_rms_epsilon"));
-        c["max_position_embeddings"] = positive(f, "qwen35.context_length");
+        c["max_position_embeddings"] = positive(f, kArch, "qwen35.context_length");
         const int64_t rotary =
-            f.find("qwen35.rope.dimension_count") ? positive(f, "qwen35.rope.dimension_count") : d.head_dim;
+            f.find("qwen35.rope.dimension_count") ? positive(f, kArch, "qwen35.rope.dimension_count") : d.head_dim;
         if (rotary > d.head_dim || rotary % 2 != 0) {
             fail("qwen35: rope.dimension_count ", rotary, " does not fit head_dim ", d.head_dim);
         }
@@ -286,76 +257,25 @@ private:
         return c;
     }
 
-    static std::vector<PackTensor> tensors(const gguf::File& f, const Dimensions& d, int64_t layers, int64_t blocks,
-                                           const std::vector<bool>& linear) {
-        Entries top;
-        top["token_embd.weight"] = one({d.vocab, d.hidden}, kPrefix + "embed_tokens.weight");
-        top["output_norm.weight"] = one({d.hidden}, kPrefix + "norm.weight", &kNorm);
-        top["output.weight"] = one({d.vocab, d.hidden}, "lm_head.weight");
-        top["output.weight"].optional = true;
-        std::vector<Entries> block(static_cast<size_t>(blocks));
+    static Layout layout(const Dimensions& d, int64_t layers, int64_t blocks, const std::vector<bool>& linear) {
+        Layout l;
+        l.top["token_embd.weight"] = one({d.vocab, d.hidden}, kPrefix + "embed_tokens.weight");
+        l.top["output_norm.weight"] = one({d.hidden}, kPrefix + "norm.weight", &kNorm);
+        l.top["output.weight"] = one({d.vocab, d.hidden}, "lm_head.weight");
+        l.top["output.weight"].optional = true;
+        l.blocks.resize(static_cast<size_t>(blocks));
         for (int64_t i = 0; i < blocks; ++i) {
             const std::string L = kPrefix + "layers." + std::to_string(i) + ".";
-            block[static_cast<size_t>(i)] = i >= layers                      ? mtp_layer(d, i - layers)
-                                            : linear[static_cast<size_t>(i)] ? linear_attention_layer(d, L)
-                                                                             : full_attention_layer(d, L);
+            l.blocks[static_cast<size_t>(i)] = i >= layers                      ? mtp_layer(d, i - layers)
+                                               : linear[static_cast<size_t>(i)] ? linear_attention_layer(d, L)
+                                                                                : full_attention_layer(d, L);
         }
-        const auto kind = [&](int64_t i) {
+        l.block_kind = [layers, linear](int64_t i) -> std::string {
             return i >= layers                      ? "an MTP layer"
                    : linear[static_cast<size_t>(i)] ? "linear attention"
                                                     : "full attention";
         };
-
-        std::vector<PackTensor> out;
-        std::map<std::string, int, std::less<>> made;  // pack tensor name -> how many tensors of the file made it
-        for (const gguf::TensorInfo& t : f.tensors()) {
-            const Entry* e = nullptr;
-            if (t.name.rfind("blk.", 0) == 0) {
-                const size_t dot = t.name.find('.', 4);
-                const std::string index = t.name.substr(4, dot == std::string::npos ? std::string::npos : dot - 4);
-                if (dot == std::string::npos || index.empty() || index.size() > 9 ||
-                    index.find_first_not_of("0123456789") != std::string::npos || std::stoll(index) >= blocks) {
-                    fail("qwen35: tensor '", t.name, "' is not in one of the file's ", blocks, " blocks");
-                }
-                const int64_t i = std::stoll(index);
-                const Entries& entries = block[static_cast<size_t>(i)];
-                const auto it = entries.find(std::string_view(t.name).substr(dot + 1));
-                if (it == entries.end()) {
-                    fail("qwen35: tensor '", t.name, "' has no counterpart in block ", i, " (", kind(i), ")");
-                }
-                e = &it->second;
-            } else {
-                const auto it = top.find(t.name);
-                if (it == top.end()) fail("qwen35: tensor '", t.name, "' has no counterpart in the model");
-                e = &it->second;
-            }
-            if (t.shape() != e->stored) {
-                fail("qwen35: tensor '", t.name, "' has shape ", dims_to_string(t.shape()), "; the metadata gives ",
-                     dims_to_string(e->stored));
-            }
-            int64_t row = 0;
-            for (const Piece& p : e->pieces) {
-                out.push_back(PackTensor{p.name, p.shape, &t, row, p.map});
-                row += numel(p.shape) / p.shape.back();
-                ++made[p.name];
-            }
-        }
-
-        // Every tensor the model reads, made once (not both from one tensor and from its two halves).
-        const auto check = [&](const Entries& entries, const std::string& where) {
-            for (const auto& [suffix, e] : entries) {
-                for (const Piece& p : e.pieces) {
-                    const auto it = made.find(p.name);
-                    const int n = it == made.end() ? 0 : it->second;
-                    if (n == 0 && !e.optional) fail("qwen35: the file has no tensor for '", p.name, "' (", where, ")");
-                    if (n > 1) fail("qwen35: '", p.name, "' comes from more than one tensor of the file (", where, ")");
-                }
-            }
-        };
-        check(top, "the model's");
-        for (int64_t i = 0; i < blocks; ++i)
-            check(block[static_cast<size_t>(i)], str_cat("block ", i, ", ", kind(i)));
-        return out;
+        return l;
     }
 };
 

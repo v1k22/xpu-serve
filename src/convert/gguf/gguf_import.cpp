@@ -47,10 +47,12 @@ void check_general(const gguf::File& f) {
     }
 }
 
-// Every row of every tensor of the file goes into the pack exactly once.
-void check_coverage(const gguf::File& f, const std::vector<PackTensor>& tensors) {
+// Every row of every tensor of the file goes into the pack exactly once, but for the derived ones, which go nowhere.
+void check_coverage(const gguf::File& f, const ImportPlan& plan) {
     std::map<const gguf::TensorInfo*, std::vector<std::pair<int64_t, int64_t>>> runs;
-    for (const PackTensor& p : tensors) {
+    for (const gguf::TensorInfo* t : plan.derived)
+        runs[t].emplace_back(0, t->rows());
+    for (const PackTensor& p : plan.tensors) {
         XS_CHECK(!p.shape.empty() && p.shape.back() == p.source->cols(), "gguf import: '", p.name, "' ",
                  dims_to_string(p.shape), " does not keep the ", p.source->cols(), " columns of '", p.source->name,
                  "'");
@@ -71,27 +73,6 @@ void check_coverage(const gguf::File& f, const std::vector<PackTensor>& tensors)
         XS_CHECK(next == t.rows(), "gguf import: rows ", next, " to ", t.rows(), " of tensor '", t.name,
                  "' are not imported");
     }
-}
-
-// The values of rows [first, first + rows) of a float tensor, as f32.
-std::vector<float> float_rows(const gguf::TensorInfo& t, int64_t first, int64_t rows) {
-    const auto n = static_cast<size_t>(rows * t.cols());
-    const size_t start = static_cast<size_t>(first * t.cols());
-    std::vector<float> out(n);
-    switch (t.dtype) {
-        case DType::F32:
-            std::memcpy(out.data(), reinterpret_cast<const float*>(t.data) + start, n * sizeof(float));
-            break;
-        case DType::F16:
-            convert_f16_to_f32(reinterpret_cast<const uint16_t*>(t.data) + start, out.data(), n);
-            break;
-        case DType::BF16:
-            convert_bf16_to_f32(reinterpret_cast<const uint16_t*>(t.data) + start, out.data(), n);
-            break;
-        default:
-            fail("gguf import: '", t.name, "' is not a float tensor");
-    }
-    return out;
 }
 
 OutUnit write_bytes(OutTensor tensor, const std::byte* begin, size_t bytes) {
@@ -195,6 +176,26 @@ double config_number(const gguf::Value& v) {
     return static_cast<double>(v.as_int());
 }
 
+std::vector<float> float_rows(const gguf::TensorInfo& t, int64_t first, int64_t rows) {
+    const auto n = static_cast<size_t>(rows * t.cols());
+    const size_t start = static_cast<size_t>(first * t.cols());
+    std::vector<float> out(n);
+    switch (t.dtype) {
+        case DType::F32:
+            std::memcpy(out.data(), reinterpret_cast<const float*>(t.data) + start, n * sizeof(float));
+            break;
+        case DType::F16:
+            convert_f16_to_f32(reinterpret_cast<const uint16_t*>(t.data) + start, out.data(), n);
+            break;
+        case DType::BF16:
+            convert_bf16_to_f32(reinterpret_cast<const uint16_t*>(t.data) + start, out.data(), n);
+            break;
+        default:
+            fail("gguf import: '", t.name, "' is not a float tensor");
+    }
+    return out;
+}
+
 const Architecture& find_architecture(std::string_view name) {
     const std::vector<const Architecture*> all{&qwen35()};
     std::string list;
@@ -221,7 +222,7 @@ ImportReport import_gguf(const ImportOptions& o) {
     const std::optional<nlohmann::ordered_json> generation = generation_config(file);
     plan.config["eos_token_id"] = tokenizer.stop_ids.size() == 1 ? nlohmann::ordered_json(tokenizer.stop_ids[0])
                                                                  : nlohmann::ordered_json(tokenizer.stop_ids);
-    check_coverage(file, plan.tensors);
+    check_coverage(file, plan);
 
     std::sort(plan.tensors.begin(), plan.tensors.end(),
               [](const PackTensor& a, const PackTensor& b) { return a.name < b.name; });

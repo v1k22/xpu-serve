@@ -35,7 +35,10 @@ struct PackTensor {
 
 struct ImportPlan {
     nlohmann::ordered_json config;    // config.json, without eos_token_id (the import adds the tokenizer's)
-    std::vector<PackTensor> tensors;  // together, every row of every tensor of the file exactly once
+    std::vector<PackTensor> tensors;  // with `derived`, every row of every tensor of the file exactly once
+    // Tensors the converter computed from the config (not the checkpoint's), which the architecture checked against
+    // the config it writes: not imported, since the model code computes them from config.json.
+    std::vector<const gguf::TensorInfo*> derived;
 };
 
 class Architecture {
@@ -55,5 +58,8 @@ const Architecture& find_architecture(std::string_view name);
 // A metadata value of type f32 as the shortest decimal that reads back as the same float (what a config.json written
 // by Python holds: 1e-06, not 9.99999997e-07); an f64 or an integer as it is.
 double config_number(const gguf::Value& v);
+
+// The values of rows [first, first + rows) of a float tensor (F32, F16, BF16), as f32.
+std::vector<float> float_rows(const gguf::TensorInfo& t, int64_t first, int64_t rows);
 
 }  // namespace xs::gguf_import

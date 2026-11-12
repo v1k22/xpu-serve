@@ -2,11 +2,11 @@
 // checkpoint it was converted from (XS_QWEN35_DIR: its config.json, tokenizer.json, tokenizer_config.json and chat
 // template; the weights are not read). The tokenizer written from the file passes the Qwen3.5 tokenizer parity cases
 // and matches Hugging Face token by token; config.json gives the model code what the checkpoint's does; the file's
-// chat template renders; the imported pack loads. Each case skips unless both variables are set.
+// chat template renders; the imported pack loads. Each case skips unless both variables are set and the file is a
+// qwen35 one.
 #include <doctest/doctest.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -18,6 +18,7 @@
 #include "convert/gguf/architecture.h"
 #include "convert/gguf/gguf_import.h"
 #include "convert/gguf/tokenizer.h"
+#include "convert/real_gguf.h"
 #include "io/gguf.h"
 #include "model/tiny_checkpoints.h"
 #include "models/config_util.h"
@@ -32,24 +33,8 @@ using xs::test::TempDir;
 
 namespace {
 
-struct RealFile {
-    fs::path gguf;
-    fs::path hf;
-};
-
-std::optional<RealFile> real_file() {
-    const char* g = std::getenv("XS_GGUF_FILE");
-    const char* h = std::getenv("XS_QWEN35_DIR");
-    if (g == nullptr || *g == '\0' || h == nullptr || *h == '\0') return std::nullopt;
-    return RealFile{g, h};
-}
-
-// The tokenizer files written from the GGUF into `dir`.
-void write_tokenizer(const gguf::File& file, const fs::path& dir) {
-    const gguf_import::TokenizerFiles t = gguf_import::tokenizer_files(file);
-    fs::create_directories(dir);
-    std::ofstream(dir / "tokenizer.json") << t.tokenizer.dump();
-    std::ofstream(dir / "tokenizer_config.json") << t.config.dump(1);
+std::optional<xs::test::RealGguf> real_file() {
+    return xs::test::real_gguf("XS_QWEN35_DIR", "qwen35");
 }
 
 }  // namespace
@@ -60,7 +45,7 @@ TEST_SUITE("gguf real file") {
         if (!real) return;
         const TempDir work("xs_gguf_real_tokenizer_test");
         const gguf::File file(real->gguf);
-        write_tokenizer(file, work.path);
+        xs::test::write_gguf_tokenizer(file, work.path);
         const auto imported = tok::Tokenizer::load(work.path);
         const nlohmann::json fixture = nlohmann::json::parse(
             std::ifstream(fs::path(XS_SOURCE_DIR) / "tests/fixtures/tokenizer/qwen35_cases.json"));
@@ -161,7 +146,7 @@ TEST_SUITE("gguf real file") {
         if (!real) return;
         const TempDir work("xs_gguf_real_template_test");
         const gguf::File file(real->gguf);
-        write_tokenizer(file, work.path);
+        xs::test::write_gguf_tokenizer(file, work.path);
         const std::string source = gguf_import::chat_template(file);
         std::ofstream(work.path / "chat_template.jinja") << source;
         const auto chat = chat::ChatTemplate::load(work.path);

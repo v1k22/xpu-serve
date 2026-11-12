@@ -16,6 +16,7 @@
 #include "backend/cpu_ref/cpu_backend.h"
 #include "chat/chat_template.h"
 #include "convert/gguf/gguf_import.h"
+#include "convert/import_test_util.h"
 #include "convert/tiny_gguf.h"
 #include "io/safetensors.h"
 #include "models/model.h"
@@ -26,71 +27,18 @@
 using namespace xs;
 namespace fs = std::filesystem;
 using xs::test::GgufWriter;
+using xs::test::import_into;
+using xs::test::relative_gap;
 using xs::test::TempDir;
+using xs::test::values;
 
 namespace {
 
 const std::vector<int32_t> kPrompt{3, 17, 42, 99, 5, 250, 7, 8, 64, 128, 266, 271};
+const std::vector<int32_t> kSteps{11, 200, 1};
 
-gguf_import::ImportReport import_into(const fs::path& gguf, const fs::path& out) {
-    gguf_import::ImportOptions o;
-    o.source = gguf;
-    o.output = out;
-    return gguf_import::import_gguf(o);
-}
-
-SessionOptions f32() {
-    SessionOptions so;
-    so.precision = DType::F32;
-    return so;
-}
-
-// The logits of a prefill of kPrompt and of three decode steps after it.
 std::vector<std::vector<float>> step_logits(const Model& model) {
-    const auto backend = make_cpu_ref_backend();
-    const auto session = backend->compile(model.graph(), model.weights(), f32());
-    std::vector<std::vector<float>> out;
-    int64_t pos = 0;
-    for (const std::vector<int32_t>& ids :
-         {kPrompt, std::vector<int32_t>{11}, std::vector<int32_t>{200}, std::vector<int32_t>{1}}) {
-        TensorMap inputs, outputs;
-        model.prepare_inputs(ids, pos, {}, inputs);
-        session->run(inputs, outputs);
-        const HostTensor& l = outputs.at("logits");
-        out.emplace_back(l.data<float>(), l.data<float>() + l.numel());
-        pos += static_cast<int64_t>(ids.size());
-    }
-    return out;
-}
-
-double relative_gap(const std::vector<std::vector<float>>& a, const std::vector<std::vector<float>>& b) {
-    double gap = 0.0, scale = 0.0;
-    for (size_t s = 0; s < a.size(); ++s) {
-        for (size_t i = 0; i < a[s].size(); ++i) {
-            gap = std::max(gap, static_cast<double>(std::fabs(a[s][i] - b[s][i])));
-            scale = std::max(scale, static_cast<double>(std::fabs(b[s][i])));
-        }
-    }
-    return gap / scale;
-}
-
-std::vector<int32_t> greedy(const Model& model, int tokens) {
-    const auto backend = make_cpu_ref_backend();
-    const auto session = backend->compile(model.graph(), model.weights(), f32());
-    std::vector<int32_t> out, feed = kPrompt;
-    int64_t pos = 0;
-    for (int i = 0; i < tokens; ++i) {
-        TensorMap inputs, outputs;
-        model.prepare_inputs(feed, pos, {}, inputs);
-        session->run(inputs, outputs);
-        pos += static_cast<int64_t>(feed.size());
-        const HostTensor& l = outputs.at("logits");
-        const float* row = l.data<float>();
-        const auto best = static_cast<int32_t>(std::max_element(row, row + l.numel()) - row);
-        out.push_back(best);
-        feed = {best};
-    }
-    return out;
+    return xs::test::step_logits(model, kPrompt, kSteps);
 }
 
 // The MTP head's logits for three pairs (hidden row, next token), from its own program.
@@ -99,7 +47,7 @@ std::vector<float> draft_logits(const Model& model) {
     REQUIRE(spec != nullptr);
     REQUIRE(spec->chain() != nullptr);
     const auto backend = make_cpu_ref_backend();
-    const auto session = backend->compile(spec->draft_graph(), model.weights(), f32());
+    const auto session = backend->compile(spec->draft_graph(), model.weights(), xs::test::f32_session());
     const int64_t hidden = model.info().hidden_size;
     std::vector<float> rows(static_cast<size_t>(3 * hidden));
     for (size_t i = 0; i < rows.size(); ++i)
@@ -109,12 +57,6 @@ std::vector<float> draft_logits(const Model& model) {
     session->run(inputs, outputs);
     const HostTensor& l = outputs.at("logits");
     return {l.data<float>(), l.data<float>() + l.numel()};
-}
-
-std::vector<float> values(const TensorView& v) {
-    std::vector<float> out(static_cast<size_t>(v.numel()));
-    quant::read_rows(v, 0, quant::matrix_rows(v.shape), out.data());
-    return out;
 }
 
 bool ends_with(const std::string& s, const std::string& tail) {
@@ -141,16 +83,7 @@ std::vector<float> grouped_values(const std::string& name, const TensorView& v) 
 // The tiny GGUF with `change` applied, imported into a fresh directory: the error it gives, or "" when it imports.
 template <typename Change>
 std::string refusal(const fs::path& dir, Change change) {
-    GgufWriter w = xs::test::build_tiny_gguf(dir / "src", 11);
-    change(w);
-    w.write(dir / "variant.gguf");
-    fs::remove_all(dir / "variant");
-    try {
-        import_into(dir / "variant.gguf", dir / "variant");
-    } catch (const Error& e) {
-        return e.what();
-    }
-    return "";
+    return xs::test::refusal(dir, [](const fs::path& src) { return xs::test::build_tiny_gguf(src, 11); }, change);
 }
 
 }  // namespace
@@ -207,7 +140,7 @@ TEST_SUITE("gguf import") {
         const double gap = relative_gap(step_logits(*pack), reference);
         MESSAGE("imported pack against its twin: largest logit difference " << gap << " of the largest logit");
         CHECK(gap < 1e-6);
-        CHECK(greedy(*pack, 8) == greedy(*twin, 8));
+        CHECK(xs::test::greedy(*pack, kPrompt, 8) == xs::test::greedy(*twin, kPrompt, 8));
         CHECK(draft_logits(*pack) == draft_logits(*twin));
 
         // Planted: the same pack read in Hugging Face's head order is another model.
