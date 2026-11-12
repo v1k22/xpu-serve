@@ -22,7 +22,7 @@ code.
 |---|---|---|---|---|
 | Gemma 4 E2B / E4B | language, images | f16, q8, q4 | E2B: 61.5 / 92 tok/s decode (f16 / q8); q4: 140, 174 with its assistant. E4B at q4: 84, 126 with its assistant | Arc Pro B60 |
 | Gemma 4 26B-A4B | language, MoE | q4 | 67 tok/s decode, 91 with its assistant | Arc Pro B60 |
-| Qwen3.5 4B | language | f16, q8, q4 | 43 / 77 / 101 tok/s decode (f16 / q8 / q4); q4: 149 with MTP; 5,000 tok/s prefill | Arc Pro B60 |
+| Qwen3.5 4B | language | f16, q8, q4, GGUF files | 43 / 77 / 101 tok/s decode (f16 / q8 / q4); q4: 149 with MTP; 5,000 tok/s prefill; its GGUF files (2 to 16 bits): 58 to 99 tok/s decode | Arc Pro B60 |
 | Qwen3.5 9B | language | f16, q8, q4 | 21 / 38 / 62 tok/s decode (f16 / q8 / q4); q4: 108 with MTP; 3,200 tok/s prefill | Arc Pro B60 |
 | Qwen3.6-35B-A3B | language, MoE | q4 | 62 tok/s decode, 94 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
 | Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
@@ -308,19 +308,72 @@ twice as fast and keeps MMLU-Pro scores, with some loss of logit fidelity on sma
 ### From a GGUF file
 
 `convert` also imports a GGUF file (llama.cpp's format) into a pack. Each quantized tensor stays exactly as the file
-stores it (Q4_K, Q6_K, IQ2_XS, ...: nothing is decoded or quantized again), so the pack holds the file's weights at
-the file's size:
+stores it (Q4_K, Q6_K, IQ3_S, ...: nothing is decoded or quantized again), so the model has the file's weights and
+takes the file's size in GPU memory:
 
 ```bash
-xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M
-xpu-serve run ~/models/Qwen3.5-4B-Q4_K_M --backend cpu-ref --prompt "Hi"
+xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M    # a few seconds
+xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
 ```
 
 The architecture comes from the file (`general.architecture`): `qwen35`, the Qwen3.5 / Qwen3.6 / Qwen3.8 dense text
 models, is supported; others are refused by name. config.json, the tokenizer and the chat template are written from
 the file's metadata (on Qwen3.5-4B the tokenizer equals the original's token by token), and the template is the
-file's, which a publisher may have changed from the original checkpoint's. The quantization options do not apply.
-The CPU reference backend reads every block format; the GPU backend does not read them yet.
+file's, which a publisher may have changed from the original checkpoint's. Thinking, tool calls and streaming work as
+with the original checkpoint. The quantization options do not apply.
+
+Both backends read all 19 of GGUF's block formats (Q4_0 to Q8_0, the K-quants, IQ1 to IQ4), each decoded to the
+values llama.cpp's own code gives (checked bit for bit on the host). A file is usually a mix of them: `Q4_K_M` of
+Qwen3.5-4B is 57 % Q4_K, 24 % Q6_K and 18 % Q5_K, and a "dynamic" (`UD-`) file mixes up to fifteen.
+
+Every file of [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) on an Arc Pro B60, beside the
+original checkpoint and our own packs of it. Decode and prefill are `bench` at a 1,024-token prompt. The questions
+are answered through the letter read-out (`--readout letters`): 25 test decisions and 300 MMLU-Pro questions, with
+how many of the 300 get the same answer as the original at f16, and the mean shift of the answer's probabilities
+from it (total variation, 0 to 1).
+
+| Variant | File | GPU memory | Decode | Prefill | Test decisions right (25) | MMLU-Pro right (300) | Same answer as f16 (300) | Shift |
+|---|---|---|---|---|---|---|---|---|
+| UD-IQ2_XXS | 1.52 GB | 1.40 GiB | 91 tok/s | 4,235 tok/s | 16 | 61 | 55 | 0.662 |
+| UD-IQ2_M | 1.76 GB | 1.63 GiB | 85 tok/s | 4,216 tok/s | 21 | 87 | 90 | 0.550 |
+| UD-Q2_K_XL | 1.94 GB | 1.80 GiB | 95 tok/s | 4,205 tok/s | 24 | 106 | 142 | 0.399 |
+| UD-IQ3_XXS | 1.95 GB | 1.80 GiB | 82 tok/s | 4,204 tok/s | 24 | 121 | 140 | 0.373 |
+| Q3_K_S | 2.11 GB | 1.95 GiB | 86 tok/s | 4,158 tok/s | 24 | 140 | 180 | 0.294 |
+| Q3_K_M | 2.29 GB | 2.12 GiB | 90 tok/s | 4,179 tok/s | 24 | 135 | 198 | 0.219 |
+| UD-Q3_K_XL | 2.44 GB | 2.26 GiB | 83 tok/s | 4,151 tok/s | 23 | 129 | 198 | 0.259 |
+| IQ4_XS | 2.48 GB | 2.30 GiB | 67 tok/s | 4,143 tok/s | 24 | 135 | 217 | 0.182 |
+| IQ4_NL | 2.58 GB | 2.39 GiB | 70 tok/s | 4,166 tok/s | 24 | 132 | 217 | 0.172 |
+| Q4_K_S | 2.59 GB | 2.40 GiB | 93 tok/s | 4,146 tok/s | 24 | 138 | 248 | 0.146 |
+| our q4 pack of it | n/a | 2.49 GiB | 109 tok/s | 4,543 tok/s | 23 | 134 | 194 | 0.260 |
+| Q4_K_M | 2.74 GB | 2.54 GiB | 90 tok/s | 4,158 tok/s | 24 | 139 | 251 | 0.143 |
+| Q4_0 | 2.58 GB | 2.58 GiB | 99 tok/s | 4,215 tok/s | 24 | 121 | 227 | 0.178 |
+| Q4_1 | 2.78 GB | 2.58 GiB | 99 tok/s | 4,216 tok/s | 24 | 138 | 238 | 0.148 |
+| UD-Q4_K_XL | 2.91 GB | 2.70 GiB | 84 tok/s | 4,149 tok/s | 24 | 148 | 252 | 0.120 |
+| Q5_K_S | 3.02 GB | 2.81 GiB | 83 tok/s | 4,126 tok/s | 24 | 136 | 272 | 0.076 |
+| Q5_K_M | 3.14 GB | 2.92 GiB | 84 tok/s | 4,136 tok/s | 24 | 135 | 271 | 0.067 |
+| UD-Q5_K_XL | 3.25 GB | 3.02 GiB | 85 tok/s | 4,138 tok/s | 24 | 136 | 274 | 0.074 |
+| Q6_K | 3.53 GB | 3.27 GiB | 81 tok/s | 4,118 tok/s | 24 | 139 | 269 | 0.047 |
+| UD-Q6_K_XL | 4.15 GB | 3.85 GiB | 74 tok/s | 4,157 tok/s | 24 | 142 | 280 | 0.036 |
+| our q8 pack of it | n/a | 4.04 GiB | 77 tok/s | 4,441 tok/s | 24 | 141 | 291 | 0.019 |
+| Q8_0 | 4.48 GB | 4.16 GiB | 74 tok/s | 4,146 tok/s | 24 | 141 | 294 | 0.018 |
+| UD-Q8_K_XL | 5.95 GB | 5.53 GiB | 58 tok/s | 4,244 tok/s | 24 | 143 | 295 | 0.015 |
+| BF16 | 8.42 GB | 7.83 GiB | 43 tok/s | 4,622 tok/s | 24 | 144 | 300 | 0.001 |
+| original checkpoint, f16 | n/a | 7.83 GiB | 44 tok/s | 4,990 tok/s | 24 | 144 | 300 | 0.000 |
+
+- **Memory is the file's.** A file's GPU memory is its size (2.74 GB is 2.55 GiB), except Q4_0, which takes 7 % more.
+- **The import is exact.** The BF16 file gives the original's answer on all 300 questions.
+- **The kernels keep the file's values.** Read by the block kernels or decoded to f16 on upload
+  (`--backend-opt block=f16`), a file gives the same answer on 298 to 300 of 300, with a mean shift of 0.001 to 0.002.
+- **Accuracy follows the bits.** From 5 bits up a file answers like the original on 9 questions in 10 or more; the
+  4-bit K-quants on 5 in 6, closer than our own round-to-nearest q4 pack at the same size (2 in 3); the 3-bit
+  K-quants on 3 in 5 to 2 in 3; UD-IQ3_XXS and the 2-bit files on fewer than half, and the smallest gets 61 right
+  where the original gets 144.
+- **Speed.** The files decode at 1.3 to 2.3 times f16's speed. Our q4 pack is the fastest at its size (109 tok/s
+  against 90 to 99 for the 4-bit files), and the IQ4 formats are the slowest per weight (67 to 70 tok/s). No format
+  is bound by memory at this size, so a smaller file is not a faster one (decision 0016 has each format's rate).
+
+A GEMV over a block format has no matrix-engine version yet, so speculative decoding over such weights is slower
+than over a pack; a mixture of experts in a block format is refused.
 
 ## Long context: int8 KV cache
 

@@ -279,7 +279,16 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Llama 3
 - [ ] Import MLX-affine packs
 - [x] Import GGUF files (`convert <file.gguf> <out-dir>`): architecture `qwen35`, tensors kept in their block formats
+- [x] GGUF block formats on the GPU: all 19, kept in the file's bits (decision 0016); every file of
+      unsloth/Qwen3.5-4B-GGUF runs at its size
 - [ ] GGUF: more architectures (`qwen35moe`, Gemma 4, LFM3)
+- [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)
+- [ ] GGUF: a matrix-engine GEMV over block formats (a speculative verify of several rows runs at a third of a
+      pack's speed), and the 9 to 64 row kernel
+- [ ] GGUF: Q4_0 at its file's size (its q4 form stores a bias per group it does not need)
+- [ ] GGUF: `serve <file.gguf>` (an import into a cache), split files
+- [ ] GGUF: the tiled value-head order inside GatedDelta (four small transposes per linear layer now: 1 % of a
+      decode step of Qwen3.5-4B at f16)
 - [x] Data-aware quantization: AWQ-style scale and clip search in `convert`, calibrated on our own engine
 - [ ] GPTQ; AWQ with the full activation covariance (not per channel); larger calibration sets
 - [ ] Anthropic `/v1/messages`, Ollama `/api/chat` and `/api/generate`
