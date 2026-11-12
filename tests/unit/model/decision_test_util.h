@@ -1,7 +1,7 @@
 #pragma once
 
 // Decision models in tests without a released checkpoint: prompt tools that need no tokenizer file, a request's run
-// on a session, and a tiny Clef checkpoint.
+// on a session, and tiny checkpoints in the released ones' layouts.
 
 #include <doctest/doctest.h>
 
@@ -149,6 +149,30 @@ inline void write_tiny_clef(const fs::path& dir, uint32_t seed) {
     specs.push_back({"joint_logit_scale", {1}, 2.0f, 2.0f});
     specs.push_back({"residual_gate", {1}, 0.7f, 0.7f});
     write_random(dir / "joint_head.safetensors", specs, seed + 1);
+}
+
+// A tiny Qwen3.5 with a read-out of answer codes beside it, as perplexity-ai/pplx-decider-flash-v1.2 is laid out.
+// The marker is the byte 0x01, a token of ByteTools.
+inline void write_tiny_pplx(const fs::path& dir, uint32_t seed, int codes = 30) {
+    const TinyQwen qwen;
+    write_tiny_qwen(dir, qwen, seed);
+    nlohmann::json decision = {{"format_version", 2},
+                               {"attention_mode", "noncausal_full_attention"},
+                               {"pooling", "last"},
+                               {"temperature", 1.5},
+                               {"codes", nlohmann::json::array()}};
+    for (int i = 0; i < codes; ++i) {
+        decision["codes"].push_back(i < 26 ? std::string(1, static_cast<char>('A' + i))
+                                           : std::string("A") + static_cast<char>('A' + i - 26));
+    }
+    std::ofstream(dir / "decision_config.json") << decision.dump(1);
+    std::ofstream(dir / "joint_config.json") << nlohmann::json{{"version", 3},
+                                                               {"template", "joint-question-inline-readout-v1"},
+                                                               {"marker", "\u0001"},
+                                                               {"readout_offset", 0}}
+                                                    .dump(1);
+    const float range = 6.0f / std::sqrt(static_cast<float>(qwen.hidden));
+    write_random(dir / "readout.safetensors", {{"weight", {codes, qwen.hidden}, -range, range}}, seed + 1);
 }
 
 }  // namespace xs::test

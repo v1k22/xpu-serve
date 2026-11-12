@@ -9,6 +9,8 @@ each question's probability per option, keyed by the option's name in the reques
 decision_parity.cpp checks the engine against them: the same tokens, the same probabilities.
 
 Clef (joint_head_config.json): joint_schema_model.py's encode_record and ClefModel, a softmax per question.
+pplx-decider (decision_config.json): the package under source/src: Decider's plan and reference path, the raw
+read-out logits over the saved temperature through a softmax.
 """
 
 import argparse
@@ -39,6 +41,24 @@ def clef(model_dir, requests):
     return cases
 
 
+def pplx(model_dir, requests):
+    sys.path.insert(0, os.path.join(model_dir, "source", "src"))
+    from pplx_decider import Decider, options
+
+    decider = Decider.from_pretrained(model_dir, device="cpu")
+    cases = []
+    for request in requests:
+        chunks = decider.encoder.plan(request, decider.max_length)
+        logits = decider.logits([request])[0]
+        probabilities = {}
+        for name, question in request["questions"].items():
+            p = (torch.tensor(logits[name], dtype=torch.float64) / decider.temperature).softmax(-1).tolist()
+            probabilities[name] = dict(zip(options(question)[0], p))
+        cases.append({"request": request, "input_ids": [chunk.input_ids.tolist() for chunk in chunks],
+                      "probabilities": probabilities})
+    return cases
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
@@ -53,6 +73,8 @@ def main():
     model_dir = os.path.abspath(args.model_dir)
     if os.path.exists(os.path.join(model_dir, "joint_head_config.json")):
         kind, cases = "clef", clef(model_dir, requests)
+    elif os.path.exists(os.path.join(model_dir, "decision_config.json")):
+        kind, cases = "pplx_decider", pplx(model_dir, requests)
     else:
         ap.error(f"{model_dir} holds no decision model this script knows")
     with open(args.out, "w") as f:

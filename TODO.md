@@ -383,8 +383,10 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       four programs of the decoder's session; parity with its Python code (tiny and released checkpoints), 25 test
       decisions end to end on the Arc Pro B60
 - [x] `run --request`, `bench` (latency, `--state-tokens`), `tests/e2e/systemone_eval.py`
-- [ ] pplx-decider-flash-v1.2 (Qwen3.5-4B, whole-prompt attention in the full-attention layers, a read-out at a
-      marker per question)
+- [x] pplx-decider-flash-v1.2 (`perplexity-ai/pplx-decider-flash-v1.2`, Qwen3.5-4B): whole-prompt attention in the
+      full-attention layers, a read-out at a marker per question, the checkpoint's temperature; long requests split
+      by question; parity with its package (tiny and released checkpoints), 25 test decisions end to end
+- [ ] pplx-decider past a few thousand tokens: its single step is slower per token than a chunked prefill
 - [ ] OpenJev (Qwen3.8-27B: the output layer's rows of the option letters, one prompt per question)
 - [ ] Images (`assets`, box questions): needs the Qwen3.5 vision tower
 - [ ] Packs of decision checkpoints (`convert`)

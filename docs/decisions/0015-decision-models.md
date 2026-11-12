@@ -48,40 +48,57 @@ OpenJev ships a helper that asks vLLM for one token's log-probabilities per ques
   (the symbolic step dimension): the options' evidence layers, the questions' decoder layers, the scorer; they read
   those slots with `KvRead`. Between them the host does what has a per-request shape: span means, each question's
   softmax over its own options, cosines. The head needed one new op, the exact GELU.
+- **pplx-decider reads its whole prompt in one step.** Its full-attention layers see every token of the prompt,
+  the later ones too (the Gated DeltaNet layers stay causal), so the decoder's builders take the way a
+  full-attention layer sees the sequence: through a KV slot, or over the step. The program has no KV slots; its
+  read-out (a 255-row matmul) runs on every row and the host takes the rows at the markers, divides by the
+  checkpoint's temperature and applies the softmax over a question's own options. A request over the limit is split
+  by question as the reference splits it, each part with the whole state; text that spells a special token loses its
+  angle brackets as in the reference, which leaves the chat markers alone, as that code does.
 - **The Qwen3.5 decoder's builders are shared** (`qwen3_5::Decoder`): the language model and the decision models
   built on that decoder make their programs from the same layer code.
 - **Images are refused by name** (`assets`, `images`, box questions): the Qwen3.5 vision tower is not loaded yet.
 
 ## What was measured
 
-**Clef-Flash against its own code** (`joint_schema_model.py`, float32 on the CPU; `tests/parity/decision/reference.py`),
-on 13 requests chosen to break a prompt (32 questions: every type, nested JSON with floats and key orders, text in
-four scripts, literal special tokens, 40 options, a single option, missing instructions, a prompt of 2,665 tokens):
+**Each model against its own code** (Clef: `joint_schema_model.py`; pplx-decider: its `pplx_decider` package; float32
+on the CPU; `tests/parity/decision/reference.py`), on 13 requests chosen to break a prompt (32 questions: every type,
+nested JSON with floats and key orders, text in four scripts, literal special tokens, 40 options, a single option,
+missing and empty instructions, a prompt of about 2,600 tokens):
 
 | Checkpoint | Backend | Tokens | Largest probability difference | Top option |
 |---|---|---|---|---|
-| tiny (random, the released layout) | cpu-ref f32 | equal on 13 of 13 | 6e-7 | equal on 32 of 32 |
-| tiny, prompt fed 7 tokens a step | cpu-ref f32 | equal | 6e-7 | equal |
-| tiny | Arc Pro B60 f32 / f16 | equal | 6e-7 / 0.0010 | equal |
+| tiny Clef (random, the released layout) | cpu-ref f32 | equal on 13 of 13 | 6e-7 | equal on 32 of 32 |
+| tiny Clef, prompt fed 7 tokens a step | cpu-ref f32 | equal | 6e-7 | equal |
+| tiny Clef | Arc Pro B60 f32 / f16 | equal | 6e-7 / 0.0010 | equal |
 | `Cloudflare/clef-flash` | Arc Pro B60 f16 | equal on 13 of 13 | 0.0007 | equal on 32 of 32 |
+| tiny pplx-decider | cpu-ref f32 | equal on 13 of 13 | 1.6e-6 | equal on 32 of 32 |
+| tiny pplx-decider | Arc Pro B60 f32 / f16 | equal | 2.4e-6 / 0.0052 | equal |
+| `perplexity-ai/pplx-decider-flash-v1.2` | Arc Pro B60 f16 | equal on 13 of 13 | 0.0009 | equal on 32 of 32 |
+
+The first run of the pplx-decider prompt failed this test on one request: an empty `instructions` string must fall
+back to the model's default wording, as Python's `or` does.
 
 **End to end through the server** (`tests/e2e/decisions25.json`: 25 questions with one accepted answer each, 12
-choice, 8 noul, 5 score; `tests/e2e/systemone_eval.py`), Arc Pro B60, f16, 15.2 GiB on the device:
+choice, 8 noul, 5 score; `tests/e2e/systemone_eval.py`), Arc Pro B60, f16:
 
-| Model | Accepted answer | Same answer as its reference | Largest probability difference | Latency p50 / p95 | Prompt |
-|---|---|---|---|---|---|
-| Clef-Flash | 25 of 25 | 25 of 25 | 0.00005 | 89 / 96 ms | 150 to 262 tokens |
+| Model | On the device | Accepted answer | Same answer as its reference | Largest probability difference | Latency p50 / p95 | Prompt |
+|---|---|---|---|---|---|---|
+| Clef-Flash | 15.2 GiB | 25 of 25 | 25 of 25 | 0.00005 | 89 / 96 ms | 150 to 262 tokens |
+| pplx-decider-flash-v1.2 | 7.8 GiB | 25 of 25 | 25 of 25 | 0.00006 | 38 / 46 ms | 92 to 230 tokens |
 
 Latency is the client's wall time for one request at a time; the server's own time is 2 ms less.
 
-**Latency by prompt size** (`bench --state-tokens`; three questions with eight options), Clef-Flash, Arc Pro B60, f16:
+**Latency by prompt size** (`bench --state-tokens`; three questions with eight options), Arc Pro B60, f16, p50:
 
-| Prompt tokens | 320 | 512 | 1,024 | 2,048 | 4,096 | 8,192 | 16,000 |
+| Prompt tokens | sample | 512 | 1,024 | 2,048 | 4,096 | 8,192 | 16,000 |
 |---|---|---|---|---|---|---|---|
-| Latency p50 | 118 ms | 165 ms | 323 ms | 644 ms | 1.31 s | 2.74 s | 5.86 s |
+| Clef-Flash | 118 ms (320 tokens) | 165 ms | 323 ms | 644 ms | 1.31 s | 2.74 s | 5.86 s |
+| pplx-decider-flash-v1.2 | 45 ms (165 tokens) | 103 ms | 216 ms | 456 ms | 1.03 s | 2.53 s | 7.17 s |
 
-All but 3 ms is the decoder reading the prompt (about 3,000 tokens a second, the engine's prefill speed for this
-decoder); the head's three programs take 1.5, 1.0 and 0.4 ms.
+For Clef-Flash all but 3 ms is the decoder reading the prompt (about 3,000 tokens a second, the engine's prefill
+speed for this decoder); the head's three programs take 1.5, 1.0 and 0.4 ms. pplx-decider's time grows faster than
+its prompt: about 4,800 tokens a second up to 1,024 tokens, 2,200 at 16,000, one step holding the whole prompt.
 
 ## Consequences
 
@@ -90,5 +107,7 @@ decoder); the head's three programs take 1.5, 1.0 and 0.4 ms.
   faster decision. Requests run one at a time.
 - Packs (`convert`) of decision checkpoints are not written yet: the two that have a head fit a 24 GB card at f16,
   and a prefill does not get faster from quantized weights on a discrete GPU.
+- pplx-decider's long prompts are the place to gain: its single step is slower per token past a few thousand
+  tokens, and nothing of a state can be kept for the next request.
 - A new decision model is a `DecisionModel` and, when it has a new read-out, its own programs; the runtime, the
   server and the tests' harness stay as they are.

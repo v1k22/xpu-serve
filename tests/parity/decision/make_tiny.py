@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """A tiny random decision model in the layout of a released one, for parity tests (test-only).
 
-    python -I tests/parity/decision/make_tiny.py --from <a clef-flash checkpoint> --out <dir>
+    python -I tests/parity/decision/make_tiny.py --from <a clef-flash or pplx-decider checkpoint> --out <dir>
 
 The decoder is a Qwen3.5 of four layers (three Gated DeltaNet, one full attention) with a small vision tower, as the
-released checkpoints carry one; the head has the released head's structure at a small width. The tokenizer, the
-processor and chat template files and the checkpoint's own Python code are copied from `--from`, so the vocabulary is
-the real one and reference.py runs the tiny model with the code the real one runs with. Random weights give
-near-uniform answers, which would hide a wrong option order or span: the head's output scales are raised so that
-answers spread.
+released checkpoints carry one; the head has the released head's structure at a small width (Clef's joint schema
+head; pplx-decider's read-out of 255 answer codes). The tokenizer, the processor and chat template files and the
+checkpoint's own Python code are copied from `--from`, so the vocabulary is the real one and reference.py runs the
+tiny model with the code the real one runs with. Random weights give near-uniform answers, which would hide a wrong
+option order or span: the head's output scales are raised so that answers spread.
 """
 
 import argparse
@@ -22,7 +22,7 @@ from safetensors.torch import save_file
 
 COPIED = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "processor_config.json", "vocab.json",
           "merges.txt", "preprocessor_config.json", "video_preprocessor_config.json", "joint_schema_model.py",
-          "joint_config.json"]
+          "joint_config.json", "decision_config.json", "source"]
 
 
 def decoder_config(vocab_size, hidden):
@@ -77,6 +77,27 @@ def clef(source, out, vocab_size):
     return sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in head.parameters())
 
 
+def pplx(source, out, vocab_size):
+    """Qwen3_5Model + readout.safetensors, as perplexity-ai/pplx-decider-flash-v1.2."""
+    from transformers import Qwen3_5Model
+
+    hidden = 96
+    config = decoder_config(vocab_size, hidden)
+    with open(os.path.join(source, "config.json")) as f:
+        released = json.load(f)
+    for key in ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id"):
+        setattr(config, key, released[key])
+    model = Qwen3_5Model(config)
+    model.save_pretrained(out, safe_serialization=True)
+    with open(os.path.join(source, "decision_config.json")) as f:
+        codes = len(json.load(f)["codes"])
+    readout = torch.nn.Linear(hidden, codes, bias=False)
+    with torch.no_grad():
+        readout.weight.mul_(4.0)
+    save_file({"weight": readout.weight.detach()}, os.path.join(out, "readout.safetensors"), metadata={"format": "pt"})
+    return sum(p.numel() for p in model.parameters()) + readout.weight.numel()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="source", required=True, help="a released checkpoint of the kind to imitate")
@@ -90,11 +111,15 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     if os.path.exists(os.path.join(args.source, "joint_head_config.json")):
         kind, count = "clef", clef(args.source, args.out, vocab_size)
+    elif os.path.exists(os.path.join(args.source, "decision_config.json")):
+        kind, count = "pplx_decider", pplx(args.source, args.out, vocab_size)
     else:
-        ap.error(f"{args.source} is not a checkpoint this script imitates (clef)")
+        ap.error(f"{args.source} is not a checkpoint this script imitates (clef, pplx-decider)")
     for f in COPIED:
         src = os.path.join(args.source, f)
-        if os.path.exists(src):
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(args.out, f), dirs_exist_ok=True)
+        elif os.path.exists(src):
             shutil.copy(src, os.path.join(args.out, f))
     print(f"{kind}: {count / 1e6:.1f} M parameters -> {args.out}")
 

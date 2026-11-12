@@ -77,18 +77,29 @@ std::unique_ptr<SafetensorsWeights> SafetensorsWeights::open_dir(const std::file
     if (paths.empty()) fail("no safetensors files in '", dir.string(), "'");
 
     auto weights = std::unique_ptr<SafetensorsWeights>(new SafetensorsWeights());
-    for (const auto& p : paths) {
-        auto file = std::make_unique<SafetensorsFile>(p);
-        for (const auto& [name, view] : file->tensors()) {
-            if (!weights->index_.emplace(name, &view).second) {
-                fail("tensor '", name, "' appears in more than one safetensors file under '", dir.string(), "'");
-            }
-        }
-        weights->files_.push_back(std::move(file));
-    }
+    for (const auto& p : paths)
+        weights->add_file(p);
     weights->pair_fp8();
     if (fs::exists(dir / kPackManifest)) weights->apply_pack_manifest(dir / kPackManifest);
     return weights;
+}
+
+std::unique_ptr<SafetensorsWeights> SafetensorsWeights::open_file(const std::filesystem::path& path) {
+    auto weights = std::unique_ptr<SafetensorsWeights>(new SafetensorsWeights());
+    weights->add_file(path);
+    weights->pair_fp8();
+    return weights;
+}
+
+void SafetensorsWeights::add_file(const std::filesystem::path& path) {
+    auto file = std::make_unique<SafetensorsFile>(path);
+    for (const auto& [name, view] : file->tensors()) {
+        if (!index_.emplace(name, &view).second) {
+            fail("tensor '", name, "' appears in more than one safetensors file under '", path.parent_path().string(),
+                 "'");
+        }
+    }
+    files_.push_back(std::move(file));
 }
 
 void SafetensorsWeights::pair_fp8() {

@@ -8,6 +8,7 @@
 #include "models/model.h"
 #include "models/pi05/pi05.h"
 #include "models/policy.h"
+#include "models/pplx_decider/pplx_decider.h"
 #include "models/qwen3_5/qwen3_5.h"
 #include "util/error.h"
 
@@ -41,7 +42,7 @@ ModelKind model_kind(const std::filesystem::path& dir) {
     // LeRobot policies name their type under "type"; Hugging Face models under "model_type".
     if (config.contains("type") && !config.contains("model_type")) return ModelKind::Policy;
     // A decision model's config.json is its decoder's: the head beside it tells.
-    return clef::is_checkpoint(dir) ? ModelKind::Decision : ModelKind::Language;
+    return clef::is_checkpoint(dir) || pplx_decider::is_checkpoint(dir) ? ModelKind::Decision : ModelKind::Language;
 }
 
 const char* question_type_name(QuestionType type) {
@@ -53,13 +54,16 @@ const char* question_type_name(QuestionType type) {
     return "?";
 }
 
-std::vector<std::string> supported_decision_models() { return {"clef"}; }
+std::vector<std::string> supported_decision_models() {
+    return {"clef", "pplx_decider"};
+}
 
 std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& dir) {
     if (!std::filesystem::is_directory(dir)) fail("model directory '", dir.string(), "' does not exist");
     const auto config = cfg::read_json(dir / "config.json");
     cfg::check_quantization(config);
     if (clef::is_checkpoint(dir)) return clef::load(dir, config);
+    if (pplx_decider::is_checkpoint(dir)) return pplx_decider::load(dir, config);
     std::string list;
     for (const auto& t : supported_decision_models()) list += (list.empty() ? "" : ", ") + t;
     fail("'", dir.string(), "' is not a decision model this build serves (", list, ")");

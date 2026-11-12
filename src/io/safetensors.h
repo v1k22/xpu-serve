@@ -51,6 +51,8 @@ inline constexpr int kPackVersion = 1;
 class SafetensorsWeights final : public WeightStore {
 public:
     static std::unique_ptr<SafetensorsWeights> open_dir(const std::filesystem::path& dir);
+    // One file on its own (a head kept beside a model's shards, which open_dir does not read when an index lists them).
+    static std::unique_ptr<SafetensorsWeights> open_file(const std::filesystem::path& path);
 
     const TensorView* find(const std::string& name) const override;
     std::vector<std::string> names() const override;
@@ -63,6 +65,7 @@ public:
     void join_rows(const std::string& name, const std::vector<std::string>& parts, Dims shape);
 
 private:
+    void add_file(const std::filesystem::path& path);
     void apply_pack_manifest(const std::filesystem::path& path);
     void pair_fp8();
 

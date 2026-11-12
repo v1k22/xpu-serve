@@ -10,7 +10,7 @@ live here, and the math runs on Intel GPUs through our SYCL backend (our own ker
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
 **Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8, LFM3), a robot policy (π0.5) and decision
-models (Clef-Flash, behind the System One API), from the
+models (Clef-Flash, pplx-decider-flash, behind the System One API), from the
 original checkpoint, its FP8 release where there is one, or a q8 / q4 pack written by `xpu-serve convert`, one request
 at a time, on Intel GPUs through the SYCL backend; speculative decoding with each model's drafter (Qwen's MTP head,
 Gemma 4's assistant checkpoints, DFlash 2 and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the
@@ -29,6 +29,7 @@ code.
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
 | π0.5 | robot policy | f16, q8 | 215 / 198 ms per call (f16 / q8); 115 / 113 ms on the Arc Pro B60 | Arc B390, 3 cameras |
 | Clef-Flash | decision | f16 | 89 ms per decision (p50; 96 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
+| pplx-decider-flash-v1.2 | decision | f16 | 38 ms per decision (p50; 46 ms p95) on prompts of 92 to 230 tokens; 216 ms at 1,024 tokens | Arc Pro B60 |
 
 | Model | Checkpoint (`model_type`) | Checked against |
 |---|---|---|
@@ -41,6 +42,7 @@ code.
 | LFM3-1.7B | `LiquidAI/LFM3-1.7B` (`lfm3`) | Hugging Face fp32 logits, greedy text (the checkpoint's own modeling code); MMLU-Pro (25 questions): 60 % |
 | π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 1e-3 (GPU f16) |
 | Clef-Flash | `Cloudflare/clef-flash` (`qwen3_5` with a joint schema head) | its own Python code in fp32: the same prompt tokens, probabilities within 0.0007 (GPU f16); 25 of 25 test decisions right and equal to that code's |
+| pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (`qwen3_5` with a read-out per question) | its own Python package in fp32: the same prompt tokens, probabilities within 0.0009 (GPU f16); 25 of 25 test decisions right and equal to that code's |
 
 Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card, and their FP8
 releases (half the download) load and convert like the originals; LFM3 thinks by
@@ -191,12 +193,19 @@ header. Images (`assets`, box questions) are refused by name: the Qwen3.5 vision
 | Model | Checkpoint | How it decides | On the Arc Pro B60 (f16) |
 |---|---|---|---|
 | Clef-Flash | `Cloudflare/clef-flash` (9B) | every question of a request in one pass; a transformer head scores the options | 15.2 GiB; 89 ms per decision at about 180 tokens |
+| pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (4B) | every question of a request in one pass, each read at a marker after its options; calibrated with the checkpoint's temperature | 7.8 GiB; 38 ms per decision at about 110 tokens |
 
-Latency is the time to read the prompt, so it grows with the state (Clef-Flash, three questions):
+The per-decision times are medians over 25 test decisions, one question a request, all of which both models answer
+right. Questions sent together share one pass and can move each other's answers; Perplexity's card recommends one
+question per request for its model unless the questions are facets of one decision. A pplx-decider request longer
+than `--ctx` is answered in parts (its questions split, each part with the whole state), as its own code does.
 
-| Prompt tokens | 320 | 512 | 1,024 | 2,048 | 4,096 | 8,192 | 16,000 |
+Latency is the time to read the prompt, so it grows with the state (three questions, p50):
+
+| Prompt tokens | sample | 512 | 1,024 | 2,048 | 4,096 | 8,192 | 16,000 |
 |---|---|---|---|---|---|---|---|
-| Latency p50 | 118 ms | 165 ms | 323 ms | 644 ms | 1.31 s | 2.74 s | 5.86 s |
+| Clef-Flash | 118 ms (320 tokens) | 165 ms | 323 ms | 644 ms | 1.31 s | 2.74 s | 5.86 s |
+| pplx-decider-flash-v1.2 | 45 ms (165 tokens) | 103 ms | 216 ms | 456 ms | 1.03 s | 2.53 s | 7.17 s |
 
 Without a server, `run` answers one request file and `bench` times one (its own sample by default, `--state-tokens N`
 to grow the state):
@@ -271,7 +280,7 @@ Every layer is tested against a reference:
 | Whole model (Gemma 4, Qwen3.5, LFM3) | Hugging Face fp32 logits and greedy output | `tests/unit/model/model_parity.cpp` |
 | Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/gemma4_vision_parity.cpp` |
 | Robot policy (π0.5) | LeRobot fp32 actions and prompt token ids, 3 cameras and 1 | `tests/unit/model/policy_parity.cpp` |
-| Decision model (Clef-Flash) | the checkpoint's own Python code in fp32: prompt token ids and every option's probability | `tests/unit/model/decision_parity.cpp` |
+| Decision models (Clef-Flash, pplx-decider-flash) | the checkpoint's own Python code in fp32: prompt token ids and every option's probability | `tests/unit/model/decision_parity.cpp` |
 | System One API | the API's schema and error bodies; 25 decisions with accepted answers through a running server | `tests/unit/server/test_systemone_http.cpp`, `tests/e2e/` |
 
 The model parity test needs the model and generated fixtures:
