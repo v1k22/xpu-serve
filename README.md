@@ -20,7 +20,7 @@ code.
 
 | Model | Kind | Weights | Speed | Measured on |
 |---|---|---|---|---|
-| Gemma 4 E2B / E4B | language, images | f16, q8, q4 | E2B: 61.5 / 92 tok/s decode (f16 / q8); q4: 140, 174 with its assistant. E4B at q4: 84, 126 with its assistant | Arc Pro B60 |
+| Gemma 4 E2B / E4B | language, images | f16, q8, q4, GGUF files (text) | E2B: 61.5 / 92 tok/s decode (f16 / q8); q4: 140, 174 with its assistant. E4B at q4: 84, 126 with its assistant | Arc Pro B60 |
 | Gemma 4 26B-A4B | language, MoE | q4 | 67 tok/s decode, 91 with its assistant | Arc Pro B60 |
 | Qwen3.5 4B | language | f16, q8, q4, GGUF files | 43 / 77 / 101 tok/s decode (f16 / q8 / q4); q4: 149 with MTP; 5,000 tok/s prefill; its GGUF files (2 to 16 bits): 58 to 99 tok/s decode | Arc Pro B60 |
 | Qwen3.5 9B | language | f16, q8, q4 | 21 / 38 / 62 tok/s decode (f16 / q8 / q4); q4: 108 with MTP; 3,200 tok/s prefill | Arc Pro B60 |
@@ -378,8 +378,54 @@ from it (total variation, 0 to 1).
   against 90 to 99 for the 4-bit files), and the IQ4 formats are the slowest per weight (67 to 70 tok/s). No format
   is bound by memory at this size, so a smaller file is not a faster one (decision 0016 has each format's rate).
 
-A GEMV over a block format has no matrix-engine version yet, so speculative decoding over such weights is slower
-than over a pack; a mixture of experts in a block format is refused.
+Every file of [unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF), measured the same
+way (the original checkpoint and our packs without their vision tower):
+
+| Variant | File | GPU memory | Decode | Prefill | Test decisions right (25) | MMLU-Pro right (300) | Same answer as f16 (300) | Shift |
+|---|---|---|---|---|---|---|---|---|
+| UD-IQ2_M | 2.29 GB | 0.83 GiB | 114 tok/s | 6,325 tok/s | 22 | 61 | 122 | 0.524 |
+| UD-IQ3_XXS | 2.37 GB | 0.90 GiB | 111 tok/s | 6,316 tok/s | 22 | 68 | 137 | 0.494 |
+| UD-Q2_K_XL | 2.40 GB | 0.93 GiB | 122 tok/s | 5,837 tok/s | 22 | 56 | 121 | 0.528 |
+| Q3_K_S | 2.45 GB | 0.97 GiB | 117 tok/s | 6,234 tok/s | 21 | 63 | 167 | 0.393 |
+| Q3_K_M | 2.54 GB | 1.06 GiB | 116 tok/s | 6,056 tok/s | 22 | 69 | 199 | 0.296 |
+| UD-Q3_K_XL | 2.92 GB | 1.14 GiB | 114 tok/s | 5,941 tok/s | 23 | 69 | 195 | 0.284 |
+| IQ4_XS | 2.98 GB | 1.20 GiB | 98 tok/s | 6,182 tok/s | 22 | 58 | 247 | 0.168 |
+| IQ4_NL | 3.04 GB | 1.25 GiB | 97 tok/s | 5,747 tok/s | 22 | 61 | 249 | 0.158 |
+| Q4_K_S | 3.04 GB | 1.25 GiB | 124 tok/s | 6,175 tok/s | 22 | 64 | 239 | 0.179 |
+| Q4_K_M | 3.11 GB | 1.31 GiB | 120 tok/s | 6,156 tok/s | 23 | 63 | 237 | 0.170 |
+| Q4_0 | 3.04 GB | 1.36 GiB | 127 tok/s | 6,296 tok/s | 21 | 51 | 195 | 0.301 |
+| Q4_1 | 3.15 GB | 1.36 GiB | 126 tok/s | 6,089 tok/s | 23 | 60 | 240 | 0.178 |
+| UD-Q4_K_XL | 3.18 GB | 1.38 GiB | 117 tok/s | 6,198 tok/s | 23 | 65 | 233 | 0.184 |
+| our q4 pack of it | n/a | 1.43 GiB | 121 tok/s | 4,792 tok/s | 22 | 64 | 227 | 0.229 |
+| Q5_K_S | 3.32 GB | 1.51 GiB | 111 tok/s | 6,160 tok/s | 23 | 66 | 262 | 0.099 |
+| Q5_K_M | 3.36 GB | 1.54 GiB | 110 tok/s | 5,546 tok/s | 23 | 65 | 261 | 0.092 |
+| UD-Q5_K_XL | 4.29 GB | 1.59 GiB | 110 tok/s | 6,239 tok/s | 23 | 61 | 260 | 0.104 |
+| Q6_K | 4.50 GB | 1.79 GiB | 109 tok/s | 6,011 tok/s | 23 | 65 | 276 | 0.071 |
+| UD-Q6_K_XL | 4.71 GB | 1.98 GiB | 100 tok/s | 6,210 tok/s | 23 | 65 | 281 | 0.056 |
+| our q8 pack of it | n/a | 2.23 GiB | 91 tok/s | 5,377 tok/s | 23 | 66 | 293 | 0.023 |
+| Q8_0 | 5.05 GB | 2.29 GiB | 91 tok/s | 6,268 tok/s | 23 | 65 | 292 | 0.019 |
+| UD-Q8_K_XL | 5.28 GB | 2.49 GiB | 85 tok/s | 6,319 tok/s | 23 | 65 | 293 | 0.020 |
+| BF16 | 9.31 GB | 4.25 GiB | 61 tok/s | 6,676 tok/s | 23 | 62 | 300 | 0.000 |
+| original checkpoint, f16 | n/a | 4.25 GiB | 61 tok/s | 6,220 tok/s | 23 | 62 | 300 | 0.000 |
+
+- **The import is exact here too**: the BF16 file gives the original's answer on all 300 questions, and against the
+  same weights decoded to f16 on upload a file's answers are the same on 299 to 300 of 300.
+- **GPU memory is under half the file**: the per-layer embedding table (2.35 billion weights, about half of a file)
+  is read on the host, a row per token, as it is from the original checkpoint.
+- **The drafter files** (`MTP/mtp-gemma-4-E2B-it-*.gguf`, llama.cpp's `gemma4-assistant`) import as a drafter:
+  `--spec mtp --drafter <its dir>` writes the same text as without it and decodes at 243 tok/s on the Q4_0 file
+  (128 without), 219 on Q8_0 (91), 183 on Q4_K_M (119) and 180 on BF16 (61), on `bench`'s generated text. A K-quant
+  target gains less: a verify of several rows has no matrix-engine kernel over block formats yet.
+
+**Tool calls and chat templates.** A pack imported from a GGUF renders the file's own chat template.
+`tests/e2e/tool_calls.py` runs 23 easy to medium cases against a server (one tool or ten offered, calls in parallel,
+no tool needed, a streamed call, thinking on, and six conversations of two or three turns that need an earlier
+tool's result) and `tool_calls_rubric.md` says what each must do. Graded by a stronger model, for the original
+checkpoint, its BF16 GGUF and its Q4_K_M GGUF alike: Qwen3.5-4B 23 of 23 well-formed and 23 of 23 right; Gemma 4 E2B
+23 of 23 well-formed and 22 of 23 right (the same miss in all three). The BF16 GGUF made the original's tool calls,
+name and arguments, in every case of both models.
+
+A mixture of experts in a block format is refused.
 
 ## Long context: int8 KV cache
 
