@@ -47,6 +47,13 @@ Config parse_config(const nlohmann::json& config_json) {
     c.linear_key_dim = cfg::get_int(t, "linear_key_head_dim", where);
     c.linear_value_dim = cfg::get_int(t, "linear_value_head_dim", where);
     c.conv_kernel = cfg::get_int(t, "linear_conv_kernel_dim", where);
+    const std::string order =
+        t.contains("linear_value_head_order") ? cfg::get_string(t, "linear_value_head_order", where) : "grouped";
+    if (order == "tiled") {
+        c.value_head_order = ValueHeadOrder::Tiled;
+    } else if (order != "grouped") {
+        fail(where, ": linear_value_head_order '", order, "' is not supported (supported: grouped, tiled)");
+    }
     c.mtp_layers = cfg::get_int_or(t, "mtp_num_hidden_layers", 0, where);
     if (cfg::get_bool_or(t, "mtp_use_dedicated_embeddings", false, where)) {
         fail(where, ": mtp_use_dedicated_embeddings is not supported (the MTP head reads the target's embedding)");

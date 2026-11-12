@@ -55,3 +55,15 @@ TEST_CASE("qwen3_5 config: refuses what it does not implement, by name") {
         CHECK_THROWS_WITH_AS(xs::qwen3_5::parse_config(config), doctest::Contains(k.key), xs::Error);
     }
 }
+
+TEST_CASE("qwen3_5 config: linear_value_head_order, grouped unless the config says tiled") {
+    json config = qwen38_config();
+    CHECK(xs::qwen3_5::parse_config(config).value_head_order == xs::qwen3_5::ValueHeadOrder::Grouped);
+    config["text_config"]["linear_value_head_order"] = "tiled";
+    CHECK(xs::qwen3_5::parse_config(config).value_head_order == xs::qwen3_5::ValueHeadOrder::Tiled);
+    config["text_config"]["linear_value_head_order"] = "grouped";
+    CHECK(xs::qwen3_5::parse_config(config).value_head_order == xs::qwen3_5::ValueHeadOrder::Grouped);
+    config["text_config"]["linear_value_head_order"] = "interleaved";
+    CHECK_THROWS_WITH_AS(xs::qwen3_5::parse_config(config),
+                         doctest::Contains("linear_value_head_order 'interleaved' is not supported"), xs::Error);
+}

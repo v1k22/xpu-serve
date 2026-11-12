@@ -40,6 +40,13 @@ HostTensor to_f32(const std::string& name, const TensorView& t) {
     return out;
 }
 
+// Heads of x [kT, a * b, d] (or [kT, a * b] when d is 0) with head i * b + j moved to j * a + i: value heads from the
+// tiled order to the grouped one with a = r (value heads per key head), b = key heads; back with a and b swapped.
+Value swap_head_order(Graph& g, Value x, int64_t a, int64_t b, int64_t d) {
+    if (d == 0) return g.reshape(g.transpose(g.reshape(x, {kT, a, b}), {0, 2, 1}), {kT, a * b});
+    return g.reshape(g.transpose(g.reshape(x, {kT, a, b, d}), {0, 2, 1, 3}), {kT, a * b, d});
+}
+
 }  // namespace
 
 Decoder::Decoder(const Config& cfg, const WeightStore& weights)
@@ -155,19 +162,29 @@ Value Decoder::linear_attention(Graph& g, const std::string& layer, const std::s
                                            g.reshape(conv_w, {conv_width, cfg_.conv_kernel})));
     const Value q = g.reshape(g.slice(qkv, 1, 0, key_width), {kT, hk, dk});
     const Value k = g.reshape(g.slice(qkv, 1, key_width, 2 * key_width), {kT, hk, dk});
-    const Value v = g.reshape(g.slice(qkv, 1, 2 * key_width, conv_width), {kT, hv, dv});
+    Value v = g.reshape(g.slice(qkv, 1, 2 * key_width, conv_width), {kT, hv, dv});
 
     // beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias), the per-token log decay.
-    const Value beta = g.sigmoid(g.matmul(x, weight(g, L + "in_proj_b.weight")));
+    Value beta = g.sigmoid(g.matmul(x, weight(g, L + "in_proj_b.weight")));
     HostTensor neg_a = to_f32(L + "A_log", weights_.get(L + "A_log"));
     for (int64_t j = 0; j < neg_a.numel(); ++j)
         neg_a.data<float>()[j] = -std::exp(neg_a.data<float>()[j]);
-    const Value decay =
-        g.mul(g.softplus(g.add(g.matmul(x, weight(g, L + "in_proj_a.weight")), weight(g, L + "dt_bias"))),
-              g.constant(std::move(neg_a)));
+    Value decay = g.mul(g.softplus(g.add(g.matmul(x, weight(g, L + "in_proj_a.weight")), weight(g, L + "dt_bias"))),
+                        g.constant(std::move(neg_a)));
 
+    // The recurrence pairs value head h with key head h / r: a tiled checkpoint's value heads go to that order, and
+    // its outputs back to the order of z, the norm and out_proj. With one key head, or one value head per key head,
+    // the two orders are the same.
+    const int64_t r = hv / hk;
+    const bool tiled = cfg_.value_head_order == ValueHeadOrder::Tiled && hk > 1 && r > 1;
+    if (tiled) {
+        v = swap_head_order(g, v, r, hk, dv);
+        beta = swap_head_order(g, beta, r, hk, 0);
+        decay = swap_head_order(g, decay, r, hk, 0);
+    }
     const int slot = g.add_recurrent_slot(hv, dk, dv, label);
     Value o = g.gated_delta(slot, q, k, v, decay, beta, 1e-6f);
+    if (tiled) o = swap_head_order(g, o, hk, r, dv);
 
     // Qwen3_5RMSNormGated: rms_norm(o) * w * silu(z), per value head.
     const Value z = g.reshape(g.matmul(x, weight(g, L + "in_proj_z.weight")), {kT, hv, dv});
