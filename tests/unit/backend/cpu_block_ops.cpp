@@ -12,9 +12,6 @@ using namespace xs::graph;
 
 namespace {
 
-constexpr BlockFormat kFormats[] = {BlockFormat::Q4_0, BlockFormat::Q4_1, BlockFormat::Q5_0, BlockFormat::Q5_1,
-                                    BlockFormat::Q8_0};
-
 // `w` with every weight replaced by its decoded f32 value.
 test::MemoryWeights decoded(const test::MemoryWeights& w) {
     test::MemoryWeights out;
@@ -33,7 +30,8 @@ TEST_SUITE("cpu-ref ops") {
     TEST_CASE("matmul, gather and expert_matmul read a block format weight as its decoded values") {
         const auto backend = make_cpu_ref_backend();
         test::TensorRng rng(31);
-        for (const BlockFormat f : kFormats) {
+        for (int i = 0; i < kBlockFormats; ++i) {
+            const auto f = static_cast<BlockFormat>(i);
             CAPTURE(block_format_name(f));
             const int64_t k = 2 * block_layout(f).weights;
             const auto blocks = [&](Dims shape, uint32_t seed) {
