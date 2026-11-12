@@ -17,6 +17,7 @@ size_t dtype_size(DType t) {
         case DType::Q8: return 1;
         case DType::F8: return 1;
         case DType::Q4: fail("q4 packs two values per byte; use storage_bytes");
+        case DType::Block: fail("a block format decides its own size; use block_storage_bytes");
     }
     fail("unknown dtype");
 }
@@ -39,6 +40,7 @@ std::string_view dtype_name(DType t) {
         case DType::Q8: return "q8";
         case DType::Q4: return "q4";
         case DType::F8: return "f8";
+        case DType::Block: return "block";
     }
     return "?";
 }

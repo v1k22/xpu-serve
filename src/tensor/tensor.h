@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "tensor/block_format.h"
 #include "tensor/dtype.h"
 
 namespace xs {
@@ -45,9 +46,12 @@ struct TensorView {
     const void* data = nullptr;   // dense values or codes; null for an F8 weight
     QuantParams quant;            // dtype Q8 / Q4 only
     std::span<const Fp8Run> fp8;  // an F8 weight: the rows of its matrix [numel / cols, cols], run after run
+    BlockFormat block = BlockFormat::Q4_0;  // dtype Block only: `data` is the matrix's rows as blocks of this format
 
     int64_t numel() const { return xs::numel(shape); }
-    size_t nbytes() const { return storage_bytes(dtype, numel()); }
+    size_t nbytes() const {
+        return dtype == DType::Block ? block_storage_bytes(block, numel()) : storage_bytes(dtype, numel());
+    }
 };
 
 // Owning (or borrowing) dense row-major host tensor. Copies share storage; use clone() for a deep copy.

@@ -77,6 +77,7 @@ std::vector<float> HostTensor::to_f32() const {
             break;
         case DType::Q8:
         case DType::Q4:
+        case DType::Block:
             fail("a host tensor never holds quantized codes");
     }
     return out;
