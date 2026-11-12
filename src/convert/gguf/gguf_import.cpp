@@ -41,7 +41,7 @@ void check_general(const gguf::File& f) {
     if (const gguf::Value* t = f.find("general.type"); t != nullptr && t->as_string() != "model") {
         fail("GGUF '", f.path().string(), "' is general.type '", t->as_string(), "', not a model");
     }
-    // ggml changed the layout of Q4_0, Q4_1 and Q8_0 blocks at version 2 and has kept it since.
+    // The block layouts read here are quantization version 2's (version 1 laid out Q4_0, Q4_1 and Q8_0 otherwise).
     if (const gguf::Value* q = f.find("general.quantization_version"); q != nullptr && q->as_int() != 2) {
         fail("GGUF general.quantization_version ", q->as_int(), " is not supported (supported: 2)");
     }

@@ -8,7 +8,7 @@
 // - the conv1d weight [C, 1, K] is stored squeezed, [C, K]: reshaped.
 // - linear attention's value heads are stored tiled instead of grouped: kept, and config.json says
 //   linear_value_head_order "tiled" (models/qwen3_5/qwen3_5.h), since a quantized weight is never reordered.
-// - recent converters store in_proj_qkv and in_proj_z as one tensor (attn_qkv_gate), and in_proj_b and in_proj_a
+// - the converter can store in_proj_qkv and in_proj_z as one tensor (attn_qkv_gate), and in_proj_b and in_proj_a
 //   (ssm_beta_alpha): cut back into their runs of rows.
 // - the MTP head is one more block per MTP layer (blk.<n> past the decoder's layers, with nextn.* beside the first):
 //   mapped to mtp.*.

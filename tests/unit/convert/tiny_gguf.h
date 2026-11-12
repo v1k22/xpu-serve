@@ -5,7 +5,7 @@
 // names, every norm weight but linear attention's stored as 1 + w, A_log as ssm_a = -exp(A_log), the conv squeezed,
 // linear attention's value heads tiled, the vocabulary padded with [PAD<id>] placeholders and every added token that
 // looks like <|...|> typed control. Matrices are Q8_0 and Q4_0 blocks, one F16 and one BF16; layer 0 stores its input
-// projections merged (attn_qkv_gate, ssm_beta_alpha), as recent converters do.
+// projections merged (attn_qkv_gate, ssm_beta_alpha), as the converter can.
 //
 // And its twin: the Hugging Face checkpoint those bytes stand for, every weight as the f32 values the file's blocks
 // decode to, in the grouped order, with the norms and A_log computed back the way the import computes them.
