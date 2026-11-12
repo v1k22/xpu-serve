@@ -4,6 +4,7 @@
 #include <cmath>
 #include <thread>
 
+#include "quant/block_decode.h"
 #include "quant/fp8.h"
 #include "util/error.h"
 #include "util/half.h"
@@ -303,6 +304,7 @@ void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* o
 void read_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
     if (is_quantized(v.dtype)) return dequantize_rows(v, first, count, out);
     if (v.dtype == DType::F8) return fp8_rows(v, first, count, out);
+    if (v.dtype == DType::Block) return decode_block_rows(v, first, count, out);
     XS_CHECK(!v.shape.empty(), "a weight's rows need at least one dim");
     const int64_t cols = v.shape.back();
     const size_t offset = static_cast<size_t>(first * cols);
@@ -318,7 +320,8 @@ void read_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
             convert_bf16_to_f32(static_cast<const uint16_t*>(v.data) + offset, out, n);
             return;
         default:
-            fail("a weight's values are read from f32, f16, bf16, q8, q4 or f8, got ", dtype_name(v.dtype));
+            fail("a weight's values are read from f32, f16, bf16, q8, q4, f8 or a block format, got ",
+                 dtype_name(v.dtype));
     }
 }
 

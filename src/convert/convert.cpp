@@ -195,6 +195,8 @@ std::map<std::string, DType> plan_formats(const DecisionModel& model, const Conv
 // A tensor the pack keeps: its bytes as they are; an FP8 checkpoint's weight as its f32 values (a pack holds no f8,
 // and the weights that matter for size are quantized).
 OutUnit copy_unit(const std::string& name, const TensorView& v) {
+    XS_CHECK(v.dtype != DType::Block, "convert: '", name, "' is in GGUF's ", block_format_name(v.block),
+             " format; convert reads float checkpoints");
     OutUnit u;
     if (v.dtype == DType::F8) {
         u.tensors.push_back(OutTensor{name, DType::F32, v.shape});

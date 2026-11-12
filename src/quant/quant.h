@@ -64,13 +64,14 @@ Quantized quantize_awq(const TensorView& w, int64_t group, const std::vector<dou
 // Float values of rows [first, first + count) of a Q8 / Q4 view, row-major into `out` (input_scales applied).
 void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* out);
 
-// The same of a float weight however it is stored: f32 / f16 / bf16, a pack's q8 / q4, or an FP8 checkpoint's f8
-// (quant/fp8.h). What a backend or a converter reads a weight's values through.
+// The same of a float weight however it is stored: f32 / f16 / bf16, a pack's q8 / q4, an FP8 checkpoint's f8
+// (quant/fp8.h) or a GGUF block format (quant/block_decode.h). What a backend or a converter reads a weight's values
+// through.
 void read_rows(const TensorView& v, int64_t first, int64_t count, float* out);
 
-// The one-bit sketch of a weight [N, K] (f32 / f16 / bf16 / q8 / q4, K a multiple of 32) that graph::SignMatMul
-// scores every row with: signs [N, K / 32] i32, bit c % 32 of word c / 32 set where w[n, c] >= 0, and scales [N] f32,
-// each row's mean magnitude (the scale that brings +-scale closest to the row).
+// The one-bit sketch of a weight [N, K] (stored as anything read_rows reads, K a multiple of 32) that
+// graph::SignMatMul scores every row with: signs [N, K / 32] i32, bit c % 32 of word c / 32 set where w[n, c] >= 0, and
+// scales [N] f32, each row's mean magnitude (the scale that brings +-scale closest to the row).
 struct SignSketch {
     HostTensor signs;
     HostTensor scales;
