@@ -9,12 +9,16 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 
 #include <nlohmann/json.hpp>
 
 #include "decision/runner.h"
+#include "models/letter_readout/letter_readout.h"
+#include "models/model.h"
+#include "models/policy.h"
 #include "parity_util.h"
 #include "server/decision_handlers.h"
 
@@ -41,21 +45,31 @@ TEST_CASE("decision model matches its reference code" * doctest::skip(!enabled()
     options.session = xs::test::parity_options();
     options.session.max_context = 16384;
     options.chunk_tokens = std::stoll(env_or("XS_DECISION_CHUNK", "1024"));
-    const auto runner = xs::DecisionRunner::create(env_or("XS_TEST_DECISION_DIR", ""), options);
+    const std::string dir = env_or("XS_TEST_DECISION_DIR", "");
+    std::unique_ptr<xs::DecisionModel>
+        model;  // a language model: read at the option letters, as the fixtures' helper does
+    if (xs::model_kind(dir) == xs::ModelKind::Language) {
+        model = xs::letter_readout::make(xs::load_model(dir, xs::LoadOptions{.vision = false}),
+                                         *xs::letter_readout::preset(fixtures.value("preset", "letters")));
+    }
+    const auto runner = xs::DecisionRunner::create(dir, options, std::move(model));
 
     double worst = 0;
     int questions = 0, top_differs = 0;
     for (const auto& c : fixtures["cases"]) {
         const xs::DecisionRequest request = xs::server::parse_systemone_request(c["request"]);
-        const auto expected_ids = c["input_ids"].get<std::vector<std::vector<int32_t>>>();
-        const std::vector<std::vector<int32_t>> ids = runner->tokens(request);
+        const xs::DecisionResult result = runner->decide(request);
+        // The same sequences, in whatever order each side read them (a model that reads one prompt per question).
+        auto expected_ids = c["input_ids"].get<std::vector<std::vector<int32_t>>>();
+        std::vector<std::vector<int32_t>> ids = result.sequences;
+        std::sort(expected_ids.begin(), expected_ids.end());
+        std::sort(ids.begin(), ids.end());
         REQUIRE(ids.size() == expected_ids.size());
         for (size_t s = 0; s < ids.size(); ++s) {
             CAPTURE(s);
             REQUIRE(ids[s].size() == expected_ids[s].size());
             CHECK(ids[s] == expected_ids[s]);
         }
-        const xs::DecisionResult result = runner->decide(request);
         REQUIRE(result.answers.size() == request.questions.size());
         for (size_t q = 0; q < request.questions.size(); ++q) {
             const xs::DecisionQuestion& question = request.questions[q];

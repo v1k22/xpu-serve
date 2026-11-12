@@ -387,7 +387,13 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       full-attention layers, a read-out at a marker per question, the checkpoint's temperature; long requests split
       by question; parity with its package (tiny and released checkpoints), 25 test decisions end to end
 - [ ] pplx-decider past a few thousand tokens: its single step is slower per token than a chunked prefill
-- [ ] OpenJev (Qwen3.8-27B: the output layer's rows of the option letters, one prompt per question)
+- [x] OpenJev (`openjev/openjev`, Qwen3.8-27B) and any chat model, `--readout openjev|letters`: a prompt per question,
+      the logits of the option letters, its helper's calibration and many-option composition; the state read once
+      (the last step undone whole: `Session::truncate`); parity with the helper on a tiny checkpoint, the q4 pack
+      against the checkpoint in fp32 on 25 test decisions
+- [ ] Decisions and chat from one server for a language model read with `--readout`
+- [ ] OpenJev's question parts of 65 to about 200 tokens take about 345 ms on the Arc Pro B60 where parts of up to
+      64 take about 140 ms: above `few_rows` (64 at most) a q4 step dequantizes every weight for its GEMMs
 - [ ] Images (`assets`, box questions): needs the Qwen3.5 vision tower
 - [ ] Packs of decision checkpoints (`convert`)
 - [ ] Batching several requests into one step

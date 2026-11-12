@@ -11,12 +11,17 @@ decision_parity.cpp checks the engine against them: the same tokens, the same pr
 Clef (joint_head_config.json): joint_schema_model.py's encode_record and ClefModel, a softmax per question.
 pplx-decider (decision_config.json): the package under source/src: Decider's plan and reference path, the raw
 read-out logits over the saved temperature through a softmax.
+OpenJev (helper/shim.py): the helper's own code with the settings of its serving guide. Only its client is replaced:
+the one call it makes to a server (the log-probabilities of the option letters at the first output position) is
+answered by the model in transformers, and the answers are left unrounded.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
+import types
 
 import torch
 
@@ -59,6 +64,57 @@ def pplx(model_dir, requests):
     return cases
 
 
+def letters(model_dir, requests):
+    from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+
+    # The helper reads its settings from the environment when imported: serve/SERVE.md's.
+    os.environ.update(READOUT_T="0.85", READOUT_NOUL_T="1.829074", READOUT_NOUL_BIAS="0", READOUT_TARGETED="1",
+                      READOUT_INSTR_STYLE="pyrepr", TOKENIZER=model_dir)
+    sys.modules["openai"] = types.SimpleNamespace(OpenAI=lambda **kwargs: None)  # its import; no server is called
+    spec = importlib.util.spec_from_file_location("shim", os.path.join(model_dir, "helper", "shim.py"))
+    shim = importlib.util.module_from_spec(spec)
+    sys.modules["shim"] = shim
+    spec.loader.exec_module(shim)
+    shim.round = lambda value, digits=None: value
+
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = Qwen3_5ForConditionalGeneration.from_pretrained(model_dir, dtype=torch.float32).eval()
+    prompts = []
+
+    def create(messages=None, extra_body=None, **kwargs):
+        wanted = extra_body["logprob_token_ids"]
+        assert extra_body["chat_template_kwargs"] == {"enable_thinking": False} and isinstance(messages[0]["content"], str)
+        ids = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, enable_thinking=False)
+        ids = ids["input_ids"] if hasattr(ids, "keys") else ids
+        prompts.append(list(ids))
+        with torch.inference_mode():
+            logits = model(input_ids=torch.tensor([ids])).logits[0, -1].double()
+        scores = logits.log_softmax(-1)
+        top = [types.SimpleNamespace(token=f"token_id:{i}", logprob=float(scores[i])) for i in wanted]
+        content = [types.SimpleNamespace(top_logprobs=top)]
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(logprobs=types.SimpleNamespace(content=content))],
+                                     usage=types.SimpleNamespace(prompt_tokens=len(ids)))
+
+    shim.client = types.SimpleNamespace(chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create)))
+    cases = []
+    for request in requests:
+        prompts.clear()
+        state = shim.with_image(request["state"])
+        probabilities = {}
+        for name, question in request["questions"].items():
+            if question.get("instructions") is None:  # the helper needs instructions; the engine refuses these too
+                probabilities = None
+                break
+            answer, _ = shim.ANSWER[question["type"]](state, question)
+            if question["type"] == "noul":
+                probabilities[name] = {"true": answer["noul"], "false": 1 - answer["noul"]}
+            else:
+                probabilities[name] = answer["probabilities"]
+        if probabilities is not None:
+            cases.append({"request": request, "input_ids": [list(p) for p in prompts], "probabilities": probabilities})
+    return cases
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
@@ -75,10 +131,15 @@ def main():
         kind, cases = "clef", clef(model_dir, requests)
     elif os.path.exists(os.path.join(model_dir, "decision_config.json")):
         kind, cases = "pplx_decider", pplx(model_dir, requests)
+    elif os.path.exists(os.path.join(model_dir, "helper", "shim.py")):
+        kind, cases = "letter_readout", letters(model_dir, requests)
     else:
         ap.error(f"{model_dir} holds no decision model this script knows")
+    fixtures = {"kind": kind, "cases": cases}
+    if kind == "letter_readout":
+        fixtures["preset"] = "openjev"  # the settings the helper ran with
     with open(args.out, "w") as f:
-        json.dump({"kind": kind, "cases": cases}, f, ensure_ascii=False)
+        json.dump(fixtures, f, ensure_ascii=False)
     tokens = sum(len(ids) for c in cases for ids in c["input_ids"])
     print(f"{kind}: {len(cases)} requests, {tokens} tokens -> {args.out}")
 

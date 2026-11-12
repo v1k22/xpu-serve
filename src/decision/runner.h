@@ -32,7 +32,7 @@ struct DecisionTiming {
 struct DecisionResult {
     std::vector<DecisionAnswer> answers;  // one per question, in the request's order
     int64_t input_tokens = 0;             // tokens of every sequence the request was read as
-    int sequences = 0;
+    std::vector<std::vector<int32_t>> sequences;  // those sequences
     int steps = 0;  // program runs
     DecisionTiming timing;
 };
@@ -57,6 +57,7 @@ public:
 private:
     class Tools;
     DecisionRunner();
+    DecisionLimits current_limits() const;  // limits_ with what the session holds now
 
     DecisionSpec spec_;
     DecisionLimits limits_;

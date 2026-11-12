@@ -10,7 +10,7 @@ live here, and the math runs on Intel GPUs through our SYCL backend (our own ker
 [DESIGN.md](DESIGN.md) for the why and [TODO.md](TODO.md) for the plan.
 
 **Status: v0.4.** Language models (Gemma 4, Qwen3.5 / Qwen3.6 / Qwen3.8, LFM3), a robot policy (π0.5) and decision
-models (Clef-Flash, pplx-decider-flash, behind the System One API), from the
+models (Clef-Flash, pplx-decider-flash, OpenJev, behind the System One API), from the
 original checkpoint, its FP8 release where there is one, or a q8 / q4 pack written by `xpu-serve convert`, one request
 at a time, on Intel GPUs through the SYCL backend; speculative decoding with each model's drafter (Qwen's MTP head,
 Gemma 4's assistant checkpoints, DFlash 2 and DSpine block drafters for Qwen3.8-27B). [CLAUDE.md](CLAUDE.md) maps the
@@ -28,8 +28,9 @@ code.
 | Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
 | π0.5 | robot policy | f16, q8 | 215 / 198 ms per call (f16 / q8); 115 / 113 ms on the Arc Pro B60 | Arc B390, 3 cameras |
-| Clef-Flash | decision | f16 | 89 ms per decision (p50; 96 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
-| pplx-decider-flash-v1.2 | decision | f16 | 38 ms per decision (p50; 46 ms p95) on prompts of 92 to 230 tokens; 216 ms at 1,024 tokens | Arc Pro B60 |
+| Clef-Flash | decision | f16 | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
+| pplx-decider-flash-v1.2 | decision | f16 | 39 ms per decision (p50; 57 ms p95) on prompts of 92 to 230 tokens; 214 ms at 1,024 tokens | Arc Pro B60 |
+| OpenJev | decision (a language model read at the option letters) | q4 | 266 ms per decision (p50; 478 ms p95) on prompts of 67 to 198 tokens, 143 ms for another question about the state just read; 1.46 s for three questions on a 1,024-token prompt | Arc Pro B60 |
 
 | Model | Checkpoint (`model_type`) | Checked against |
 |---|---|---|
@@ -43,6 +44,7 @@ code.
 | π0.5 | `lerobot/pi05_base` (LeRobot `pi05`) | LeRobot fp32 actions: max error 5e-6 (cpu-ref), 1e-3 (GPU f16) |
 | Clef-Flash | `Cloudflare/clef-flash` (`qwen3_5` with a joint schema head) | its own Python code in fp32: the same prompt tokens, probabilities within 0.0007 (GPU f16); 25 of 25 test decisions right and equal to that code's |
 | pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (`qwen3_5` with a read-out per question) | its own Python package in fp32: the same prompt tokens, probabilities within 0.0009 (GPU f16); 25 of 25 test decisions right and equal to that code's |
+| OpenJev | `openjev/openjev` (`qwen3_5`, Qwen3.8-27B; weights CC BY-NC 4.0) | its own helper code over transformers in fp32: tiny-checkpoint parity (the same prompts, probabilities within 0.0024 on the GPU at f16); the q4 pack against the checkpoint in fp32: 25 of 25 test decisions right and equal, probabilities within 0.0095 |
 
 Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card, and their FP8
 releases (half the download) load and convert like the originals; LFM3 thinks by
@@ -190,22 +192,42 @@ not rounded. A body that does not follow the schema gets the API's 422 with the 
 `--ctx` its 400 (`max_tokens_exceeded`): nothing is cut to fit. Each response has its timings in a `Server-Timing`
 header. Images (`assets`, box questions) are refused by name: the Qwen3.5 vision tower is not loaded yet.
 
-| Model | Checkpoint | How it decides | On the Arc Pro B60 (f16) |
+| Model | Checkpoint | How it decides | On the Arc Pro B60 |
 |---|---|---|---|
-| Clef-Flash | `Cloudflare/clef-flash` (9B) | every question of a request in one pass; a transformer head scores the options | 15.2 GiB; 89 ms per decision at about 180 tokens |
-| pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (4B) | every question of a request in one pass, each read at a marker after its options; calibrated with the checkpoint's temperature | 7.8 GiB; 38 ms per decision at about 110 tokens |
+| Clef-Flash | `Cloudflare/clef-flash` (9B) | every question of a request in one pass; a transformer head scores the options | f16, 15.2 GiB; 89 ms per decision at about 180 tokens |
+| pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (4B) | every question of a request in one pass, each read at a marker after its options; calibrated with the checkpoint's temperature | f16, 7.8 GiB; 39 ms per decision at about 110 tokens |
+| OpenJev | `openjev/openjev` (27B, a tuned Qwen3.8-27B; weights CC BY-NC 4.0) | a prompt per question; the output layer's scores of the option letters at the first output position, calibrated as its helper does | q4 pack, 16.2 GiB; 266 ms per decision at about 90 tokens, 143 ms for another question about the same state |
 
-The per-decision times are medians over 25 test decisions, one question a request, all of which both models answer
-right. Questions sent together share one pass and can move each other's answers; Perplexity's card recommends one
-question per request for its model unless the questions are facets of one decision. A pplx-decider request longer
-than `--ctx` is answered in parts (its questions split, each part with the whole state), as its own code does.
+The per-decision times are medians over 25 test decisions, one question a request, all of which the three models
+answer right. Questions sent together share one pass in Clef and pplx-decider and can move each other's answers;
+Perplexity's card recommends one question per request for its model unless the questions are facets of one decision.
+A pplx-decider request longer than `--ctx` is answered in parts (its questions split, each part with the whole
+state), as its own code does.
 
-Latency is the time to read the prompt, so it grows with the state (three questions, p50):
+OpenJev is a language model, so its directory serves as one unless `--readout` asks for decisions, and a 24 GB card
+takes it as a q4 pack:
+
+```bash
+xpu-serve convert ~/models/openjev --out ~/models/openjev-q4 --quant q4
+xpu-serve serve ~/models/openjev-q4 --device GPU --ctx 16384 --readout openjev
+```
+
+`--readout openjev` reads the letters with the calibration of OpenJev's serving guide (temperature 0.85, the yes / no
+slope 1.829074); `--readout letters` reads any chat model the same way without calibration, and
+`--readout-temperature`, `--readout-noul-temperature` and `--readout-noul-bias` set the numbers. Each question is a
+prompt of its own, so its answer does not depend on the other questions; the state is read once per request, and a
+request about the state of the one before reads only its questions. A question with more than 52 options takes
+several passes, as in the helper. OpenJev needs `instructions` in every question.
+
+Latency is the time to read the prompt, so it grows with the state (three questions, p50; for OpenJev, whose three
+questions are three prompts, also the time when the state was read by the request before):
 
 | Prompt tokens | sample | 512 | 1,024 | 2,048 | 4,096 | 8,192 | 16,000 |
 |---|---|---|---|---|---|---|---|
-| Clef-Flash | 118 ms (320 tokens) | 165 ms | 323 ms | 644 ms | 1.31 s | 2.74 s | 5.86 s |
-| pplx-decider-flash-v1.2 | 45 ms (165 tokens) | 103 ms | 216 ms | 456 ms | 1.03 s | 2.53 s | 7.17 s |
+| Clef-Flash | 123 ms (325 tokens) | 165 ms | 323 ms | 643 ms | 1.34 s | 2.74 s | 5.89 s |
+| pplx-decider-flash-v1.2 | 46 ms (170 tokens) | 104 ms | 214 ms | 456 ms | 1.07 s | 2.53 s | 7.31 s |
+| OpenJev (q4), a new state | 538 ms (84 tokens) | 1.03 s | 1.46 s | 2.54 s | 4.75 s | 9.47 s | 19.6 s |
+| OpenJev (q4), the same state again | 429 ms | 434 ms | 434 ms | 440 ms | 455 ms | 475 ms | 523 ms |
 
 Without a server, `run` answers one request file and `bench` times one (its own sample by default, `--state-tokens N`
 to grow the state):
@@ -280,7 +302,7 @@ Every layer is tested against a reference:
 | Whole model (Gemma 4, Qwen3.5, LFM3) | Hugging Face fp32 logits and greedy output | `tests/unit/model/model_parity.cpp` |
 | Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/gemma4_vision_parity.cpp` |
 | Robot policy (π0.5) | LeRobot fp32 actions and prompt token ids, 3 cameras and 1 | `tests/unit/model/policy_parity.cpp` |
-| Decision models (Clef-Flash, pplx-decider-flash) | the checkpoint's own Python code in fp32: prompt token ids and every option's probability | `tests/unit/model/decision_parity.cpp` |
+| Decision models (Clef-Flash, pplx-decider-flash, OpenJev) | the checkpoint's own Python code in fp32: prompt token ids and every option's probability | `tests/unit/model/decision_parity.cpp` |
 | System One API | the API's schema and error bodies; 25 decisions with accepted answers through a running server | `tests/unit/server/test_systemone_http.cpp`, `tests/e2e/` |
 
 The model parity test needs the model and generated fixtures:

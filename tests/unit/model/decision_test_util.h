@@ -44,17 +44,20 @@ public:
 
 // Runs `request` as the runtime does (decision/runner.cpp) and returns each question's probabilities.
 inline std::vector<std::vector<double>> decide(const DecisionModel& model, Session& session,
-                                               const DecisionRequest& request, const DecisionLimits& limits,
-                                               int* steps = nullptr) {
+                                               const DecisionRequest& request, DecisionLimits limits,
+                                               int* steps = nullptr, size_t* sequences = nullptr) {
     const ByteTools tools;
+    limits.held_tokens = session.num_cached(0);
     const std::unique_ptr<DecisionRun> run = model.start(request, tools, limits);
     TensorMap outputs;
     while (std::optional<DecisionRun::Step> step = run->next(outputs)) {
         if (step->keep == 0) session.reset();
+        if (step->keep > 0 && session.num_cached(0) > step->keep) session.truncate(0, step->keep);
         outputs.clear();
         session.run(step->program, step->inputs, outputs, step->outputs);
         if (steps != nullptr) ++*steps;
     }
+    if (sequences != nullptr) *sequences = run->sequences().size();
     return run->probabilities();
 }
 

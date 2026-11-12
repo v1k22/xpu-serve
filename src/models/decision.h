@@ -83,7 +83,7 @@ public:
         TensorMap inputs;                  // every input of that program
         std::vector<std::string> outputs;  // the outputs to bring back
         // Tokens of the sequence's state to keep before the step runs: all of them (-1), none (0: a new sequence),
-        // or a prefix (what Session::truncate can cut back to).
+        // or a prefix that Session::truncate can cut back to (the tokens before the last step: that step undone).
         int64_t keep = -1;
     };
 
@@ -92,7 +92,8 @@ public:
     virtual std::optional<Step> next(TensorMap& outputs) = 0;
     // After the last step: each question's probabilities over its options, in DecisionQuestion::options order.
     virtual std::vector<std::vector<double>> probabilities() const = 0;
-    // The token sequences the request is read as (one, or one per question or chunk of questions).
+    // The token sequences the request is read as (one, or one per question or part of the questions): those known
+    // so far, which is all of them once the run is over.
     virtual const std::vector<std::vector<int32_t>>& sequences() const = 0;
 };
 
@@ -103,10 +104,13 @@ struct DecisionSpec {
     int64_t rewind_tokens = 0;  // SessionOptions::rewind_tokens the model's steps need (DecisionRun::Step::keep)
 };
 
-// What the session a run's steps go to can take.
+// What the session a run's steps go to can take, and what it holds as the run starts.
 struct DecisionLimits {
     int64_t max_tokens = 0;    // the longest sequence (never more than DecisionSpec::max_tokens)
     int64_t chunk_tokens = 0;  // tokens a step should feed at most, for a model that can read its prompt in pieces
+    // Tokens of state left by the run before (0 after a reset or a failed run): a model that reads one request's
+    // prompt on top of the last one's prefix checks its own record of that prompt against this count.
+    int64_t held_tokens = 0;
 };
 
 class DecisionModel {

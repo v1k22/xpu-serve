@@ -38,7 +38,6 @@ xs::DecisionResult fake_decide(const xs::DecisionRequest& request) {
         r.answers.push_back(xs::make_answer(q.type, p));
     }
     r.input_tokens = 42;
-    r.sequences = 1;
     r.steps = 1;
     r.timing.total_ms = 1.5;
     return r;

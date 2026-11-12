@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """A tiny random decision model in the layout of a released one, for parity tests (test-only).
 
-    python -I tests/parity/decision/make_tiny.py --from <a clef-flash or pplx-decider checkpoint> --out <dir>
+    python -I tests/parity/decision/make_tiny.py --from <a clef-flash, pplx-decider or openjev checkpoint> --out <dir>
 
 The decoder is a Qwen3.5 of four layers (three Gated DeltaNet, one full attention) with a small vision tower, as the
 released checkpoints carry one; the head has the released head's structure at a small width (Clef's joint schema
-head; pplx-decider's read-out of 255 answer codes). The tokenizer, the processor and chat template files and the
+head; pplx-decider's read-out of 255 answer codes; none for OpenJev, a language model with its helper). The tokenizer, the processor and chat template files and the
 checkpoint's own Python code are copied from `--from`, so the vocabulary is the real one and reference.py runs the
 tiny model with the code the real one runs with. Random weights give near-uniform answers, which would hide a wrong
 option order or span: the head's output scales are raised so that answers spread.
@@ -22,7 +22,7 @@ from safetensors.torch import save_file
 
 COPIED = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "processor_config.json", "vocab.json",
           "merges.txt", "preprocessor_config.json", "video_preprocessor_config.json", "joint_schema_model.py",
-          "joint_config.json", "decision_config.json", "source"]
+          "joint_config.json", "decision_config.json", "source", "helper", "generation_config.json"]
 
 
 def decoder_config(vocab_size, hidden):
@@ -98,6 +98,22 @@ def pplx(source, out, vocab_size):
     return sum(p.numel() for p in model.parameters()) + readout.weight.numel()
 
 
+def letters(source, out, vocab_size):
+    """Qwen3_5ForConditionalGeneration and nothing else, as openjev/openjev: the answers are read off its output layer."""
+    from transformers import Qwen3_5ForConditionalGeneration
+
+    config = decoder_config(vocab_size, 96)
+    with open(os.path.join(source, "config.json")) as f:
+        released = json.load(f)
+    for key in ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id"):
+        setattr(config, key, released[key])
+    model = Qwen3_5ForConditionalGeneration(config)
+    with torch.no_grad():
+        model.lm_head.weight.mul_(6.0)  # the letters' scores apart
+    model.save_pretrained(out, safe_serialization=True)
+    return sum(p.numel() for p in model.parameters())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="source", required=True, help="a released checkpoint of the kind to imitate")
@@ -113,8 +129,10 @@ def main():
         kind, count = "clef", clef(args.source, args.out, vocab_size)
     elif os.path.exists(os.path.join(args.source, "decision_config.json")):
         kind, count = "pplx_decider", pplx(args.source, args.out, vocab_size)
+    elif os.path.exists(os.path.join(args.source, "helper", "shim.py")):
+        kind, count = "letter_readout", letters(args.source, args.out, vocab_size)
     else:
-        ap.error(f"{args.source} is not a checkpoint this script imitates (clef, pplx-decider)")
+        ap.error(f"{args.source} is not a checkpoint this script imitates (clef, pplx-decider, openjev)")
     for f in COPIED:
         src = os.path.join(args.source, f)
         if os.path.isdir(src):

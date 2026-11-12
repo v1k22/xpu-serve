@@ -421,6 +421,78 @@
      }
     }
    }
+  },
+  {
+   "model": "test",
+   "state": "A visitor writes: my parcel was due on Monday, tracking has not moved since Friday and I need it for a trip.",
+   "questions": {
+    "category": {
+     "type": "choice",
+     "instructions": "Which help-centre category fits best?",
+     "criteria": {
+      "category_00": null,
+      "category_01": "lost parcel (queue 1)",
+      "category_02": "refund (queue 2)",
+      "category_03": "address change (queue 3)",
+      "category_04": "customs (queue 4)",
+      "category_05": null,
+      "category_06": "wrong item (queue 6)",
+      "category_07": "late delivery (queue 7)",
+      "category_08": "lost parcel (queue 8)",
+      "category_09": "refund (queue 9)",
+      "category_10": null,
+      "category_11": "customs (queue 11)",
+      "category_12": "damaged item (queue 12)",
+      "category_13": "wrong item (queue 13)",
+      "category_14": "late delivery (queue 14)",
+      "category_15": null,
+      "category_16": "refund (queue 16)",
+      "category_17": "address change (queue 17)",
+      "category_18": "customs (queue 18)",
+      "category_19": "damaged item (queue 19)",
+      "category_20": null,
+      "category_21": "late delivery (queue 21)",
+      "category_22": "lost parcel (queue 22)",
+      "category_23": "refund (queue 23)",
+      "category_24": "address change (queue 24)",
+      "category_25": null,
+      "category_26": "damaged item (queue 26)",
+      "category_27": "wrong item (queue 27)",
+      "category_28": "late delivery (queue 28)",
+      "category_29": "lost parcel (queue 29)",
+      "category_30": null,
+      "category_31": "address change (queue 31)",
+      "category_32": "customs (queue 32)",
+      "category_33": "damaged item (queue 33)",
+      "category_34": "wrong item (queue 34)",
+      "category_35": null,
+      "category_36": "lost parcel (queue 36)",
+      "category_37": "refund (queue 37)",
+      "category_38": "address change (queue 38)",
+      "category_39": "customs (queue 39)",
+      "category_40": null,
+      "category_41": "wrong item (queue 41)",
+      "category_42": "late delivery (queue 42)",
+      "category_43": "lost parcel (queue 43)",
+      "category_44": "refund (queue 44)",
+      "category_45": null,
+      "category_46": "customs (queue 46)",
+      "category_47": "damaged item (queue 47)",
+      "category_48": "wrong item (queue 48)",
+      "category_49": "late delivery (queue 49)",
+      "category_50": null,
+      "category_51": "refund (queue 51)",
+      "category_52": "address change (queue 52)",
+      "category_53": "customs (queue 53)",
+      "category_54": "damaged item (queue 54)",
+      "category_55": null,
+      "category_56": "late delivery (queue 56)",
+      "category_57": "lost parcel (queue 57)",
+      "category_58": "refund (queue 58)",
+      "category_59": "address change (queue 59)"
+     }
+    }
+   }
   }
  ]
 }

@@ -8,7 +8,9 @@ Checks, per request: the response follows the API (model, answers keyed by the q
 fields for its type, probabilities over exactly the request's options summing to 1, the choice being the most likely
 option), the answer is the accepted one (a choice's option, a noul's side of 0.5, a score's most likely level), and,
 with --reference, every probability against the model's own Python code. Latency is the client's wall time per
-request, the median of --repeat sends; the server's own split comes from its Server-Timing header.
+request: of the first send, which follows another request's state, and the median of the --repeat - 1 sends after it,
+which ask about the state just read (a model that keeps a state's prefix answers those faster). The server's own
+split comes from its Server-Timing header.
 Exit status 1 when a response breaks the API or (with --reference) a probability is off by more than --tolerance.
 """
 
@@ -104,8 +106,9 @@ def main():
     rows, broken, off = [], 0, 0
     for index, request in enumerate(data["requests"]):
         sends = [post(args.url, request) for _ in range(args.repeat)]
-        response, _, timing = sends[0]
-        wall = statistics.median(ms for _, ms, _ in sends)
+        response, first, timing = sends[0]
+        again = sends[1:] or sends
+        wall = statistics.median(ms for _, ms, _ in again)
         problems = [k for k in ("model", "answers", "usage") if k not in response]
         if list(response.get("answers", {})) != list(request["questions"]):
             problems.append("answers do not follow the questions")
@@ -113,8 +116,9 @@ def main():
             p, more = probabilities(question, response.get("answers", {}).get(name, {}))
             problems += more
             row = {"name": name, "type": question["type"], "tokens": response.get("usage", {}).get("input_tokens"),
-                   "ms": wall, "device_ms": statistics.median(server_ms(t, "device") for _, _, t in sends),
-                   "server_ms": statistics.median(server_ms(t, "total") for _, _, t in sends), "problems": problems}
+                   "first_ms": first, "ms": wall,
+                   "device_ms": statistics.median(server_ms(t, "device") for _, _, t in again),
+                   "server_ms": statistics.median(server_ms(t, "total") for _, _, t in again), "problems": problems}
             if p:
                 row["answer"] = given(question, p)
                 row["p"] = max(p.values()) if question["type"] != "noul" else p["true"]
@@ -128,16 +132,23 @@ def main():
             rows.append(row)
         broken += bool(problems)
 
-    print(f"{'question':14s} {'type':7s} {'tokens':>6s} {'answer':>16s} {'p':>6s} {'ok':>3s} {'|dp| ref':>9s} {'ms':>8s} {'device':>8s}")
+    print(f"{'question':14s} {'type':7s} {'tokens':>6s} {'answer':>16s} {'p':>6s} {'ok':>3s} {'|dp| ref':>9s} "
+          f"{'first ms':>9s} {'again ms':>9s} {'device':>8s}")
     for r in rows:
         ok = "" if "expected" not in r else ("yes" if r.get("answer") == r["expected"] else "NO")
         diff = f"{r['diff']:.4f}" if "diff" in r else ""
         print(f"{r['name']:14s} {r['type']:7s} {r['tokens']!s:>6s} {str(r.get('answer')):>16s} {r.get('p', float('nan')):6.3f} {ok:>3s} "
-              f"{diff:>9s} {r['ms']:8.1f} {r['device_ms']:8.1f}" + ("  " + "; ".join(r["problems"]) if r["problems"] else ""))
-    wall = sorted(r["ms"] for r in rows)
+              f"{diff:>9s} {r['first_ms']:9.1f} {r['ms']:9.1f} {r['device_ms']:8.1f}"
+              + ("  " + "; ".join(r["problems"]) if r["problems"] else ""))
+
+    def spread(values):
+        values = sorted(values)
+        return {"p50": statistics.median(values), "p95": values[min(len(values) - 1, int(0.95 * len(values)))],
+                "min": values[0], "max": values[-1]}
+
     summary = {"questions": len(rows), "api_problems": broken,
-               "latency_ms": {"p50": statistics.median(wall), "p95": wall[min(len(wall) - 1, int(0.95 * len(wall)))],
-                              "min": wall[0], "max": wall[-1], "server_p50": statistics.median(r["server_ms"] for r in rows),
+               "latency_ms": {"new_state": spread(r["first_ms"] for r in rows), "same_state": spread(r["ms"] for r in rows),
+                              "server_p50": statistics.median(r["server_ms"] for r in rows),
                               "device_p50": statistics.median(r["device_ms"] for r in rows)},
                "tokens": {"min": min(r["tokens"] for r in rows), "max": max(r["tokens"] for r in rows)}}
     if "expected" in data:

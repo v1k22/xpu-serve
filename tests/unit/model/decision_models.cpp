@@ -9,6 +9,8 @@
 #include "../backend/device_test_support.h"
 #include "decision_test_util.h"
 #include "models/clef/clef.h"
+#include "models/letter_readout/letter_readout.h"
+#include "models/model.h"
 #include "models/policy.h"
 #include "models/pplx_decider/pplx_decider.h"
 
@@ -252,5 +254,130 @@ TEST_SUITE("decision models") {
                           doctest::Contains("pooling"));
         CHECK_THROWS_AS(xs::pplx_decider::parse_config(with(decision, "temperature", 0.0), joint, tokenizer),
                         xs::Error);
+    }
+    TEST_CASE("letter read-out: a language model answers through the option letters") {
+        namespace lr = xs::letter_readout;
+        CHECK(lr::user_message("S", "Q?", {{"k1", "d1"}, {"k2", ""}}) ==
+              "State:\nS\n\nQuestion: Q?\nOptions:\n[A] k1: d1\n[B] k2: \n\nAnswer with the letter of the best option "
+              "only.");
+        const lr::Settings openjev = *lr::preset("openjev");
+        CHECK(openjev.temperature == doctest::Approx(0.85));
+        CHECK(openjev.noul_temperature == doctest::Approx(1.829074));
+        CHECK(openjev.python_instructions);
+        CHECK(!lr::preset("nope").has_value());
+
+        const xs::test::TempDir dir("xs_tiny_letters");
+        xs::test::write_tiny_qwen(dir.path, xs::test::TinyQwen{}, 13);
+        CHECK(xs::model_kind(dir.path) == xs::ModelKind::Language);  // a decision model only when read as one
+        const auto load = [&](const lr::Settings& s) { return lr::make(xs::load_model(dir.path), s); };
+        const auto compile = [](const xs::DecisionModel& m) {
+            return xs::make_backend("cpu-ref")->compile(m.programs(), m.weights(),
+                                                        xs::SessionOptions{.precision = xs::DType::F32});
+        };
+        const auto model = load(lr::Settings{});
+        const auto session = compile(*model);
+        const DecisionLimits whole{4096, 4096};
+        const xs::test::ByteTools tools;
+
+        int steps = 0;
+        size_t sequences = 0;
+        const auto p = xs::test::decide(*model, *session, ticket(), whole, &steps, &sequences);
+        CHECK(sequences == 3);  // a prompt per question
+        CHECK(steps == 4);      // the state once, then each question's own part
+        REQUIRE(p.size() == 3);
+        for (const auto& question : p) {
+            double total = 0;
+            for (const double v : question)
+                total += v;
+            CHECK(total == doctest::Approx(1.0));
+        }
+        CHECK(*std::max_element(p[0].begin(), p[0].end()) - *std::min_element(p[0].begin(), p[0].end()) > 0.02);
+
+        SUBCASE("each answer is the one its question gets alone, read from the start") {
+            for (size_t q = 0; q < 3; ++q) {
+                DecisionRequest alone = ticket();
+                alone.questions = {ticket().questions[q]};
+                const auto model_alone = load(lr::Settings{});
+                const auto session_alone = compile(*model_alone);
+                CHECK(max_diff({p[q]}, xs::test::decide(*model_alone, *session_alone, alone, whole)) < 1e-5);
+            }
+        }
+        SUBCASE("a request about the same state reads only its questions; another state starts over") {
+            int again = 0;
+            CHECK(max_diff(p, xs::test::decide(*model, *session, ticket(), whole, &again)) < 1e-6);
+            CHECK(again == 3);
+            DecisionRequest other = ticket();
+            other.state = "an entirely different ticket";
+            int fresh = 0;
+            xs::test::decide(*model, *session, other, whole, &fresh);
+            CHECK(fresh == 4);
+            // And a session that something else has moved on is not trusted to hold the last prompt.
+            session->reset();
+            int after_reset = 0;
+            CHECK(max_diff(p, xs::test::decide(*model, *session, ticket(), whole, &after_reset)) < 1e-6);
+            CHECK(after_reset == 4);
+        }
+        SUBCASE("the state fed in small steps gives the same answers") {
+            int small = 0;
+            const auto model_small = load(lr::Settings{});
+            const auto session_small = compile(*model_small);
+            CHECK(max_diff(p, xs::test::decide(*model_small, *session_small, ticket(), DecisionLimits{4096, 16},
+                                               &small)) < 1e-5);
+            CHECK(small > 8);
+        }
+        SUBCASE("more options than letters: parts, then their winners, composed into one distribution") {
+            DecisionRequest many = ticket();
+            many.questions = {choice("pick", "Which one?", {})};
+            for (int i = 0; i < 60; ++i)
+                many.questions[0].options.push_back({"option " + std::to_string(i), Json(nullptr)});
+            size_t prompts = 0;
+            const auto q = xs::test::decide(*model, *session, many, whole, nullptr, &prompts);
+            CHECK(prompts == 3);  // two parts of 30 and the pass over their winners
+            REQUIRE(q[0].size() == 60);
+            double total = 0;
+            for (const double v : q[0])
+                total += v;
+            CHECK(total == doctest::Approx(1.0));
+            CHECK(*std::min_element(q[0].begin(), q[0].end()) > 0);
+            // Within a part the options keep the ratios that part's prompt gave them.
+            DecisionRequest first_part = many;
+            first_part.questions[0].options.resize(30);
+            const auto model_part = load(lr::Settings{});
+            const auto session_part = compile(*model_part);
+            const auto part = xs::test::decide(*model_part, *session_part, first_part, whole);
+            CHECK(q[0][7] / q[0][3] == doctest::Approx(part[0][7] / part[0][3]).epsilon(1e-4));
+        }
+        SUBCASE("the calibration settings") {
+            const auto flat = load(lr::Settings{.temperature = 2.0, .noul_temperature = 2.0, .noul_bias = 0.5});
+            const auto flat_session = compile(*flat);
+            const auto q = xs::test::decide(*flat, *flat_session, ticket(), whole);
+            // A choice at temperature 2: the square root of the ratios.
+            CHECK(q[0][1] / q[0][0] == doctest::Approx(std::sqrt(p[0][1] / p[0][0])).epsilon(1e-4));
+            // A noul: logit(P(true)) = logit(the yes option's share) / 2 + 0.5, the share read at temperature 2.
+            const auto logit = [](double v) { return std::log(v / (1 - v)); };
+            CHECK(logit(q[1][0]) == doctest::Approx(logit(p[1][0]) / 2 / 2 + 0.5).epsilon(1e-4));
+        }
+        SUBCASE("what the model does not take is refused by name") {
+            DecisionRequest no_instructions = ticket(), one_level = ticket(), image = ticket();
+            no_instructions.questions[0].instructions = Json(nullptr);
+            one_level.questions = {score("s", "Rate", {"only"})};
+            image.state = Json{{"note", "see"}, {"screenshot", "data:image/png;base64,AAAA"}};
+            for (const DecisionRequest* r : {&no_instructions, &one_level, &image}) {
+                CHECK_THROWS_AS(model->start(*r, tools, whole), xs::DecisionRefused);
+            }
+            try {
+                model->start(ticket(), tools, DecisionLimits{60, 60});
+                FAIL("expected a refusal");
+            } catch (const xs::DecisionRefused& e) {
+                CHECK(e.code() == "max_tokens_exceeded");
+            }
+        }
+        SUBCASE("the GPU agrees with the reference backend") {
+            namespace dev = xs::test::device;
+            if (!dev::enabled()) return;
+            const auto gpu_model = load(lr::Settings{});
+            const auto gpu = dev::backend().compile(gpu_model->programs(), gpu_model->weights(), dev::options());
+            CHECK(max_diff(p, xs::test::decide(*gpu_model, *gpu, ticket(), whole)) < (dev::is_f16() ? 2e-2 : 1e-4));
+        }
     }
 }

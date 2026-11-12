@@ -28,7 +28,7 @@ Qwen3.6, Qwen3.8; text; a hybrid of Gated DeltaNet linear attention and full att
 and LFM3 (text; a hybrid of gated short convolutions and full or sliding-window attention),
 and decision models behind the System One API (`POST /v1/systemone`: Clef-Flash, a Qwen3.5 decoder with a joint
 schema head; pplx-decider-flash, one whose full-attention layers see the whole prompt, with a read-out per question;
-docs/decisions/0015),
+OpenJev, a language model read at the option letters with `--readout`; docs/decisions/0015),
 served end to end on the SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs
 from `convert`; speculative decoding with the model's drafter (`--spec mtp`: Qwen's MTP head, a Gemma 4 assistant
 with `--drafter`; `--spec dflash|dspine`: a block drafter checkpoint for Qwen3.8-27B with `--drafter`;
@@ -55,6 +55,7 @@ build/src/xpu-serve run   <decision-model-dir> --device GPU --request request.js
 - Useful flags: `--backend sycl|cpu-ref` (default: sycl when built), `--device GPU|GPU.0|GPU.1`, `--precision f16|f32`,
   `--kv-dtype auto|i8`, `--ctx N`, `--prefill-chunk N`, `--backend-opt attention=auto|rows|gemm`,
   `--backend-opt gemv=auto|vector|xmx`, `--backend-opt few_rows=N`, `--spec mtp|dflash|dspine --spec-k N`,
+  `--readout letters|openjev` (a language model served as a decision model),
   `--drafter <dir>`,
   `--draft-shortlist N`, `--no-vision`,
   `--log-level debug`. `xpu-serve <command> --help` lists all of them;
@@ -108,7 +109,7 @@ area).
 | `convert/` | xs_core | `convert_model`: checkpoint (language model, policy, or a drafter beside its model with `--target`) -> pack; the model's own graphs decide which weights to quantize (`plan_graph_formats`: bandwidth-bound matmuls, or all with `--scope all`) |
 | `image/` | xs_core | `Image` (8-bit RGB), `decode` (stb_image), `resize_bicubic` (bit-exact with torchvision), `content_hash` |
 | `graph/` | xs_core | the step graph IR and builder (`graph.h` holds the op spec) |
-| `models/` | xs_core | `model.h` (the `Model` interface: language models), `policy.h` (the `Policy` interface: robot policies, one static program per call shape: camera subset, step count, padded prompt length), `decision.h` (the `DecisionModel` interface: decision models, which lay out a request's prompt and name the steps to run), `registry.cpp` (model_type / LeRobot type / a head beside the decoder -> code, `model_kind`), `config_util` (checked JSON readers), `common/blocks` (the shared building blocks: gated MLPs, mixture of experts, RMSNorm variants, RoPE frequencies, attention, a drafter's head over a shortlist), `common/py_text` (a JSON value as Python's `json.dumps` and `str` write it: what reference code puts in a prompt), one folder per architecture (`pi05/`: π0.5; `clef/` and `pplx_decider/`: decision models on the Qwen3.5 decoder), `drafters/dflash` (block drafters that serve any target they were trained for: DFlash, DFlash 2, DSpine) |
+| `models/` | xs_core | `model.h` (the `Model` interface: language models), `policy.h` (the `Policy` interface: robot policies, one static program per call shape: camera subset, step count, padded prompt length), `decision.h` (the `DecisionModel` interface: decision models, which lay out a request's prompt and name the steps to run), `registry.cpp` (model_type / LeRobot type / a head beside the decoder -> code, `model_kind`), `config_util` (checked JSON readers), `common/blocks` (the shared building blocks: gated MLPs, mixture of experts, RMSNorm variants, RoPE frequencies, attention, a drafter's head over a shortlist), `common/py_text` (a JSON value as Python's `json.dumps` and `str` write it: what reference code puts in a prompt), one folder per architecture (`pi05/`: π0.5; `clef/` and `pplx_decider/`: decision models on the Qwen3.5 decoder), `letter_readout/` (any language model as a decision model: OpenJev), `drafters/dflash` (block drafters that serve any target they were trained for: DFlash, DFlash 2, DSpine) |
 | `engine/` | xs_core | `Engine` (one sequence: prefix reuse, chunked prefill, image encoding, decode loop, speculative rounds: draft, verify, accept, roll back), `Sampler` (and rejection sampling of a draft), request/result types (`MediaInput`), `media` (placeholder expansion), `service.h` (the `InferenceService` interface the server uses), `spec/` (the drafter side of speculative decoding: `drafter.h` is what the engine drives and the session's program order; `chain_drafter` feeds a token-a-run drafter the target's hidden states and chains its drafts; `block_drafter` runs a block drafter's program and follows its candidates) |
 | `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `sycl/` |
 | `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
@@ -134,6 +135,7 @@ area).
 | `src/models/decision.h` | What a decision model provides: `spec()`, `programs()`, `weights()`, and `start(request, tools, limits)` -> a `DecisionRun` that hands the runtime one step at a time and ends with each question's probabilities |
 | `src/models/clef/` | Clef: `clef_prompt.cpp` (the reference's record encoding: token ids and the spans of each instruction and option), `clef_model.cpp` (the encode program, which keeps what the head's attentions read of the sequence in KV slots, the route, fields and score programs, and the host work between them) |
 | `src/models/pplx_decider/` | pplx-decider (protocol version 3): `pplx_prompt.cpp` (the chat-template prompt with answer codes and a marker per question, special tokens in user text neutralized, a long request split by question), `pplx_model.cpp` (one program: the decoder with whole-step full attention and the read-out on every row; temperature and softmax on the host) |
+| `src/models/letter_readout/letter_readout.cpp` | A `Model` behind the `DecisionModel` interface (OpenJev's helper): a prompt per question through the chat template, the logits of the option letters at the first output position, temperature and yes / no calibration (`Settings`, presets by name), more options than letters in parts and a pass over their winners; the state's part of a prompt read once and each question's part undone for the next |
 | `src/decision/runner.cpp` | Wiring from a decision model directory to answers: compiles the programs, runs a request's steps, times them |
 | `src/server/decision_handlers.cpp` | `POST /v1/systemone`: the request schema (422 bodies naming the field), the answers, `Server-Timing` |
 | `src/models/lfm3/lfm3_model.cpp` | LFM3: gated short convolutions (`causal_conv` between two gates of one projection), attention with q/k norms and a sigmoid gate per head (full layers rotate half of each head, sliding layers all of it within their window), every operator and MLP output normed again before the residual add, the head tied to the embedding |
@@ -215,9 +217,11 @@ sequence. Model code builds it once at load time; a backend compiles it once.
   such as Gemma 4's per-layer embedding rows, and the image rows that replace soft-token embeddings).
 - Conv and recurrent slots (`add_conv_slot`, `add_recurrent_slot`) hold fixed-size per-sequence state for
   `causal_conv` and `gated_delta`. They summarize the whole sequence, so a session cannot cut them back to a prefix,
-  except inside a last step of up to `SessionOptions::rewind_tokens` tokens (a speculative verify; the backend keeps
-  that step's inputs and replays the kept ones). The engine reuses a cached prefix for such models only when the new
-  prompt extends it, else it starts over.
+  with two exceptions: the last step can be undone whole (the state before it is the buffer the step did not write:
+  how a decision model reads one question after another on one state), and inside a last step of up to
+  `SessionOptions::rewind_tokens` tokens any count can be kept (a speculative verify; the backend keeps that step's
+  inputs and replays the kept ones). The engine reuses a cached prefix for such models only when the new prompt
+  extends it, else it starts over.
 - A session can hold several programs (the target's step, prefill and verify graphs and a drafter): they share
   weights by name and state slots by label; a program that only reads a KV slot (`kv_read`) attends to another's.
 - A graph without slots is stateless (every run stands alone): that is how vision encoders run, one image per run,
@@ -242,7 +246,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/backend/device_*.cpp` | each op on the GPU backend (`device_encoder_ops.cpp` likewise), sessions, agreement with cpu-ref (also with an int8 KV cache on both), decode timing and quantized matmul timing by rows, format and path (`XS_DEVICE_BENCH=1`, `device_quant_timing.cpp`) | the same references; skip unless `XS_DEVICE_TEST_DEVICE` is set |
 | `tests/unit/backend/*_moe_ops.cpp` | Div, Softmax, TopK (ties to the lower index), ReduceSum, ExpertMatMul and the `moe` block (softmax and sigmoid routers, shared expert), on cpu-ref and the GPU | fp64 references and an fp64 composition of the block (`moe_ops_cases.h`) |
 | `tests/unit/backend/*_shortlist_ops.cpp` | SignMatMul (words loaded whole and one by one, rows that fill no sub-group) and the shortlist head: the best rows by sketch, their exact logits, the head's pick, on cpu-ref and the GPU | fp64 references (`shortlist_cases.h`) |
-| `tests/unit/backend/*_programs.cpp` | sessions of several programs: KV slots shared by label, KvRead, truncate inside a short step (conv, gated delta, KV) equals never running the dropped tokens; a run asked for some outputs returns those and advances the state all the same | the same session without them (`session_cases.h`) |
+| `tests/unit/backend/*_programs.cpp` | sessions of several programs: KV slots shared by label, KvRead, truncate inside a short step (conv, gated delta, KV) equals never running the dropped tokens, the last step undone whole equals never running it; a run asked for some outputs returns those and advances the state all the same | the same session without them (`session_cases.h`) |
 | `tests/unit/engine/` | speculative decoding emits exactly the greedy tokens (a stateful tiny model, a partly wrong drafter that drafts a token a run or a block a run, prefix reuse, stops); the same tokens when greedy decoding reads each row's `argmax` output instead of the logits; rejection sampling draws the target's distribution | plain greedy decoding; exact distributions |
 | `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on cpu-ref and the GPU | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |
 | `tests/unit/tokenizer/` | encode/decode, streaming; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`); whole tokenizers of Gemma 4, Qwen3.5 and LFM3 (`parity_cases.h`; each needs its checkpoint's `tokenizer.json`) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`, `gen_lfm3_cases.py`; tables from `gen_unicode_tables.py`) |
@@ -258,7 +262,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/backend/*_policy_ops.cpp` | LayerNorm, Concat (also of computed values that share a part), attention with a key bias over static queries (head dims 72, 256) and within blocks of tokens | fp64 references (`policy_ops_cases.h`) |
 | `tests/unit/model/gemma4_vision_parity.cpp` | image input: pixels, vision features, expanded prompt, logits, greedy (whole and chunked prefill), prefix reuse by image | Hugging Face fp32, from `tests/parity/model/hf_vision_reference.py` |
 | `tests/unit/model/decision_parity.cpp` | a decision model (`XS_TEST_DECISION_DIR`): each request's prompt tokens and every option's probability | the checkpoint's own Python code in fp32, from `tests/parity/decision/reference.py` over `requests.json` (`make_tiny.py` writes a tiny checkpoint in a released one's layout) |
-| `tests/unit/model/decision_models.cpp` | decision models on tiny checkpoints the test writes (`decision_test_util.h`). Clef: a prompt fed in steps, a choice's options reordered, questions decided jointly, a request over the limit refused. pplx-decider: answers that depend on later questions, a noul's code order, a long request answered in parts, special tokens neutralized, refusals. Both: the GPU against cpu-ref | the same model run differently |
+| `tests/unit/model/decision_models.cpp` | decision models on tiny checkpoints the test writes (`decision_test_util.h`). Clef: a prompt fed in steps, a choice's options reordered, questions decided jointly, a request over the limit refused. pplx-decider: answers that depend on later questions, a noul's code order, a long request answered in parts, special tokens neutralized, refusals. Letter read-out (a tiny language model): each answer equal to its question asked alone, the state read once per request and not again by the next request about it, more options than letters, the calibration settings, refusals. All: the GPU against cpu-ref | the same model run differently |
 | `tests/unit/model/py_text.cpp` | Python's text for a JSON value: `json.dumps` (key order kept or sorted, both separators), `str()`, float `repr` | what Python wrote |
 | `tests/unit/decision/` | answers from probabilities: the API's confidence formulas, each question type | the API's documented example and formulas |
 | `tests/unit/server/test_systemone_http.cpp` | the System One API: the schema refused field by field (422 bodies), answers of each type, 400 / 500, concurrent clients | a fake decision function |
@@ -348,7 +352,8 @@ draft program, and one way of drafting. The engine needs nothing new.
    the program, its inputs, the outputs to bring back, and how much of the sequence's state to keep. Rows whose
    count varies per request (options, questions) are a program's `kT`; what has a per-request shape beyond that is
    host work between steps. Refuse what the model cannot take with `DecisionRefused` (the client sees the message).
-   `models/clef/` (a head of several programs) and `models/pplx_decider/` (one program) are the examples.
+   `models/clef/` (a head of several programs), `models/pplx_decider/` (one program) and `models/letter_readout/`
+   (a language model's own step graph, a prompt per question) are the examples.
 3. Write prompts exactly as the reference does (`models/common/py_text.h` for JSON the Python way), and give
    probabilities in `DecisionQuestion::options` order whatever order the prompt uses.
 4. Register it in `registry.cpp` (`model_kind`, `load_decision_model`, `supported_decision_models`).
@@ -396,6 +401,6 @@ draft program, and one way of drafting. The engine needs nothing new.
 - Decision models: text states only (`assets`, `images` and box questions are refused by name); no packs yet
   (`convert` takes language models, policies and drafters); a decision's latency is the prefill of its prompt.
   pplx-decider reads a prompt in one step (its attention looks ahead), which costs more per token past a few
-  thousand tokens.
+  thousand tokens. A language model read with `--readout` serves decisions only (no chat on the same server).
 - One sequence at a time; no batching.
 - Sliding-window layers keep every key in memory (the kernels read only the window; memory still grows with context).

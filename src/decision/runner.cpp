@@ -72,15 +72,21 @@ std::unique_ptr<DecisionRunner> DecisionRunner::create(const std::filesystem::pa
     return r;
 }
 
+DecisionLimits DecisionRunner::current_limits() const {
+    DecisionLimits limits = limits_;
+    limits.held_tokens = writers_.empty() ? 0 : session_->num_cached(writers_.front());
+    return limits;
+}
+
 std::vector<std::vector<int32_t>> DecisionRunner::tokens(const DecisionRequest& request) const {
-    return model_->start(request, *tools_, limits_)->sequences();
+    return model_->start(request, *tools_, current_limits())->sequences();
 }
 
 DecisionResult DecisionRunner::decide(const DecisionRequest& request) {
     XS_CHECK(!request.questions.empty(), "a decision request needs at least one question");
     DecisionResult result;
     Timer timer;
-    const std::unique_ptr<DecisionRun> run = model_->start(request, *tools_, limits_);
+    const std::unique_ptr<DecisionRun> run = model_->start(request, *tools_, current_limits());
     result.timing.prompt_ms = timer.elapsed_ms();
     TensorMap outputs;
     try {
@@ -114,9 +120,9 @@ DecisionResult DecisionRunner::decide(const DecisionRequest& request) {
                  "' has ", request.questions[q].options.size(), " options, the model scored ", probabilities[q].size());
         result.answers.push_back(make_answer(request.questions[q].type, probabilities[q]));
     }
-    for (const auto& sequence : run->sequences())
+    result.sequences = run->sequences();
+    for (const auto& sequence : result.sequences)
         result.input_tokens += static_cast<int64_t>(sequence.size());
-    result.sequences = static_cast<int>(run->sequences().size());
     result.timing.total_ms = timer.elapsed_ms();
     return result;
 }

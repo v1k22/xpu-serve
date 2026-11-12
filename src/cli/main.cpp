@@ -16,6 +16,7 @@
 #include "convert/convert.h"
 #include "decision/runner.h"
 #include "decision/service.h"
+#include "models/letter_readout/letter_readout.h"
 #include "models/policy.h"
 #include "policy/runner.h"
 #include "policy/service.h"
@@ -53,24 +54,40 @@ std::string default_backend() {
 }
 
 void add_engine_options(Args& a) {
-    a.value("backend", "backend: " + [] {
-        std::string s;
-        for (const auto& b : available_backends()) s += (s.empty() ? "" : " | ") + b;
-        return s;
-    }(), default_backend())
+    a.value(
+         "backend",
+         "backend: " +
+             [] {
+                 std::string s;
+                 for (const auto& b : available_backends())
+                     s += (s.empty() ? "" : " | ") + b;
+                 return s;
+             }(),
+         default_backend())
         .value("device", "device, e.g. GPU, GPU.1, CPU (default: the backend's choice)")
         .value("precision", "compute precision: f16 | f32", "f16")
-        .value("kv-dtype", "KV cache: auto (the precision's float) | i8 (int8 with a scale per token and head)",
-               "auto")
+        .value("kv-dtype", "KV cache: auto (the precision's float) | i8 (int8 with a scale per token and head)", "auto")
         .value("ctx", "context length in tokens (prompt + output)", "8192")
         .value("prefill-chunk", "tokens per prefill step", "1024")
         .value("backend-opt", "backend options as key=value[,key=value]")
-        .value("spec", "speculative decoding: off | mtp (the model's MTP head, or a Gemma 4 assistant with --drafter) | "
-                       "dflash | dspine (a block drafter checkpoint with --drafter)", "off")
+        .value("spec",
+               "speculative decoding: off | mtp (the model's MTP head, or a Gemma 4 assistant with --drafter) | "
+               "dflash | dspine (a block drafter checkpoint with --drafter)",
+               "off")
         .value("spec-k", "speculative decoding: drafts per round (default: 3, or 7 of a block drafter's block)")
-        .value("drafter", "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, a DFlash or DSpine drafter)")
-        .value("draft-shortlist", "speculative decoding: an MTP head picks among this many tokens, chosen by a one-bit "
-                                  "sketch of the output layer and re-scored exactly (0: it reads the whole layer)", "64")
+        .value("drafter",
+               "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, a DFlash or DSpine drafter)")
+        .value("draft-shortlist",
+               "speculative decoding: an MTP head picks among this many tokens, chosen by a one-bit "
+               "sketch of the output layer and re-scored exactly (0: it reads the whole layer)",
+               "64")
+        .value("readout",
+               "serve a language model as a decision model, its answers read at the option letters: letters | "
+               "openjev (OpenJev's published calibration)")
+        .value("readout-temperature", "--readout: the letter scores are divided by it (default: the preset's)")
+        .value("readout-noul-temperature",
+               "--readout: the slope of a yes / no answer's calibration (default: the preset's)")
+        .value("readout-noul-bias", "--readout: the bias of a yes / no answer's calibration (default: the preset's)")
         .value("log-level", "debug | info | warn | error", "info")
         .flag("no-vision", "do not load the model's vision encoder (text only)")
         .flag("help", "show this help");
@@ -120,6 +137,29 @@ ServiceOptions service_options(const Args& a) {
         pos = comma + 1;
     }
     return o;
+}
+
+// A model directory answers decisions: it holds a decision model, or --readout reads a language model as one.
+bool decides(const Args& a, const std::string& dir) {
+    return a.has("readout") || model_kind(dir) == ModelKind::Decision;
+}
+
+// The decision runtime for `dir`: its decision model, or with --readout its language model read at the option letters.
+std::unique_ptr<DecisionRunner> decision_runner(const Args& a, const std::string& dir, const DecisionRunnerOptions& o) {
+    if (!a.has("readout")) return DecisionRunner::create(dir, o);
+    if (model_kind(dir) != ModelKind::Language) fail("--readout reads a language model; '", dir, "' is not one");
+    std::optional<letter_readout::Settings> settings = letter_readout::preset(a.get("readout"));
+    if (!settings) {
+        std::string list;
+        for (const auto& n : letter_readout::preset_names())
+            list += (list.empty() ? "" : ", ") + n;
+        fail("--readout must be one of ", list, "; got '", a.get("readout"), "'");
+    }
+    if (a.has("readout-temperature")) settings->temperature = a.get_double("readout-temperature");
+    if (a.has("readout-noul-temperature")) settings->noul_temperature = a.get_double("readout-noul-temperature");
+    if (a.has("readout-noul-bias")) settings->noul_bias = a.get_double("readout-noul-bias");
+    return DecisionRunner::create(dir, o,
+                                  letter_readout::make(load_model(dir, LoadOptions{.vision = false}), *settings));
 }
 
 DecisionRunnerOptions decision_options(const ServiceOptions& so) {
@@ -251,8 +291,8 @@ int cmd_serve(const std::vector<std::string>& argv) {
         srv.run();
         return 0;
     }
-    if (model_kind(dir) == ModelKind::Decision) {  // the System One API
-        auto decisions = DecisionService::create(DecisionRunner::create(dir, decision_options(so)));
+    if (decides(a, dir)) {  // the System One API
+        auto decisions = DecisionService::create(decision_runner(a, dir, decision_options(so)));
         server::Server srv(*decisions, opts);
         log::info("serving decision model ", decisions->spec().id, " on http://", opts.host, ":", opts.port);
         srv.run();
@@ -357,13 +397,13 @@ DecisionRequest read_decision_request(const std::string& path) {
 int run_decision(const Args& a, const std::string& dir) {
     XS_CHECK(a.has("request"), "a decision model answers a request: --request <file with {\"state\", \"questions\"}>");
     const DecisionRequest request = read_decision_request(a.get("request"));
-    auto runner = DecisionRunner::create(dir, decision_options(service_options(a)));
+    auto runner = decision_runner(a, dir, decision_options(service_options(a)));
     const DecisionResult r = runner->decide(request);
     std::printf("%s\n", server::systemone_response(request, r, runner->spec().id).dump(2).c_str());
     std::fflush(stdout);
     std::fprintf(stderr, "[%lld tokens in %d sequence(s), %d steps: %.1f ms (prompt %.1f, device %.1f)]\n",
-                 static_cast<long long>(r.input_tokens), r.sequences, r.steps, r.timing.total_ms, r.timing.prompt_ms,
-                 r.timing.device_ms);
+                 static_cast<long long>(r.input_tokens), static_cast<int>(r.sequences.size()), r.steps,
+                 r.timing.total_ms, r.timing.prompt_ms, r.timing.device_ms);
     return 0;
 }
 
@@ -386,7 +426,7 @@ int cmd_run(const std::vector<std::string>& argv) {
     a.parse(argv);
     if (wants_help(a, "run", "<model-dir> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
-    if (model_kind(model_dir_arg(a, "run")) == ModelKind::Decision) return run_decision(a, model_dir_arg(a, "run"));
+    if (decides(a, model_dir_arg(a, "run"))) return run_decision(a, model_dir_arg(a, "run"));
     auto service = EngineService::create(model_dir_arg(a, "run"), service_options(a));
     const SamplingParams sampling = sampling_from(a, service->model().default_sampling);
     const int max_tokens = a.get_int("max-tokens");
@@ -494,38 +534,45 @@ int bench_policy(const Args& a, const std::string& dir) {
 // the runtime's sample; --state-tokens swaps its state for filler text of that many tokens.
 int bench_decision(const Args& a, const std::string& dir) {
     const ServiceOptions so = service_options(a);
-    auto runner = DecisionRunner::create(dir, decision_options(so));
+    auto runner = decision_runner(a, dir, decision_options(so));
     DecisionRequest request = a.has("request") ? read_decision_request(a.get("request")) : sample_decision_request();
+    // A text state gets a line of its own in front, different every run, so that each run reads a state the session
+    // has not read; --state-tokens sizes the prompt with that line in place.
+    const bool text = request.state.is_string() || a.get_int("state-tokens") > 0;
+    std::string state = request.state.is_string() ? request.state.get<std::string>() : "";
+    const auto with_run = [&](int run) { request.state = str_cat("Run ", run, ".\n", state); };
     if (const int want = a.get_int("state-tokens"); want > 0) {
-        const auto tokens = [&] { return static_cast<int>(runner->tokens(request).front().size()); };
-        std::string state;
+        const auto tokens = [&] {
+            with_run(0);
+            return static_cast<int>(runner->tokens(request).front().size());
+        };
+        state.clear();
         int line = 0;
         const auto grow = [&](int lines) {
             for (int i = 0; i < lines; ++i) {
-                state +=
-                    str_cat("Entry ", ++line,
-                            ": the order shipped on time, the invoice matched and the customer confirmed receipt.\n");
+                state += str_cat("Entry ", ++line,
+                                 ": the order shipped on time, the invoice matched and the customer confirmed receipt.\n");
             }
-            request.state = state;
         };
-        grow(0);
-        for (int have = tokens(); have < want; have = tokens())
-            grow(1 + (want - have) / 24);  // a line is about 20 tokens
+        for (int have = tokens(); have < want; have = tokens()) grow(1 + (want - have) / 24);  // a line: about 20 tokens
         for (int have = tokens(); have > want && state.size() > 8; have = tokens()) {
             state.resize(state.size() - std::max<size_t>(1, static_cast<size_t>(have - want) * 3));
-            request.state = state;
         }
     }
-    std::vector<double> total, device, prompt;
+    // Each run asks twice: about a state the session has not read, then about that state again, which a model that
+    // keeps a state's prefix answers from there.
+    std::vector<double> fresh, again, device;
     DecisionResult last;
     for (int run = 0; run < a.get_int("runs"); ++run) {
+        if (text) with_run(run);
         last = runner->decide(request);
-        total.push_back(last.timing.total_ms);
+        fresh.push_back(last.timing.total_ms);
         device.push_back(last.timing.device_ms);
-        prompt.push_back(last.timing.prompt_ms);
+        const DecisionResult repeat = runner->decide(request);
+        again.push_back(repeat.timing.total_ms);
         if (a.has("verbose")) {
-            std::printf("run %d: %.2f ms (prompt %.2f, device %.2f)\n", run, last.timing.total_ms,
-                        last.timing.prompt_ms, last.timing.device_ms);
+            std::printf("run %d: %.2f ms (prompt %.2f, device %.2f), the same state again %.2f ms\n", run,
+                        last.timing.total_ms, last.timing.prompt_ms, last.timing.device_ms, repeat.timing.total_ms);
         }
     }
     size_t options = 0;
@@ -533,12 +580,14 @@ int bench_decision(const Args& a, const std::string& dir) {
         options += q.options.size();
     std::printf("%s: %zu question(s) with %zu options, %lld tokens in %d sequence(s), %d steps, %s %s %s\n",
                 runner->spec().id.c_str(), request.questions.size(), options, static_cast<long long>(last.input_tokens),
-                last.sequences, last.steps, so.backend.c_str(),
+                static_cast<int>(last.sequences.size()), last.steps, so.backend.c_str(),
                 so.session.device.empty() ? "default" : so.session.device.c_str(),
                 std::string(dtype_name(so.session.precision)).c_str());
-    std::printf("latency over %zu runs: p50 %.2f ms, p90 %.2f, min %.2f, max %.2f | device p50 %.2f, prompt p50 %.2f\n",
-                total.size(), percentile(total, 0.5), percentile(total, 0.9), percentile(total, 0.0),
-                percentile(total, 1.0), percentile(device, 0.5), percentile(prompt, 0.5));
+    std::printf(
+        "latency over %zu runs: p50 %.2f ms, p90 %.2f, min %.2f, max %.2f (device p50 %.2f) | the same state "
+        "again: p50 %.2f ms\n",
+        fresh.size(), percentile(fresh, 0.5), percentile(fresh, 0.9), percentile(fresh, 0.0), percentile(fresh, 1.0),
+        percentile(device, 0.5), percentile(again, 0.5));
     return 0;
 }
 
@@ -615,7 +664,7 @@ int cmd_bench(const std::vector<std::string>& argv) {
     log::set_level(log::parse_level(a.get("log-level")));
     const std::string dir = model_dir_arg(a, "bench");
     if (model_kind(dir) == ModelKind::Policy) return bench_policy(a, dir);
-    if (model_kind(dir) == ModelKind::Decision) return bench_decision(a, dir);
+    if (decides(a, dir)) return bench_decision(a, dir);
     auto service = EngineService::create(dir, service_options(a));
     const int n_gen = a.get_int("gen-tokens");
     if (!a.get("prompts").empty()) return bench_prompts(*service, a.get("prompts"), n_gen, a.get_int("runs"));
