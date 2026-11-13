@@ -1,5 +1,6 @@
 // A decision model against the checkpoint's own Python code (tests/parity/decision/reference.py): each request is
-// read as the same tokens and every option gets the same probability. Opt-in:
+// read as the same tokens and every option gets the same probability, and a request the reference refuses is refused.
+// Opt-in:
 //
 //   XS_TEST_DECISION_DIR   the checkpoint (a released one, or tests/parity/decision/make_tiny.py's)
 //   XS_DECISION_FIXTURES   reference.py's output for it
@@ -55,9 +56,15 @@ TEST_CASE("decision model matches its reference code" * doctest::skip(!enabled()
     const auto runner = xs::DecisionRunner::create(dir, options, std::move(model));
 
     double worst = 0;
-    int questions = 0, top_differs = 0;
+    int questions = 0, top_differs = 0, refused = 0;
     for (const auto& c : fixtures["cases"]) {
         const xs::DecisionRequest request = xs::server::parse_systemone_request(c["request"]);
+        if (c.contains("refused")) {
+            CAPTURE(c["refused"].get<std::string>());
+            CHECK_THROWS_AS(runner->decide(request), xs::DecisionRefused);
+            ++refused;
+            continue;
+        }
         const xs::DecisionResult result = runner->decide(request);
         // The same sequences, in whatever order each side read them (a model that reads one prompt per question).
         auto expected_ids = c["input_ids"].get<std::vector<std::vector<int32_t>>>();
@@ -95,6 +102,7 @@ TEST_CASE("decision model matches its reference code" * doctest::skip(!enabled()
             ++questions;
         }
     }
-    MESSAGE(fixtures["kind"].get<std::string>(), ": ", fixtures["cases"].size(), " requests, ", questions,
-            " questions, max |probability difference| ", worst, ", top option differs on ", top_differs);
+    MESSAGE(fixtures["kind"].get<std::string>(), ": ", fixtures["cases"].size(), " requests (", refused,
+            " refused), ", questions, " questions, max |probability difference| ", worst, ", top option differs on ",
+            top_differs);
 }

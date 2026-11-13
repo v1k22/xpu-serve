@@ -183,4 +183,115 @@ inline void write_tiny_pplx(const fs::path& dir, uint32_t seed, int codes = 30) 
     write_random(dir / "readout.safetensors", {{"weight", {codes, qwen.hidden}, -range, range}}, seed + 1);
 }
 
+// A tiny Laya or Julia-1 as the released checkpoints lay them out: a ModernBERT encoder of four layers (global, two
+// local ones that see 4 tokens on either side, global) in encoder/, the decision head beside it in one
+// model.safetensors (torch's names), the configuration files each reads. A byte is a token (ByteTools): bytes 1, 2 and
+// 3 are the [CLS], [SEP] and mask tokens tokenizer/tokenizer_config.json names.
+struct TinyLaya {
+    bool julia = false;
+    int64_t max_tokens = 256;  // Laya's max_len, Julia's max_length
+    int64_t head_tokens = 96;  // head_max_len, head_length
+    bool strict = true;        // Julia's strict_encoding
+    std::vector<double> temperature{1.0, 1.0, 1.0};
+    nlohmann::json temperature_by_options = nlohmann::json::object();
+    bool root_config = true;  // Laya's root config.json (its variants' folders have none)
+};
+
+inline void write_tiny_laya(const fs::path& dir, const TinyLaya& m, uint32_t seed) {
+    const int64_t hidden = 128, inter = 48, layers = 4, vocab = 256;
+    fs::create_directories(dir / "encoder");
+    fs::create_directories(dir / "tokenizer");
+    const nlohmann::json kinds = {"full_attention", "sliding_attention", "sliding_attention", "full_attention"};
+    const nlohmann::json rope = {{"full_attention", {{"rope_theta", 160000.0}, {"rope_type", "default"}}},
+                                 {"sliding_attention", {{"rope_theta", 10000.0}, {"rope_type", "default"}}}};
+    std::ofstream(dir / "encoder" / "config.json") << nlohmann::json{{"model_type", "modernbert"},
+                                                                     {"hidden_size", hidden},
+                                                                     {"intermediate_size", inter},
+                                                                     {"num_hidden_layers", layers},
+                                                                     {"num_attention_heads", 4},
+                                                                     {"vocab_size", vocab},
+                                                                     {"max_position_embeddings", 512},
+                                                                     {"hidden_activation", "gelu"},
+                                                                     {"norm_eps", 1e-5},
+                                                                     {"norm_bias", false},
+                                                                     {"local_attention", 8},
+                                                                     {"layer_types", kinds},
+                                                                     {"rope_parameters", rope}}
+                                                          .dump(1);
+    std::ofstream(dir / "tokenizer" / "tokenizer_config.json")
+        << nlohmann::json{{"cls_token", "\u0001"}, {"sep_token", "\u0002"}, {"mask_token", "\u0003"}}.dump(1);
+    if (m.julia) {
+        std::ofstream(dir / "config.json") << nlohmann::json{{"format_version", 1},
+                                                             {"architecture", "JuliaDecisionModel"},
+                                                             {"julia_config_file", "julia_config.json"},
+                                                             {"encoder_config_file", "encoder/config.json"},
+                                                             {"weights_file", "model.safetensors"},
+                                                             {"tokenizer_directory", "tokenizer"}}
+                                                  .dump(1);
+        std::ofstream(dir / "julia_config.json") << nlohmann::json{{"format_version", 1},
+                                                                   {"architecture", "JuliaDecisionModel"},
+                                                                   {"weight_dtype", "float32"},
+                                                                   {"head_layers", 2},
+                                                                   {"n_act", 2},
+                                                                   {"dropout", 0.1}}
+                                                        .dump(1);
+        std::ofstream(dir / "inference-policy.json") << nlohmann::json{{"max_length", m.max_tokens},
+                                                                       {"head_length", m.head_tokens},
+                                                                       {"strict_encoding", m.strict},
+                                                                       {"calibration", nullptr}}
+                                                            .dump(1);
+    } else {
+        if (m.root_config) std::ofstream(dir / "config.json") << nlohmann::json{{"model_type", "laya"}}.dump(1);
+        std::ofstream(dir / "rl_agent_config.json")
+            << nlohmann::json{{"head_layers", 2},
+                              {"max_len", m.max_tokens},
+                              {"head_max_len", m.head_tokens},
+                              {"act_costs", {{"escalate", 0.5}}},
+                              {"temperature", m.temperature},
+                              {"temperature_by_options", m.temperature_by_options}}
+                   .dump(1);
+    }
+    std::vector<TinyTensor> specs;
+    const auto matrix = [&](const std::string& name, int64_t out, int64_t in, float scale) {
+        const float range = scale / std::sqrt(static_cast<float>(in));
+        specs.push_back({name, {out, in}, -range, range});
+    };
+    const auto norm = [&](const std::string& stem, bool bias) {
+        specs.push_back({stem + ".weight", {hidden}, 0.7f, 1.3f});
+        if (bias) specs.push_back({stem + ".bias", {hidden}, -0.2f, 0.2f});
+    };
+    const auto linear = [&](const std::string& stem, int64_t out, int64_t in) {
+        matrix(stem + ".weight", out, in, 1.0f);
+        specs.push_back({stem + ".bias", {out}, -0.2f, 0.2f});
+    };
+    specs.push_back({"encoder.embeddings.tok_embeddings.weight", {vocab, hidden}, -1.0f, 1.0f});
+    norm("encoder.embeddings.norm", false);
+    for (int64_t i = 0; i < layers; ++i) {
+        const std::string L = "encoder.layers." + std::to_string(i) + ".";
+        if (i > 0) norm(L + "attn_norm", false);
+        matrix(L + "attn.Wqkv.weight", 3 * hidden, hidden, 3.0f);  // scores that pick out a few keys
+        matrix(L + "attn.Wo.weight", hidden, hidden, 1.0f);
+        norm(L + "mlp_norm", false);
+        matrix(L + "mlp.Wi.weight", 2 * inter, hidden, 1.0f);
+        matrix(L + "mlp.Wo.weight", hidden, inter, 1.0f);
+    }
+    norm("encoder.final_norm", false);
+    for (int i = 0; i < 2; ++i) {
+        const std::string L = "head.layers." + std::to_string(i) + ".";
+        norm(L + "norm1", true);
+        matrix(L + "self_attn.in_proj_weight", 3 * hidden, hidden, 3.0f);
+        specs.push_back({L + "self_attn.in_proj_bias", {3 * hidden}, -0.2f, 0.2f});
+        linear(L + "self_attn.out_proj", hidden, hidden);
+        norm(L + "norm2", true);
+        linear(L + "linear1", 4 * hidden, hidden);
+        linear(L + "linear2", hidden, 4 * hidden);
+    }
+    specs.push_back({"type_emb.weight", {3, hidden}, -1.0f, 1.0f});
+    norm("scorer.0", true);
+    linear("scorer.1", hidden, hidden);
+    specs.push_back({"scorer.3.weight", {1, hidden}, -1.0f, 1.0f});
+    specs.push_back({"scorer.3.bias", {1}, -0.2f, 0.2f});
+    write_random(dir / "model.safetensors", specs, seed);
+}
+
 }  // namespace xs::test

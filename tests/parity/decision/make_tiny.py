@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """A tiny random decision model in the layout of a released one, for parity tests (test-only).
 
-    python -I tests/parity/decision/make_tiny.py --from <a clef-flash, pplx-decider or openjev checkpoint> --out <dir>
+    python -I tests/parity/decision/make_tiny.py --from <a clef-flash, pplx-decider, openjev, laya or julia-1
+        checkpoint> --out <dir>
 
 The decoder is a Qwen3.5 of four layers (three Gated DeltaNet, one full attention) with a small vision tower, as the
 released checkpoints carry one; the head has the released head's structure at a small width (Clef's joint schema
-head; pplx-decider's read-out of 255 answer codes; none for OpenJev, a language model with its helper). The tokenizer, the processor and chat template files and the
-checkpoint's own Python code are copied from `--from`, so the vocabulary is the real one and reference.py runs the
-tiny model with the code the real one runs with. Random weights give near-uniform answers, which would hide a wrong
-option order or span: the head's output scales are raised so that answers spread.
+head; pplx-decider's read-out of 255 answer codes; none for OpenJev, a language model with its helper). Laya (its
+root or a variant's folder) and Julia-1 get a ModernBERT encoder of four layers, a global one each side of two local
+ones with a window of 16, and their decision head, as their own code builds it. The tokenizer, the processor and chat
+template files and the checkpoint's own Python code are copied from `--from`, so the vocabulary is the real one and
+reference.py runs the tiny model with the code the real one runs with. Random weights give near-uniform answers,
+which would hide a wrong option order or span: the head's output scales are raised so that answers spread.
 """
 
 import argparse
@@ -22,7 +25,9 @@ from safetensors.torch import save_file
 
 COPIED = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "processor_config.json", "vocab.json",
           "merges.txt", "preprocessor_config.json", "video_preprocessor_config.json", "joint_schema_model.py",
-          "joint_config.json", "decision_config.json", "source", "helper", "generation_config.json"]
+          "joint_config.json", "decision_config.json", "source", "helper", "generation_config.json",
+          "rl_agent_config.json", "rl_common.py", "rl_agent_api.py", "inference-policy.json", "julia", "pyproject.toml",
+          "tokenizer"]
 
 
 def decoder_config(vocab_size, hidden):
@@ -114,6 +119,68 @@ def letters(source, out, vocab_size):
     return sum(p.numel() for p in model.parameters())
 
 
+def modern_bert_config(source):
+    """The released encoder's config.json at a small size; local layers see 8 tokens on either side."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(os.path.join(source, "encoder"))
+    config.hidden_size, config.intermediate_size, config.num_hidden_layers = 128, 96, 4
+    config.num_attention_heads, config.local_attention = 4, 16
+    config.layer_types = ["full_attention", "sliding_attention", "sliding_attention", "full_attention"]
+    config.initializer_range = 0.2
+    return config
+
+
+def spread(model):
+    """Biases and norms off their defaults (a dropped one would not show), the scores apart."""
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("bias"):
+                p.normal_(0.0, 0.1)
+            elif "norm" in name and name.endswith("weight") or name == "scorer.0.weight":
+                p.normal_(1.0, 0.2)
+        model.scorer[3].weight.mul_(8.0)
+
+
+def laya(source, out, vocab_size):
+    """rl_common.DecisionModel on a tiny ModernBERT, as convaiinnovations/laya stores it (f16, the temperature buffer
+    f32), with the root's config.json and the code beside it (a variant's folder has the code one level up)."""
+    from transformers import AutoModel
+
+    code = source if os.path.exists(os.path.join(source, "rl_common.py")) else os.path.dirname(source)
+    sys.path.insert(0, os.path.abspath(code))
+    import rl_common
+
+    with open(os.path.join(source, "rl_agent_config.json")) as f:
+        cfg = json.load(f)
+    encoder = AutoModel.from_config(modern_bert_config(source), attn_implementation="sdpa")
+    model = rl_common.DecisionModel(encoder, cfg["head_layers"], len(cfg["act_costs"]) + 1)
+    spread(model)
+    state = {k: v if k == "temperature" else v.half() for k, v in model.state_dict().items()}
+    save_file({k: v.contiguous() for k, v in state.items()}, os.path.join(out, "model.safetensors"),
+              metadata={"format": "pt"})
+    encoder.config.save_pretrained(os.path.join(out, "encoder"))
+    for f in ("rl_common.py", "rl_agent_api.py", "config.json"):
+        if os.path.exists(os.path.join(code, f)):
+            shutil.copy(os.path.join(code, f), os.path.join(out, f))
+    return sum(p.numel() for p in model.parameters())
+
+
+def julia(source, out, vocab_size):
+    """julia.model.JuliaDecisionModel on a tiny ModernBERT, saved by its own save_pretrained (f32)."""
+    from transformers import AutoModel
+
+    sys.path.insert(0, os.path.abspath(source))
+    from julia.model import JuliaDecisionModel
+
+    encoder = AutoModel.from_config(modern_bert_config(source), attn_implementation="sdpa")
+    model = JuliaDecisionModel(encoder, head_layers=2)
+    spread(model)
+    model.save_pretrained(out)
+    shutil.copy(os.path.join(source, "config.json"), os.path.join(out, "config.json"))
+    return sum(p.numel() for p in model.parameters())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="source", required=True, help="a released checkpoint of the kind to imitate")
@@ -123,7 +190,8 @@ def main():
     torch.manual_seed(args.seed)
     from transformers import AutoTokenizer
 
-    vocab_size = len(AutoTokenizer.from_pretrained(args.source))
+    tokenizer = os.path.join(args.source, "tokenizer")  # Laya and Julia-1 keep it in a folder
+    vocab_size = len(AutoTokenizer.from_pretrained(tokenizer if os.path.isdir(tokenizer) else args.source))
     os.makedirs(args.out, exist_ok=True)
     if os.path.exists(os.path.join(args.source, "joint_head_config.json")):
         kind, count = "clef", clef(args.source, args.out, vocab_size)
@@ -131,8 +199,12 @@ def main():
         kind, count = "pplx_decider", pplx(args.source, args.out, vocab_size)
     elif os.path.exists(os.path.join(args.source, "helper", "shim.py")):
         kind, count = "letter_readout", letters(args.source, args.out, vocab_size)
+    elif os.path.exists(os.path.join(args.source, "rl_agent_config.json")):
+        kind, count = "laya", laya(args.source, args.out, vocab_size)
+    elif os.path.exists(os.path.join(args.source, "julia_config.json")):
+        kind, count = "julia", julia(args.source, args.out, vocab_size)
     else:
-        ap.error(f"{args.source} is not a checkpoint this script imitates (clef, pplx-decider, openjev)")
+        ap.error(f"{args.source} is not a checkpoint this script imitates (clef, pplx-decider, openjev, laya, julia-1)")
     for f in COPIED:
         src = os.path.join(args.source, f)
         if os.path.isdir(src):

@@ -14,6 +14,15 @@ read-out logits over the saved temperature through a softmax.
 OpenJev (helper/shim.py): the helper's own code with the settings of its serving guide. Only its client is replaced:
 the one call it makes to a server (the log-probabilities of the option letters at the first output position) is
 answered by the model in transformers, and the answers are left unrounded.
+Laya (rl_agent_config.json): rl_agent_api.py's RLAgent.system_one, its probabilities left unrounded; a question
+without instructions is passed with null ones (the request schema does not tell them apart; the reference writes
+null as "null").
+Julia-1 (julia_config.json): julia's load_model and predict_typed with inference-policy.json's limits and encoding.
+The encoder's inference-only forward (julia/router/encoder.py) is written against transformers 5.0's ModernBERT
+internals: with a later transformers it is taken off, and ModernBERT's own forward computes the same.
+
+A request the reference refuses is a case with "refused" (its message) instead of tokens and probabilities; the
+engine must refuse it too.
 """
 
 import argparse
@@ -115,6 +124,76 @@ def letters(model_dir, requests):
     return cases
 
 
+def laya(model_dir, requests):
+    sys.path.insert(0, model_dir)
+    import rl_agent_api
+
+    agent = rl_agent_api.RLAgent(model_dir, device="cpu")
+    rl_agent_api.round = lambda value, digits=None: value  # system_one rounds to 4 digits
+    sequences = []
+
+    def build(*args, **kwargs):
+        ids, markers = build_sequence(*args, **kwargs)
+        sequences.append(list(ids))
+        return ids, markers
+
+    build_sequence = rl_agent_api.build_sequence
+    rl_agent_api.build_sequence = build
+    cases = []
+    for request in requests:
+        sequences.clear()
+        questions = {name: dict(q, instructions=q.get("instructions")) for name, q in request["questions"].items()}
+        try:
+            answers = agent.system_one(request["state"], questions)["answers"]
+        except (ValueError, TypeError) as e:
+            cases.append({"request": request, "refused": str(e)})
+            continue
+        probabilities = {}
+        for name, a in answers.items():
+            if a["type"] == "noul":
+                probabilities[name] = {"true": a["noul"], "false": 1 - a["noul"]}
+            else:
+                probabilities[name] = a["probabilities"]
+        cases.append({"request": request, "input_ids": list(sequences), "probabilities": probabilities})
+    return cases
+
+
+def julia(model_dir, requests):
+    sys.path.insert(0, model_dir)
+    import julia.router.engine as engine_module
+    from julia import load_model
+
+    with open(os.path.join(model_dir, "inference-policy.json")) as f:
+        policy = json.load(f)
+    engine = load_model(model_dir, device="cpu", max_length=policy["max_length"], head_length=policy["head_length"],
+                        strict_encoding=policy["strict_encoding"])
+    torch.set_float32_matmul_precision("highest")  # its configure() allows reduced-precision float32 matmuls
+    encoder = engine.model.encoder
+    if not hasattr(type(encoder), "_update_attention_mask") and "forward" in vars(encoder):
+        del encoder.forward  # the specialized forward needs transformers 5.0 (see above)
+    sequences = []
+
+    def sequence(*args, **kwargs):
+        encoded = encode(*args, **kwargs)
+        sequences.append(list(encoded["ids"]))
+        return encoded
+
+    encode = engine_module.sequence
+    engine_module.sequence = sequence
+    cases = []
+    for request in requests:
+        sequences.clear()
+        engine.clear_cache()
+        try:
+            answers = engine.predict(state=request["state"], questions=request["questions"])["answers"]
+        except ValueError as e:
+            cases.append({"request": request, "refused": str(e)})
+            continue
+        probabilities = {name: a["probabilities"] for name, a in answers.items()}
+        cases.append({"request": request, "input_ids": list(sequences), "probabilities": probabilities})
+    return cases
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
@@ -133,6 +212,10 @@ def main():
         kind, cases = "pplx_decider", pplx(model_dir, requests)
     elif os.path.exists(os.path.join(model_dir, "helper", "shim.py")):
         kind, cases = "letter_readout", letters(model_dir, requests)
+    elif os.path.exists(os.path.join(model_dir, "rl_agent_config.json")):
+        kind, cases = "laya", laya(model_dir, requests)
+    elif os.path.exists(os.path.join(model_dir, "julia_config.json")):
+        kind, cases = "julia", julia(model_dir, requests)
     else:
         ap.error(f"{model_dir} holds no decision model this script knows")
     fixtures = {"kind": kind, "cases": cases}
@@ -140,8 +223,9 @@ def main():
         fixtures["preset"] = "openjev"  # the settings the helper ran with
     with open(args.out, "w") as f:
         json.dump(fixtures, f, ensure_ascii=False)
-    tokens = sum(len(ids) for c in cases for ids in c["input_ids"])
-    print(f"{kind}: {len(cases)} requests, {tokens} tokens -> {args.out}")
+    tokens = sum(len(ids) for c in cases for ids in c.get("input_ids", []))
+    refused = sum("refused" in c for c in cases)
+    print(f"{kind}: {len(cases)} requests ({refused} refused), {tokens} tokens -> {args.out}")
 
 
 if __name__ == "__main__":

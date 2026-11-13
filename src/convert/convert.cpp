@@ -308,6 +308,10 @@ ConvertReport convert_model(const ConvertOptions& o) {
         policy_model = load_policy(o.source);
     } else if (decision) {
         decision_model = load_decision_model(o.source);
+        if (!decision_model->spec().tokenizer_dir.empty()) {
+            fail("convert: '", o.source.string(), "' (", decision_model->spec().arch, ") keeps its tokenizer and ",
+                 "configuration in folders of its own, which a pack does not carry yet");
+        }
     } else if (drafter) {
         model = load_model(o.target, LoadOptions{.vision = false, .speculation = true, .drafter = o.source});
         const Speculation* spec = model->speculation();
