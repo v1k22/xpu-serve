@@ -413,7 +413,7 @@ Every layer is tested against a reference:
 
 | What | Reference | Where |
 |---|---|---|
-| Tokenizer (Gemma BPE, byte-level BPE with NFC, LFM3's, BERT WordPiece) | Hugging Face `tokenizers`, exact ids and text | `tests/unit/tokenizer/` |
+| Tokenizer (Gemma BPE, byte-level BPE with NFC, LFM3's, BERT WordPiece, ModernBERT's and mmBERT's) | Hugging Face `tokenizers`, exact ids and text | `tests/unit/tokenizer/` |
 | Chat template | `apply_chat_template`, byte-exact | `tests/unit/chat/` |
 | Image resize | torchvision's antialiased bicubic, bit-exact | `tests/unit/image/` |
 | Every graph op, on cpu-ref and on the GPU | fp64 references, with planted-bug controls | `tests/unit/backend/` |

@@ -6,7 +6,6 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -26,6 +25,7 @@
 
 namespace {
 using Ids = std::vector<int32_t>;
+using xs::test::fnv1a64;
 using xs::test::ScratchModelDir;
 using xs::test::stream_decode;
 
@@ -126,9 +126,7 @@ nlohmann::json bert_normalizer(bool clean_text, bool chinese, nlohmann::json str
 
 std::vector<std::string> pre_tokenize(std::string_view text) {
     const auto pre_tokenizer = xs::tok::make_pre_tokenizer({{"type", "BertPreTokenizer"}});
-    std::vector<std::string> pieces;
-    for (const std::string_view piece : pre_tokenizer->split({text})) pieces.emplace_back(piece);
-    return pieces;
+    return pre_tokenizer->split({std::string(text)});
 }
 
 std::string decode_tokens(const nlohmann::json& config, std::vector<std::string> tokens) {
@@ -136,14 +134,6 @@ std::string decode_tokens(const nlohmann::json& config, std::vector<std::string>
     std::string text;
     for (const auto& token : tokens) text += token;
     return text;
-}
-
-std::string fnv1a64(std::string_view text) {
-    uint64_t h = 0xCBF29CE484222325ull;
-    for (const char b : text) h = (h ^ static_cast<uint8_t>(b)) * 0x100000001B3ull;
-    char hex[17];
-    std::snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(h));
-    return hex;
 }
 
 // The code points of one block (surrogates left out), each followed by `after` except the last when `between`.
@@ -342,32 +332,9 @@ TEST_SUITE("tokenizer_parity") {
             CAPTURE(name);
             REQUIRE_MESSAGE(models.contains(name), "XS_WORDPIECE_DIRS: no WordPiece cases for a directory named '"
                                                        << name << "'");
-            const nlohmann::json* f = &models[name];
-            if (f->contains("same_as")) f = &models[(*f)["same_as"].get<std::string>()];
-            const auto tok = xs::tok::Tokenizer::load(dir);
-            CHECK(tok->vocab_size() == (*f)["vocab_size"].get<int32_t>());
-            CHECK_FALSE(tok->bos_id().has_value());
-            CHECK_FALSE(tok->eos_id().has_value());
-            for (const int32_t id : (*f)["special_ids"].get<Ids>()) CHECK(tok->is_special(id));
-            REQUIRE((*f)["encode_cases"].size() >= 480);
-            for (const auto& c : (*f)["encode_cases"]) {
-                CAPTURE(c["name"].get<std::string>());
-                const Ids ids = tok->encode(c["text"].get<std::string>(), c["parse_special"].get<bool>());
-                CHECK(ids == c["ids"].get<Ids>());
-                const Ids expected = c["ids_with_special"].get<Ids>();
-                CHECK(tok->with_special_tokens(ids) == expected);
-                CHECK(tok->decode(expected) == c["decoded"].get<std::string>());
-                CHECK(tok->decode(expected, true) == c["decoded_skip_special"].get<std::string>());
-                CHECK(stream_decode(*tok, expected, false) == c["decoded"].get<std::string>());
-                CHECK(stream_decode(*tok, expected, true) == c["decoded_skip_special"].get<std::string>());
-            }
-            for (const auto& c : (*f)["decode_cases"]) {
-                CAPTURE(c["name"].get<std::string>());
-                const Ids ids = c["ids"].get<Ids>();
-                CHECK(tok->decode(ids) == c["decoded"].get<std::string>());
-                CHECK(tok->decode(ids, true) == c["decoded_skip_special"].get<std::string>());
-                CHECK(stream_decode(*tok, ids, false) == c["decoded"].get<std::string>());
-            }
+            const nlohmann::json& f = xs::test::cases_of(models, name);
+            REQUIRE(f["encode_cases"].size() >= 480);
+            xs::test::check_special_token_cases(*xs::tok::Tokenizer::load(dir), f);
         }
     }
 }

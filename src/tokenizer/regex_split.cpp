@@ -41,8 +41,9 @@ uint8_t flags_of(char32_t c) {
 
 // The building blocks of the supported patterns.
 enum class AltKind {
-    kContractions,        // (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    kContractions,        // (?i:'s|'t|'re|'ve|'m|'ll|'d), or without (?i)
     kLetters,             // [^\r\n\p{L}\p{N}]?<letters>+
+    kSpaceThenRun,        //  ?<class>+, the class the flags in `letters` (or, with `negated`, its complement)
     kNumbers,             // \p{N}{1,max}
     kPunctuation,         //  ?[^\s\p{L}\p{N}<\p{M} with marks>]+[\r\n]*
     kSpacesThenNewlines,  // \s*[\r\n]+
@@ -52,8 +53,10 @@ enum class AltKind {
 
 struct Alternative {
     AltKind kind;
-    uint8_t letters = kLetter;  // kLetters: the body class; kPunctuation: also excluded
+    uint8_t letters = kLetter;  // kLetters: the body class; kPunctuation: also excluded; kSpaceThenRun: the class
     size_t max_count = SIZE_MAX;  // kNumbers
+    bool negated = false;         // kSpaceThenRun
+    bool ignore_case = true;      // kContractions
 };
 
 // Simple case folding restricted to the contraction letters: ASCII, and U+017F LONG S which folds to 's'.
@@ -106,10 +109,10 @@ private:
         switch (alt.kind) {
             case AltKind::kContractions: {
                 if (s[i].c != '\'' || i + 1 >= n) return i;
-                const char32_t a = fold(s[i + 1].c);
+                const char32_t a = alt.ignore_case ? fold(s[i + 1].c) : s[i + 1].c;
                 if (a == 's' || a == 't' || a == 'm' || a == 'd') return i + 2;
                 if (i + 2 >= n) return i;
-                const char32_t b = fold(s[i + 2].c);
+                const char32_t b = alt.ignore_case ? fold(s[i + 2].c) : s[i + 2].c;
                 if ((a == 'r' || a == 'v') && b == 'e') return i + 3;
                 if (a == 'l' && b == 'l') return i + 3;
                 return i;
@@ -119,6 +122,11 @@ private:
                 auto prefix = [](uint8_t f) { return (f & (kNewline | kLetter | kNumber)) == 0; };
                 if (i + 1 < n && prefix(s[i].flags) && body(s[i + 1].flags)) return run(i + 1, body);
                 return body(s[i].flags) ? run(i, body) : i;
+            }
+            case AltKind::kSpaceThenRun: {
+                auto in_class = [&](uint8_t f) { return ((f & alt.letters) != 0) != alt.negated; };
+                if (s[i].c == ' ' && i + 1 < n && in_class(s[i + 1].flags)) return run(i + 1, in_class);
+                return in_class(s[i].flags) ? run(i, in_class) : i;
             }
             case AltKind::kNumbers: {
                 size_t j = i;
@@ -181,7 +189,19 @@ std::unique_ptr<RegexSplitter> RegexSplitter::for_pattern(std::string_view patte
     if (pattern == kQwen35) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter | kMark, 1));
     if (pattern == kQwen2) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter, 1));
     if (pattern == kLlama3) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter, 3));
+    if (pattern == R"('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)") return gpt2();
     return nullptr;
+}
+
+std::unique_ptr<RegexSplitter> RegexSplitter::gpt2() {
+    return std::make_unique<AlternativesSplitter>(std::vector<Alternative>{
+        {.kind = AltKind::kContractions, .ignore_case = false},
+        {.kind = AltKind::kSpaceThenRun, .letters = kLetter},
+        {.kind = AltKind::kSpaceThenRun, .letters = kNumber},
+        {.kind = AltKind::kSpaceThenRun, .letters = kSpace | kLetter | kNumber, .negated = true},
+        {.kind = AltKind::kSpacesNotBeforeNonSpace},
+        {.kind = AltKind::kSpaces},
+    });
 }
 
 }  // namespace xs::tok

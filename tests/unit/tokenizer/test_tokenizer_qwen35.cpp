@@ -100,9 +100,7 @@ TEST_SUITE("tokenizer") {
                 const std::string text = c[0].get<std::string>();
                 CAPTURE(name);
                 CAPTURE(text);
-                std::vector<std::string> pieces;
-                for (const auto piece : split->split({text})) pieces.emplace_back(piece);
-                CHECK(pieces == c[1].get<std::vector<std::string>>());
+                CHECK(split->split({text}) == c[1].get<std::vector<std::string>>());
             }
         }
     }
@@ -209,25 +207,20 @@ TEST_SUITE("tokenizer") {
             return "loaded without error";
         };
         nlohmann::json j = tiny_byte_level_json();
-        j["pre_tokenizer"]["pretokenizers"][1]["add_prefix_space"] = true;
-        CHECK(error(j) == "tokenizer.json pre_tokenizer 'ByteLevel' with add_prefix_space is not supported");
-
-        j = tiny_byte_level_json();
-        j["pre_tokenizer"]["pretokenizers"][1]["use_regex"] = true;
-        CHECK(error(j) == "tokenizer.json pre_tokenizer 'ByteLevel' with use_regex is not supported");
-
-        j = tiny_byte_level_json();
         std::swap(j["pre_tokenizer"]["pretokenizers"][0], j["pre_tokenizer"]["pretokenizers"][1]);
         CHECK(error(j) == "tokenizer.json pre_tokenizer 'ByteLevel' must be the last step");
 
         j = tiny_byte_level_json();
         j["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = "\\p{L}+";
         CHECK(error(j) == "tokenizer.json pre_tokenizer 'Split' Regex '\\p{L}+' is not supported");
+    }
 
-        j = tiny_byte_level_json();
+    TEST_CASE("tokenizer: a byte the byte-level vocab lacks is dropped, as Hugging Face drops it without unk") {
+        nlohmann::json j = tiny_byte_level_json();
         j["model"]["vocab"].erase(chars("\x01"));
         j["model"]["vocab"]["spare"] = 1;
-        CHECK(error(j) == "tokenizer.json BPE vocab has no byte-level character for byte 1");
+        const ScratchModelDir dir(j);
+        CHECK(xs::tok::Tokenizer::load(dir.path())->encode("a\x01" "b") == Ids{'a', 'b'});
     }
 }
 

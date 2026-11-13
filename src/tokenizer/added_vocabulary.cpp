@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "tokenizer/json_fields.h"
+#include "tokenizer/normalizer.h"
 #include "tokenizer/utf8.h"
 #include "util/error.h"
 
@@ -54,20 +55,22 @@ bool accept_match(const AddedToken& token, std::string_view text, size_t segment
 }
 }  // namespace
 
-AddedVocabulary::AddedVocabulary(const nlohmann::json& added_tokens) {
+AddedVocabulary::AddedVocabulary(const nlohmann::json& added_tokens, const Normalizer* normalizer) {
     if (!added_tokens.is_null() && !added_tokens.is_array()) fail("tokenizer.json 'added_tokens' must be a list");
     if (added_tokens.is_array()) {
         for (const auto& entry : added_tokens) tokens_.push_back(parse_token(entry));
     }
     for (size_t i = 0; i < tokens_.size(); ++i) {
-        const AddedToken& token = tokens_[i];
+        AddedToken& token = tokens_[i];
+        token.pattern = token.normalized && normalizer ? normalizer->normalize(token.content) : token.content;
+        if (token.pattern.empty()) fail("tokenizer.json added token ", token.id, " normalizes to nothing");
         has_normalized_ = has_normalized_ || token.normalized;
-        by_first_byte_[token.normalized][static_cast<uint8_t>(token.content[0])].push_back(i);
+        by_first_byte_[token.normalized][static_cast<uint8_t>(token.pattern[0])].push_back(i);
     }
     for (auto& pass : by_first_byte_) {
         for (auto& bucket : pass) {
             std::stable_sort(bucket.begin(), bucket.end(), [this](size_t a, size_t b) {
-                return tokens_[a].content.size() > tokens_[b].content.size();
+                return tokens_[a].pattern.size() > tokens_[b].pattern.size();
             });
         }
     }
@@ -78,9 +81,9 @@ std::optional<AddedVocabulary::Match> AddedVocabulary::next_match(std::string_vi
     const auto& buckets = by_first_byte_[normalized_pass];
     for (size_t pos = from; pos < text.size(); ++pos) {
         for (const size_t index : buckets[static_cast<uint8_t>(text[pos])]) {
-            const std::string& content = tokens_[index].content;
-            if (text.compare(pos, content.size(), content) == 0) {
-                return Match{pos, pos + content.size(), &tokens_[index]};
+            const std::string& pattern = tokens_[index].pattern;
+            if (text.compare(pos, pattern.size(), pattern) == 0) {
+                return Match{pos, pos + pattern.size(), &tokens_[index]};
             }
         }
     }

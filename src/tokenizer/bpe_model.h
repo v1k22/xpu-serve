@@ -49,7 +49,7 @@ private:
     Vocab vocab_;
     std::unordered_map<uint64_t, Merge> merges_;  // key: left id << 32 | right id
     std::array<int32_t, 256> byte_ids_{};          // "<0xXX>" ids for byte fallback; -1 when absent
-    std::array<int32_t, 256> byte_level_ids_{};    // ids of the byte-level characters
+    std::array<int32_t, 256> byte_level_ids_{};    // ids of the byte-level characters; -1 when absent
     bool byte_level_ = false;
     std::optional<int32_t> unk_id_;
     bool byte_fallback_ = false;

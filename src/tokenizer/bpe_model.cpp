@@ -96,9 +96,7 @@ void BpeModel::add_merge(std::string_view left, std::string_view right, int32_t 
 void BpeModel::use_byte_level_alphabet() {
     byte_level_ = true;
     for (int b = 0; b < 256; ++b) {
-        const auto symbol_id = id(byte_level::byte_piece(static_cast<uint8_t>(b)));
-        if (!symbol_id) fail("tokenizer.json BPE vocab has no byte-level character for byte ", b);
-        byte_level_ids_[b] = *symbol_id;
+        byte_level_ids_[b] = id(byte_level::byte_piece(static_cast<uint8_t>(b))).value_or(-1);
     }
 }
 
@@ -137,29 +135,39 @@ std::vector<BpeModel::Symbol> BpeModel::initial_symbols(std::string_view piece) 
         const auto pos = static_cast<int32_t>(symbols.size());
         symbols.push_back({symbol_id, pos - 1, pos + 1, false});
     };
-    if (byte_level_) {
-        for (const char b : piece) add(byte_level_ids_[static_cast<uint8_t>(b)]);
-        if (!symbols.empty()) symbols.back().next = -1;
-        return symbols;
-    }
     bool unk_pending = false;
-    for (size_t pos = 0; pos < piece.size();) {
-        const size_t len = utf8::char_length(piece, pos);
-        const std::string_view ch = piece.substr(pos, len);
-        pos += len;
-        if (const auto ch_id = id(ch)) {
+    auto add_char = [&](std::string_view ch, std::optional<int32_t> ch_id) {
+        if (ch_id) {
             if (unk_pending) add(*unk_id_);
             unk_pending = false;
             add(*ch_id);
-            continue;
+            return;
         }
         if (byte_fallback_ && has_byte_tokens(ch)) {
             for (const char b : ch) add(byte_ids_[static_cast<uint8_t>(b)]);
-            continue;
+            return;
         }
-        if (!unk_id_) continue;  // no unk token: Hugging Face drops the character
+        if (!unk_id_) return;  // no unk token: Hugging Face drops the character
         if (unk_pending && !fuse_unk_) add(*unk_id_);
         unk_pending = true;
+    };
+    if (byte_level_) {
+        // Each byte is one character of the byte-level alphabet; a vocab may lack the bytes UTF-8 never uses.
+        for (const char b : piece) {
+            const int32_t b_id = byte_level_ids_[static_cast<uint8_t>(b)];
+            if (b_id >= 0) {
+                add_char({}, b_id);
+            } else {
+                add_char(byte_level::byte_piece(static_cast<uint8_t>(b)), std::nullopt);
+            }
+        }
+    } else {
+        for (size_t pos = 0; pos < piece.size();) {
+            const size_t len = utf8::char_length(piece, pos);
+            const std::string_view ch = piece.substr(pos, len);
+            pos += len;
+            add_char(ch, id(ch));
+        }
     }
     if (unk_pending) add(*unk_id_);
     if (!symbols.empty()) symbols.back().next = -1;

@@ -1,8 +1,9 @@
 #pragma once
 
-// Hand-written matchers for the regexes that byte-level BPE tokenizers use in their Split pre-tokenizer (no regex
-// engine). Each supported pattern is a list of alternatives tried in order at every position, with the leftmost-first
-// backtracking semantics of the Oniguruma engine Hugging Face tokenizers uses.
+// Hand-written matchers for the regexes that byte-level BPE tokenizers use in their Split pre-tokenizer, and the GPT-2
+// regex of the ByteLevel pre-tokenizer (no regex engine). Each supported pattern is a list of alternatives tried in
+// order at every position, with the leftmost-first backtracking semantics of the Oniguruma engine Hugging Face
+// tokenizers uses.
 
 #include <cstddef>
 #include <memory>
@@ -16,6 +17,8 @@ class RegexSplitter {
 public:
     // The matcher for `pattern`, or nullptr when the pattern is not one of the supported ones.
     static std::unique_ptr<RegexSplitter> for_pattern(std::string_view pattern);
+    // The ByteLevel pre-tokenizer's regex: 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+    static std::unique_ptr<RegexSplitter> gpt2();
     virtual ~RegexSplitter() = default;
 
     // Byte ranges [begin, end) of the successive non-overlapping matches in `text`, left to right.

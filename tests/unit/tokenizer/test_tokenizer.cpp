@@ -81,6 +81,17 @@ TEST_SUITE("tokenizer") {
         CHECK(tok->vocab_size() == 32);
     }
 
+    TEST_CASE("tokenizer: a normalized added token is matched and named by its normalized content") {
+        nlohmann::json j = tiny_json();
+        j["added_tokens"].push_back({{"id", 31}, {"content", "lo w"}, {"normalized", true}, {"special", false}});
+        const ScratchModelDir dir(j);
+        const auto tok = xs::tok::Tokenizer::load(dir.path());
+        CHECK(tok->encode("hello world") == Ids{18, 7, 31, 23, 7, 11});  // "lo▁w" in "hello▁world"
+        CHECK(tok->token_text(31) == "lo▁w");
+        CHECK(tok->token_id("lo w") == 31);
+        CHECK(tok->decode(Ids{18, 31, 23}) == "helo wor");
+    }
+
     TEST_CASE("tokenizer: invalid UTF-8 input reaches byte fallback or unk instead of being dropped") {
         const auto tok = xs::tok::Tokenizer::load(tiny_dir());
         CHECK(tok->encode("h\xC3h") == Ids{5, 13, 5});
@@ -152,8 +163,8 @@ TEST_SUITE("tokenizer") {
         CHECK(load_error(j) == "tokenizer.json normalizer 'NFKC' is not supported");
 
         j = tiny_json();
-        j["pre_tokenizer"] = {{"type", "Metaspace"}};
-        CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'Metaspace' is not supported");
+        j["pre_tokenizer"] = {{"type", "UnicodeScripts"}};
+        CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'UnicodeScripts' is not supported");
 
         j = tiny_json();
         j["decoder"]["decoders"][1] = {{"type", "CTC"}};
