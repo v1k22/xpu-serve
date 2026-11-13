@@ -6,6 +6,7 @@
 
 #include "io/joined_weights.h"
 #include "models/clef/clef.h"
+#include "models/common/torch_nn.h"
 #include "models/config_util.h"
 #include "models/qwen3_5/qwen3_5_decoder.h"
 #include "quant/quant.h"
@@ -233,13 +234,11 @@ public:
 private:
     static std::string name(const std::string& tensor) { return kHead + tensor; }
     Value weight(Graph& g, const std::string& tensor) const { return g.weight(*weights_, name(tensor)); }
-    // torch.nn.Linear under `stem`: x @ weight^T + bias (when it has one).
     Value linear(Graph& g, Value x, const std::string& stem) const {
-        const Value y = g.matmul(x, weight(g, stem + ".weight"));
-        return weights_->contains(name(stem + ".bias")) ? g.add(y, weight(g, stem + ".bias")) : y;
+        return torch_nn::linear(g, *weights_, x, name(stem));
     }
     Value layer_norm(Graph& g, Value x, const std::string& stem) const {
-        return g.layer_norm(x, weight(g, stem + ".weight"), weight(g, stem + ".bias"), kLayerNormEps);
+        return torch_nn::layer_norm(g, *weights_, x, name(stem), kLayerNormEps);
     }
     int64_t head_dim() const { return head_.width / head_.heads; }
     Value split_heads(Graph& g, Value x) const { return g.reshape(x, {kT, head_.heads, head_dim()}); }

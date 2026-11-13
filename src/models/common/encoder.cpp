@@ -2,6 +2,7 @@
 
 #include <cmath>
 
+#include "models/common/torch_nn.h"
 #include "models/config_util.h"
 #include "quant/quant.h"
 #include "util/error.h"
@@ -56,10 +57,6 @@ private:
 
 }  // namespace
 
-Value layer_norm(Graph& g, const WeightStore& weights, Value x, const std::string& stem, float eps) {
-    return g.layer_norm(x, g.weight(weights, stem + ".weight"), g.weight(weights, stem + ".bias"), eps);
-}
-
 Value table_row(Graph& g, const WeightStore& weights, const std::string& name, int64_t row) {
     const TensorView& table = weights.get(name);
     XS_CHECK(table.shape.size() == 2 && row >= 0 && row < table.shape[0], "'", name, "' ",
@@ -81,8 +78,8 @@ blocks::AttentionSpec attention_spec(int64_t heads, int64_t head_dim) {
 }
 
 Value post_norm_layer(Graph& g, const WeightStore& weights, const Layer& layer, Value x, float eps) {
-    x = layer_norm(g, weights, g.add(x, layer.attention(x)), layer.norm1, eps);
-    return layer_norm(g, weights, g.add(x, layer.mlp(x)), layer.norm2, eps);
+    x = torch_nn::layer_norm(g, weights, g.add(x, layer.attention(x)), layer.norm1, eps);
+    return torch_nn::layer_norm(g, weights, g.add(x, layer.mlp(x)), layer.norm2, eps);
 }
 
 EmbeddingSpec embedding_spec(const std::filesystem::path& dir, std::string arch, const st::Pipeline& pipeline,

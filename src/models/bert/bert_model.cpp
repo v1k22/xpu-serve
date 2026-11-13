@@ -4,6 +4,7 @@
 
 #include "models/bert/bert.h"
 #include "models/common/encoder.h"
+#include "models/common/torch_nn.h"
 #include "util/error.h"
 
 namespace xs::bert {
@@ -11,10 +12,6 @@ namespace {
 
 using encoder::Graph;
 using encoder::Value;
-
-Value linear(Graph& g, const WeightStore& w, Value x, const std::string& stem) {
-    return g.add(g.matmul(x, g.weight(w, stem + ".weight")), g.weight(w, stem + ".bias"));
-}
 
 Value encode(Graph& g, const WeightStore& w, const Config& c, Value ids, Value positions) {
     const float eps = static_cast<float>(c.layer_norm_eps);
@@ -24,14 +21,15 @@ Value encode(Graph& g, const WeightStore& w, const Config& c, Value ids, Value p
         x = g.add(g.gather(g.weight(w, "embeddings.word_embeddings.weight"), ids),
                   encoder::table_row(g, w, "embeddings.token_type_embeddings.weight", 0));
         x = g.add(x, g.gather(g.weight(w, "embeddings.position_embeddings.weight"), positions));
-        x = encoder::layer_norm(g, w, x, "embeddings.LayerNorm", eps);
+        x = torch_nn::layer_norm(g, w, x, "embeddings.LayerNorm", eps);
     }
     const blocks::AttentionSpec spec = encoder::attention_spec(c.num_heads, c.head_dim);
     for (int64_t i = 0; i < c.num_layers; ++i) {
         Graph::Scope s(g, "layers." + std::to_string(i));
         const std::string L = "encoder.layer." + std::to_string(i) + ".";
         const auto biased = [&g, &w](std::string stem) {
-            return blocks::Linear([&g, &w, stem = std::move(stem)](Value v) { return linear(g, w, v, stem); });
+            return blocks::Linear(
+                [&g, &w, stem = std::move(stem)](Value v) { return torch_nn::linear(g, w, v, stem); });
         };
         blocks::AttentionParts parts;
         parts.q = biased(L + "attention.self.query");
@@ -43,7 +41,8 @@ Value encode(Graph& g, const WeightStore& w, const Config& c, Value ids, Value p
         layer.norm1 = L + "attention.output.LayerNorm";
         layer.mlp = [&](Value v) {
             Graph::Scope m(g, "mlp");
-            return linear(g, w, g.gelu(linear(g, w, v, L + "intermediate.dense")), L + "output.dense");
+            const Value h = g.gelu(torch_nn::linear(g, w, v, L + "intermediate.dense"));
+            return torch_nn::linear(g, w, h, L + "output.dense");
         };
         layer.norm2 = L + "output.LayerNorm";
         x = encoder::post_norm_layer(g, w, layer, x, eps);

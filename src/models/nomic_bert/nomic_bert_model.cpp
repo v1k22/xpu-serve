@@ -2,6 +2,7 @@
 // NomicBertAttention, NomciBertGatedMLP).
 
 #include "models/common/encoder.h"
+#include "models/common/torch_nn.h"
 #include "models/nomic_bert/nomic_bert.h"
 #include "util/error.h"
 
@@ -19,7 +20,7 @@ Value encode(Graph& g, const WeightStore& w, const Config& c, Value ids, Value p
         Graph::Scope s(g, "embeddings");
         x = g.add(g.gather(g.weight(w, "embeddings.word_embeddings.weight"), ids),
                   encoder::table_row(g, w, "embeddings.token_type_embeddings.weight", 0));
-        x = encoder::layer_norm(g, w, x, "emb_ln", eps);
+        x = torch_nn::layer_norm(g, w, x, "emb_ln", eps);
     }
     const Value inv_freq = g.constant(blocks::rope_inv_freq(c.rope_theta, c.head_dim, c.head_dim / 2, c.head_dim / 2));
     const blocks::AttentionSpec spec = encoder::attention_spec(c.num_heads, c.head_dim);
