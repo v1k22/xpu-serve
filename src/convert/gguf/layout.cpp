@@ -1,5 +1,7 @@
 #include "convert/gguf/layout.h"
 
+#include <algorithm>
+
 #include "util/error.h"
 
 namespace xs::gguf_import {
@@ -7,6 +9,11 @@ namespace xs::gguf_import {
 Entry one(Dims stored, std::string name, const FloatMap* map) {
     Dims shape = stored;
     return Entry{std::move(stored), {Piece{std::move(name), std::move(shape), map}}};
+}
+
+bool same_shape(const Dims& shape, const Dims& stored) {
+    const auto rest = [](const Dims& d) { return std::find_if(d.begin(), d.end(), [](int64_t n) { return n != 1; }); };
+    return std::equal(rest(shape), shape.end(), rest(stored), stored.end());
 }
 
 int64_t positive(const gguf::File& file, std::string_view architecture, const std::string& key) {
@@ -61,7 +68,7 @@ void map_tensors(const std::vector<const gguf::TensorInfo*>& tensors, std::strin
             if (it == layout.top.end()) fail(architecture, ": tensor '", t.name, "' has no counterpart in the model");
             e = &it->second;
         }
-        if (t.shape() != e->stored) {
+        if (!same_shape(t.shape(), e->stored)) {
             fail(architecture, ": tensor '", t.name, "' has shape ", dims_to_string(t.shape()), "; the metadata gives ",
                  dims_to_string(e->stored));
         }

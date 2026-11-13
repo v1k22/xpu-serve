@@ -44,10 +44,14 @@ struct Layout {
     std::function<std::string(int64_t)> block_kind;  // what block i is, for errors ("linear attention")
 };
 
+// Whether a tensor of the file of shape `shape` is stored as `stored`. Leading dims of 1 do not count: llama.cpp's
+// converter writes a [1, n] tensor as it is, llama-quantize writes it as [n] (ggml_n_dims), llama.cpp reads both.
+bool same_shape(const Dims& shape, const Dims& stored);
+
 // Every tensor of `tensors` (the model's, from its file or from two: a head in a file of its own) through `layout`,
 // into plan.tensors (and the computed ones into plan.derived). Refuses by name, as "<architecture>: ...": a tensor the
-// layout has no entry for, a shape other than its entry's, a pack tensor no tensor holds (unless every entry naming it
-// is optional) or that more than one does.
+// layout has no entry for, a shape other than its entry's (same_shape), a pack tensor no tensor holds (unless every
+// entry naming it is optional) or that more than one does.
 void map_tensors(const std::vector<const gguf::TensorInfo*>& tensors, std::string_view architecture,
                  const Layout& layout, ImportPlan& plan);
 // Every tensor of `file`.

@@ -308,7 +308,7 @@ private:
             if (t.name.starts_with(block)) {
                 tensors.push_back(&t);
             } else if (const auto e = l.top.find(t.name); e != l.top.end()) {
-                if (t.shape() != e->second.stored) {
+                if (!same_shape(t.shape(), e->second.stored)) {
                     fail("qwen35: the MTP file's '", t.name, "' has shape ", dims_to_string(t.shape()),
                          "; the model's is ", dims_to_string(e->second.stored));
                 }

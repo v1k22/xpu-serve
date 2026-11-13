@@ -388,6 +388,10 @@ TEST_SUITE("gguf import") {
     TEST_CASE("refusals name what is wrong") {
         const TempDir work("xs_gguf_import_refusal_test");
         CHECK(refusal(work.path, [](GgufWriter&) {}).empty());
+        // Leading dims of 1 do not count: [n] written as [1, n] is the same tensor.
+        CHECK(refusal(work.path, [](GgufWriter& w) {
+                  w.drop_tensor("output_norm.weight").f32_tensor("output_norm.weight", {128, 1}, std::vector<float>(128));
+              }).empty());
         const auto architecture = [&](const char* name) {
             return refusal(work.path, [&](GgufWriter& w) {
                 w.drop_value("general.architecture").string("general.architecture", name);
