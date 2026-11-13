@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """A tiny random decision model in the layout of a released one, for parity tests (test-only).
 
-    python -I tests/parity/decision/make_tiny.py --from <a clef-flash, pplx-decider or openjev checkpoint> --out <dir>
+    python -I tests/parity/decision/make_tiny.py --from <a clef-flash, pplx-decider, openjev or d1 checkpoint>
+        --out <dir>
 
 The decoder is a Qwen3.5 of four layers (three Gated DeltaNet, one full attention) with a small vision tower, as the
 released checkpoints carry one; the head has the released head's structure at a small width (Clef's joint schema
@@ -9,6 +10,10 @@ head; pplx-decider's read-out of 255 answer codes; none for OpenJev, a language 
 checkpoint's own Python code are copied from `--from`, so the vocabulary is the real one and reference.py runs the
 tiny model with the code the real one runs with. Random weights give near-uniform answers, which would hide a wrong
 option order or span: the head's output scales are raised so that answers spread.
+
+d1 (LiquidAI/d1-2B) is an LFM3-VL built from the checkpoint's own classes: an LFM3 text decoder of eight layers
+(convolutions around full and sliding attention, a window shorter than most prompts, small RoPE bases, decisive head
+gates, norms away from 1) and a small vision tower, with the released config's d1_ settings and calibration.json.
 """
 
 import argparse
@@ -22,7 +27,8 @@ from safetensors.torch import save_file
 
 COPIED = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "processor_config.json", "vocab.json",
           "merges.txt", "preprocessor_config.json", "video_preprocessor_config.json", "joint_schema_model.py",
-          "joint_config.json", "decision_config.json", "source", "helper", "generation_config.json"]
+          "joint_config.json", "decision_config.json", "source", "helper", "generation_config.json",
+          "calibration.json"]
 
 
 def decoder_config(vocab_size, hidden):
@@ -114,6 +120,57 @@ def letters(source, out, vocab_size):
     return sum(p.numel() for p in model.parameters())
 
 
+def d1(source, out, vocab_size):
+    """D1Model (an LFM3-VL with the System One API), as LiquidAI/d1-2B: the text decoder under model.language_model.,
+    the vision tower and projector beside it, the checkpoint's code named in config.json."""
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    with open(os.path.join(source, "config.json")) as f:
+        config = json.load(f)
+    auto_map = dict(config["auto_map"])
+    released = config["text_config"]
+    config["text_config"] = dict(
+        model_type="lfm3", vocab_size=vocab_size, hidden_size=64, intermediate_size=96, num_hidden_layers=8,
+        num_attention_heads=4, num_key_value_heads=1, head_dim=32, conv_L_cache=7, conv_bias=False, sliding_window=16,
+        max_position_embeddings=4096, norm_eps=1e-5, initializer_range=0.05, tie_word_embeddings=True,
+        use_sandwich_norm=True, bos_token_id=released["bos_token_id"], eos_token_id=released["eos_token_id"],
+        pad_token_id=released["pad_token_id"],
+        layer_types=["conv", "conv", "full_attention", "conv", "sliding_attention", "conv", "full_attention", "conv"],
+        rope_parameters={"full_attention": {"rope_type": "default", "rope_theta": 200.0, "partial_rotary_factor": 0.5},
+                         "sliding_attention": {"rope_type": "default", "rope_theta": 50.0}})
+    config["vision_config"] = dict(config["vision_config"], hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                                   layer_types=["conv", "full_attention"], num_attention_heads=2,
+                                   num_key_value_heads=2)
+    config["projector_hidden_size"] = 64
+    config_cls = get_class_from_dynamic_module(auto_map["AutoConfig"], source)
+    model_cls = get_class_from_dynamic_module(auto_map["AutoModel"], source)
+    model = model_cls(config_cls.from_dict(config))
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("self_attn.gate_proj.weight"):
+                p.normal_(0.0, 1.0)
+            elif name.endswith("conv.conv.weight"):
+                p.normal_(0.0, 0.4)
+            elif p.dim() == 1 and "norm" in name:
+                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
+    model.save_pretrained(out, safe_serialization=True)
+    path = os.path.join(out, "config.json")
+    with open(path) as f:
+        saved = json.load(f)
+    saved.update(architectures=["D1Model"], auto_map=auto_map)  # the checkpoint's own code, as released
+    with open(path, "w") as f:
+        json.dump(saved, f, indent=2)
+    for name in os.listdir(source):
+        if name.endswith(".py"):
+            shutil.copy(os.path.join(source, name), os.path.join(out, name))
+    return sum(p.numel() for p in model.parameters())
+
+
+def is_d1(source):
+    with open(os.path.join(source, "config.json")) as f:
+        return json.load(f).get("architectures") == ["D1Model"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--from", dest="source", required=True, help="a released checkpoint of the kind to imitate")
@@ -123,16 +180,18 @@ def main():
     torch.manual_seed(args.seed)
     from transformers import AutoTokenizer
 
-    vocab_size = len(AutoTokenizer.from_pretrained(args.source))
+    vocab_size = len(AutoTokenizer.from_pretrained(args.source, trust_remote_code=is_d1(args.source)))
     os.makedirs(args.out, exist_ok=True)
-    if os.path.exists(os.path.join(args.source, "joint_head_config.json")):
+    if is_d1(args.source):
+        kind, count = "d1", d1(args.source, args.out, vocab_size)
+    elif os.path.exists(os.path.join(args.source, "joint_head_config.json")):
         kind, count = "clef", clef(args.source, args.out, vocab_size)
     elif os.path.exists(os.path.join(args.source, "decision_config.json")):
         kind, count = "pplx_decider", pplx(args.source, args.out, vocab_size)
     elif os.path.exists(os.path.join(args.source, "helper", "shim.py")):
         kind, count = "letter_readout", letters(args.source, args.out, vocab_size)
     else:
-        ap.error(f"{args.source} is not a checkpoint this script imitates (clef, pplx-decider, openjev)")
+        ap.error(f"{args.source} is not a checkpoint this script imitates (clef, pplx-decider, openjev, d1)")
     for f in COPIED:
         src = os.path.join(args.source, f)
         if os.path.isdir(src):

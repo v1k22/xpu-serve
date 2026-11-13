@@ -2,11 +2,12 @@
 """Reference answers of a decision model, from the checkpoint's own Python code in float32 on the CPU (test-only).
 
     python -I tests/parity/decision/reference.py --model-dir <checkpoint> --requests tests/parity/decision/requests.json
-        --out <fixtures.json>
+        --out <fixtures.json> [--set-size N]
 
 For each request of the file (System One request bodies): the token ids of every sequence the model reads it as, and
 each question's probability per option, keyed by the option's name in the request (a noul's by "true" and "false").
-decision_parity.cpp checks the engine against them: the same tokens, the same probabilities.
+decision_parity.cpp checks the engine against them: the same tokens, the same probabilities. A request the
+reference code refuses is left out (the engine refuses it too).
 
 Clef (joint_head_config.json): joint_schema_model.py's encode_record and ClefModel, a softmax per question.
 pplx-decider (decision_config.json): the package under source/src: Decider's plan and reference path, the raw
@@ -14,6 +15,10 @@ read-out logits over the saved temperature through a softmax.
 OpenJev (helper/shim.py): the helper's own code with the settings of its serving guide. Only its client is replaced:
 the one call it makes to a server (the log-probabilities of the option letters at the first output position) is
 answered by the model in transformers, and the answers are left unrounded.
+d1 (config.json's architectures: D1Model): the checkpoint's own model class and runner (AutoModel with its code): the
+sequences its runner lays out and the probabilities it reads, through calibration.json's temperature. --set-size is
+the runner's set_size, the questions read together after one state: the checkpoint's own (d1_set_size) by default; 1
+reads each question alone, as the engine does.
 """
 
 import argparse
@@ -115,19 +120,52 @@ def letters(model_dir, requests):
     return cases
 
 
+def d1(model_dir, requests, set_size):
+    from transformers import AutoModel
+
+    model = AutoModel.from_pretrained(model_dir, trust_remote_code=True, dtype=torch.float32)
+    engine = model.engine
+    cases = []
+    for request in requests:
+        try:
+            questions = list(engine.named(request["questions"]).values())
+        except ValueError as e:
+            print(f"left out: {e}")
+            continue
+        asked = [(request["state"], questions, [])]
+        sequences = engine._sequences(asked, set_size=set_size)
+        probs = engine.run(asked, set_size=set_size)[0][0]
+        probabilities = {}
+        for (name, question), p in zip(request["questions"].items(), probs):
+            names = (["true", "false"] if question["type"] == "noul" else
+                     list(question["criteria"]) if question["type"] == "choice" else [str(i) for i in range(len(p))])
+            probabilities[name] = dict(zip(names, p))
+        cases.append({"request": request, "input_ids": [list(s[2]) for s in sequences],
+                      "probabilities": probabilities})
+    return cases
+
+
+def is_d1(model_dir):
+    with open(os.path.join(model_dir, "config.json")) as f:
+        return json.load(f).get("architectures") == ["D1Model"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--requests", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--set-size", type=int, default=None, help="d1: questions read together (default: the model's)")
     args = ap.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
     with open(args.requests) as f:
         requests = json.load(f)["requests"]
     model_dir = os.path.abspath(args.model_dir)
-    if os.path.exists(os.path.join(model_dir, "joint_head_config.json")):
+    if is_d1(model_dir):
+        kind, cases = "d1", d1(model_dir, requests, args.set_size)
+    elif os.path.exists(os.path.join(model_dir, "joint_head_config.json")):
         kind, cases = "clef", clef(model_dir, requests)
     elif os.path.exists(os.path.join(model_dir, "decision_config.json")):
         kind, cases = "pplx_decider", pplx(model_dir, requests)

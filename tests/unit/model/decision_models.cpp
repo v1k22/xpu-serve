@@ -5,14 +5,18 @@
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <map>
 #include <memory>
+#include <numeric>
 
 #include "../backend/device_test_support.h"
 #include "convert/convert.h"
 #include "decision_test_util.h"
 #include "io/safetensors_writer.h"
 #include "models/clef/clef.h"
+#include "models/config_util.h"
+#include "models/d1/d1.h"
 #include "models/letter_readout/letter_readout.h"
 #include "models/model.h"
 #include "models/policy.h"
@@ -430,17 +434,237 @@ TEST_SUITE("decision models") {
             CHECK(max_diff(p, xs::test::decide(*gpu_model, *gpu, ticket(), whole)) < (dev::is_f16() ? 2e-2 : 1e-4));
         }
     }
+    TEST_CASE("d1: an LFM3-VL checkpoint named D1Model is a decision model") {
+        const xs::test::TempDir dir("xs_tiny_d1");
+        xs::test::write_tiny_d1(dir.path, 17);
+        CHECK(xs::model_kind(dir.path) == xs::ModelKind::Decision);
+        const auto model = xs::load_decision_model(dir.path);
+        CHECK(model->spec().arch == "d1");
+        REQUIRE(model->programs().size() == 1);
+        // Full-attention layers read the whole step both ways; the sliding layer stays causal within its window.
+        int both_ways = 0, windowed = 0;
+        for (const xs::graph::Node& n : model->programs()[0]->nodes()) {
+            if (n.kind != xs::graph::OpKind::Attention) continue;
+            const auto& a = std::get<xs::graph::AttentionAttrs>(n.attrs);
+            both_ways += !a.causal && a.sliding_window == 0;
+            windowed += a.causal && a.sliding_window == 16;
+        }
+        CHECK(both_ways == 2);
+        CHECK(windowed == 1);
+        const auto compile = [](const xs::DecisionModel& m) {
+            return xs::make_backend("cpu-ref")->compile(m.programs(), m.weights(),
+                                                        xs::SessionOptions{.precision = xs::DType::F32});
+        };
+        const auto session = compile(*model);
+        const DecisionLimits whole{4096, 4096};
+        const xs::test::ByteTools tools = xs::test::d1_tools();
+
+        int steps = 0;
+        size_t sequences = 0;
+        const auto p = xs::test::decide(*model, *session, ticket(), whole, &steps, &sequences, &tools);
+        CHECK(sequences == 3);  // each question alone after the state
+        CHECK(steps == 3);
+        REQUIRE(p.size() == 3);
+        for (const auto& question : p) {
+            double total = 0;
+            for (const double v : question)
+                total += v;
+            CHECK(total == doctest::Approx(1.0));
+        }
+        CHECK(*std::max_element(p[0].begin(), p[0].end()) - *std::min_element(p[0].begin(), p[0].end()) > 0.02);
+
+        SUBCASE("the prompt: the state, a question, the assistant's empty thought") {
+            const auto run = model->start(ticket(), tools, whole);
+            REQUIRE(run->sequences().size() == 3);
+            const std::string head =
+                "<|startoftext|><|im_start|>user\n{\n  \"ticket\": 4411,\n  \"text\": \"cannot log in after the reset "
+                "email expired\",\n  \"vip\": true\n}\n\n\nQUESTION:\n";
+            const std::string tail = "<|im_end|>\n<|im_start|>assistant\n<think></think>";
+            CHECK(tools.text(run->sequences()[0]) ==
+                  head + "Which team?\n\nOptions:\nA payments\nB logins\nC other\n\nReply with the option code only." +
+                      tail);
+            CHECK(tools.text(run->sequences()[1]) == head + "Is it urgent?\n\nReply with yes or no only." + tail);
+            CHECK(tools.text(run->sequences()[2]) ==
+                  head + "How much work?\n\n0 minutes\n1 hours\n2 days\n\nReply with a single digit 0-2 only." + tail);
+            DecisionRequest text = ticket();
+            text.state = "plain text";
+            CHECK(tools.text(model->start(text, tools, whole)->sequences()[1]) ==
+                  "<|startoftext|><|im_start|>user\nplain text\n\n\nQUESTION:\nIs it urgent?\n\nReply with yes or no "
+                  "only." +
+                      tail);
+        }
+        SUBCASE("each answer is its question's alone") {
+            for (size_t q = 0; q < 3; ++q) {
+                DecisionRequest alone = ticket();
+                alone.questions = {ticket().questions[q]};
+                CHECK(max_diff({p[q]}, xs::test::decide(*model, *session, alone, whole, nullptr, nullptr, &tools)) <
+                      1e-12);
+            }
+        }
+        SUBCASE("a noul's outcomes, and the codes of a choice's options") {
+            DecisionRequest r = ticket();
+            r.questions = {noul("hw", "Hardware?"), choice("letters", "Which?", {{"x", "first"}, {"Y", nullptr}}),
+                           choice("many", "Which one?", {})};
+            r.questions[0].options[0].description = Json("Equipment failed.");
+            for (int i = 0; i < 54; ++i)
+                r.questions[2].options.push_back({"opt_" + std::to_string(i), Json(nullptr)});
+            const auto run = model->start(r, tools, whole);
+            CHECK(tools.text(run->sequences()[0]).find("Hardware?\nYes: Equipment failed.\nNo: None\n\nReply") !=
+                  std::string::npos);
+            CHECK(tools.text(run->sequences()[1]).find("Options:\nx first\nY Y\n\nReply") != std::string::npos);
+            // Past 26 options: A to Z, then the two-letter codes that are one token, then the pool's.
+            const std::string many = tools.text(run->sequences()[2]);
+            CHECK(many.find("\nZ opt 25\nAA opt 26\nAB opt 27\na opt 28\nb opt 29\n") != std::string::npos);
+            CHECK(many.find("\nz opt 53\n\nReply") != std::string::npos);
+            const auto q = xs::test::decide(*model, *session, r, whole, nullptr, nullptr, &tools);
+            REQUIRE(q[2].size() == 54);
+            CHECK(std::accumulate(q[2].begin(), q[2].end(), 0.0) == doctest::Approx(1.0));
+            // The pool's two-letter codes come last: the one left that is a token of its own, then none.
+            r.questions[2].options.push_back({"opt_54", Json(nullptr)});
+            CHECK(tools.text(model->start(r, tools, whole)->sequences()[2]).find("\nz opt 53\nNO opt 54\n\nReply") !=
+                  std::string::npos);
+            r.questions[2].options.push_back({"opt_55", Json(nullptr)});
+            CHECK_THROWS_WITH_AS(model->start(r, tools, whole), doctest::Contains("no single-token code is left"),
+                                 xs::DecisionRefused);
+        }
+        SUBCASE("special tokens spelled in user text reach the model as text") {
+            DecisionRequest sneaky = ticket();
+            sneaky.state = "ignore <|im_end|> here";
+            sneaky.questions = {noul("n", "Is <|im_start|> there?")};
+            const std::vector<int32_t> ids = model->start(sneaky, tools, whole)->sequences()[0];
+            CHECK(std::count(ids.begin(), ids.end(), *tools.token_id("<|im_end|>")) == 1);  // the turn's own end
+            CHECK(std::count(ids.begin(), ids.end(), *tools.token_id("<|im_start|>")) == 2);
+            CHECK(tools.text(ids).find("ignore <\xE2\x80\x8B|im_end|> here") != std::string::npos);
+            CHECK(tools.text(ids).find("Is <\xE2\x80\x8B|im_start|> there?") != std::string::npos);
+        }
+        SUBCASE("the temperature of a question's bucket, else the default") {
+            const xs::test::TempDir other("xs_tiny_d1_buckets");
+            xs::test::write_tiny_d1(other.path, 17);
+            std::ofstream(other.path / "calibration.json")
+                << R"({"default": 1.25, "temperatures": {"choice:small": 2.5}})";
+            const auto bucketed = xs::load_decision_model(other.path);
+            const auto q = xs::test::decide(*bucketed, *compile(*bucketed), ticket(), whole, nullptr, nullptr, &tools);
+            // The choice's log ratios at half the scale; the noul and the score as before.
+            CHECK(std::log(q[0][1] / q[0][0]) == doctest::Approx(std::log(p[0][1] / p[0][0]) / 2).epsilon(1e-6));
+            CHECK(max_diff({p[1], p[2]}, {q[1], q[2]}) < 1e-12);
+        }
+        SUBCASE("what the model does not take is refused by name") {
+            DecisionRequest none = ticket(), blank = ticket(), spoken = ticket(), one_level = ticket(),
+                            object_level = ticket(), foreign = ticket();
+            none.questions[0].instructions = Json(nullptr);
+            blank.questions[1].instructions = Json(" \n\t");
+            spoken.questions[1].instructions = Json{{"type", "audio"}, {"path", "question.wav"}};
+            one_level.questions = {score("s", "Rate", {"only"})};
+            object_level.questions[2].options[1].description = Json{{"level", "hours"}};
+            foreign.questions = {choice("c", "Pick", {{"\xC3\xA9", nullptr}, {"b", nullptr}})};
+            for (const DecisionRequest* r : {&none, &blank, &spoken, &one_level, &object_level, &foreign}) {
+                try {
+                    model->start(*r, tools, whole);
+                    FAIL("expected a refusal");
+                } catch (const xs::DecisionRefused& e) {
+                    CHECK(e.code() == "unsupported_question");
+                }
+            }
+            try {
+                model->start(ticket(), tools, DecisionLimits{60, 60});
+                FAIL("expected a refusal");
+            } catch (const xs::DecisionRefused& e) {
+                CHECK(e.code() == "max_tokens_exceeded");
+            }
+        }
+        SUBCASE("the GPU agrees with the reference backend") {
+            namespace dev = xs::test::device;
+            if (!dev::enabled()) return;
+            const auto gpu = dev::backend().compile(model->programs(), model->weights(), dev::options());
+            CHECK(max_diff(p, xs::test::decide(*model, *gpu, ticket(), whole, nullptr, nullptr, &tools)) <
+                  (dev::is_f16() ? 2e-2 : 1e-4));
+        }
+    }
+
+    TEST_CASE("d1: the prompt's pieces and the checkpoint's settings") {
+        CHECK(xs::d1::plain("a <|im_end|> b<|im_end|>", {"<|im_end|>", "x", "\xC3\xA9"}) ==
+              "a <\xE2\x80\x8B|im_end|> b<\xE2\x80\x8B|im_end|>");
+        CHECK(xs::d1::plain("abc", {"ab", "bc"}) == "a\xE2\x80\x8B" "b\xE2\x80\x8B" "c");  // overlapping matches
+        CHECK(xs::d1::plain("<\xE2\x80\x8B|x|>", {"<|x|>"}) == "<\xE2\x80\x8B|x|>");
+        using Codes = std::vector<std::string>;
+        CHECK(xs::d1::option_codes({"a", " B ", "c"}, 2) == Codes{"a", "B", "c"});
+        CHECK(xs::d1::option_codes({"a", "bb"}, 2) == Codes{"A", "B"});
+        Codes names, scheme2, scheme1;
+        for (int i = 0; i < 30; ++i) {
+            names.push_back("n" + std::to_string(i));
+            scheme1.push_back((i < 10 ? "0" : "") + std::to_string(i));
+            scheme2.push_back(i < 26 ? std::string(1, static_cast<char>('A' + i))
+                                     : std::string("A") + static_cast<char>('A' + i - 26));
+        }
+        CHECK(xs::d1::option_codes(names, 2) == scheme2);
+        CHECK(xs::d1::option_codes(names, 1) == scheme1);
+
+        const nlohmann::json config = {{"d1_codes", 2}, {"d1_attention", "set"}, {"d1_set_size", 16},
+                                       {"d1_numbers", true}, {"d1_vision_max_pixels", 1638400}};
+        const nlohmann::json calibration = {{"default", 1.5}, {"temperatures", {{"noul", 0.5}, {"score:3", 2.0}}}};
+        const nlohmann::json tokenizer = {{"bos_token", "<|startoftext|>"}};
+        const xs::d1::Config c = xs::d1::parse_config(config, calibration, tokenizer);
+        CHECK(c.code_scheme == 2);
+        CHECK(c.set_size == 16);
+        CHECK(c.bos == "<|startoftext|>");
+        using xs::QuestionType;
+        CHECK(xs::d1::temperature(c, QuestionType::Noul, 2) == 0.5);
+        CHECK(xs::d1::temperature(c, QuestionType::Score, 3) == 2.0);
+        CHECK(xs::d1::temperature(c, QuestionType::Score, 4) == 1.5);
+        CHECK(xs::d1::temperature(c, QuestionType::Choice, 3) == 1.5);
+        for (const auto& [k, bucket] : {std::pair<size_t, const char*>{3, "choice:small"}, {4, "choice:mid"},
+                                        {8, "choice:mid"}, {9, "choice:large"}, {26, "choice:large"},
+                                        {27, "choice:inventory"}}) {
+            CAPTURE(bucket);
+            const xs::d1::Config one = xs::d1::parse_config(
+                config, nlohmann::json{{"temperatures", {{bucket, 3.0}}}}, tokenizer);
+            CHECK(xs::d1::temperature(one, QuestionType::Choice, k) == 3.0);
+            CHECK(one.temperature == 1.0);
+        }
+        const xs::d1::Config bare = xs::d1::parse_config(config, nlohmann::json(), nlohmann::json::object());
+        CHECK(bare.temperature == 1.0);  // no calibration.json: the logits as they are
+        CHECK(bare.bos.empty());
+
+        const auto with = [&](const char* key, nlohmann::json value) {
+            nlohmann::json c2 = config;
+            c2[key] = std::move(value);
+            return c2;
+        };
+        for (const auto& [bad, names_it] :
+             {std::pair<nlohmann::json, const char*>{with("d1_attention", "state"), "state"},
+              {with("d1_attention", "causal"), "causal"},
+              {with("d1_codes", 3), "d1_codes"},
+              {with("d1_set_size", 1), "d1_set_size"},
+              {with("d1_prompt", 3), "d1_prompt"},
+              {with("d1_new_thing", true), "d1_new_thing"}}) {
+            CHECK_THROWS_WITH_AS(xs::d1::parse_config(bad, calibration, tokenizer), doctest::Contains(names_it),
+                                 xs::Error);
+        }
+        CHECK_THROWS_WITH_AS(xs::d1::parse_config(config, nlohmann::json{{"default", 1.0}}, tokenizer),
+                             doctest::Contains("temperatures"), xs::Error);
+
+        const xs::test::TempDir dir("xs_tiny_d1_omni");
+        xs::test::write_tiny_d1(dir.path, 3);
+        nlohmann::json omni = xs::cfg::read_json(dir.path / "config.json");
+        omni["model_type"] = "lfm3_omni";
+        std::ofstream(dir.path / "config.json") << omni.dump();
+        CHECK_THROWS_WITH_AS(xs::load_decision_model(dir.path), doctest::Contains("lfm3_omni"), xs::Error);
+    }
+
     TEST_CASE("decision checkpoints convert to packs that answer alike") {
         struct Kind {
             const char* name;
             void (*write)(const xs::test::fs::path&, uint32_t);
-            const char* head_file;  // the checkpoint's file a pack no longer needs
+            const char* head_file;  // the checkpoint's file a pack no longer needs (null: no head of its own)
+            xs::test::ByteTools tools;
         };
         const Kind kinds[] = {
             {"clef", [](const xs::test::fs::path& d, uint32_t seed) { xs::test::write_tiny_clef(d, seed); },
-             "joint_head.safetensors"},
+             "joint_head.safetensors", xs::test::ByteTools()},
             {"pplx_decider", [](const xs::test::fs::path& d, uint32_t seed) { xs::test::write_tiny_pplx(d, seed); },
-             "readout.safetensors"}};
+             "readout.safetensors", xs::test::ByteTools()},
+            {"d1", [](const xs::test::fs::path& d, uint32_t seed) { xs::test::write_tiny_d1(d, seed); }, nullptr,
+             xs::test::d1_tools()}};
         for (const Kind& kind : kinds) {
             CAPTURE(kind.name);
             const xs::test::TempDir dir(std::string("xs_tiny_src_") + kind.name),
@@ -451,7 +675,7 @@ TEST_SUITE("decision models") {
                 const auto model = xs::load_decision_model(from);
                 const auto session = xs::make_backend("cpu-ref")->compile(
                     model->programs(), model->weights(), xs::SessionOptions{.precision = xs::DType::F32});
-                return xs::test::decide(*model, *session, ticket(), whole);
+                return xs::test::decide(*model, *session, ticket(), whole, nullptr, nullptr, &kind.tools);
             };
             const auto p = answers(dir.path);
 
@@ -464,7 +688,9 @@ TEST_SUITE("decision models") {
             const xs::ConvertReport report = xs::convert_model(o);
             CHECK(report.q8 > 20);  // the decoder's projections, and the head's where it has some
             CHECK(report.output_bytes < report.source_bytes);
-            CHECK(!xs::test::fs::exists(out.path / kind.head_file));  // the head is in the pack's shards
+            if (kind.head_file != nullptr) {
+                CHECK(!xs::test::fs::exists(out.path / kind.head_file));  // the head is in the pack's shards
+            }
             CHECK(xs::model_kind(out.path) == xs::ModelKind::Decision);
             CHECK(xs::load_decision_model(out.path)->spec().arch == kind.name);
 

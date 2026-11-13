@@ -493,6 +493,59 @@
      }
     }
    }
+  },
+  {
+   "model": "test",
+   "state": "Incident 7731: the database replica in eu-west lost power at 02:10; failover finished at 02:14 and no data was lost.",
+   "questions": {
+    "page": {
+     "type": "noul",
+     "instructions": "Should the on-call engineer be paged now?",
+     "criteria": {
+      "true": "A person must act within minutes.",
+      "false": "It can wait for business hours."
+     }
+    },
+    "hardware": {
+     "type": "noul",
+     "instructions": "Is this a hardware problem?",
+     "criteria": {
+      "true": "Physical equipment failed."
+     }
+    },
+    "resolved": {
+     "type": "noul",
+     "instructions": "Has the problem been resolved?",
+     "criteria": {
+      "false": null
+     }
+    },
+    "severity": {
+     "type": "score",
+     "instructions": "How severe was the incident?",
+     "criteria": [
+      "none",
+      "trivial",
+      "minor",
+      "low",
+      "moderate",
+      "notable",
+      "high",
+      "major",
+      "critical",
+      "catastrophic"
+     ]
+    },
+    "grade": {
+     "type": "choice",
+     "instructions": "Which grade fits the response?",
+     "criteria": {
+      "a": "Excellent",
+      "b": "Adequate",
+      "C": null
+     }
+    }
+   }
   }
  ]
 }

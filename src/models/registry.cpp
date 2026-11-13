@@ -2,6 +2,7 @@
 
 #include "models/bert/bert.h"
 #include "models/clef/clef.h"
+#include "models/d1/d1.h"
 #include "models/common/sentence_transformers.h"
 #include "models/config_util.h"
 #include "models/decision.h"
@@ -63,8 +64,10 @@ ModelKind model_kind(const std::filesystem::path& dir) {
         is_embedding_type(config.at("model_type").get<std::string>()) && st::has_pooling(dir)) {
         return ModelKind::Embedding;
     }
-    // A decision model's config.json is its decoder's: the head beside it tells.
-    return clef::is_checkpoint(dir) || pplx_decider::is_checkpoint(dir) ? ModelKind::Decision : ModelKind::Language;
+    // A decision model's config.json is its decoder's: the head beside it tells, or the architecture it names (d1).
+    return clef::is_checkpoint(dir) || pplx_decider::is_checkpoint(dir) || d1::is_checkpoint(dir)
+               ? ModelKind::Decision
+               : ModelKind::Language;
 }
 
 const char* question_type_name(QuestionType type) {
@@ -77,7 +80,7 @@ const char* question_type_name(QuestionType type) {
 }
 
 std::vector<std::string> supported_decision_models() {
-    return {"clef", "pplx_decider"};
+    return {"clef", "d1", "pplx_decider"};
 }
 
 std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& dir) {
@@ -85,6 +88,7 @@ std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& 
     const auto config = cfg::read_json(dir / "config.json");
     cfg::check_quantization(config);
     if (clef::is_checkpoint(dir)) return clef::load(dir, config);
+    if (d1::is_checkpoint(dir)) return d1::load(dir, config);
     if (pplx_decider::is_checkpoint(dir)) return pplx_decider::load(dir, config);
     std::string list;
     for (const auto& t : supported_decision_models()) list += (list.empty() ? "" : ", ") + t;

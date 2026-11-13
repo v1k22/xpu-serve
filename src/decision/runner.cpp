@@ -13,10 +13,15 @@ namespace xs {
 class DecisionRunner::Tools final : public PromptTools {
 public:
     explicit Tools(const std::filesystem::path& dir)
-        : tokenizer_(tok::Tokenizer::load(dir)), template_(chat::ChatTemplate::load(dir)) {}
+        : tokenizer_(tok::Tokenizer::load(dir)), template_(chat::ChatTemplate::load(dir)) {
+        for (int32_t id = 0; id < tokenizer_->vocab_size(); ++id) {
+            if (tokenizer_->is_special(id)) special_.push_back(tokenizer_->token_text(id));
+        }
+    }
 
     std::vector<int32_t> encode(std::string_view text) const override { return tokenizer_->encode(text); }
     std::optional<int32_t> token_id(std::string_view piece) const override { return tokenizer_->token_id(piece); }
+    std::vector<std::string> special_tokens() const override { return special_; }
     std::string chat(const Json& messages) const override {
         return template_->render(messages, Json(nullptr), true, Json{{"enable_thinking", false}});
     }
@@ -24,6 +29,7 @@ public:
 private:
     std::unique_ptr<tok::Tokenizer> tokenizer_;
     std::unique_ptr<chat::ChatTemplate> template_;
+    std::vector<std::string> special_;
 };
 
 DecisionRunner::DecisionRunner() = default;
