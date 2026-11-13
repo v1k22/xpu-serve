@@ -9,13 +9,14 @@ namespace {
 constexpr int8_t kInvalid = -1;
 constexpr int8_t kSkip = -2;
 
+constexpr std::string_view kAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
 constexpr std::array<int8_t, 256> make_table() {
     std::array<int8_t, 256> t{};
     for (auto& v : t)
         v = kInvalid;
-    constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    for (size_t i = 0; i < alphabet.size(); ++i)
-        t[static_cast<unsigned char>(alphabet[i])] = static_cast<int8_t>(i);
+    for (size_t i = 0; i < kAlphabet.size(); ++i)
+        t[static_cast<unsigned char>(kAlphabet[i])] = static_cast<int8_t>(i);
     for (const char c : {' ', '\t', '\r', '\n'})
         t[static_cast<unsigned char>(c)] = kSkip;
     return t;
@@ -61,6 +62,25 @@ std::optional<std::vector<uint8_t>> base64_decode(std::string_view text) {
             break;
         default:
             return std::nullopt;  // one leftover sextet cannot encode a byte
+    }
+    return out;
+}
+
+std::string base64_encode(std::span<const uint8_t> bytes) {
+    std::string out;
+    out.reserve((bytes.size() + 2) / 3 * 4);
+    size_t i = 0;
+    for (; i + 3 <= bytes.size(); i += 3) {
+        const uint32_t group = uint32_t{bytes[i]} << 16 | uint32_t{bytes[i + 1]} << 8 | bytes[i + 2];
+        for (const int shift : {18, 12, 6, 0})
+            out.push_back(kAlphabet[group >> shift & 63]);
+    }
+    if (const size_t rest = bytes.size() - i; rest > 0) {
+        const uint32_t group = uint32_t{bytes[i]} << 16 | (rest == 2 ? uint32_t{bytes[i + 1]} << 8 : 0);
+        out.push_back(kAlphabet[group >> 18 & 63]);
+        out.push_back(kAlphabet[group >> 12 & 63]);
+        out.push_back(rest == 2 ? kAlphabet[group >> 6 & 63] : '=');
+        out.push_back('=');
     }
     return out;
 }
