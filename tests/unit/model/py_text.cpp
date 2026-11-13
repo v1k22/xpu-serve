@@ -52,6 +52,15 @@ TEST_SUITE("python text") {
         CHECK(xs::py::json_dumps(value, {.sort_keys = true, .compact = true}) == text(R"J("{\"alpha\":1e+16,\"both\":\"a ' and a \\\" here\",\"count\":12345678901234,\"empty\":{},\"it's\":\"single ' only\",\"list\":[],\"mid\":-0.5,\"nbsp\":\"a\u00a0b\u200bc\u2028d\ud83d\ude00e\",\"nested\":{\"a\":{\"x\":0.1,\"y\":1},\"b\":[1,2.5,\"x\"]},\"none\":null,\"ok\":false,\"text\":\"quote \\\" backslash \\\\ newline \\n tab \\t done \\u0001 \u007f\",\"unicode\":\"na\u00efve caf\u00e9 \u2014 \u65e5\u672c\u8a9e \u2713\",\"zeta\":1e-05}")J"));
     }
 
+    TEST_CASE("json.dumps with an indent: a member a line, \",\" between them, empty containers closed at once") {
+        const Json value = Json::parse(text(kValue));
+        CHECK(xs::py::json_dumps(value, {.indent = 2}) == text(R"J("{\n  \"zeta\": 1e-05,\n  \"alpha\": 1e+16,\n  \"mid\": -0.5,\n  \"count\": 12345678901234,\n  \"ok\": false,\n  \"none\": null,\n  \"text\": \"quote \\\" backslash \\\\ newline \\n tab \\t done \\u0001 \u007f\",\n  \"nested\": {\n    \"b\": [\n      1,\n      2.5,\n      \"x\"\n    ],\n    \"a\": {\n      \"y\": 1,\n      \"x\": 0.1\n    }\n  },\n  \"unicode\": \"naïve café — 日本語 ✓\",\n  \"it's\": \"single ' only\",\n  \"both\": \"a ' and a \\\" here\",\n  \"nbsp\": \"a b​c d😀e\",\n  \"empty\": {},\n  \"list\": []\n}")J"));
+        CHECK(xs::py::json_dumps(Json::parse(R"([[], {}, [1, [2, {"a": []}]], "s"])"), {.indent = 2}) ==
+              text(R"J("[\n  [],\n  {},\n  [\n    1,\n    [\n      2,\n      {\n        \"a\": []\n      }\n    ]\n  ],\n  \"s\"\n]")J"));
+        CHECK(xs::py::json_dumps(Json("top"), {.indent = 2}) == "\"top\"");
+        CHECK(xs::py::json_dumps(Json(3.0), {.indent = 2}) == "3.0");
+    }
+
     TEST_CASE("str() of a loaded value is Python's repr; a string is itself") {
         const Json value = Json::parse(text(kValue));
         CHECK(xs::py::str(value) == text(R"J("{'zeta': 1e-05, 'alpha': 1e+16, 'mid': -0.5, 'count': 12345678901234, 'ok': False, 'none': None, 'text': 'quote \" backslash \\\\ newline \\n tab \\t done \\x01 \\x7f', 'nested': {'b': [1, 2.5, 'x'], 'a': {'y': 1, 'x': 0.1}}, 'unicode': 'na\u00efve caf\u00e9 \u2014 \u65e5\u672c\u8a9e \u2713', \"it's\": \"single ' only\", 'both': 'a \\' and a \" here', 'nbsp': 'a\\xa0b\\u200bc\\u2028d\ud83d\ude00e', 'empty': {}, 'list': []}")J"));
