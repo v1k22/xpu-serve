@@ -332,98 +332,42 @@ Both backends read all 19 of GGUF's block formats (Q4_0 to Q8_0, the K-quants, I
 values llama.cpp's own code gives (checked bit for bit on the host). A file is usually a mix of them: `Q4_K_M` of
 Qwen3.5-4B is 57 % Q4_K, 24 % Q6_K and 18 % Q5_K, and a "dynamic" (`UD-`) file mixes up to fifteen.
 
-Every file of [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) on an Arc Pro B60, beside the
-original checkpoint and our own packs of it. Decode and prefill are `bench` at a 1,024-token prompt. The questions
-are answered through the letter read-out (`--readout letters`): 25 test decisions and 300 MMLU-Pro questions, with
-how many of the 300 get the same answer as the original at f16, and the mean shift of the answer's probabilities
-from it (total variation, 0 to 1).
+Measured on an Arc Pro B60 with every file of
+[unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) (22) and
+[unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF) (21, and its drafter files).
+**[docs/gguf_models.md](docs/gguf_models.md) has every file's numbers**, what each file holds, the checks behind them
+and the kernel rates; a few of them here. "Same as f16" is how many of 300 MMLU-Pro questions get the answer the
+original checkpoint gives at f16.
 
-| Variant | File | GPU memory | Decode | Prefill | Test decisions right (25) | MMLU-Pro right (300) | Same answer as f16 (300) | Shift |
+| Variant | Qwen3.5-4B: file | GPU memory | Decode | Same as f16 | Gemma 4 E2B: file | GPU memory | Decode | Same as f16 |
 |---|---|---|---|---|---|---|---|---|
-| UD-IQ2_XXS | 1.52 GB | 1.40 GiB | 91 tok/s | 4,235 tok/s | 16 | 61 | 55 | 0.662 |
-| UD-IQ2_M | 1.76 GB | 1.63 GiB | 85 tok/s | 4,216 tok/s | 21 | 87 | 90 | 0.550 |
-| UD-Q2_K_XL | 1.94 GB | 1.80 GiB | 95 tok/s | 4,205 tok/s | 24 | 106 | 142 | 0.399 |
-| UD-IQ3_XXS | 1.95 GB | 1.80 GiB | 82 tok/s | 4,204 tok/s | 24 | 121 | 140 | 0.373 |
-| Q3_K_S | 2.11 GB | 1.95 GiB | 86 tok/s | 4,158 tok/s | 24 | 140 | 180 | 0.294 |
-| Q3_K_M | 2.29 GB | 2.12 GiB | 90 tok/s | 4,179 tok/s | 24 | 135 | 198 | 0.219 |
-| UD-Q3_K_XL | 2.44 GB | 2.26 GiB | 83 tok/s | 4,151 tok/s | 23 | 129 | 198 | 0.259 |
-| IQ4_XS | 2.48 GB | 2.30 GiB | 67 tok/s | 4,143 tok/s | 24 | 135 | 217 | 0.182 |
-| IQ4_NL | 2.58 GB | 2.39 GiB | 70 tok/s | 4,166 tok/s | 24 | 132 | 217 | 0.172 |
-| Q4_K_S | 2.59 GB | 2.40 GiB | 93 tok/s | 4,146 tok/s | 24 | 138 | 248 | 0.146 |
-| our q4 pack of it | n/a | 2.49 GiB | 109 tok/s | 4,543 tok/s | 23 | 134 | 194 | 0.260 |
-| Q4_K_M | 2.74 GB | 2.54 GiB | 90 tok/s | 4,158 tok/s | 24 | 139 | 251 | 0.143 |
-| Q4_0 | 2.58 GB | 2.58 GiB | 99 tok/s | 4,215 tok/s | 24 | 121 | 227 | 0.178 |
-| Q4_1 | 2.78 GB | 2.58 GiB | 99 tok/s | 4,216 tok/s | 24 | 138 | 238 | 0.148 |
-| UD-Q4_K_XL | 2.91 GB | 2.70 GiB | 84 tok/s | 4,149 tok/s | 24 | 148 | 252 | 0.120 |
-| Q5_K_S | 3.02 GB | 2.81 GiB | 83 tok/s | 4,126 tok/s | 24 | 136 | 272 | 0.076 |
-| Q5_K_M | 3.14 GB | 2.92 GiB | 84 tok/s | 4,136 tok/s | 24 | 135 | 271 | 0.067 |
-| UD-Q5_K_XL | 3.25 GB | 3.02 GiB | 85 tok/s | 4,138 tok/s | 24 | 136 | 274 | 0.074 |
-| Q6_K | 3.53 GB | 3.27 GiB | 81 tok/s | 4,118 tok/s | 24 | 139 | 269 | 0.047 |
-| UD-Q6_K_XL | 4.15 GB | 3.85 GiB | 74 tok/s | 4,157 tok/s | 24 | 142 | 280 | 0.036 |
-| our q8 pack of it | n/a | 4.04 GiB | 77 tok/s | 4,441 tok/s | 24 | 141 | 291 | 0.019 |
-| Q8_0 | 4.48 GB | 4.16 GiB | 74 tok/s | 4,146 tok/s | 24 | 141 | 294 | 0.018 |
-| UD-Q8_K_XL | 5.95 GB | 5.53 GiB | 58 tok/s | 4,244 tok/s | 24 | 143 | 295 | 0.015 |
-| BF16 | 8.42 GB | 7.83 GiB | 43 tok/s | 4,622 tok/s | 24 | 144 | 300 | 0.001 |
-| original checkpoint, f16 | n/a | 7.83 GiB | 44 tok/s | 4,990 tok/s | 24 | 144 | 300 | 0.000 |
+| BF16 | 8.42 GB | 7.83 GiB | 43 tok/s | 300 | 9.31 GB | 4.25 GiB | 61 tok/s | 300 |
+| Q8_0 | 4.48 GB | 4.16 GiB | 74 tok/s | 294 | 5.05 GB | 2.29 GiB | 91 tok/s | 292 |
+| Q6_K | 3.53 GB | 3.27 GiB | 81 tok/s | 269 | 4.50 GB | 1.79 GiB | 109 tok/s | 276 |
+| Q5_K_M | 3.14 GB | 2.92 GiB | 84 tok/s | 271 | 3.36 GB | 1.54 GiB | 110 tok/s | 261 |
+| Q4_K_M | 2.74 GB | 2.54 GiB | 90 tok/s | 251 | 3.11 GB | 1.31 GiB | 120 tok/s | 237 |
+| Q4_0 | 2.58 GB | 2.58 GiB | 99 tok/s | 227 | 3.04 GB | 1.36 GiB | 127 tok/s | 195 |
+| Q3_K_M | 2.29 GB | 2.12 GiB | 90 tok/s | 198 | 2.54 GB | 1.06 GiB | 116 tok/s | 199 |
+| UD-IQ2_M | 1.76 GB | 1.63 GiB | 85 tok/s | 90 | 2.29 GB | 0.83 GiB | 114 tok/s | 122 |
+| *original, f16* | | 7.83 GiB | 44 tok/s | 300 | | 4.25 GiB | 61 tok/s | 300 |
+| *our q4 pack* | | 2.49 GiB | 109 tok/s | 194 | | 1.43 GiB | 121 tok/s | 227 |
 
-- **Memory is the file's.** A file's GPU memory is its size (2.74 GB is 2.55 GiB), except Q4_0, which takes 7 % more.
-- **The import is exact.** The BF16 file gives the original's answer on all 300 questions.
+- **Memory is the file's.** A Qwen file takes its size on the GPU (2.74 GB is 2.55 GiB); a Gemma 4 E2B file under
+  half of it, because its per-layer embedding table is read on the host.
+- **The import is exact.** Both BF16 files give the original checkpoint's answer on all 300 questions.
 - **The kernels keep the file's values.** Read by the block kernels or decoded to f16 on upload
-  (`--backend-opt block=f16`), a file gives the same answer on 298 to 300 of 300, with a mean shift of 0.001 to 0.002.
-- **Accuracy follows the bits.** From 5 bits up a file answers like the original on 9 questions in 10 or more; the
-  4-bit K-quants on 5 in 6, closer than our own round-to-nearest q4 pack at the same size (2 in 3); the 3-bit
-  K-quants on 3 in 5 to 2 in 3; UD-IQ3_XXS and the 2-bit files on fewer than half, and the smallest gets 61 right
-  where the original gets 144.
-- **Speed.** The files decode at 1.3 to 2.3 times f16's speed. Our q4 pack is the fastest at its size (109 tok/s
-  against 90 to 99 for the 4-bit files), and the IQ4 formats are the slowest per weight (67 to 70 tok/s). No format
-  is bound by memory at this size, so a smaller file is not a faster one (decision 0016 has each format's rate).
-
-Every file of [unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF), measured the same
-way (the original checkpoint and our packs without their vision tower):
-
-| Variant | File | GPU memory | Decode | Prefill | Test decisions right (25) | MMLU-Pro right (300) | Same answer as f16 (300) | Shift |
-|---|---|---|---|---|---|---|---|---|
-| UD-IQ2_M | 2.29 GB | 0.83 GiB | 114 tok/s | 6,325 tok/s | 22 | 61 | 122 | 0.524 |
-| UD-IQ3_XXS | 2.37 GB | 0.90 GiB | 111 tok/s | 6,316 tok/s | 22 | 68 | 137 | 0.494 |
-| UD-Q2_K_XL | 2.40 GB | 0.93 GiB | 122 tok/s | 5,837 tok/s | 22 | 56 | 121 | 0.528 |
-| Q3_K_S | 2.45 GB | 0.97 GiB | 117 tok/s | 6,234 tok/s | 21 | 63 | 167 | 0.393 |
-| Q3_K_M | 2.54 GB | 1.06 GiB | 116 tok/s | 6,056 tok/s | 22 | 69 | 199 | 0.296 |
-| UD-Q3_K_XL | 2.92 GB | 1.14 GiB | 114 tok/s | 5,941 tok/s | 23 | 69 | 195 | 0.284 |
-| IQ4_XS | 2.98 GB | 1.20 GiB | 98 tok/s | 6,182 tok/s | 22 | 58 | 247 | 0.168 |
-| IQ4_NL | 3.04 GB | 1.25 GiB | 97 tok/s | 5,747 tok/s | 22 | 61 | 249 | 0.158 |
-| Q4_K_S | 3.04 GB | 1.25 GiB | 124 tok/s | 6,175 tok/s | 22 | 64 | 239 | 0.179 |
-| Q4_K_M | 3.11 GB | 1.31 GiB | 120 tok/s | 6,156 tok/s | 23 | 63 | 237 | 0.170 |
-| Q4_0 | 3.04 GB | 1.36 GiB | 127 tok/s | 6,296 tok/s | 21 | 51 | 195 | 0.301 |
-| Q4_1 | 3.15 GB | 1.36 GiB | 126 tok/s | 6,089 tok/s | 23 | 60 | 240 | 0.178 |
-| UD-Q4_K_XL | 3.18 GB | 1.38 GiB | 117 tok/s | 6,198 tok/s | 23 | 65 | 233 | 0.184 |
-| our q4 pack of it | n/a | 1.43 GiB | 121 tok/s | 4,792 tok/s | 22 | 64 | 227 | 0.229 |
-| Q5_K_S | 3.32 GB | 1.51 GiB | 111 tok/s | 6,160 tok/s | 23 | 66 | 262 | 0.099 |
-| Q5_K_M | 3.36 GB | 1.54 GiB | 110 tok/s | 5,546 tok/s | 23 | 65 | 261 | 0.092 |
-| UD-Q5_K_XL | 4.29 GB | 1.59 GiB | 110 tok/s | 6,239 tok/s | 23 | 61 | 260 | 0.104 |
-| Q6_K | 4.50 GB | 1.79 GiB | 109 tok/s | 6,011 tok/s | 23 | 65 | 276 | 0.071 |
-| UD-Q6_K_XL | 4.71 GB | 1.98 GiB | 100 tok/s | 6,210 tok/s | 23 | 65 | 281 | 0.056 |
-| our q8 pack of it | n/a | 2.23 GiB | 91 tok/s | 5,377 tok/s | 23 | 66 | 293 | 0.023 |
-| Q8_0 | 5.05 GB | 2.29 GiB | 91 tok/s | 6,268 tok/s | 23 | 65 | 292 | 0.019 |
-| UD-Q8_K_XL | 5.28 GB | 2.49 GiB | 85 tok/s | 6,319 tok/s | 23 | 65 | 293 | 0.020 |
-| BF16 | 9.31 GB | 4.25 GiB | 61 tok/s | 6,676 tok/s | 23 | 62 | 300 | 0.000 |
-| original checkpoint, f16 | n/a | 4.25 GiB | 61 tok/s | 6,220 tok/s | 23 | 62 | 300 | 0.000 |
-
-- **The import is exact here too**: the BF16 file gives the original's answer on all 300 questions, and against the
-  same weights decoded to f16 on upload a file's answers are the same on 299 to 300 of 300.
-- **GPU memory is under half the file**: the per-layer embedding table (2.35 billion weights, about half of a file)
-  is read on the host, a row per token, as it is from the original checkpoint.
-- **The drafter files** (`MTP/mtp-gemma-4-E2B-it-*.gguf`, llama.cpp's `gemma4-assistant`) import as a drafter:
-  `--spec mtp --drafter <its dir>` writes the same text as without it and decodes at 243 tok/s on the Q4_0 file
-  (128 without), 219 on Q8_0 (91), 183 on Q4_K_M (119) and 180 on BF16 (61), on `bench`'s generated text. A K-quant
-  target gains less: a verify of several rows has no matrix-engine kernel over block formats yet.
-
-**Tool calls and chat templates.** A pack imported from a GGUF renders the file's own chat template.
-`tests/e2e/tool_calls.py` runs 23 easy to medium cases against a server (one tool or ten offered, calls in parallel,
-no tool needed, a streamed call, thinking on, and six conversations of two or three turns that need an earlier
-tool's result) and `tool_calls_rubric.md` says what each must do. Graded by a stronger model, for the original
-checkpoint, its BF16 GGUF and its Q4_K_M GGUF alike: Qwen3.5-4B 23 of 23 well-formed and 23 of 23 right; Gemma 4 E2B
-23 of 23 well-formed and 22 of 23 right (the same miss in all three). The BF16 GGUF made the original's tool calls,
-name and arguments, in every case of both models.
+  (`--backend-opt block=f16`), a file gives the same answer on 298 to 300 of 300.
+- **Accuracy follows the bits**, and is the file's: from 5 bits up a file answers like the original on about 9
+  questions in 10, the 4-bit K-quants on about 4 in 5, the 2-bit files on fewer than half.
+- **Speed.** Files decode at 1.3 to 2.3 times f16's speed. No format is bound by memory at these sizes, so a smaller
+  file is not a faster one; the IQ4 formats are the slowest per weight.
+- **Drafters.** Gemma's `MTP/` files import as a drafter (`--spec mtp --drafter <its dir>`): the same text, at 243
+  tok/s on the Q4_0 file (128 without) and 183 on Q4_K_M (119). A K-quant target gains less: a verify of several
+  rows has no matrix-engine kernel over block formats yet.
+- **Tool calls and chat templates.** A pack renders the GGUF's own template. On the 23 tool-calling cases of
+  `tests/e2e/tool_calls.py` (one turn and several, graded by a stronger model against `tool_calls_rubric.md`), the
+  original checkpoint, its BF16 GGUF and its Q4_K_M GGUF score alike: Qwen3.5-4B 23 of 23 well-formed and right,
+  Gemma 4 E2B 23 well-formed and 22 right, and the BF16 GGUF makes the original's calls in every case.
 
 A mixture of experts in a block format is refused.
 

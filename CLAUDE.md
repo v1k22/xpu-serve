@@ -91,6 +91,7 @@ xpu-serve/
 ├── DESIGN.md               the design (why), roadmap, open questions
 ├── TODO.md                 phase checklists; [x] = done and tested
 ├── docs/decisions/         one short record per decision (NNNN-title.md)
+├── docs/gguf_models.md     what was measured with GGUF files: every variant of two model families
 ├── third_party/            vendored header-only deps (see third_party/README.md)
 ├── src/                    everything that ships (section 4)
 └── tests/                  unit tests, parity scripts, fixtures (section 7)
