@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 #include "io/safetensors.h"
 #include "io/safetensors_writer.h"
 #include "quant/fp8.h"
@@ -27,9 +29,13 @@ namespace xs::test {
 
 namespace fs = std::filesystem;
 
+// A directory of this process's own (two test binaries may run at once, e.g. one per GPU), emptied on both ends.
 struct TempDir {
     fs::path path;
-    explicit TempDir(const std::string& name) : path(fs::temp_directory_path() / name) { fs::remove_all(path); }
+    explicit TempDir(const std::string& name)
+        : path(fs::temp_directory_path() / (name + "." + std::to_string(::getpid()))) {
+        fs::remove_all(path);
+    }
     ~TempDir() { fs::remove_all(path); }
 };
 
