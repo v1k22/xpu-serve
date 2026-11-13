@@ -65,6 +65,9 @@ public:
     std::vector<bool> bools() const;
     std::vector<Value> elements() const;  // any array, element by element (the way to read nested arrays)
 
+    // The same type (and element type) and the same bytes as `other`, whatever the two keys: one value, exactly.
+    bool same_as(const Value& other) const;
+
     Value() = default;
 
 private:

@@ -44,9 +44,13 @@ struct Layout {
     std::function<std::string(int64_t)> block_kind;  // what block i is, for errors ("linear attention")
 };
 
-// Every tensor of `file` through `layout`, into plan.tensors (and the computed ones into plan.derived). Refuses by
-// name, as "<architecture>: ...": a tensor the layout has no entry for, a shape other than its entry's, a pack tensor
-// no tensor of the file holds (unless every entry naming it is optional) or that more than one does.
+// Every tensor of `tensors` (the model's, from its file or from two: a head in a file of its own) through `layout`,
+// into plan.tensors (and the computed ones into plan.derived). Refuses by name, as "<architecture>: ...": a tensor the
+// layout has no entry for, a shape other than its entry's, a pack tensor no tensor holds (unless every entry naming it
+// is optional) or that more than one does.
+void map_tensors(const std::vector<const gguf::TensorInfo*>& tensors, std::string_view architecture,
+                 const Layout& layout, ImportPlan& plan);
+// Every tensor of `file`.
 void map_tensors(const gguf::File& file, std::string_view architecture, const Layout& layout, ImportPlan& plan);
 
 // Metadata `key`, an integer that must be positive.

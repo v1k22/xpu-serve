@@ -363,6 +363,12 @@ std::vector<bool> Value::bools() const {
     return out;
 }
 
+bool Value::same_as(const Value& other) const {
+    if (type_ != other.type_ || bytes_ != other.bytes_) return false;
+    if (type_ == ValueType::Array && (element_type_ != other.element_type_ || count_ != other.count_)) return false;
+    return bytes_ == 0 || std::memcmp(data_, other.data_, bytes_) == 0;
+}
+
 std::vector<Value> Value::elements() const {
     need_array();
     std::vector<Value> out;

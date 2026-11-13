@@ -5,6 +5,9 @@
 // the names the model code reads. The import driver (gguf_import.cpp) writes them: a tensor in a block format byte for
 // byte, a float tensor as stored or through a value-by-value transform. A quantized tensor is never decoded, re-encoded
 // or reordered; it can only be cut into runs of whole rows.
+//
+// A model's MTP head can come in a file of its own (`convert --mtp`): the plan then draws its tensors from two files,
+// and is the plan of a model file that held the head.
 
 #include <string>
 #include <string_view>
@@ -34,11 +37,16 @@ struct PackTensor {
 };
 
 struct ImportPlan {
-    nlohmann::ordered_json config;    // config.json, without eos_token_id (the import adds the tokenizer's)
-    std::vector<PackTensor> tensors;  // with `derived`, every row of every tensor of the file exactly once
+    nlohmann::ordered_json config;  // config.json, without eos_token_id (the import adds the tokenizer's)
+    // With `derived` and `copies`, every row of every tensor of the files exactly once.
+    std::vector<PackTensor> tensors;
     // Tensors the converter computed from the config (not the checkpoint's), which the architecture checked against
     // the config it writes: not imported, since the model code computes them from config.json.
     std::vector<const gguf::TensorInfo*> derived;
+    // Tensors of an MTP head's file that repeat one of the model's (llama.cpp's draft model carries its own embedding,
+    // output head and final norm), which the architecture checked against the model's shapes: not imported, since
+    // the head reads the model's.
+    std::vector<const gguf::TensorInfo*> copies;
     // A drafter beside a target model: it is served with the target's tokenizer, chat template and stop tokens, so its
     // pack holds config.json and the weights only.
     bool drafter = false;
@@ -51,6 +59,11 @@ public:
     // Refuses by name what it does not implement: metadata keys of its namespace it does not know, tensors it has no
     // name for, shapes that disagree with the metadata.
     virtual ImportPlan plan(const gguf::File& file) const = 0;
+    // The plan of `file`, a model without its MTP head, with the head taken from `mtp`, a file of its own: the plan
+    // of a file that held both. Refuses by name a model file that has a head, and an MTP file of another architecture,
+    // of another model (metadata that disagrees with the file's) or with tensors beyond the head and the copies.
+    // The default refuses it by name, for an architecture that has no such files.
+    virtual ImportPlan plan_with_mtp(const gguf::File& file, const gguf::File& mtp) const;
 };
 
 const Architecture& qwen35();

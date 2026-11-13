@@ -47,11 +47,14 @@ void check_general(const gguf::File& f) {
     }
 }
 
-// Every row of every tensor of the file goes into the pack exactly once, but for the derived ones, which go nowhere.
-void check_coverage(const gguf::File& f, const ImportPlan& plan) {
+// Every row of every tensor of the files goes into the pack exactly once, but for the derived ones and the copies,
+// which go nowhere.
+void check_coverage(const std::vector<const gguf::File*>& files, const ImportPlan& plan) {
     std::map<const gguf::TensorInfo*, std::vector<std::pair<int64_t, int64_t>>> runs;
-    for (const gguf::TensorInfo* t : plan.derived)
-        runs[t].emplace_back(0, t->rows());
+    for (const auto* list : {&plan.derived, &plan.copies}) {
+        for (const gguf::TensorInfo* t : *list)
+            runs[t].emplace_back(0, t->rows());
+    }
     for (const PackTensor& p : plan.tensors) {
         XS_CHECK(!p.shape.empty() && p.shape.back() == p.source->cols(), "gguf import: '", p.name, "' ",
                  dims_to_string(p.shape), " does not keep the ", p.source->cols(), " columns of '", p.source->name,
@@ -61,17 +64,21 @@ void check_coverage(const gguf::File& f, const ImportPlan& plan) {
                  p.first_row, " to ", p.first_row + rows, " of '", p.source->name, "', which has ", p.source->rows());
         runs[p.source].emplace_back(p.first_row, rows);
     }
-    for (const gguf::TensorInfo& t : f.tensors()) {
-        auto it = runs.find(&t);
-        if (it == runs.end()) fail("gguf import: tensor '", t.name, "' of the file is not imported");
-        std::sort(it->second.begin(), it->second.end());
-        int64_t next = 0;
-        for (const auto& [first, count] : it->second) {
-            XS_CHECK(first == next, "gguf import: rows of tensor '", t.name, "' are imported twice or not at all");
-            next = first + count;
+    for (const gguf::File* f : files) {
+        for (const gguf::TensorInfo& t : f->tensors()) {
+            auto it = runs.find(&t);
+            if (it == runs.end()) {
+                fail("gguf import: tensor '", t.name, "' of ", f->path().filename().string(), " is not imported");
+            }
+            std::sort(it->second.begin(), it->second.end());
+            int64_t next = 0;
+            for (const auto& [first, count] : it->second) {
+                XS_CHECK(first == next, "gguf import: rows of tensor '", t.name, "' are imported twice or not at all");
+                next = first + count;
+            }
+            XS_CHECK(next == t.rows(), "gguf import: rows ", next, " to ", t.rows(), " of tensor '", t.name,
+                     "' are not imported");
         }
-        XS_CHECK(next == t.rows(), "gguf import: rows ", next, " to ", t.rows(), " of tensor '", t.name,
-                 "' are not imported");
     }
 }
 
@@ -196,6 +203,10 @@ std::vector<float> float_rows(const gguf::TensorInfo& t, int64_t first, int64_t 
     return out;
 }
 
+ImportPlan Architecture::plan_with_mtp(const gguf::File&, const gguf::File&) const {
+    fail(name(), ": an MTP head in a file of its own (--mtp) is not supported for this architecture");
+}
+
 const Architecture& find_architecture(std::string_view name) {
     const std::vector<const Architecture*> all{&qwen35(), &gemma4(), &gemma4_assistant()};
     std::string list;
@@ -215,8 +226,16 @@ ImportReport import_gguf(const ImportOptions& o) {
     }
     const gguf::File file(o.source);
     check_general(file);
+    std::vector<const gguf::File*> files{&file};  // the files the plan's tensors come from
+    std::optional<gguf::File> mtp;
+    if (!o.mtp.empty()) {
+        mtp.emplace(o.mtp);
+        check_general(*mtp);
+        files.push_back(&*mtp);
+    }
     const std::string architecture(file.get_string("general.architecture"));
-    ImportPlan plan = find_architecture(architecture).plan(file);
+    const Architecture& arch = find_architecture(architecture);
+    ImportPlan plan = mtp ? arch.plan_with_mtp(file, *mtp) : arch.plan(file);
     // A language model's tokenizer, chat template and sampling defaults (a drafter has the target's).
     std::optional<TokenizerFiles> tokenizer;
     std::string chat;
@@ -229,7 +248,10 @@ ImportReport import_gguf(const ImportOptions& o) {
         plan.config["eos_token_id"] =
             stops.size() == 1 ? nlohmann::ordered_json(stops[0]) : nlohmann::ordered_json(stops);
     }
-    check_coverage(file, plan);
+    check_coverage(files, plan);
+    for (const gguf::TensorInfo* t : plan.copies) {
+        log::info("gguf: ", t->name, " of ", o.mtp.filename().string(), " is left out: the head reads the model's");
+    }
 
     std::sort(plan.tensors.begin(), plan.tensors.end(),
               [](const PackTensor& a, const PackTensor& b) { return a.name < b.name; });
@@ -273,6 +295,7 @@ ImportReport import_gguf(const ImportOptions& o) {
         if (const gguf::Value* v = file.find(key)) source[key] = std::string(v->as_string());
     }
     if (const gguf::Value* v = file.find("general.file_type")) source["general.file_type"] = v->as_int();
+    if (mtp) source["mtp"] = o.mtp.filename().string();
     manifest["source"] = std::move(source);
     manifest["tensors"] = std::move(manifest_tensors);
     write_json(o.output / kPackManifest, manifest, 1);
@@ -281,14 +304,17 @@ ImportReport import_gguf(const ImportOptions& o) {
     report.architecture = architecture;
     if (const gguf::Value* v = file.find("general.name")) report.model_name = std::string(v->as_string());
     std::map<std::string, FormatShare> formats;
-    for (const gguf::TensorInfo& t : file.tensors()) {
-        FormatShare& s = formats[t.type_name()];
-        s.format = t.type_name();
-        ++s.tensors;
-        s.weights += t.numel();
-        s.bytes += t.nbytes;
-        ++report.tensors;
-        report.weights += t.numel();
+    for (const gguf::File* f : files) {
+        for (const gguf::TensorInfo& t : f->tensors()) {
+            if (std::find(plan.copies.begin(), plan.copies.end(), &t) != plan.copies.end()) continue;
+            FormatShare& s = formats[t.type_name()];
+            s.format = t.type_name();
+            ++s.tensors;
+            s.weights += t.numel();
+            s.bytes += t.nbytes;
+            ++report.tensors;
+            report.weights += t.numel();
+        }
     }
     for (auto& [name, share] : formats)
         report.formats.push_back(share);

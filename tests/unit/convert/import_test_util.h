@@ -1,6 +1,6 @@
 #pragma once
 
-// What the GGUF import tests share: importing a file, a model's logits and greedy tokens on cpu-ref, a weight's
+// What the GGUF import tests share: importing a file, a model's logits, greedy tokens and drafts on cpu-ref, a weight's
 // values, and the error a changed file gives.
 
 #include <doctest/doctest.h>
@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "backend/cpu_ref/cpu_backend.h"
 #include "convert/gguf/gguf_import.h"
+#include "engine/spec/chain_drafter.h"
 #include "io/gguf_test_util.h"
 #include "models/model.h"
 #include "quant/quant.h"
@@ -20,10 +22,13 @@
 
 namespace xs::test {
 
-inline gguf_import::ImportReport import_into(const std::filesystem::path& gguf, const std::filesystem::path& out) {
+// `gguf` imported into `out`, with its MTP head from the file `mtp` when one is given.
+inline gguf_import::ImportReport import_into(const std::filesystem::path& gguf, const std::filesystem::path& out,
+                                             const std::filesystem::path& mtp = {}) {
     gguf_import::ImportOptions o;
     o.source = gguf;
     o.output = out;
+    o.mtp = mtp;
     return gguf_import::import_gguf(o);
 }
 
@@ -86,10 +91,53 @@ inline std::vector<int32_t> greedy(const Model& model, const std::vector<int32_t
     return out;
 }
 
+// A model's drafter after a prefill of `prompt`: its logits for (the first greedy token, the prompt's last hidden row),
+// and the three drafts it chains from them.
+struct Drafts {
+    std::vector<float> logits;
+    std::vector<int32_t> tokens;
+};
+inline Drafts drafts(const Model& model, const std::vector<int32_t>& prompt) {
+    const Speculation* spec = model.speculation();
+    REQUIRE(spec != nullptr);
+    REQUIRE(spec->chain() != nullptr);
+    SessionOptions options = f32_session();
+    options.rewind_tokens = 4;
+    const graph::Graph* programs[] = {&model.graph(), &spec->prefill_graph(), &spec->verify_graph(),
+                                      &spec->draft_graph()};
+    const auto session = make_cpu_ref_backend()->compile(programs, model.weights(), options);
+    TensorMap inputs, outputs;
+    model.prepare_inputs(prompt, 0, {}, inputs);
+    session->run(spec::kPrefill, inputs, outputs);
+    const HostTensor hidden = std::move(outputs.at("hidden"));
+    const HostTensor& l = outputs.at("logits");
+    const auto first =
+        static_cast<int32_t>(std::max_element(l.data<float>(), l.data<float>() + l.numel()) - l.data<float>());
+    const std::span<const float> rows(hidden.data<float>(), static_cast<size_t>(hidden.numel()));
+    inputs.clear();
+    spec->chain()->prepare_draft(std::vector<int32_t>{first}, rows.last(static_cast<size_t>(hidden.dim(1))),
+                                 static_cast<int64_t>(prompt.size()) - 1, 0, inputs);
+    session->run(spec::kDraft, inputs, outputs);
+    Drafts out;
+    out.logits.assign(outputs.at("logits").data<float>(),
+                      outputs.at("logits").data<float>() + outputs.at("logits").numel());
+    spec::ChainDrafter drafter(*spec, *session);
+    drafter.add(TensorMap{{"hidden", hidden}}, hidden.dim(0), 0, prompt);
+    out.tokens = drafter.propose(first, 3);
+    return out;
+}
+
 inline std::vector<float> values(const TensorView& v) {
     std::vector<float> out(static_cast<size_t>(v.numel()));
     quant::read_rows(v, 0, quant::matrix_rows(v.shape), out.data());
     return out;
+}
+
+// `error` names `text`; else it is shown.
+inline bool has(const std::string& error, const std::string& text) {
+    const bool found = error.find(text) != std::string::npos;
+    if (!found) MESSAGE("the error is: '" << error << "'");
+    return found;
 }
 
 // The GGUF `build(dir / "src")` writes, with `change` applied, imported into a fresh directory: the error it gives,

@@ -158,6 +158,32 @@ TEST_SUITE("gguf reader") {
         CHECK(f.find_tensor("t")->nbytes == 16);
     }
 
+    TEST_CASE("two values are the same only in type and bytes, whatever their keys") {
+        const TempDir dir("xs_gguf_reader_same_test");
+        std::filesystem::create_directories(dir.path);
+        GgufWriter w;
+        w.u32("a", 5120).u32("b", 5120).i32("c", 5120).u32("d", 4096);
+        w.f32("e", 1e-6f).f32("f", 1e-6f).f64("g", 1e-6).f32("h", -0.0f).f32("i", 0.0f);
+        w.string("j", "qwen35").string("k", "qwen35").string("l", "qwen3");
+        w.i32s("m", {11, 11, 10, 0}).i32s("n", {11, 11, 10, 0}).i32s("o", {11, 11, 10}).u32("p", 0);
+        w.array("q", T::U32, 4, pod_bytes(std::vector<uint32_t>{11, 11, 10, 0}));
+        w.write(dir.path / "same.gguf");
+        const gguf::File f(dir.path / "same.gguf");
+        const auto same = [&](const char* a, const char* b) { return f.get(a).same_as(f.get(b)); };
+        CHECK(same("a", "b"));
+        CHECK_FALSE(same("a", "c"));  // the same number as another type
+        CHECK_FALSE(same("a", "d"));
+        CHECK(same("e", "f"));
+        CHECK_FALSE(same("e", "g"));
+        CHECK_FALSE(same("h", "i"));  // -0 and 0 compare equal as floats
+        CHECK(same("j", "k"));
+        CHECK_FALSE(same("j", "l"));
+        CHECK(same("m", "n"));
+        CHECK_FALSE(same("m", "o"));
+        CHECK_FALSE(same("m", "q"));  // the same values as another element type
+        CHECK_FALSE(same("m", "p"));
+    }
+
     TEST_CASE("a vocabulary-sized string array reads as views, without copying the strings") {
         const TempDir dir("xs_gguf_reader_vocab_test");
         std::filesystem::create_directories(dir.path);

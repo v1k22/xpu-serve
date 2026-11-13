@@ -46,7 +46,8 @@ const char* kUsage =
     "  xpu-serve run   <model-dir> [options]   chat in the terminal (--prompt for one shot)\n"
     "  xpu-serve bench <model-dir> [options]   prefill / decode speed, or a decision model's latency\n"
     "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--method rtn|awq]   quantized pack\n"
-    "  xpu-serve convert <file.gguf> <out-dir>  a GGUF file as a pack, its tensors as the file stores them\n"
+    "  xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>]   a GGUF file as a pack, its tensors as the file\n"
+    "                                          stores them (--mtp: its MTP head from a file of its own)\n"
     "  xpu-serve info                          backends and devices\n"
     "\n"
     "<model-dir> is a Hugging Face model directory (config.json, *.safetensors, tokenizer.json) or a pack that\n"
@@ -205,17 +206,24 @@ int convert_gguf(const Args& a) {
         }
     }
     const std::vector<std::string>& pos = a.positionals();
-    if (pos.size() > 2 || (pos.size() == 2) == a.has("out")) fail("usage: xpu-serve convert <file.gguf> <out-dir>");
+    if (pos.size() > 2 || (pos.size() == 2) == a.has("out")) {
+        fail("usage: xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>]");
+    }
     gguf_import::ImportOptions o;
     o.source = pos[0];
     o.output = pos.size() == 2 ? pos[1] : a.get("out");
-    if (!std::filesystem::is_regular_file(o.source)) fail("convert: '", pos[0], "' is not a file");
-    if (!gguf::has_gguf_magic(o.source)) fail("convert: '", pos[0], "' ends in .gguf but is not a GGUF file");
+    o.mtp = a.get("mtp");
+    for (const std::filesystem::path& file : {o.source, o.mtp}) {
+        if (file.empty()) continue;
+        if (!std::filesystem::is_regular_file(file)) fail("convert: '", file.string(), "' is not a file");
+        if (!gguf::has_gguf_magic(file)) fail("convert: '", file.string(), "' is not a GGUF file");
+    }
     o.converter = std::string("xpu-serve ") + XS_VERSION;
     const gguf_import::ImportReport r = gguf_import::import_gguf(o);
     const std::string named = r.model_name.empty() ? r.architecture : r.architecture + " (" + r.model_name + ")";
-    std::printf("imported %s: %s, %lld tensors\n", o.source.filename().string().c_str(), named.c_str(),
-                static_cast<long long>(r.tensors));
+    const std::string with = o.mtp.empty() ? "" : " with the MTP head of " + o.mtp.filename().string();
+    std::printf("imported %s%s: %s, %lld tensors\n", o.source.filename().string().c_str(), with.c_str(),
+                named.c_str(), static_cast<long long>(r.tensors));
     for (const gguf_import::FormatShare& f : r.formats) {
         std::printf("  %-8s %5lld tensors  %5.1f %% of the weights  %7.3f GB\n", f.format.c_str(),
                     static_cast<long long>(f.tensors),
@@ -240,18 +248,22 @@ int cmd_convert(const std::vector<std::string>& argv) {
         .value("calib-tokens", "AWQ: calibration tokens, at most", "8192")
         .value("backend", "AWQ: calibration backend (default: the first of this build)")
         .value("device", "AWQ: calibration device")
+        .value("mtp",
+               "a GGUF file: the model's MTP head from this file of its own (llama.cpp's draft model of it), for a "
+               "GGUF file without one")
         .value("log-level", "debug | info | warn | error", "info")
         .flag("help", "show this help");
     a.parse(argv);
     if (wants_help(
             a, "convert",
             "<model-dir> --out <dir> [options]\n"
-            "       xpu-serve convert <file.gguf> <out-dir>   (a GGUF file, its tensors as the file stores them: "
-            "of the options, only --out and --log-level apply)")) {
+            "       xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>]   (a GGUF file, its tensors as the file "
+            "stores them: of the options, only --out, --mtp and --log-level apply)")) {
         return 0;
     }
     log::set_level(log::parse_level(a.get("log-level")));
     if (!a.positionals().empty() && is_gguf_name(a.positionals()[0])) return convert_gguf(a);
+    if (a.has("mtp")) fail("convert: --mtp applies to a GGUF file (the MTP head of a model file without one)");
     ConvertOptions o;
     o.source = model_dir_arg(a, "convert");
     if (std::filesystem::is_regular_file(o.source)) {
