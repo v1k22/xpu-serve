@@ -18,14 +18,15 @@
 #include "convert/gguf/gguf_import.h"
 #include "convert/import_test_util.h"
 #include "convert/tiny_gemma4_gguf.h"
-#include "engine/spec/chain_drafter.h"
 #include "models/model.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
 
 using namespace xs;
 namespace fs = std::filesystem;
+using xs::test::Drafts;
 using xs::test::GgufWriter;
+using xs::test::has;
 using xs::test::import_into;
 using xs::test::relative_gap;
 using xs::test::TempDir;
@@ -54,45 +55,8 @@ std::string assistant_refusal(const fs::path& dir, Change change) {
 
 // The drafter after a prefill of kPrompt: its logits for (the first greedy token, the prompt's last hidden row), and
 // the three drafts it chains from them.
-struct Drafts {
-    std::vector<float> logits;
-    std::vector<int32_t> tokens;
-};
 Drafts drafts(const Model& model) {
-    const Speculation* spec = model.speculation();
-    REQUIRE(spec != nullptr);
-    REQUIRE(spec->chain() != nullptr);
-    SessionOptions options = xs::test::f32_session();
-    options.rewind_tokens = 4;
-    const graph::Graph* programs[] = {&model.graph(), &spec->prefill_graph(), &spec->verify_graph(),
-                                      &spec->draft_graph()};
-    const auto session = make_cpu_ref_backend()->compile(programs, model.weights(), options);
-    TensorMap inputs, outputs;
-    model.prepare_inputs(kPrompt, 0, {}, inputs);
-    session->run(spec::kPrefill, inputs, outputs);
-    const HostTensor hidden = std::move(outputs.at("hidden"));
-    const HostTensor& l = outputs.at("logits");
-    const auto first =
-        static_cast<int32_t>(std::max_element(l.data<float>(), l.data<float>() + l.numel()) - l.data<float>());
-    const std::span<const float> rows(hidden.data<float>(), static_cast<size_t>(hidden.numel()));
-    inputs.clear();
-    spec->chain()->prepare_draft(std::vector<int32_t>{first}, rows.last(static_cast<size_t>(hidden.dim(1))),
-                                 static_cast<int64_t>(kPrompt.size()) - 1, 0, inputs);
-    session->run(spec::kDraft, inputs, outputs);
-    Drafts out;
-    out.logits.assign(outputs.at("logits").data<float>(),
-                      outputs.at("logits").data<float>() + outputs.at("logits").numel());
-    spec::ChainDrafter drafter(*spec, *session);
-    drafter.add(TensorMap{{"hidden", hidden}}, hidden.dim(0), 0, kPrompt);
-    out.tokens = drafter.propose(first, 3);
-    return out;
-}
-
-// `error` names `text`; else it is shown.
-bool has(const std::string& error, const std::string& text) {
-    const bool found = error.find(text) != std::string::npos;
-    if (!found) MESSAGE("the error is: '" << error << "'");
-    return found;
+    return xs::test::drafts(model, kPrompt);
 }
 
 }  // namespace
