@@ -465,6 +465,7 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     XS_CHECK(ks[2] == qs[2], "attention head_dim differs: q ", qs[2], ", k ", ks[2]);
     XS_CHECK(qs[1] % ks[1] == 0, "attention heads ", qs[1], " not a multiple of kv heads ", ks[1]);
     XS_CHECK(attrs.sliding_window >= 0 && attrs.softcap >= 0.0f && attrs.block >= 0, "invalid attention attributes");
+    XS_CHECK(!attrs.grouped, "attention in groups takes the tokens' groups (attention_in_groups)");
     if (attrs.block > 0) {
         XS_CHECK(!attrs.causal && attrs.sliding_window == 0 && qs[0] > 0 && ks[0] == qs[0] && qs[0] % attrs.block == 0,
                  "attention within blocks of ", attrs.block, " takes non-causal q, k and v of one static length, a "
@@ -474,12 +475,29 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
 }
 
 Value Graph::attention(Value q, Value k, Value v, Value key_bias, const AttentionAttrs& attrs) {
-    XS_CHECK(!attrs.causal, "attention with a key bias must not be causal");
+    XS_CHECK(!attrs.causal && !attrs.grouped, "attention with a key bias must not be causal or in groups");
     const Value out = attention(q, k, v, attrs);
     const TensorType& bt = type(key_bias);
     XS_CHECK(bt.dtype == DType::F32 && bt.shape == (Dims{type(k).shape[0]}), "attention key_bias must be f32 [",
              dim_to_string(type(k).shape[0]), "], got ", shape_to_string(bt.shape), " (", where(key_bias), ")");
     nodes_[static_cast<size_t>(out.node)].inputs.push_back(key_bias);
+    return out;
+}
+
+Value Graph::attention_in_groups(Value q, Value k, Value v, Value groups, const AttentionAttrs& attrs) {
+    XS_CHECK(attrs.grouped && !attrs.causal && attrs.sliding_window == 0 && attrs.block == 0,
+             "attention in groups is not causal and has no window or block");
+    AttentionAttrs plain = attrs;
+    plain.grouped = false;
+    const Value out = attention(q, k, v, plain);
+    XS_CHECK(type(q).shape[0] == kT && type(k).shape[0] == kT, "attention in groups takes q, k and v of the step's "
+             "own tokens, got q ", shape_to_string(type(q).shape), " and k ", shape_to_string(type(k).shape));
+    const TensorType& gt = type(groups);
+    XS_CHECK(gt.dtype == DType::I32 && gt.shape == (Dims{kT}), "attention groups must be i32 [T], got ",
+             dtype_name(gt.dtype), shape_to_string(gt.shape), " (", where(groups), ")");
+    Node& n = nodes_[static_cast<size_t>(out.node)];
+    n.attrs = attrs;
+    n.inputs.push_back(groups);
     return out;
 }
 

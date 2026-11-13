@@ -167,6 +167,66 @@ TEST_SUITE("device encoder ops" * doctest::skip(!dev::enabled())) {
         }
     }
 
+    TEST_CASE("attention in groups, every lowering, head dims 64 and 128, GQA 4/4 and 16/4") {
+        test::TensorRng rng(18);
+        // Few tokens; a state and 16 questions after it (several key blocks and row tiles); ids in no order at all.
+        std::vector<int64_t> sixteen{150};
+        for (int64_t i = 0; i < 16; ++i)
+            sixteen.push_back(9 + i % 7);
+        std::vector<int32_t> scattered;
+        for (int i = 0; i < 301; ++i)
+            scattered.push_back(static_cast<int32_t>((i * 7 + i / 13) % 5));
+        const std::vector<std::vector<int32_t>> layouts = {test::ref::run_groups({3, 2, 1}),
+                                                           test::ref::run_groups(sixteen), scattered};
+        for (const int64_t dim : {64, 128}) {
+            for (const auto& [q_heads, kv_heads] : {std::pair<int64_t, int64_t>{4, 4}, {16, 4}}) {
+                for (size_t l = 0; l < layouts.size(); ++l) {
+                    for (const std::string& impl : dev::attention_impls()) {
+                        CAPTURE(dim);
+                        CAPTURE(q_heads);
+                        CAPTURE(l);
+                        CAPTURE(impl);
+                        const std::vector<int32_t>& groups = layouts[l];
+                        const auto tokens = static_cast<int64_t>(groups.size());
+                        const HostTensor q = rng.uniform(DType::F32, {tokens, q_heads, dim}, 2.0f);
+                        const HostTensor k = rng.uniform(DType::F32, {tokens, kv_heads, dim}, 2.0f);
+                        const HostTensor v = rng.uniform(DType::F32, {tokens, kv_heads, dim});
+                        AttentionAttrs attrs;
+                        attrs.causal = false;
+                        attrs.grouped = true;
+                        attrs.scale = 1.0f / std::sqrt(static_cast<float>(dim));
+                        Graph g;
+                        g.output("out", g.attention_in_groups(g.input("q", DType::F32, {kT, q_heads, dim}),
+                                                              g.input("k", DType::F32, {kT, kv_heads, dim}),
+                                                              g.input("v", DType::F32, {kT, kv_heads, dim}),
+                                                              g.input("groups", DType::I32, {kT}), attrs));
+                        SessionOptions options = dev::options();
+                        options.extra["attention"] = impl;
+                        const HostTensor ids = test::make_tensor(DType::I32, {tokens}, groups);
+                        const HostTensor out =
+                            dev::run(g, test::MemoryWeights{}, {{"q", q}, {"k", k}, {"v", v}, {"groups", ids}}, options)
+                                .at("out");
+                        test::ref::AttentionSpec spec;
+                        spec.scale = attrs.scale;
+                        spec.causal = false;
+                        spec.groups = groups;
+                        const dev::Tolerance tol = dev::tolerance({1e-5, 1e-5}, {4e-3, 4e-3});
+                        CHECK(dev::close("attention_groups", out,
+                                         test::ref::attention(to_f64(q), to_f64(k), to_f64(v), spec), tol));
+                        for (const int planted : {0, 1, 2}) {  // no groups, or a mask one way only
+                            test::ref::AttentionSpec p = spec;
+                            if (planted == 0) p.groups.clear();
+                            p.state_sees_itself_only = planted == 1;
+                            p.questions_without_state = planted == 2;
+                            CHECK_FALSE(test::all_close(out, test::ref::attention(to_f64(q), to_f64(k), to_f64(v), p),
+                                                        tol.atol, tol.rtol));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     TEST_CASE("a graph without KV slots is stateless: runs do not accumulate tokens") {
         Graph g;
         g.output("out", g.scale(g.input("x", DType::F32, {kT, 4}), 2.0f));

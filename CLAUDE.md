@@ -248,7 +248,9 @@ sequence. Model code builds it once at load time; a backend compiles it once.
   Clamp, RmsNorm, Softmax, TopK, ReduceSum, Reshape, Slice, Transpose, PrevRow (each row of a step replaced by the row
   before it), Rope (1-D or axial, optionally partial), KvCache, KvRead (another program's KV slot, read only),
   Attention (causal with optional window, or non-causal: every key, the keys of the query's own block of tokens, or
-  a window as wide after each query as before it: a drafter's block over a cache, an encoder's local attention),
+  a window as wide after each query as before it: a drafter's block over a cache, an encoder's local attention; or
+  the step's tokens in groups, group 0 seeing and seen by all, any other group itself and group 0: questions packed
+  after their state),
   CausalConv and GatedDelta (stateful, for linear attention),
   ExpertMatMul (each token's chosen experts from a stacked `[E, N, K]` bank, for mixture of experts), SignMatMul (a
   matmul by a one-bit weight: the cheap score of every row that a shortlist starts from). The exact semantics
@@ -284,7 +286,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 |---|---|---|
 | `tests/unit/test_graph.cpp`, `test_half.cpp`, `test_base64.cpp` | IR shape inference and validation; f16/bf16 conversions; base64 | hand-written expectations, RFC 4648 vectors |
 | `tests/unit/image/` | decoding, resize, hashing | Pillow-written images; torchvision resize outputs in `tests/fixtures/image/` (bit-exact) |
-| `tests/unit/backend/cpu_*.cpp` | each op on cpu-ref (`cpu_encoder_ops.cpp`: the encoder ops and stateless sessions), KV sessions, attention masks | fp64 references in `reference_ops.h`, with planted-bug controls |
+| `tests/unit/backend/cpu_*.cpp` | each op on cpu-ref (`cpu_encoder_ops.cpp`: the encoder ops and stateless sessions, attention in groups), KV sessions, attention masks | fp64 references in `reference_ops.h`, with planted-bug controls |
 | `tests/unit/backend/device_*.cpp` | each op on the GPU backend (`device_encoder_ops.cpp` likewise), sessions, agreement with cpu-ref (also with an int8 KV cache on both), decode timing and quantized matmul timing by rows, format and path (`XS_DEVICE_BENCH=1`, `device_quant_timing.cpp`) | the same references; skip unless `XS_DEVICE_TEST_DEVICE` is set |
 | `tests/unit/backend/*_moe_ops.cpp` | Div, Softmax, TopK (ties to the lower index), ReduceSum, ExpertMatMul and the `moe` block (softmax and sigmoid routers, shared expert), on cpu-ref and the GPU | fp64 references and an fp64 composition of the block (`moe_ops_cases.h`) |
 | `tests/unit/backend/*_shortlist_ops.cpp` | SignMatMul (words loaded whole and one by one, rows that fill no sub-group) and the shortlist head: the best rows by sketch, their exact logits, the head's pick, on cpu-ref and the GPU | fp64 references (`shortlist_cases.h`) |

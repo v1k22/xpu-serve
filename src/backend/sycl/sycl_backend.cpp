@@ -843,7 +843,11 @@ private:
                     const int64_t d = graph_.type(n.inputs[0]).shape.back();
                     XS_CHECK(d % 8 == 0 && d <= 512, where(i), ": head_dim ", d,
                              " is not supported (a multiple of 8, at most 512)");
-                    if (n.inputs.size() == 4) need(3, is_f32(3), "f32");
+                    if (std::get<graph::AttentionAttrs>(n.attrs).grouped) {
+                        need(3, dt(n.inputs[3]) == DType::I32, "i32");
+                    } else if (n.inputs.size() == 4) {
+                        need(3, is_f32(3), "f32");
+                    }
                     break;
                 }
                 case OpKind::GatedDelta: {
@@ -2126,7 +2130,11 @@ private:
                 s.window = a.sliding_window;
                 s.causal = a.causal;
                 s.block = a.block < s.tokens ? a.block : 0;  // one block: every key
-                if (n.inputs.size() == 4) s.key_bias = in_f32(3);
+                if (a.grouped) {
+                    s.groups = reinterpret_cast<const int32_t*>(in_ptr(3));
+                } else if (n.inputs.size() == 4) {
+                    s.key_bias = in_f32(3);
+                }
                 if (in_dt(1) == DType::I8) {
                     const int slot = std::get<graph::KvCacheAttrs>(graph_.node(n.inputs[1]).attrs).slot;
                     const KvBuffers& b = kv_buffers(slot);

@@ -115,6 +115,35 @@ TEST_CASE("attention within blocks takes non-causal operands of one static lengt
     CHECK_THROWS_AS(g.attention(q, k, k, attrs), xs::Error);
 }
 
+TEST_CASE("attention in groups takes the step's own q, k and v and an i32 group per token") {
+    Graph g;
+    AttentionAttrs attrs;
+    attrs.causal = false;
+    attrs.grouped = true;
+    const Value q = g.input("q", DType::F32, {kT, 4, 8});
+    const Value k = g.input("k", DType::F32, {kT, 2, 8});
+    const Value groups = g.input("groups", DType::I32, {kT});
+    const Value out = g.attention_in_groups(q, k, k, groups, attrs);
+    CHECK(g.type(out).shape == (xs::Dims{kT, 4, 8}));
+    CHECK(g.node(out).inputs.size() == 4);
+    CHECK(std::get<AttentionAttrs>(g.node(out).attrs).grouped);
+    CHECK_THROWS_AS(g.attention(q, k, k, attrs), xs::Error);  // groups only through attention_in_groups
+    CHECK_THROWS_AS(g.attention(q, k, k, g.input("bias", DType::F32, {kT}), attrs), xs::Error);
+    CHECK_THROWS_AS(g.attention_in_groups(q, k, k, g.input("f", DType::F32, {kT}), attrs), xs::Error);
+    CHECK_THROWS_AS(g.attention_in_groups(q, k, k, g.input("g2", DType::I32, {kT, 1}), attrs), xs::Error);
+    const auto [ka, va] = g.kv_cache(g.add_kv_slot(2, 8, 0, "cache"), k, k);
+    CHECK_THROWS_AS(g.attention_in_groups(q, ka, va, groups, attrs), xs::Error);  // keys of a cache
+    AttentionAttrs other = attrs;
+    other.sliding_window = 4;
+    CHECK_THROWS_AS(g.attention_in_groups(q, k, k, groups, other), xs::Error);
+    other = attrs;
+    other.causal = true;
+    CHECK_THROWS_AS(g.attention_in_groups(q, k, k, groups, other), xs::Error);
+    other = attrs;
+    other.grouped = false;
+    CHECK_THROWS_AS(g.attention_in_groups(q, k, k, groups, other), xs::Error);
+}
+
 TEST_CASE("prev_row keeps the shape; float rows only") {
     Graph g;
     const Value x = g.input("x", DType::F32, {kT, 3, 5});

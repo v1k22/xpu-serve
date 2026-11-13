@@ -429,6 +429,7 @@ class CpuProgram {
             }
             case OpKind::Attention: {
                 const auto& a = std::get<graph::AttentionAttrs>(n.attrs);
+                if (a.grouped) return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, nullptr, &in(3))};
                 if (n.inputs.size() == 4) {
                     const HostTensor bias = f32(3);
                     return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, &bias)};

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <numbers>
 #include <vector>
@@ -106,9 +107,10 @@ double dot(const float* a, const float* b, int64_t n) {
     return (s0 + s1) + (s2 + s3);
 }
 
-// Softmax-weighted sum of v rows for one query head; keys [first, last] are the visible ones.
+// Softmax-weighted sum of v rows for one query head over keys [first, last]: those `visible` keeps (empty: all).
 void attend_one(const float* q, const HostTensor& k_all, const HostTensor& v_all, int64_t kv_head, int64_t first,
-                int64_t last, const graph::AttentionAttrs& attrs, const float* key_bias, float* out) {
+                int64_t last, const graph::AttentionAttrs& attrs, const float* key_bias,
+                const std::function<bool(int64_t)>& visible, float* out) {
     const int64_t kv_heads = k_all.dim(1);
     const int64_t head_dim = k_all.dim(2);
     const float* k = k_all.data<float>();
@@ -116,6 +118,10 @@ void attend_one(const float* q, const HostTensor& k_all, const HostTensor& v_all
     std::vector<double> scores(static_cast<size_t>(last - first + 1));
     double max_score = -std::numeric_limits<double>::infinity();
     for (int64_t j = first; j <= last; ++j) {
+        if (visible && !visible(j)) {
+            scores[static_cast<size_t>(j - first)] = -std::numeric_limits<double>::infinity();
+            continue;
+        }
         double s = attrs.scale * dot(q, k + (j * kv_heads + kv_head) * head_dim, head_dim);
         if (attrs.softcap > 0.0f) s = attrs.softcap * std::tanh(s / attrs.softcap);
         if (key_bias != nullptr) s += key_bias[j];
@@ -449,7 +455,7 @@ HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& 
 }
 
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
-                     const graph::AttentionAttrs& attrs, const HostTensor* key_bias) {
+                     const graph::AttentionAttrs& attrs, const HostTensor* key_bias, const HostTensor* groups) {
     check_f32(q, "attention q");
     check_f32(k_all, "attention k");
     check_f32(v_all, "attention v");
@@ -463,10 +469,15 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
     XS_CHECK(k_all.shape() == v_all.shape() && k_all.dim(2) == head_dim && q_heads % kv_heads == 0,
              "attention shapes q ", dims_to_string(q.shape()), ", k ", dims_to_string(k_all.shape()), ", v ",
              dims_to_string(v_all.shape()), " do not fit");
-    const int64_t group = q_heads / kv_heads;
+    const int64_t heads_per_kv = q_heads / kv_heads;
     XS_CHECK(key_bias == nullptr || (!attrs.causal && key_bias->numel() == kv_len), "attention key bias of ",
              key_bias == nullptr ? 0 : key_bias->numel(), " for ", kv_len, " keys");
     const float* bias = key_bias != nullptr ? key_bias->data<float>() : nullptr;
+    XS_CHECK(attrs.grouped == (groups != nullptr), "attention in groups needs the tokens' groups, and only it");
+    XS_CHECK(groups == nullptr || (groups->dtype() == DType::I32 && groups->numel() == tokens && kv_len == tokens),
+             "attention groups of ", groups == nullptr ? 0 : groups->numel(), " for ", tokens, " queries and ", kv_len,
+             " keys");
+    const int32_t* group = groups != nullptr ? groups->data<int32_t>() : nullptr;
     HostTensor out(DType::F32, q.shape());
     pool.parallel_for(tokens * q_heads, [&](int64_t item) {
         const int64_t t = item / q_heads;
@@ -479,8 +490,12 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
             first = t / attrs.block * attrs.block;
             last = first + attrs.block - 1;
         }
+        std::function<bool(int64_t)> visible;
+        if (group != nullptr) {
+            visible = [group, t](int64_t j) { return group[t] == 0 || group[j] == 0 || group[t] == group[j]; };
+        }
         const int64_t offset = (t * q_heads + h) * head_dim;
-        attend_one(q.data<float>() + offset, k_all, v_all, h / group, first, last, attrs, bias,
+        attend_one(q.data<float>() + offset, k_all, v_all, h / heads_per_kv, first, last, attrs, bias, visible,
                    out.data<float>() + offset);
     });
     return out;

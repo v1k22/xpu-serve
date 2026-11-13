@@ -158,6 +158,10 @@ struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op'
 // (T <= sliding_window); an encoder's local attention sees the keys within sliding_window - 1 of it (ModernBERT).
 // Not causal with a block (an encoder over several images at once): q, k and v have one static length, a multiple of
 // `block`, and key j is visible to query i iff both fall in the same run of `block` tokens.
+// Not causal in groups (`grouped`; questions packed after the state they ask about): q, k and v are the step's own
+// [T, ...] and a fourth input, groups [T] i32, gives each token's group; key j is visible to query i iff
+// groups[i] == 0, groups[j] == 0 or groups[i] == groups[j]. Group 0 sees every token and every token sees it; any
+// other group sees group 0 and itself. No window, block or key bias.
 // scores = scale * q.k (f32); if softcap > 0: scores = softcap * tanh(scores / softcap); softmax in f32.
 struct AttentionAttrs {
     float scale = 1.0f;
@@ -165,6 +169,7 @@ struct AttentionAttrs {
     float softcap = 0.0f;
     bool causal = true;
     int64_t block = 0;
+    bool grouped = false;
 };
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
@@ -245,6 +250,8 @@ public:
     Value attention(Value q, Value k_all, Value v_all, const AttentionAttrs& attrs);
     // Non-causal attention whose key j's scores get key_bias[j] added (AttentionAttrs::causal must be false).
     Value attention(Value q, Value k, Value v, Value key_bias, const AttentionAttrs& attrs);
+    // Attention of the step's tokens in groups, groups [T] i32 (AttentionAttrs::grouped, not causal).
+    Value attention_in_groups(Value q, Value k, Value v, Value groups, const AttentionAttrs& attrs);
     int add_conv_slot(int64_t channels, int64_t kernel, std::string label);
     Value causal_conv(int slot, Value x, Value w);
     int add_recurrent_slot(int64_t heads, int64_t key_dim, int64_t value_dim, std::string label);

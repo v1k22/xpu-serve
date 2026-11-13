@@ -41,8 +41,10 @@ HostTensor causal_conv(const HostTensor& x, const HostTensor& w, std::vector<flo
 // q, k [T, Hk, Dk], v [T, Hv, Dv], g, beta [T, Hv], state [Hv * Dk * Dv] (updated in place).
 HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& k, const HostTensor& v,
                        const HostTensor& g, const HostTensor& beta, float qk_l2norm_eps, std::vector<float>& state);
+// `groups` [T] i32: the tokens' groups of attention in groups (AttentionAttrs::grouped), else null.
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
-                     const graph::AttentionAttrs& attrs, const HostTensor* key_bias = nullptr);
+                     const graph::AttentionAttrs& attrs, const HostTensor* key_bias = nullptr,
+                     const HostTensor* groups = nullptr);
 HostTensor div(const HostTensor& a, const HostTensor& b);
 HostTensor softmax(const HostTensor& x);
 // (values f32, indices i32) of the k largest along the last axis, largest first; ties keep the lower index first.

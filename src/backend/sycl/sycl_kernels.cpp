@@ -428,6 +428,7 @@ void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v,
     const int64_t window = s.window;
     const bool causal = s.causal;
     const float* key_bias = s.key_bias;
+    const int32_t* groups = s.groups;
     constexpr int kWg = kAttnSubGroups * kSubGroup;
     syclex::submit(q, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>(kAttnSubGroups * (D + 2)), h);
@@ -483,6 +484,7 @@ void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v,
             float m = -std::numeric_limits<float>::infinity();
             float l = 0.0f;
             for (int64_t j = lo + sgid; j <= last; j += kAttnSubGroups) {
+                if (groups != nullptr && !group_sees(groups, t, j)) continue;  // the same for the whole sub-group
                 float x[DPL];
                 load(k + (j * hkv_n + kh) * D, x);
                 float dot = 0.0f;
@@ -1813,6 +1815,7 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
     const int64_t window = s.window;
     const bool causal = s.causal;
     const float* key_bias = s.key_bias;
+    const int32_t* groups = s.groups;
     constexpr size_t kWg = 256;
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * kWg, kWg), [=](sycl::nd_item<1> it) {
         const int64_t r = static_cast<int64_t>(it.get_group(0));
@@ -1830,6 +1833,9 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
         CT* pr = probs + r * keys;
         const int64_t lid = static_cast<int64_t>(it.get_local_id(0));
         auto score = [&](int64_t j) {
+            if (groups != nullptr && !group_sees(groups, t0 + tl, k_lo + j)) {
+                return -std::numeric_limits<float>::infinity();
+            }
             const float v = sr[j];
             const float c = softcap > 0.0f ? softcap * sycl::tanh(v / softcap) : v;
             return key_bias != nullptr ? c + key_bias[k_lo + j] : c;

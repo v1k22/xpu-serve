@@ -95,6 +95,7 @@ struct FlashArgs {
     float softcap = 0.0f;
     bool causal = false;
     const float* key_bias = nullptr;
+    const int32_t* groups = nullptr;
 };
 
 template <int DP, int BC, int MT, int SGS, typename QT>
@@ -231,7 +232,8 @@ struct FlashKernel {
                         const int pos = pos0 + r0 + i;
                         bool ok = key_ok && r0 + i < rows_valid;
                         ok = ok && (!a.causal || j <= pos) &&
-                             (a.window <= 0 || (j > pos - a.window && j < pos + a.window));
+                             (a.window <= 0 || (j > pos - a.window && j < pos + a.window)) &&
+                             (a.groups == nullptr || group_sees(a.groups, t0 + r0 + i, j));
                         y = ok ? y + bias : kNegInf;
                         x = y;
                         mb[i] = sycl::fmax(mb[i], y);
@@ -343,6 +345,7 @@ void flash_t(sycl::queue& q, const QT* qp, const half* k, const half* v, float* 
     a.softcap = s.softcap;
     a.causal = s.causal;
     a.key_bias = s.key_bias;
+    a.groups = s.groups;
     const auto wgs = static_cast<size_t>(s.kv_heads * a.row_blocks * split);
     syclex::submit(q, [&](sycl::handler& h) {
         K kernel{qp, k, v, out, part, a, sycl::local_accessor<float, 1>(sycl::range<1>(K::kSlmFloats), h)};

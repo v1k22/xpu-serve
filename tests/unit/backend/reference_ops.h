@@ -281,7 +281,32 @@ struct AttentionSpec {
     bool causal = true;        // false: keys after a query are visible too (within the window, when there is one)
     std::vector<double> key_bias;  // empty, or one per key: added to every query's score of that key
     bool one_sided = false;        // planted-bug control: a non-causal window that leaves every key after a query
+    // Empty, or each token's group (attention in groups, T == L): key j is visible to query i iff either is in group
+    // 0 or both share a group.
+    std::vector<int32_t> groups;
+    // Planted-bug controls of groups: group 0 sees only itself (as a state read without its questions); a group
+    // other than 0 does not see group 0 (questions without their state).
+    bool state_sees_itself_only = false;
+    bool questions_without_state = false;
 };
+
+// The groups of a state of lengths[0] tokens (group 0) and questions of lengths[1], lengths[2], ... after it (groups
+// 1, 2, ...).
+inline std::vector<int32_t> run_groups(const std::vector<int64_t>& lengths) {
+    std::vector<int32_t> out;
+    for (size_t g = 0; g < lengths.size(); ++g)
+        out.insert(out.end(), static_cast<size_t>(lengths[g]), static_cast<int32_t>(g));
+    return out;
+}
+
+// Whether query i sees key j under spec's groups (true without groups).
+inline bool group_visible(const AttentionSpec& spec, int64_t i, int64_t j) {
+    if (spec.groups.empty()) return true;
+    const int32_t gi = spec.groups[static_cast<size_t>(i)], gj = spec.groups[static_cast<size_t>(j)];
+    if (gi == gj) return true;
+    if (gi == 0) return !spec.state_sees_itself_only;
+    return gj == 0 && !spec.questions_without_state;
+}
 
 // Builds the full [T, L] mask and score matrix per head, then a max-subtracted softmax.
 inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& v, const AttentionSpec& spec) {
@@ -297,7 +322,8 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
                 const int64_t reach = spec.sliding_window + spec.window_slack;
                 const bool visible =
                     (!spec.causal || j <= p) &&
-                    (spec.sliding_window == 0 || (p - j < reach && (spec.causal || spec.one_sided || j - p < reach)));
+                    (spec.sliding_window == 0 || (p - j < reach && (spec.causal || spec.one_sided || j - p < reach))) &&
+                    group_visible(spec, i, j);
                 if (!visible) continue;
                 double s = 0;
                 for (int64_t d = 0; d < dim; ++d)

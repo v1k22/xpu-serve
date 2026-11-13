@@ -160,6 +160,59 @@ TEST_SUITE("cpu-ref encoder ops") {
         }
     }
 
+    TEST_CASE("attention in groups: group 0 sees and is seen by every token, any other group itself and group 0") {
+        test::TensorRng rng(17);
+        // A state of 7 tokens and three questions after it; one question after its state; ids in no order at all.
+        const std::vector<std::vector<int32_t>> layouts = {test::ref::run_groups({7, 5, 4, 6}),
+                                                           test::ref::run_groups({9, 6}),
+                                                           {2, 0, 1, 1, 0, 3, 3, 2, 0, 1, 2, 3, 3}};
+        for (const auto& [q_heads, kv_heads] : {std::pair<int64_t, int64_t>{4, 4}, {6, 2}, {16, 4}}) {
+            for (size_t l = 0; l < layouts.size(); ++l) {
+                CAPTURE(q_heads);
+                CAPTURE(l);
+                const std::vector<int32_t>& groups = layouts[l];
+                const auto tokens = static_cast<int64_t>(groups.size());
+                const int64_t dim = 16;
+                const HostTensor q = rng.uniform(DType::F32, {tokens, q_heads, dim}, 2.0f);
+                const HostTensor k = rng.uniform(DType::F32, {tokens, kv_heads, dim}, 2.0f);
+                const HostTensor v = rng.uniform(DType::F32, {tokens, kv_heads, dim});
+                AttentionAttrs attrs;
+                attrs.causal = false;
+                attrs.grouped = true;
+                attrs.scale = 0.4f;
+                Graph g;
+                g.output("out", g.attention_in_groups(g.input("q", DType::F32, {kT, q_heads, dim}),
+                                                      g.input("k", DType::F32, {kT, kv_heads, dim}),
+                                                      g.input("v", DType::F32, {kT, kv_heads, dim}),
+                                                      g.input("groups", DType::I32, {kT}), attrs));
+                const HostTensor ids = test::make_tensor(DType::I32, {tokens}, groups);
+                const HostTensor out = run_out(g, {{"q", q}, {"k", k}, {"v", v}, {"groups", ids}});
+                test::ref::AttentionSpec spec;
+                spec.scale = 0.4;
+                spec.causal = false;
+                spec.groups = groups;
+                const auto matches = [&](const test::ref::AttentionSpec& s) {
+                    return test::all_close(out, test::ref::attention(to_f64(q), to_f64(k), to_f64(v), s), kAtol,
+                                           kRtol);
+                };
+                CHECK(matches(spec));
+                test::ref::AttentionSpec every_key = spec;
+                every_key.groups.clear();
+                if (l == 1) {  // a lone question reads the whole step both ways
+                    CHECK(matches(every_key));
+                    continue;
+                }
+                CHECK_FALSE(matches(every_key));  // planted bugs: no groups, or a mask one way only
+                test::ref::AttentionSpec planted = spec;
+                planted.state_sees_itself_only = true;
+                CHECK_FALSE(matches(planted));
+                planted = spec;
+                planted.questions_without_state = true;
+                CHECK_FALSE(matches(planted));
+            }
+        }
+    }
+
     TEST_CASE("a graph without KV slots is stateless: runs do not accumulate tokens") {
         Graph g;
         g.output("out", g.scale(g.input("x", DType::F32, {kT, 4}), 2.0f));

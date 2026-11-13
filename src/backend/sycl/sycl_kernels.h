@@ -149,7 +149,14 @@ struct AttentionShape {
     bool causal = true;
     const float* key_bias = nullptr;  // [N], added to key j's scores (non-causal only); null: none
     int64_t block = 0;                // > 0: queries see the keys of their own run of `block` tokens (T == N)
+    // [T] (T == N, not causal): token i sees token j iff either is in group 0 or both share a group; null: none
+    const int32_t* groups = nullptr;
 };
+// Whether query i sees key j under the tokens' groups (graph.h, AttentionAttrs::grouped).
+inline bool group_sees(const int32_t* groups, int64_t i, int64_t j) {
+    const int32_t gi = groups[i], gj = groups[j];
+    return gi == 0 || gj == 0 || gi == gj;
+}
 // The most keys one query sees.
 inline int64_t attention_visible_keys(const AttentionShape& s) {
     if (s.block > 0) return s.block;
