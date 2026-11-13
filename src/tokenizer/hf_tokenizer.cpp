@@ -152,7 +152,7 @@ private:
             model_->tokenize(text, ids);
             return;
         }
-        for (const std::string_view piece : pre_tokenizer_->split({text})) model_->tokenize(piece, ids);
+        for (const std::string& piece : pre_tokenizer_->split({std::string(text)})) model_->tokenize(piece, ids);
     }
 
     std::optional<int32_t> config_token_id(const nlohmann::json& config, const char* key) const {

@@ -163,8 +163,8 @@ TEST_SUITE("tokenizer") {
         CHECK(load_error(j) == "tokenizer.json normalizer 'NFKC' is not supported");
 
         j = tiny_json();
-        j["pre_tokenizer"] = {{"type", "Metaspace"}};
-        CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'Metaspace' is not supported");
+        j["pre_tokenizer"] = {{"type", "UnicodeScripts"}};
+        CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'UnicodeScripts' is not supported");
 
         j = tiny_json();
         j["decoder"]["decoders"][1] = {{"type", "CTC"}};

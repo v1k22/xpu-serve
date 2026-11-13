@@ -1,9 +1,10 @@
 #pragma once
 
 // Hugging Face tokenizer.json tokenizers, implemented natively (no Python, no Rust).
-// Scope: BPE models as used by Gemma (Replace normalizer, Split pre-tokenizer, byte fallback, fuse_unk), byte-level
-// BPE as used by Qwen (NFC, regex Split, ByteLevel) and WordPiece as used by BERT-family encoders (BertNormalizer,
-// BertPreTokenizer, WordPiece decoder), with added/special tokens and TemplateProcessing post-processors.
+// Scope: BPE models as used by Gemma (Replace normalizer, Split or Metaspace pre-tokenizer, byte fallback, fuse_unk),
+// byte-level BPE as used by Qwen (NFC, regex Split, ByteLevel) and ModernBERT (ByteLevel with the GPT-2 regex), and
+// WordPiece as used by BERT-family encoders (BertNormalizer, BertPreTokenizer, WordPiece decoder), with added/special
+// tokens (normalized ones matched in normalized text) and TemplateProcessing post-processors.
 // Unsupported components are refused by name. tokenizer.json's truncation and padding are not applied: callers own
 // sequence lengths.
 
