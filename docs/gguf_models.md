@@ -1,8 +1,8 @@
 # GGUF files: what was measured
 
-Every result behind xpu-serve's GGUF support, in one place: three language models and a decision model (Clef-Flash),
-every file their publisher offers that fits one Intel Arc Pro B60 (24 GB). [Decision 0016](decisions/0016-gguf.md)
-has the design; the README's GGUF section has the short version.
+Every result behind xpu-serve's GGUF support, in one place: three language models and the decision models
+Clef-Flash, Clef, Laya and Julia-1, every file their publisher offers that fits one Intel Arc Pro B60 (24 GB).
+[Decision 0016](decisions/0016-gguf.md) has the design; the README's GGUF section has the short version.
 
 ## How it was measured
 
@@ -355,6 +355,30 @@ tokens).
   answers of 300 and fits with 5.8 GiB to spare; a decision costs about 0.44 s, five times Clef-Flash's.
 - **The quantized files are slower**: a decision is one prefill over the prompt, which dequantizes every quantized
   weight for its GEMM (as 0015 measured for q8 and q4 packs), so they cost about 50 ms more than f16.
+
+## Laya and Julia-1 (decision models)
+
+Files: [ggml-org/Laya-GGUF](https://huggingface.co/ggml-org/Laya-GGUF) and
+[ggml-org/Julia-1-GGUF](https://huggingface.co/ggml-org/Julia-1-GGUF), both files each (BF16, Q8_0). llama.cpp's
+`modern-bert` architecture with a Laya read-out (`decision.type = "laya"`) holds the encoder, the two-layer head and
+the scorer; `convert` imports either file into the original checkpoint's layout, telling the two models apart by the
+prompt template the converter writes (decision 0018). The BF16 files are roundings of the originals (F16 for Laya,
+F32 for Julia-1), not copies. Measured as Clef-Flash above, against each original's own code in fp32; Julia-1 refuses
+what its strict policy refuses (8 of the 25 test decisions, 5 of the 300 questions), exactly as its own code does.
+
+| Variant | File | GPU memory | 25 decisions: right, same as the reference | MMLU-Pro: right, same as the reference | Probability difference, largest / p95 | Latency p50 |
+|---|---|---|---|---|---|---|
+| Laya-BF16 | 0.84 GB | 0.78 GiB | 19, 25 | 38, 299 of 300 | 0.055 / 0.006 | 8 ms |
+| Laya-Q8_0 | 0.45 GB | 0.42 GiB | 19, 25 | 38, 293 of 300 | 0.052 / 0.023 | 9 ms |
+| *Laya, original at f16* | | 0.78 GiB | 19, 25 | 37, 300 of 300 | 0.016 / 0.001 | 8 ms |
+| Julia-1-BF16 | 0.30 GB | 0.27 GiB | 8, 17 of 17 | 42, 292 of 295 | 0.074 / 0.034 | 5 ms |
+| Julia-1-Q8_0 | 0.17 GB | 0.14 GiB | 9, 16 of 17 | 41, 271 of 295 | 0.55 / 0.22 | 8 ms |
+| *Julia-1, original at f16* | | 0.27 GiB | 8, 17 of 17 | 43, 294 of 295 | 0.029 / 0.008 | 7 ms |
+
+- **The import keeps the files' values**: the tokenizers equal the originals' on every token (50,368 and 256,000), the
+  configs and head are the originals' (`gguf_modern_bert_real_file.cpp`), and every request becomes the same tokens.
+- Both are small classifiers: on MMLU-Pro's ten-option questions their references get 37 and 43 of 300 right, and the
+  engine gets the same. Julia-1's Q8_0 file moves its answers the most (24 of 295 changed).
 
 ## Tool calls and chat templates
 

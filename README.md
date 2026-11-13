@@ -33,6 +33,8 @@ code.
 | pplx-decider-flash-v1.2 | decision | f16, q8, q4 | 39 ms per decision (p50; 57 ms p95) on prompts of 92 to 230 tokens; 214 ms at 1,024 tokens | Arc Pro B60 |
 | OpenJev | decision (a language model read at the option letters) | q4 | 266 ms per decision (p50; 478 ms p95) on prompts of 67 to 198 tokens, 143 ms for another question about the state just read; 1.46 s for three questions on a 1,024-token prompt | Arc Pro B60 |
 | d1-2B | decision | f16, q8, q4 | 14 ms per decision (p50; 72 ms p95) on prompts of 35 to 209 tokens; 37 ms for three questions about a 170-token state; 3.2 / 1.7 / 1.1 GiB (f16 / q8 / q4) | Arc Pro B60 |
+| Laya | decision | f16, GGUF files | 8 ms per decision (p50) on the 25 test decisions; 19 ms for three questions (158 tokens in all); 0.78 GiB | Arc Pro B60 |
+| Julia-1 | decision | f16, GGUF files | 7 ms per decision (p50) on the 25 test decisions; 9 ms for three questions (128 tokens in all); 0.27 GiB | Arc Pro B60 |
 | all-MiniLM-L6-v2 | embedding | f16 | 1.9 ms per text (16 to 256 tokens); 651 texts/s of 128 tokens | Arc Pro B60 |
 | bge-small-en-v1.5 | embedding | f16 | 1.9 ms per text of 16 tokens, 2.1 ms at 128, 5.3 ms at 512; 471 texts/s of 128 tokens | Arc Pro B60 |
 | nomic-embed-text-v1.5 | embedding | f16 | 2.0 ms per text of 16 tokens, 3.1 ms at 128, 9.6 ms at 512, 627 ms at 8,192; 306 texts/s of 128 tokens | Arc Pro B60 |
@@ -52,6 +54,8 @@ code.
 | OpenJev | `openjev/openjev` (`qwen3_5`, Qwen3.8-27B; weights CC BY-NC 4.0) | its own helper code over transformers in fp32: tiny-checkpoint parity (the same prompts, probabilities within 0.0024 on the GPU at f16); the q4 pack against the checkpoint in fp32: 25 of 25 test decisions right and equal, probabilities within 0.0095 |
 | Clef | `ggml-org/Clef-GGUF` Q4_K_M (of `Cloudflare/clef`: Qwen3.8-27B with Clef-Flash's head) | the original's own code in fp32: 25 of 25 test decisions right and equal; 281 of 300 MMLU-Pro answers equal, probabilities within 0.11 (p95) |
 | d1-2B | `LiquidAI/d1-2B` (LFM3-VL's text model; weights under the LFM Open License v1.0, commercial use only below $10M annual revenue) | its own code in fp32 at one question a prompt: the same prompt tokens, probabilities within 0.0004 (GPU f16) and 2e-6 (f32); 25 of 25 test decisions right and equal; 299 of 300 MMLU-Pro answers equal at f16, 295 at q8, 257 at q4 |
+| Laya | `convaiinnovations/laya` (ModernBERT-large and a scoring head; Apache-2.0) | its own code in fp32: the same token sequences, probabilities within 0.004 (GPU f16) and 1e-5 (f32); the 25 test decisions answered as it answers them (19 right, as it gets); all 300 MMLU-Pro answers equal; its GGUF files: 299 (BF16) and 293 (Q8_0) |
+| Julia-1 | `SupersonicLabs/Julia-1` (mmBERT-small and the same head; Apache-2.0) | its own code in fp32 under its strict policy: the same refusals, probabilities within 0.0039 (GPU f16) and 7e-6 (f32); the 17 test decisions it takes answered as it answers them (8 right, as it gets); 294 of 295 MMLU-Pro answers equal; its GGUF files: 292 (BF16) and 271 (Q8_0) |
 | all-MiniLM-L6-v2 | `sentence-transformers/all-MiniLM-L6-v2` (`bert`) | sentence-transformers in fp32 on 15 texts up to 256 tokens: the same token ids from the text; embeddings within 1 - cosine 3.4e-7 (GPU f16), 4e-13 (GPU f32) |
 | bge-small-en-v1.5 | `BAAI/bge-small-en-v1.5` (`bert`) | the same on 15 texts up to 512 tokens: 6.9e-8 (f16), 5e-13 (f32) |
 | nomic-embed-text-v1.5 | `nomic-ai/nomic-embed-text-v1.5` (`nomic_bert`) | the same with its own modeling code on 16 texts up to 8,192 tokens: 5.4e-7 (f16), 1.1e-10 (f32) |
@@ -240,6 +244,8 @@ header. Images (`assets`, box questions) are refused by name: the Qwen3.5 vision
 | pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (4B) | every question of a request in one pass, each read at a marker after its options; calibrated with the checkpoint's temperature | f16, 7.8 GiB; 39 ms per decision at about 110 tokens |
 | OpenJev | `openjev/openjev` (27B, a tuned Qwen3.8-27B; weights CC BY-NC 4.0) | a prompt per question; the output layer's scores of the option letters at the first output position, calibrated as its helper does | q4 pack, 16.2 GiB; 266 ms per decision at about 90 tokens, 143 ms for another question about the same state |
 | d1-2B | `LiquidAI/d1-2B` (2B, LFM3-VL's text model; LFM Open License v1.0) | a prompt per question, its full-attention layers reading the prompt both ways; the output layer's scores of each option's code tokens at the answer, calibrated (T = 1.3374). Its own code packs up to 16 questions after one state, which moves some unsure answers: packing is next | f16, 3.2 GiB; 14 ms per decision on prompts of 35 to 209 tokens |
+| Laya | `convaiinnovations/laya` (421M, ModernBERT-large) | a sequence per question: the question, each option at a mask token, then the state (cut to 512 tokens, as its own code cuts it); a two-layer head scores each mask, calibrated by the number of options | f16, 0.78 GiB; 8 ms per decision |
+| Julia-1 | `SupersonicLabs/Julia-1` (144M, mmBERT-small) | Laya's design, each option read as its description; what its own code would cut (a long state or option) is refused, as its policy says | f16, 0.27 GiB; 7 ms per decision |
 
 The per-decision times are medians over 25 test decisions, one question a request, all of which the three models
 answer right. Questions sent together share one pass in Clef and pplx-decider and can move each other's answers;
@@ -371,8 +377,8 @@ The architecture comes from the file (`general.architecture`). Supported: `qwen3
 dense text models, `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
 images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
 drafter, and `clef`, the Clef decision models (Clef-Flash's files: the same answer as the original's own code on 299,
-295 and 287 of 300 MMLU-Pro questions at BF16, Q8_0 and Q4_K_M; Clef's Q4_K_M, 16.9 GiB on the card: 281); others
-are refused by name. A Qwen3.5-family file that comes without its MTP head (the smallest files of
+295 and 287 of 300 MMLU-Pro questions at BF16, Q8_0 and Q4_K_M; Clef's Q4_K_M, 16.9 GiB on the card: 281), and
+`modern-bert` with a Laya read-out, the files of Laya and Julia-1; others are refused by name. A Qwen3.5-family file that comes without its MTP head (the smallest files of
 Qwen3.8-27B) takes the head from its `MTP/mtp-*.gguf` file with `--mtp`: the pack is the one a file with the head
 gives, and `--spec mtp` drafts with it. config.json, the tokenizer and the chat template are
 written from the file's metadata (on Qwen3.5-4B and Gemma 4 E2B the tokenizer equals the original's token by token),
