@@ -223,11 +223,14 @@ TEST_SUITE("tokenizer") {
         j = tiny_byte_level_json();
         j["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = "\\p{L}+";
         CHECK(error(j) == "tokenizer.json pre_tokenizer 'Split' Regex '\\p{L}+' is not supported");
+    }
 
-        j = tiny_byte_level_json();
+    TEST_CASE("tokenizer: a byte the byte-level vocab lacks is dropped, as Hugging Face drops it without unk") {
+        nlohmann::json j = tiny_byte_level_json();
         j["model"]["vocab"].erase(chars("\x01"));
         j["model"]["vocab"]["spare"] = 1;
-        CHECK(error(j) == "tokenizer.json BPE vocab has no byte-level character for byte 1");
+        const ScratchModelDir dir(j);
+        CHECK(xs::tok::Tokenizer::load(dir.path())->encode("a\x01" "b") == Ids{'a', 'b'});
     }
 }
 
