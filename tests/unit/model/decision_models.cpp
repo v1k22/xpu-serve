@@ -803,6 +803,25 @@ TEST_SUITE("decision models") {
         CHECK_THROWS_WITH_AS(written(r), doctest::Contains("an object or array is not supported"), xs::DecisionRefused);
     }
 
+    TEST_CASE("laya: a request whose every question has a single option is refused; beside two options, answered") {
+        const xs::test::TempDir dir("xs_tiny_laya_single");
+        xs::test::write_tiny_laya(dir.path, xs::test::TinyLaya{}, 12);
+        const auto model = xs::load_decision_model(dir.path);
+        const auto session = xs::make_backend("cpu-ref")->compile(model->programs(), model->weights(),
+                                                                  xs::SessionOptions{.precision = xs::DType::F32});
+        const DecisionLimits whole{4096, 4096};
+        DecisionRequest r;
+        r.state = "s";
+        r.questions = {choice("c", "Pick", {{"only", "the one there is"}}), score("s", "Rate", {"low"})};
+        CHECK_THROWS_WITH_AS(xs::test::decide(*model, *session, r, whole), doctest::Contains("single option"),
+                             xs::DecisionRefused);
+        r.questions.push_back(noul("n", "Odd?"));  // as its reference reads them: a lone option's probability is 1
+        const auto p = xs::test::decide(*model, *session, r, whole);
+        REQUIRE(p.size() == 3);
+        CHECK(p[0] == std::vector<double>{1.0});
+        CHECK(p[1] == std::vector<double>{1.0});
+    }
+
     TEST_CASE("laya: the temperature of a question's type, or of its type and option count, divides its logits") {
         const xs::test::TempDir plain("xs_tiny_laya_t1"), fitted("xs_tiny_laya_t2");
         xs::test::TinyLaya m;

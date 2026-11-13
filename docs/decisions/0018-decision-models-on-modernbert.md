@@ -41,8 +41,10 @@ and over the 64 tokens on either side of each token in the others. llama.cpp ser
   llama.cpp's converter finds them (Laya's variant folders have no `config.json`); all three Laya variants share the
   code path (the multilingual one with mmBERT's tokenizer).
 - **Each model's own policy.** Laya cuts as its reference does and refuses only what it refuses (options past the
-  sequence; a noul description that is not text, which its reference fails on); a cut state is logged at info, since
-  the response cannot say so. Julia-1 follows its `inference-policy.json`: strict encoding refuses by name what would
+  sequence) or fails on (a noul description that is not text; a request whose every question has a single option,
+  where its reference takes the two best options of the widest question); a single option beside a question of two
+  or more is answered with probability 1, as its reference answers it. A cut state is logged at info, since the
+  response cannot say so. Julia-1 follows its `inference-policy.json`: strict encoding refuses by name what would
   be cut and a request that spells its mask token. A question without instructions reads as null, which Laya writes
   `null` as its reference writes an explicit null (the request schema does not tell a missing one from a null one;
   the reference's API wrapper fails on a missing one). Answers (choice, score, confidence) come from

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -86,6 +87,13 @@ public:
         std::vector<Encoded> encoded;
         for (const DecisionQuestion& q : request.questions)
             encoded.push_back(encode_question(request, q, tools, cfg_, max_tokens));
+        // Laya's reference takes the two best options of the request's widest question (rl_common.py
+        // DecisionModel.forward) and fails without one of two; Julia-1 refused such questions above.
+        if (std::all_of(encoded.begin(), encoded.end(), [](const Encoded& e) { return e.markers.size() < 2; })) {
+            throw DecisionRefused("Laya reads a request only if one of its questions has two options or more; every "
+                                  "question here has a single option",
+                                  "unsupported_question");
+        }
         return std::make_unique<LayaRun>(*this, request, std::move(encoded));
     }
 
