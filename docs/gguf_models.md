@@ -321,9 +321,11 @@ What each file holds:
 | UD-Q6_K_L (does not fit) | 24.17 GB | 3 | in the file | Q6_K 60 %, Q8_0 31 %, Q5_K 9 % |
 | MTP/mtp-Qwen3.8-27B-Q4_0 | 1.36 GB | 3 | the head alone | Q3_K 86 % (its own embedding and output head), Q4_K 11 %, Q6_K 4 % |
 
-## Clef-Flash (a decision model)
+## Clef-Flash and Clef (decision models)
 
-Files: [ggml-org/Clef-Flash-GGUF](https://huggingface.co/ggml-org/Clef-Flash-GGUF), all three (BF16, Q8_0, Q4_K_M).
+Files: [ggml-org/Clef-Flash-GGUF](https://huggingface.co/ggml-org/Clef-Flash-GGUF), all three (BF16, Q8_0, Q4_K_M), and
+Clef's Q4_K_M from [ggml-org/Clef-GGUF](https://huggingface.co/ggml-org/Clef-GGUF) (Clef is Qwen3.8-27B with the same head; its Q8_0,
+28.7 GB, and BF16, 54.1 GB, do not fit the card).
 llama.cpp's `clef` architecture is the Qwen3.5 decoder under the `clef.` namespace plus Clef's joint schema head
 (`dec.blk.*`, `decision.*`); `convert` imports it into the pack the Clef model serves from the original checkpoint
 (decision 0016). The vision files (`mmproj-*`) are not read.
@@ -342,11 +344,15 @@ tokens).
 | Q4_K_M | 6.7 GB | 5.25 GiB | 25 | 195 | 287 | 0.39 / 0.12 | 150 ms | 185 ms |
 | *original at f16* | | 15.01 GiB | 25 | 198 | 299 | 0.0016 / 0.0005 | 90 ms | 124 ms |
 | *original in f32 on the CPU* | | | 25 | 198 | 300 | 0 | | |
+| Clef Q4_K_M | 19.5 GB | 16.93 GiB | 25 | 200 | 281 | 0.19 / 0.11 | 443 ms | 549 ms |
+| *Clef, original in f32 on the CPU* | | | 25 | 203 | 300 | 0 | | |
 
 - **The import is exact**: on each file the config and the head's shapes are the original's, the BF16 file's head
   holds the original's values, its Q8_0 matrices (in both quantized files) are within 0.42 % of them, and the scales
   the file stores are exp and sigmoid of the original's parameters (`gguf_clef_real_file.cpp`).
 - **BF16 is the original**: it answers as the original at f16 does. Q8_0 changes 5 answers of 300 and Q4_K_M 13.
+- **Clef's Q4_K_M** (compared with its own original's code, which at 27B does not fit the card at f16) changes 19
+  answers of 300 and fits with 5.8 GiB to spare; a decision costs about 0.44 s, five times Clef-Flash's.
 - **The quantized files are slower**: a decision is one prefill over the prompt, which dequantizes every quantized
   weight for its GEMM (as 0015 measured for q8 and q4 packs), so they cost about 50 ms more than f16.
 
