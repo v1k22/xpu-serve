@@ -430,6 +430,27 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 
 ---
 
+## Embedding models (`POST /v1/embeddings`) — docs/decisions/0017
+
+- [x] `EmbeddingModel` as a fourth model kind (a sentence-transformers checkpoint: `modules.json` with a Pooling
+      module); the pipeline read as sentence-transformers reads it (mean or CLS pooling, Normalize when listed, the
+      longest input), everything else refused by name; the runtime and its service (`src/embedding/`)
+- [x] BERT (all-MiniLM-L6-v2, bge-small-en-v1.5) and NomicBERT (nomic-embed-text-v1.5, read to 8192 tokens after
+      training on 2048): parity with sentence-transformers on cpu-ref (tiny and released checkpoints, up to 8192 tokens)
+- [x] `POST /v1/embeddings` as OpenAI's (text, token ids, float or base64, OpenAI's 400s naming the field; `dimensions`
+      only the model's own; over-long inputs refused); `run --prompt`, `bench` (latency by length, throughput)
+- [ ] Text through the checkpoints' WordPiece tokenizers (the tokenizer work), then the text cases of
+      `embedding_parity.cpp` (`XS_EMBEDDING_TEXTS=1`)
+- [ ] Parity and timing on the Arc Pro B60 (f16 and f32)
+- [ ] Several inputs of a request in one step (padded with a key bias, or Attention's `block` for inputs of one length)
+- [ ] Shorter embeddings (`dimensions`) for checkpoints that declare them (Matryoshka)
+- [ ] The rerank and score APIs (cross-encoders)
+- [ ] Packs of embedding models (`convert` refuses them by name)
+- **Done when:** a client of OpenAI's embeddings API gets sentence-transformers' vectors from the GPU at a speed
+  measured against vLLM's.
+
+---
+
 ## World models
 
 - [ ] `WorldModel` kind and `world/` runtime; first model: V-JEPA 2-AC (planning, batch axis) or Matrix-Game

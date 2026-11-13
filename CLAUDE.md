@@ -33,7 +33,9 @@ OpenJev, a language model read at the option letters with `--readout`; docs/deci
 served end to end on the SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs
 from `convert`; speculative decoding with the model's drafter (`--spec mtp`: Qwen's MTP head, a Gemma 4 assistant
 with `--drafter`; `--spec dflash|dspine`: a block drafter checkpoint for Qwen3.8-27B with `--drafter`;
-docs/design-spec-decode.md). One sequence at a time.
+docs/design-spec-decode.md). One sequence at a time. Embedding models behind `POST /v1/embeddings` (all-MiniLM-L6-v2
+and bge-small-en-v1.5: BERT; nomic-embed-text-v1.5: NomicBERT; docs/decisions/0017), checked against
+sentence-transformers on cpu-ref.
 
 ## 2. Build, run, test
 
@@ -406,7 +408,19 @@ draft program, and one way of drafting. The engine needs nothing new.
    checkpoint the test writes go in `decision_models.cpp`. End to end: `tests/e2e/systemone_eval.py --reference`.
 6. Update TODO.md, this file's map and the README's decision models table.
 
-### 8.7 Add a GGUF architecture
+### 8.7 Add an embedding model
+
+1. An encoder in `src/models/<arch>/`: its config (refusals by name) and a graph from `models/common/encoder.h` (BERT's
+   post-norm layer, attention over the whole sequence) and `blocks`, made into a model with `encoder::embedding_spec`
+   and `encoder::make_model`; register the `model_type` in `registry.cpp` (`supported_embedding_models`,
+   `load_embedding_model`).
+2. A pipeline beyond Transformer, Pooling (mean, CLS) and Normalize (another pooling mode, a Dense module, a prompt)
+   is refused today: teach `models/common/sentence_transformers` and `embedding/pooling` first.
+3. Tests: `make_tiny.py` learns to write a tiny one and `tests/parity/embedding/reference.py` runs it;
+   `embedding_parity.cpp` then compares hidden states and embeddings; refusals in `embedding_config.cpp`.
+4. Update TODO.md, this file's map and the README.
+
+### 8.8 Add a GGUF architecture
 
 `xpu-serve convert <file.gguf> <out-dir>` imports the file into a pack for a model the engine already serves from
 Hugging Face safetensors (8.1 first, if it does not).
@@ -505,5 +519,8 @@ Hugging Face safetensors (8.1 first, if it does not).
   answers the model is unsure of (docs/decisions/0015); `convert` rounds to nearest for them (no AWQ).
   pplx-decider reads a prompt in one step (its attention looks ahead), which costs more per token past a few
   thousand tokens. A language model read with `--readout` serves decisions only (no chat on the same server).
+- Embedding models: BERT and NomicBERT encoders of sentence-transformers checkpoints, mean or CLS pooling; a request's
+  inputs run one at a time (no batching); an input over the limit is refused, not cut; `dimensions` only as the
+  model's own; no rerank or score API; no packs (`convert` refuses them).
 - One sequence at a time; no batching.
 - Sliding-window layers keep every key in memory (the kernels read only the window; memory still grows with context).
