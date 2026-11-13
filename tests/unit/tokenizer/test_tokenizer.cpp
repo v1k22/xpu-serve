@@ -130,6 +130,29 @@ TEST_SUITE("tokenizer") {
         CHECK_THROWS_AS(tok->token_text(31), xs::Error);
     }
 
+    TEST_CASE("tokenizer: with_special_tokens puts the post-processor's special tokens around one sequence") {
+        const auto with_special = [](const nlohmann::json& j, const Ids& ids) {
+            const ScratchModelDir dir(j);
+            return xs::tok::Tokenizer::load(dir.path())->with_special_tokens(ids);
+        };
+        nlohmann::json j = tiny_json();
+        const Ids hello = {21, 26};
+        CHECK(with_special(j, hello) == hello);  // a single template of the sequence alone, as Gemma 4's
+        j["post_processor"] = nlohmann::json::parse(R"({"type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                       {"SpecialToken": {"id": "<end>", "type_id": 0}}],
+            "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+                               "<end>": {"id": "<end>", "ids": [2, 3], "tokens": ["</s>", "<mark>"]}}})");
+        CHECK(with_special(j, hello) == Ids{1, 21, 26, 2, 3});
+        CHECK(with_special(j, {}) == Ids{1, 2, 3});
+        j["post_processor"] = {
+            {"type", "ByteLevel"}, {"add_prefix_space", false}, {"trim_offsets", false}, {"use_regex", false}};
+        CHECK(with_special(j, hello) == hello);
+        j["post_processor"] = nullptr;
+        CHECK(with_special(j, hello) == hello);
+    }
+
     TEST_CASE("tokenizer: stream decoding matches full decoding") {
         const auto tok = xs::tok::Tokenizer::load(tiny_dir());
         for (const std::string text : {"hello world", "é€é€xyz", " hello  <mark>  world", "hello<s>é</s>"}) {
@@ -167,5 +190,16 @@ TEST_SUITE("tokenizer") {
         j = tiny_json();
         j["post_processor"] = {{"type", "RobertaProcessing"}};
         CHECK(load_error(j) == "tokenizer.json post_processor 'RobertaProcessing' is not supported");
+
+        const std::string kTemplate = "tokenizer.json post_processor 'TemplateProcessing': ";
+        j = tiny_json();
+        j["post_processor"]["single"] = nlohmann::json::parse(
+            R"([{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}])");
+        CHECK(load_error(j) == kTemplate + "special token '<s>' is not in 'special_tokens'");
+        j["post_processor"]["single"] = nlohmann::json::parse(R"([{"Sequence": {"id": "B", "type_id": 0}}])");
+        CHECK(load_error(j) == kTemplate + "the single template names sequence 'B' (one sequence is A)");
+        j["post_processor"]["single"] = nlohmann::json::parse(
+            R"([{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 1}}])");
+        CHECK(load_error(j) == kTemplate + "the single template must hold sequence A exactly once");
     }
 }

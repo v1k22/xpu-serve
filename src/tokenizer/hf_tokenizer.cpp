@@ -1,5 +1,6 @@
 // The Tokenizer behind Tokenizer::load: a Hugging Face tokenizer.json pipeline (added tokens -> normalizer ->
-// pre-tokenizer -> model; decoder on the way back).
+// pre-tokenizer -> model; the post-processor on request; decoder on the way back). tokenizer.json's truncation and
+// padding are not applied: callers own sequence lengths.
 
 #include <algorithm>
 #include <stdexcept>
@@ -10,9 +11,9 @@
 #include "models/config_util.h"
 #include "tokenizer/added_vocabulary.h"
 #include "tokenizer/decoder.h"
-#include "tokenizer/json_fields.h"
 #include "tokenizer/model.h"
 #include "tokenizer/normalizer.h"
+#include "tokenizer/post_processor.h"
 #include "tokenizer/pre_tokenizer.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
@@ -20,14 +21,6 @@
 
 namespace xs::tok {
 namespace {
-
-// Post-processors only add special tokens around an encoding (TemplateProcessing) or adjust offsets (ByteLevel);
-// encode does neither, so these are accepted and unused.
-void check_post_processor(const nlohmann::json& config) {
-    if (config.is_null()) return;
-    const std::string type = component_type(config, "post_processor");
-    if (type != "TemplateProcessing" && type != "ByteLevel") refuse_component("post_processor", type);
-}
 
 // tokenizer_config.json writes a special token as "<bos>" or as {"content": "<bos>", ...}.
 std::optional<std::string> config_token(const nlohmann::json& config, const char* key) {
@@ -78,8 +71,8 @@ public:
           pre_tokenizer_(make_pre_tokenizer(tokenizer_json.value("pre_tokenizer", nlohmann::json()))),
           model_(make_model(tokenizer_json.contains("model") ? tokenizer_json.at("model") : nlohmann::json(),
                             pre_tokenizer_ && pre_tokenizer_->byte_level())),
+          post_processor_(make_post_processor(tokenizer_json.value("post_processor", nlohmann::json()))),
           decoder_(make_decoder(tokenizer_json.value("decoder", nlohmann::json()))) {
-        check_post_processor(tokenizer_json.value("post_processor", nlohmann::json()));
         id_limit_ = model_->id_limit();
         for (const AddedToken& token : added_.tokens()) {
             id_limit_ = std::max(id_limit_, token.id + 1);
@@ -108,6 +101,10 @@ public:
             }
         }
         return ids;
+    }
+
+    std::vector<int32_t> with_special_tokens(std::vector<int32_t> ids) const override {
+        return post_processor_ ? post_processor_->single(std::move(ids)) : ids;
     }
 
     std::string decode(std::span<const int32_t> ids, bool skip_special) const override {
@@ -179,6 +176,7 @@ private:
     std::unique_ptr<Normalizer> normalizer_;
     std::unique_ptr<PreTokenizer> pre_tokenizer_;
     std::unique_ptr<Model> model_;
+    std::unique_ptr<PostProcessor> post_processor_;
     std::unique_ptr<Decoder> decoder_;
     int32_t id_limit_ = 0;
     std::unordered_map<int32_t, const AddedToken*> added_by_id_;  // points into added_, which never changes

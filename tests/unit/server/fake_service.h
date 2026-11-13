@@ -26,6 +26,7 @@ public:
     std::vector<int32_t> encode(std::string_view text, bool) const override {
         return {text.begin(), text.end()};
     }
+    std::vector<int32_t> with_special_tokens(std::vector<int32_t> ids) const override { return ids; }
     std::string decode(std::span<const int32_t> ids, bool) const override {
         std::string out;
         for (int32_t id : ids) out.push_back(char(id));
