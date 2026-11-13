@@ -440,6 +440,14 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 - [ ] A prefill from quantized weights that does not dequantize every weight each step: it costs a Clef-Flash pack
       50 to 65 ms a step on the Arc Pro B60, which makes packs of decision models slower than f16
 - [ ] Batching several requests into one step
+- [x] Laya (`convaiinnovations/laya`: the root model, `typed-decisions/`, `multilingual/`) and Julia-1
+      (`SupersonicLabs/Julia-1`): ModernBERT encoders read at a mask token per option, a sequence per question; the
+      graph's non-causal window made symmetric (ModernBERT's local attention); one model with each one's policy
+      (Laya cuts as its reference, Julia-1's strict encoding refuses); parity with their code on cpu-ref (tiny and
+      released checkpoints, refusals included), 25 test decisions through the server on cpu-ref (docs/decisions/0018)
+- [ ] Laya and Julia-1 on the Arc Pro B60: parity (`XS_PARITY_BACKEND=sycl`), the 25 decisions, latency
+- [ ] Laya and Julia-1: the questions of a request in one step (Attention's `block`, or a key bias over padding)
+- [ ] q8 / q4 packs of Laya and Julia-1 (`convert` refuses them: a pack does not carry their folders)
 - **Done when:** each model answers as its reference code does and a System One client cannot tell the servers apart.
 
 ---

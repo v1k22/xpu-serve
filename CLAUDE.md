@@ -548,6 +548,10 @@ Hugging Face safetensors (8.1 first, if it does not).
   answers the model is unsure of (docs/decisions/0015); `convert` rounds to nearest for them (no AWQ).
   pplx-decider reads a prompt in one step (its attention looks ahead), which costs more per token past a few
   thousand tokens. A language model read with `--readout` serves decisions only (no chat on the same server).
+  Laya and Julia-1 (docs/decisions/0018) read a sequence per question, the state again for each; Laya cuts what does
+  not fit as its reference does (a state past 512 tokens, logged at info), Julia-1 refuses what its strict encoding
+  cannot read whole; neither has a q8 / q4 pack (`convert` refuses one by name; their GGUF files import), and
+  neither was measured on the GPU yet.
 - Embedding models: BERT and NomicBERT encoders of sentence-transformers checkpoints, mean or CLS pooling; a request's
   inputs run one at a time (no batching); an input over the limit is refused, not cut; `dimensions` only as the
   model's own; no rerank or score API; no packs (`convert` refuses them).
