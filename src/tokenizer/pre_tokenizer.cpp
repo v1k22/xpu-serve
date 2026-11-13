@@ -6,6 +6,8 @@
 
 #include "tokenizer/json_fields.h"
 #include "tokenizer/regex_split.h"
+#include "tokenizer/unicode.h"
+#include "tokenizer/utf8.h"
 #include "util/error.h"
 
 namespace xs::tok {
@@ -127,6 +129,31 @@ public:
     bool byte_level() const override { return true; }
 };
 
+// Hugging Face's BertPreTokenizer: whitespace (Rust's char::is_whitespace) ends a piece and is dropped, and each
+// punctuation character (bert.rs is_bert_punc) is a piece of its own.
+class BertPreTokenizer final : public PreTokenizer {
+public:
+    std::vector<std::string_view> split(const std::vector<std::string_view>& pieces) const override {
+        std::vector<std::string_view> out;
+        for (const std::string_view piece : pieces) {
+            size_t word = 0;  // start of the piece being read
+            for (size_t pos = 0; pos < piece.size();) {
+                const char32_t c = utf8::decode_at(piece, pos);
+                const size_t len = utf8::char_length(piece, pos);
+                const bool space = utf8::is_whitespace(c);
+                if (space || unicode::is_bert(c, unicode::kBertPunctuation)) {
+                    if (pos > word) out.push_back(piece.substr(word, pos - word));
+                    if (!space) out.push_back(piece.substr(pos, len));
+                    word = pos + len;
+                }
+                pos += len;
+            }
+            if (piece.size() > word) out.push_back(piece.substr(word));
+        }
+        return out;
+    }
+};
+
 class SequencePreTokenizer final : public PreTokenizer {
 public:
     explicit SequencePreTokenizer(std::vector<std::unique_ptr<PreTokenizer>> steps) : steps_(std::move(steps)) {
@@ -185,6 +212,7 @@ std::unique_ptr<PreTokenizer> make_pre_tokenizer(const nlohmann::json& config) {
     const std::string type = component_type(config, kWhat);
     if (type == "Split") return make_split(config);
     if (type == "ByteLevel") return make_byte_level(config);
+    if (type == "BertPreTokenizer") return std::make_unique<BertPreTokenizer>();
     if (type == "Sequence") return make_sequence(config);
     refuse_component(kWhat, type);
 }

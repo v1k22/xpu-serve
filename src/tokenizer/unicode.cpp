@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <unordered_map>
-#include <vector>
 
 #include "tokenizer/unicode_tables.h"
 #include "tokenizer/utf8.h"
@@ -49,7 +48,7 @@ bool nfc_unsafe(char32_t c) {
     return c >= 0x300 && find_range(t::kNfcUnsafeRanges, t::kNfcUnsafeRangeCount, c) != nullptr;
 }
 
-void decompose(char32_t c, std::vector<char32_t>& out) {
+void decompose(char32_t c, std::u32string& out) {
     if (c >= kSBase && c < kSBase + kSCount) {
         const char32_t s = c - kSBase;
         out.push_back(kLBase + s / kNCount);
@@ -79,15 +78,9 @@ char32_t compose_pair(char32_t a, char32_t b) {
 }
 
 // NFC of a sequence of code points (UAX #15: decompose, reorder by combining class, compose).
-void nfc_chars(std::vector<char32_t>& chars) {
-    std::vector<char32_t> d;
-    d.reserve(chars.size() + 4);
-    for (const char32_t c : chars) decompose(c, d);
-    for (size_t i = 1; i < d.size(); ++i) {
-        const uint8_t cc = combining_class(d[i]);
-        if (cc == 0) continue;
-        for (size_t j = i; j > 0 && combining_class(d[j - 1]) > cc; --j) std::swap(d[j - 1], d[j]);
-    }
+void nfc_chars(std::u32string& chars) {
+    std::u32string d = std::move(chars);
+    nfd(d);
     chars.clear();
     if (d.empty()) return;
     size_t starter = 0;
@@ -143,6 +136,45 @@ uint8_t combining_class(char32_t c) {
     return r == nullptr ? 0 : r->ccc;
 }
 
+void nfd(std::u32string& chars) {
+    std::u32string d;
+    d.reserve(chars.size() + 4);
+    for (const char32_t c : chars) decompose(c, d);
+    for (size_t i = 1; i < d.size(); ++i) {
+        const uint8_t cc = combining_class(d[i]);
+        if (cc == 0) continue;
+        for (size_t j = i; j > 0 && combining_class(d[j - 1]) > cc; --j) std::swap(d[j - 1], d[j]);
+    }
+    chars = std::move(d);
+}
+
+bool is_bert(char32_t c, BertClass bert_class) {
+    const t::BertClassRange* r = find_range(t::kBertClassRanges, t::kBertClassRangeCount, c);
+    return r != nullptr && (r->classes & bert_class) != 0;
+}
+
+void append_lowercase(char32_t c, std::u32string& out) {
+    if (c < 0x80) {
+        out.push_back(c >= 'A' && c <= 'Z' ? c + 32 : c);
+        return;
+    }
+    const t::LowercaseRun* run = find_range(t::kLowercaseRuns, t::kLowercaseRunCount, c);
+    if (run != nullptr && (c - run->first) % run->stride == 0) {
+        out.push_back(static_cast<char32_t>(static_cast<int32_t>(c) + run->delta));
+        return;
+    }
+    const t::LowercaseExpansion* end = t::kLowercaseExpansions + t::kLowercaseExpansionCount;
+    const t::LowercaseExpansion* it = std::lower_bound(
+        t::kLowercaseExpansions, end, c, [](const t::LowercaseExpansion& e, char32_t v) { return e.code_point < v; });
+    if (it == end || it->code_point != c) {
+        out.push_back(c);
+        return;
+    }
+    for (const char32_t lower : it->lower) {
+        if (lower != 0) out.push_back(lower);
+    }
+}
+
 // Text is copied through up to the first unsafe character; from the safe character before it (which may compose with
 // what follows) to the next safe character, the segment is normalized. A safe character (quick check Yes, combining
 // class 0) never interacts with what precedes it, so segments normalize independently.
@@ -152,7 +184,7 @@ std::string nfc(std::string_view text) {
     size_t copied = 0;     // text[0, copied) is in out
     size_t last_safe = 0;  // start of the last safe character seen at or after `copied`
     bool have_safe = false;
-    std::vector<char32_t> chars;
+    std::u32string chars;
     for (size_t pos = 0; pos < text.size();) {
         if (static_cast<uint8_t>(text[pos]) < 0xCC) {  // lead bytes below 0xCC encode code points below U+0300
             last_safe = pos;

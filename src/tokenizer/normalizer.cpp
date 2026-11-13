@@ -54,6 +54,73 @@ public:
     std::string normalize(std::string_view text) const override { return unicode::nfc(text); }
 };
 
+// Hugging Face's BertNormalizer (normalizers/bert.rs), its steps in its order. strip_accents is NFD without the
+// nonspacing marks; lowercase maps each character on its own.
+class BertNormalizer final : public Normalizer {
+public:
+    BertNormalizer(bool clean_text, bool handle_chinese_chars, bool strip_accents, bool lowercase)
+        : clean_text_(clean_text),
+          handle_chinese_chars_(handle_chinese_chars),
+          strip_accents_(strip_accents),
+          lowercase_(lowercase) {}
+
+    std::string normalize(std::string_view text) const override {
+        // Rust strings are valid UTF-8: an invalid sequence reads as U+FFFD, as with String::from_utf8_lossy.
+        const std::string valid = utf8::lossy(text);
+        std::u32string chars;
+        chars.reserve(valid.size());
+        for (size_t pos = 0; pos < valid.size(); pos += utf8::char_length(valid, pos)) {
+            chars.push_back(utf8::decode_at(valid, pos));
+        }
+        if (clean_text_) {
+            std::erase_if(chars,
+                          [](char32_t c) { return c == 0 || c == 0xFFFD || unicode::is_bert(c, unicode::kBertControl); });
+            for (char32_t& c : chars) {
+                if (utf8::is_whitespace(c)) c = U' ';
+            }
+        }
+        if (handle_chinese_chars_) {
+            std::u32string spaced;
+            spaced.reserve(chars.size());
+            for (const char32_t c : chars) {
+                if (unicode::is_bert(c, unicode::kBertChinese)) {
+                    spaced += {U' ', c, U' '};
+                } else {
+                    spaced.push_back(c);
+                }
+            }
+            chars = std::move(spaced);
+        }
+        if (strip_accents_) {
+            unicode::nfd(chars);
+            std::erase_if(chars, [](char32_t c) { return unicode::is_bert(c, unicode::kBertNonspacingMark); });
+        }
+        if (lowercase_) {
+            std::u32string lowered;
+            lowered.reserve(chars.size());
+            for (const char32_t c : chars) unicode::append_lowercase(c, lowered);
+            chars = std::move(lowered);
+        }
+        std::string out;
+        out.reserve(chars.size());
+        for (const char32_t c : chars) utf8::append(out, c);
+        return out;
+    }
+
+private:
+    bool clean_text_;
+    bool handle_chinese_chars_;
+    bool strip_accents_;
+    bool lowercase_;
+};
+
+std::unique_ptr<Normalizer> make_bert(const nlohmann::json& config) {
+    const bool lowercase = bool_field(config, "lowercase", kWhat);
+    return std::make_unique<BertNormalizer>(bool_field(config, "clean_text", kWhat),
+                                            bool_field(config, "handle_chinese_chars", kWhat),
+                                            bool_field_or(config, "strip_accents", lowercase, kWhat), lowercase);
+}
+
 class SequenceNormalizer final : public Normalizer {
 public:
     explicit SequenceNormalizer(std::vector<std::unique_ptr<Normalizer>> steps) : steps_(std::move(steps)) {}
@@ -106,6 +173,7 @@ std::unique_ptr<Normalizer> make_normalizer(const nlohmann::json& config) {
                                                  bool_field_or(config, "strip_right", false, kWhat));
     }
     if (type == "NFC") return std::make_unique<NfcNormalizer>();
+    if (type == "BertNormalizer") return make_bert(config);
     if (type == "Sequence") return make_sequence(config);
     refuse_component(kWhat, type);
 }

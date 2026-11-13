@@ -45,10 +45,16 @@ std::string string_field(const nlohmann::json& component, const char* key, std::
     return component.at(key).get<std::string>();
 }
 
+bool bool_field(const nlohmann::json& component, const char* key, std::string_view what) {
+    if (!component.contains(key) || !component.at(key).is_boolean()) {
+        fail("tokenizer.json ", what, ": field '", key, "' must be a boolean");
+    }
+    return component.at(key).get<bool>();
+}
+
 bool bool_field_or(const nlohmann::json& component, const char* key, bool fallback, std::string_view what) {
     if (!component.contains(key) || component.at(key).is_null()) return fallback;
-    if (!component.at(key).is_boolean()) fail("tokenizer.json ", what, ": field '", key, "' must be a boolean");
-    return component.at(key).get<bool>();
+    return bool_field(component, key, what);
 }
 
 }  // namespace xs::tok

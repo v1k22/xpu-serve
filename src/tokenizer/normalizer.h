@@ -1,6 +1,6 @@
 #pragma once
 
-// tokenizer.json normalizers: Replace (string pattern), Prepend, Strip, NFC and Sequence.
+// tokenizer.json normalizers: Replace (string pattern), Prepend, Strip, NFC, BertNormalizer and Sequence.
 
 #include <memory>
 #include <string>

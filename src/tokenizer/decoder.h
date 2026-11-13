@@ -1,7 +1,7 @@
 #pragma once
 
-// tokenizer.json decoders: Replace (string pattern), ByteFallback, ByteLevel, Fuse, Strip and Sequence. Like Hugging
-// Face, each decoder maps the list of token strings to a new list; the final text is their concatenation.
+// tokenizer.json decoders: Replace (string pattern), ByteFallback, ByteLevel, Fuse, Strip, WordPiece and Sequence. Like
+// Hugging Face, each decoder maps the list of token strings to a new list; the final text is their concatenation.
 
 #include <memory>
 #include <string>

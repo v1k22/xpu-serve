@@ -6,6 +6,7 @@
 
 #include "tokenizer/bpe_model.h"
 #include "tokenizer/json_fields.h"
+#include "tokenizer/wordpiece_model.h"
 #include "util/error.h"
 
 namespace xs::tok {
@@ -52,6 +53,10 @@ std::optional<std::string_view> Vocab::piece(int32_t id) const {
 std::unique_ptr<Model> make_model(const nlohmann::json& config, bool byte_level) {
     const std::string type = component_type(config, "model");
     if (type == "BPE") return std::make_unique<BpeModel>(config, byte_level);
+    if (type == "WordPiece") {
+        if (byte_level) fail("tokenizer.json model 'WordPiece' after a ByteLevel pre-tokenizer is not supported");
+        return std::make_unique<WordPieceModel>(config);
+    }
     refuse_component("model", type);
 }
 

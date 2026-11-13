@@ -10,11 +10,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include "scratch_model_dir.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
 
 namespace {
 using Ids = std::vector<int32_t>;
+using xs::test::ScratchModelDir;
 
 std::filesystem::path tiny_dir() { return std::filesystem::path(XS_SOURCE_DIR) / "tests/fixtures/tokenizer/tiny"; }
 
@@ -22,24 +24,6 @@ nlohmann::json tiny_json() {
     std::ifstream in(tiny_dir() / "tokenizer.json");
     return nlohmann::json::parse(in);
 }
-
-// A scratch model directory holding one tokenizer.json, removed on destruction.
-class ScratchModelDir {
-public:
-    explicit ScratchModelDir(const nlohmann::json& tokenizer_json)
-        : path_(std::filesystem::temp_directory_path() /
-                ("xs_tok_test_" + std::to_string(reinterpret_cast<uintptr_t>(this)))) {
-        std::filesystem::create_directories(path_);
-        std::ofstream(path_ / "tokenizer.json") << tokenizer_json.dump();
-    }
-    ~ScratchModelDir() { std::filesystem::remove_all(path_); }
-    ScratchModelDir(const ScratchModelDir&) = delete;
-    ScratchModelDir& operator=(const ScratchModelDir&) = delete;
-    const std::filesystem::path& path() const { return path_; }
-
-private:
-    std::filesystem::path path_;
-};
 
 std::string load_error(const nlohmann::json& tokenizer_json) {
     const ScratchModelDir dir(tokenizer_json);
@@ -172,8 +156,8 @@ TEST_SUITE("tokenizer") {
         CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'Metaspace' is not supported");
 
         j = tiny_json();
-        j["decoder"]["decoders"][1] = {{"type", "WordPiece"}};
-        CHECK(load_error(j) == "tokenizer.json decoder 'WordPiece' is not supported");
+        j["decoder"]["decoders"][1] = {{"type", "CTC"}};
+        CHECK(load_error(j) == "tokenizer.json decoder 'CTC' is not supported");
 
         j = tiny_json();
         j["model"]["type"] = "Unigram";

@@ -22,6 +22,7 @@ std::string string_pattern(const nlohmann::json& component, std::string_view wha
 std::optional<std::string> regex_pattern(const nlohmann::json& component, std::string_view what);
 
 std::string string_field(const nlohmann::json& component, const char* key, std::string_view what);
+bool bool_field(const nlohmann::json& component, const char* key, std::string_view what);
 bool bool_field_or(const nlohmann::json& component, const char* key, bool fallback, std::string_view what);
 
 }  // namespace xs::tok

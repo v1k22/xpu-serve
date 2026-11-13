@@ -1,7 +1,7 @@
 #pragma once
 
 // The tokenizer.json model: the vocabulary, and the algorithm that turns one pre-tokenized piece into ids. BPE
-// (bpe_model.h); others are refused by name.
+// (bpe_model.h) and WordPiece (wordpiece_model.h); others are refused by name.
 
 #include <cstdint>
 #include <memory>
