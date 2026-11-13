@@ -96,3 +96,18 @@ TEST_CASE("lfm3 config: refuses what it does not implement, by name") {
     config["rope_parameters"].erase("sliding_attention");
     CHECK_THROWS_WITH_AS(xs::lfm3::parse_config(config), doctest::Contains("sliding_attention"), xs::Error);
 }
+
+TEST_CASE("lfm3 config: an lfm3_vl checkpoint's text decoder is its text_config") {
+    json vl = {{"model_type", "lfm3_vl"}, {"text_config", lfm3_config()}, {"vision_config", {{"hidden_size", 1024}}}};
+    CHECK(&xs::lfm3::text_config(vl) == &vl["text_config"]);
+    CHECK(xs::lfm3::parse_config(xs::lfm3::text_config(vl)).num_layers == 24);
+    const json text = lfm3_config();
+    CHECK(&xs::lfm3::text_config(text) == &text);
+
+    CHECK_THROWS_WITH_AS(xs::lfm3::text_config(json{{"model_type", "lfm3_omni"}, {"text_config", lfm3_config()}}),
+                         doctest::Contains("lfm3_omni"), xs::Error);
+    CHECK_THROWS_WITH_AS(xs::lfm3::text_config(json{{"model_type", "lfm3_vl"}}), doctest::Contains("text_config"),
+                         xs::Error);
+    vl["text_config"]["model_type"] = "lfm2";
+    CHECK_THROWS_WITH_AS(xs::lfm3::text_config(vl), doctest::Contains("lfm2"), xs::Error);
+}
