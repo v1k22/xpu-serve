@@ -1,8 +1,8 @@
 # GGUF files: what was measured
 
-Every result behind xpu-serve's GGUF support, in one place: three models, every file their publisher offers that fits
-one Intel Arc Pro B60 (24 GB). [Decision 0016](decisions/0016-gguf.md) has the design; the README's GGUF section
-has the short version.
+Every result behind xpu-serve's GGUF support, in one place: three language models and a decision model (Clef-Flash),
+every file their publisher offers that fits one Intel Arc Pro B60 (24 GB). [Decision 0016](decisions/0016-gguf.md)
+has the design; the README's GGUF section has the short version.
 
 ## How it was measured
 
@@ -320,6 +320,35 @@ What each file holds:
 | UD-Q6_K_M | 23.08 GB | 3 | in the file | Q6_K 62 %, Q8_0 20 %, Q5_K 18 % |
 | UD-Q6_K_L (does not fit) | 24.17 GB | 3 | in the file | Q6_K 60 %, Q8_0 31 %, Q5_K 9 % |
 | MTP/mtp-Qwen3.8-27B-Q4_0 | 1.36 GB | 3 | the head alone | Q3_K 86 % (its own embedding and output head), Q4_K 11 %, Q6_K 4 % |
+
+## Clef-Flash (a decision model)
+
+Files: [ggml-org/Clef-Flash-GGUF](https://huggingface.co/ggml-org/Clef-Flash-GGUF), all three (BF16, Q8_0, Q4_K_M).
+llama.cpp's `clef` architecture is the Qwen3.5 decoder under the `clef.` namespace plus Clef's joint schema head
+(`dec.blk.*`, `decision.*`); `convert` imports it into the pack the Clef model serves from the original checkpoint
+(decision 0016). The vision files (`mmproj-*`) are not read.
+
+The reference is the original checkpoint's own code (`joint_schema_model.py`) in float32 on the CPU
+(`tests/parity/decision/reference.py`), on the 25 test decisions and the 300 MMLU-Pro questions; each pack is served
+through the System One API and scored against it (`tests/e2e/systemone_eval.py --reference`). "Same as the
+reference" counts the questions answered as the reference answers them; the probability differences are per option.
+Latency is the p50 of the 25 test decisions as served (about 180 tokens each), and `bench` (3 questions, 325
+tokens).
+
+| Variant | File | GPU memory | 25 decisions right | MMLU-Pro right (300) | Same answer as the reference (300) | Probability difference, largest / p95 | Latency p50 | `bench` p50 |
+|---|---|---|---|---|---|---|---|---|
+| BF16 | 18.2 GB | 15.01 GiB | 25 | 198 | 299 | 0.0019 / 0.0006 | 96 ms | 129 ms |
+| Q8_0 | 9.7 GB | 7.98 GiB | 25 | 197 | 295 | 0.035 / 0.017 | 147 ms | 191 ms |
+| Q4_K_M | 6.7 GB | 5.25 GiB | 25 | 195 | 287 | 0.39 / 0.12 | 150 ms | 185 ms |
+| *original at f16* | | 15.01 GiB | 25 | 198 | 299 | 0.0016 / 0.0005 | 90 ms | 124 ms |
+| *original in f32 on the CPU* | | | 25 | 198 | 300 | 0 | | |
+
+- **The import is exact**: on each file the config and the head's shapes are the original's, the BF16 file's head
+  holds the original's values, its Q8_0 matrices (in both quantized files) are within 0.42 % of them, and the scales
+  the file stores are exp and sigmoid of the original's parameters (`gguf_clef_real_file.cpp`).
+- **BF16 is the original**: it answers as the original at f16 does. Q8_0 changes 5 answers of 300 and Q4_K_M 13.
+- **The quantized files are slower**: a decision is one prefill over the prompt, which dequantizes every quantized
+  weight for its GEMM (as 0015 measured for q8 and q4 packs), so they cost about 50 ms more than f16.
 
 ## Tool calls and chat templates
 

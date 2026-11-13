@@ -28,7 +28,7 @@ code.
 | Qwen3.8-27B | language | q4, GGUF files | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; its GGUF files (1.8 to 6.8 bits, 6 to 23 GB): 15 to 21 tok/s decode, 25 to 47 with MTP; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill, its Q4_0 file 6.4 and 17 with MTP | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
 | π0.5 | robot policy | f16, q8 | 215 / 198 ms per call (f16 / q8); 115 / 113 ms on the Arc Pro B60 | Arc B390, 3 cameras |
-| Clef-Flash | decision | f16, q8, q4 | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
+| Clef-Flash | decision | f16, q8, q4, GGUF files | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens; its GGUF files: 96 ms (BF16, 15.0 GiB), 147 ms (Q8_0, 8.0 GiB), 150 ms (Q4_K_M, 5.3 GiB) | Arc Pro B60 |
 | pplx-decider-flash-v1.2 | decision | f16, q8, q4 | 39 ms per decision (p50; 57 ms p95) on prompts of 92 to 230 tokens; 214 ms at 1,024 tokens | Arc Pro B60 |
 | OpenJev | decision (a language model read at the option letters) | q4 | 266 ms per decision (p50; 478 ms p95) on prompts of 67 to 198 tokens, 143 ms for another question about the state just read; 1.46 s for three questions on a 1,024-token prompt | Arc Pro B60 |
 | all-MiniLM-L6-v2 | embedding | f16 | 1.9 ms per text (16 to 256 tokens); 651 texts/s of 128 tokens | Arc Pro B60 |
@@ -363,9 +363,10 @@ xpu-serve serve ~/models/gemma-4-E2B-it-Q4_K_M --device GPU --drafter ~/models/g
 ```
 
 The architecture comes from the file (`general.architecture`). Supported: `qwen35`, the Qwen3.5 / Qwen3.6 / Qwen3.8
-dense text models, and `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
+dense text models, `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
 images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
-drafter; others are refused by name. A Qwen3.5-family file that comes without its MTP head (the smallest files of
+drafter, and `clef`, the Clef decision models (Clef-Flash's files: the same answer as the original's own code on 299,
+295 and 287 of 300 MMLU-Pro questions at BF16, Q8_0 and Q4_K_M); others are refused by name. A Qwen3.5-family file that comes without its MTP head (the smallest files of
 Qwen3.8-27B) takes the head from its `MTP/mtp-*.gguf` file with `--mtp`: the pack is the one a file with the head
 gives, and `--spec mtp` drafts with it. config.json, the tokenizer and the chat template are
 written from the file's metadata (on Qwen3.5-4B and Gemma 4 E2B the tokenizer equals the original's token by token),
