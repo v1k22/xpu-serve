@@ -5,10 +5,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <memory>
 
 #include "../backend/device_test_support.h"
 #include "convert/convert.h"
 #include "decision_test_util.h"
+#include "io/safetensors_writer.h"
 #include "models/clef/clef.h"
 #include "models/letter_readout/letter_readout.h"
 #include "models/model.h"
@@ -115,6 +118,52 @@ TEST_SUITE("decision models") {
             CHECK(max_diff(p, xs::test::decide(*model, *gpu, ticket(), DecisionLimits{4096, 7})) <
                   (dev::is_f16() ? 5e-3 : 1e-4));
         }
+    }
+    TEST_CASE("clef: the head's scales as a GGUF file stores them answer as the parameters they come from") {
+        namespace fs = xs::test::fs;
+        const xs::test::TempDir dir("xs_tiny_clef_scales");
+        xs::test::write_tiny_clef(dir.path / "params", 5);
+        const auto answers = [](const fs::path& from) {
+            const auto model = xs::load_decision_model(from);
+            const auto session = xs::make_backend("cpu-ref")->compile(model->programs(), model->weights(),
+                                                                      xs::SessionOptions{.precision = xs::DType::F32});
+            return xs::test::decide(*model, *session, ticket(), DecisionLimits{4096, 4096});
+        };
+        // The same checkpoint with `scales` (prior, joint, gate) in the head's file; and, when `both`, the parameters
+        // beside it.
+        const auto with_scales = [&](const fs::path& to, bool both) {
+            fs::create_directories(to);
+            for (const char* f : {"config.json", "joint_head_config.json", "model.safetensors"})
+                fs::copy_file(dir.path / "params" / f, to / f);
+            const auto head = xs::SafetensorsWeights::open_file(dir.path / "params" / "joint_head.safetensors");
+            std::vector<xs::OutUnit> units;
+            std::map<std::string, float> x;
+            for (const std::string& name : head->names()) {
+                const xs::TensorView& v = head->get(name);
+                if (name == "prior_logit_scale" || name == "joint_logit_scale" || name == "residual_gate") {
+                    x[name] = xs::HostTensor::borrow(v.dtype, v.shape, const_cast<void*>(v.data)).to_f32()[0];
+                    if (!both) continue;
+                }
+                units.push_back({{{name, v.dtype, v.shape}}, [v](std::ostream& out) {
+                                     out.write(static_cast<const char*>(v.data),
+                                               static_cast<std::streamsize>(v.nbytes()));
+                                 }});
+            }
+            REQUIRE(x.size() == 3);
+            const auto scales = std::make_shared<std::vector<float>>(
+                std::vector<float>{std::exp(std::min(x["prior_logit_scale"], std::log(100.0f))),
+                                   std::exp(std::min(x["joint_logit_scale"], std::log(100.0f))),
+                                   1.0f / (1.0f + std::exp(-x["residual_gate"]))});
+            units.push_back({{{"scales", xs::DType::F32, {3}}}, [scales](std::ostream& out) {
+                                 out.write(reinterpret_cast<const char*>(scales->data()), 3 * sizeof(float));
+                             }});
+            xs::write_safetensors(to / "joint_head.safetensors", units);
+        };
+        with_scales(dir.path / "scales", false);
+        CHECK(answers(dir.path / "scales") == answers(dir.path / "params"));
+        with_scales(dir.path / "both", true);
+        CHECK_THROWS_WITH(xs::load_decision_model(dir.path / "both"),
+                          doctest::Contains("clef: the weights hold both joint_head.scales and joint_head."));
     }
     TEST_CASE("pplx_decider: a checkpoint with a joint read-out is a decision model") {
         const xs::test::TempDir dir("xs_tiny_pplx");
