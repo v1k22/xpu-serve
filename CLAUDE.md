@@ -68,7 +68,8 @@ build/src/xpu-serve run   <decision-model-dir> --device GPU --request request.js
   drafter checkpoint beside the model); `XS_QWEN35_DIR` (a Qwen3.5 checkpoint, for tokenizer parity; with `XS_GGUF_FILE`, a qwen35 GGUF of it, for the GGUF import's real-file checks); `XS_GEMMA4_DIR` (with `XS_GGUF_FILE`, a gemma4 GGUF: the small files of the checkpoint it was converted from); `XS_GGUF_DRAFTER_FILE` (a gemma4-assistant GGUF) with `XS_GEMMA4_ASSISTANT_DIR` (the assistant checkpoint's config.json); `XS_LFM3_DIR`
   (an LFM3 checkpoint, for its tokenizer and chat template, which are not kept in this repository);
   `XS_TEST_DECISION_DIR` (a decision model) with `XS_DECISION_FIXTURES` (its reference answers) and
-  `XS_DECISION_CHUNK` (tokens a step feeds).
+  `XS_DECISION_CHUNK` (tokens a step feeds); `XS_TEST_EMBEDDING_DIR` (an embedding model) with
+  `XS_EMBEDDING_FIXTURES` (its reference embeddings) and `XS_EMBEDDING_TEXTS=1` (also tokenize the texts).
   `tests/parity/model/make_tiny.py` writes a tiny random checkpoint of an architecture (real layer pattern and tensor
   names; with the checkpoint's own modeling code for one transformers does not ship, like LFM3), or of a block
   drafter for one (`--drafter`), or an encoder in a sentence-transformers checkpoint (`--arch bert|nomic_bert`), to run
@@ -122,6 +123,7 @@ area).
 | `service/` | xs_service | `EngineService`: loads tokenizer + template + model, compiles on a backend, owns the engine thread |
 | `policy/` | xs_policy | `PolicyRunner`: a policy, its tokenizer and one compiled program per call shape; warm-up; per-call timings (`xpu-serve bench <policy-dir>`) |
 | `decision/` | xs_decision | `DecisionRunner`: a decision model, its tokenizer and chat template (`PromptTools`), its programs in one session, a request's steps run as the model names them; `answers` (probabilities -> choice, score, confidence); `DecisionService` (one device thread, requests in arrival order) |
+| `embedding/` | xs_embedding | `EmbeddingRunner`: an embedding model and its one stateless session, a run per token sequence, timings; `pooling` (mean or CLS, then the L2 norm, on the host); `EmbeddingService` (the tokenizer for text, one device thread) |
 | `cli/` | (exe) | `main.cpp` (commands serve, run, bench, convert, info), `args` (flag parser) |
 
 ### 4.1 Files that matter most
@@ -289,6 +291,8 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/server/test_systemone_http.cpp` | the System One API: the schema refused field by field (422 bodies), answers of each type, 400 / 500, concurrent clients | a fake decision function |
 | `tests/unit/model/embedding_config.cpp` | BERT's and NomicBERT's config.json, the sentence-transformers pipeline (both pooling spellings, Normalize, the longest input, `do_lower_case`), the model kind; every refusal by name | hand-written expectations |
 | `tests/unit/model/embedding_models.cpp` | encoders on tiny checkpoints the test writes (`embedding_test_util.h`): runs that keep nothing, every token seeing every other, BERT's absolute and NomicBERT's relative positions; the GPU against cpu-ref | the same model run differently |
+| `tests/unit/model/embedding_parity.cpp` | an embedding model (`XS_TEST_EMBEDDING_DIR`): hidden states, pooled vector and embedding of each case's ids, up to the model's longest input; with `XS_EMBEDDING_TEXTS=1` each text's ids too | sentence-transformers fp32, from `tests/parity/embedding/reference.py` (`make_tiny.py --arch bert|nomic_bert` writes tiny checkpoints) |
+| `tests/unit/embedding/` | pooling; the runner (a run per sequence, the limits it refuses, `--ctx` below the model's); the service (text through a tokenizer, clients on several threads) | values computed by hand; the runner on its own |
 | `tests/e2e/` | a running chat server: 23 tool-calling cases with simulated tools, one turn and several (`tool_calls.py`, graded against `tool_calls_rubric.md`; an original checkpoint and its GGUF import compared call by call). A running decision server: 25 decisions with one accepted answer each (`decisions25.json`), the API's shape, latency (`systemone_eval.py`, also against reference answers or another run's saved ones: what a pack or a setting changes); `make_mmlu_pro.py` writes a larger, harder set from MMLU-Pro (not kept here) | accepted answers; the model's reference code; another run |
 
 - `tests/parity/**/*.py` generate fixtures from Hugging Face (run with a Python venv that has `transformers`,

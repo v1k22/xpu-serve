@@ -1,0 +1,16 @@
+{
+  "texts": [
+    "Hello world, this is a test.",
+    "search_query: What is the capital of France?",
+    "search_document: Paris is the capital and most populous city of France, on the Seine.",
+    "A",
+    "The quick brown fox jumps over the lazy dog. THE QUICK BROWN FOX! 1234567890 3.14159 e=mc^2",
+    "Café naïve résumé Ångström Straße ﬁnancial — “quoted” ‘text’ … ½ ©",
+    "東京は日本の首都です。北京是中国的首都。서울은 한국의 수도입니다.",
+    "Emoji 🙂👍🏽 and symbols ∑∫√∞ ≠ ≤ → ★",
+    "def embed(text: str) -> list[float]:\n    return model.encode(text)  # tabs\tand newlines\n",
+    "unbelievable antidisestablishmentarianism pneumonoultramicroscopicsilicovolcanoconiosis",
+    "Text that writes [CLS] and [SEP] and [MASK] and [UNK] as plain words."
+  ],
+  "filler": "Embedding models turn text into vectors: documents that mean the same thing land close together, and a search compares a query's vector with every document's. The encoder reads the whole passage at once, each token attending to every other, and the sentence vector is pooled from what it writes for each token. "
+}
