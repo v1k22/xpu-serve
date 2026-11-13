@@ -20,11 +20,26 @@ void append_hex(std::string& out, const char* prefix, uint32_t value, int digits
     out += buf;
 }
 
-// json.dumps with ensure_ascii=False escapes the quote, the backslash and the C0 controls, nothing else.
-void json_string(std::string& out, const std::string& s) {
+uint32_t next_code_point(const std::string& s, size_t& i);
+
+// json.dumps escapes the quote, the backslash and the C0 controls, and with ensure_ascii DEL and every code point past
+// ASCII.
+void json_string(std::string& out, const std::string& s, bool ensure_ascii) {
     out += '"';
-    for (const char ch : s) {
+    for (size_t i = 0; i < s.size();) {
+        const char ch = s[i];
         const auto c = static_cast<unsigned char>(ch);
+        if (ensure_ascii && c >= 0x7F) {
+            const uint32_t cp = next_code_point(s, i);
+            if (cp < 0x10000) {
+                append_hex(out, "\\u", cp, 4);
+            } else {
+                append_hex(out, "\\u", 0xD800 + ((cp - 0x10000) >> 10), 4);
+                append_hex(out, "\\u", 0xDC00 + ((cp - 0x10000) & 0x3FF), 4);
+            }
+            continue;
+        }
+        ++i;
         switch (c) {
             case '"':
                 out += "\\\"";
@@ -146,7 +161,7 @@ void dump_json(std::string& out, const Json& v, const JsonStyle& style) {
     } else if (v.is_number()) {
         number(out, v);
     } else if (v.is_string()) {
-        json_string(out, v.get_ref<const std::string&>());
+        json_string(out, v.get_ref<const std::string&>(), style.ensure_ascii);
     } else if (v.is_array()) {
         out += '[';
         bool first = true;
@@ -162,7 +177,7 @@ void dump_json(std::string& out, const Json& v, const JsonStyle& style) {
         for (const auto& [key, value] : members(v, style.sort_keys)) {
             if (!first) out += item_sep;
             first = false;
-            json_string(out, *key);
+            json_string(out, *key, style.ensure_ascii);
             out += key_sep;
             dump_json(out, *value, style);
         }

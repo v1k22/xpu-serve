@@ -13,9 +13,12 @@ namespace xs::py {
 struct JsonStyle {
     bool sort_keys = false;  // json.dumps(sort_keys=True): keys in code point order, at every depth
     bool compact = false;    // separators=(",", ":"); otherwise Python's default ", " and ": "
+    // json.dumps' default: DEL and every code point past ASCII as \uxxxx (a surrogate pair past U+FFFF); otherwise
+    // as it is (ensure_ascii=False).
+    bool ensure_ascii = false;
 };
 
-// json.dumps(value, ensure_ascii=False, ...): floats as Python's repr writes them (1250.0, 1e-05, 1e+16).
+// json.dumps(value, ...): floats as Python's repr writes them (1250.0, 1e-05, 1e+16).
 std::string json_dumps(const nlohmann::ordered_json& value, JsonStyle style = {});
 
 // str(value) of what json.loads gives for it: {'a': 1, 'b': [True, None]}. A string at the top level is itself.

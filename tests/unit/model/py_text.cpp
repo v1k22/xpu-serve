@@ -49,6 +49,7 @@ TEST_SUITE("python text") {
     TEST_CASE("json.dumps keeps the key order, or sorts it, with Python's separators") {
         const Json value = Json::parse(text(kValue));
         CHECK(xs::py::json_dumps(value) == text(R"J("{\"zeta\": 1e-05, \"alpha\": 1e+16, \"mid\": -0.5, \"count\": 12345678901234, \"ok\": false, \"none\": null, \"text\": \"quote \\\" backslash \\\\ newline \\n tab \\t done \\u0001 \u007f\", \"nested\": {\"b\": [1, 2.5, \"x\"], \"a\": {\"y\": 1, \"x\": 0.1}}, \"unicode\": \"na\u00efve caf\u00e9 \u2014 \u65e5\u672c\u8a9e \u2713\", \"it's\": \"single ' only\", \"both\": \"a ' and a \\\" here\", \"nbsp\": \"a\u00a0b\u200bc\u2028d\ud83d\ude00e\", \"empty\": {}, \"list\": []}")J"));
+        CHECK(xs::py::json_dumps(value, {.ensure_ascii = true}) == text(kValue));  // Python's default wrote kValue
         CHECK(xs::py::json_dumps(value, {.sort_keys = true, .compact = true}) == text(R"J("{\"alpha\":1e+16,\"both\":\"a ' and a \\\" here\",\"count\":12345678901234,\"empty\":{},\"it's\":\"single ' only\",\"list\":[],\"mid\":-0.5,\"nbsp\":\"a\u00a0b\u200bc\u2028d\ud83d\ude00e\",\"nested\":{\"a\":{\"x\":0.1,\"y\":1},\"b\":[1,2.5,\"x\"]},\"none\":null,\"ok\":false,\"text\":\"quote \\\" backslash \\\\ newline \\n tab \\t done \\u0001 \u007f\",\"unicode\":\"na\u00efve caf\u00e9 \u2014 \u65e5\u672c\u8a9e \u2713\",\"zeta\":1e-05}")J"));
     }
 
