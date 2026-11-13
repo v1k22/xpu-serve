@@ -9,6 +9,8 @@
 //
 // And its twin: the Hugging Face checkpoint those bytes stand for, every weight as the f32 values the file's blocks
 // decode to, in the grouped order, with the norms and A_log computed back the way the import computes them.
+//
+// The decoder's part (put_tiny_decoder) also writes the decoder of a clef file (tiny_clef_gguf.h).
 
 #include <cmath>
 #include <filesystem>
@@ -175,6 +177,20 @@ public:
     template <typename Back>
     void put(const std::string& gguf_name, const Dims& gguf_shape, const std::vector<float>& stored, Storage storage,
              Back back, const std::vector<std::pair<std::string, Dims>>& twins) {
+        const std::vector<float> values = back(store(gguf_name, gguf_shape, stored, storage));
+        size_t at = 0;
+        for (const auto& [name, shape] : twins) {
+            const auto n = static_cast<size_t>(numel(shape));
+            twin(name, shape,
+                 std::vector<float>(values.begin() + static_cast<std::ptrdiff_t>(at),
+                                    values.begin() + static_cast<std::ptrdiff_t>(at + n)));
+            at += n;
+        }
+    }
+
+    // The tensor of put() alone: written to the file, and the values the file holds returned.
+    std::vector<float> store(const std::string& gguf_name, const Dims& gguf_shape, const std::vector<float>& stored,
+                             Storage storage) {
         std::vector<float> held(stored.size());
         std::string bytes;
         uint32_t type = kGgmlF32;
@@ -209,15 +225,12 @@ public:
                 break;
         }
         w_.tensor(gguf_name, Dims(gguf_shape.rbegin(), gguf_shape.rend()), type, std::move(bytes));
-        const std::vector<float> values = back(held);
-        size_t at = 0;
-        for (const auto& [name, shape] : twins) {
-            const auto n = static_cast<size_t>(numel(shape));
-            twin_.emplace_back(name, shape,
-                               std::vector<float>(values.begin() + static_cast<std::ptrdiff_t>(at),
-                                                  values.begin() + static_cast<std::ptrdiff_t>(at + n)));
-            at += n;
-        }
+        return held;
+    }
+
+    // A tensor of the twin.
+    void twin(std::string name, Dims shape, std::vector<float> values) {
+        twin_.emplace_back(std::move(name), std::move(shape), std::move(values));
     }
 
     // The twin's tensors as f32 safetensors units.
@@ -241,49 +254,51 @@ private:
     std::vector<std::tuple<std::string, Dims, std::vector<float>>> twin_;
 };
 
-// Writes, under `dir`: hf/ (the tiny checkpoint, its tokenizer and chat template), twin/ (the checkpoint the GGUF
-// stands for). Returns the GGUF's writer: the test writes the file, as it is or changed.
-inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t seed) {
-    namespace fs = std::filesystem;
-    const TinyQwen m = tiny_gguf_model();
-    write_tiny_qwen(dir / "hf", m, seed);
-    const nlohmann::json tokenizer = tiny_tokenizer_json();
-    std::ofstream(dir / "hf" / "tokenizer.json") << tokenizer.dump();
-    std::ofstream(dir / "hf" / "tokenizer_config.json") << R"({"eos_token": "<|im_end|>", "bos_token": null})";
-    std::ofstream(dir / "hf" / "chat_template.jinja") << kTinyChatTemplate;
-    const int32_t eos = tokenizer["added_tokens"][2]["id"];
+// The tiny tokenizer's end of turn, the file's eos_token_id.
+inline int32_t tiny_eos() {
+    return tiny_tokenizer_json()["added_tokens"][2]["id"];
+}
 
+// Writes `hf`: the tiny checkpoint (tiny_gguf_model()), its tokenizer and chat template.
+inline void write_tiny_hf(const std::filesystem::path& hf, uint32_t seed) {
+    write_tiny_qwen(hf, tiny_gguf_model(), seed);
+    std::ofstream(hf / "tokenizer.json") << tiny_tokenizer_json().dump();
+    std::ofstream(hf / "tokenizer_config.json") << R"({"eos_token": "<|im_end|>", "bos_token": null})";
+    std::ofstream(hf / "chat_template.jinja") << kTinyChatTemplate;
+}
+
+// The tiny checkpoint in `checkpoint` as the converter writes a Qwen3.5 decoder into a GGUF of architecture `arch`:
+// its keys under "<arch>.", the tokenizer's, and its tensors into `w`, with an MTP head when `mtp`; their twin's into
+// `b`.
+inline void put_tiny_decoder(GgufWriter& w, TinyGgufBuilder& b, const std::filesystem::path& checkpoint,
+                             const std::string& arch, bool mtp, uint32_t seed) {
+    const TinyQwen m = tiny_gguf_model();
     const int64_t h = m.hidden, hk = m.lin_k_heads, hv = m.lin_v_heads, dv = m.lin_dim;
     const int64_t key_width = hk * m.lin_dim, value_width = hv * dv, conv_width = 2 * key_width + value_width;
     const auto layers = static_cast<int64_t>(m.layers.size());
-    GgufWriter w;
-    w.string("general.architecture", "qwen35")
-        .string("general.type", "model")
-        .string("general.name", "Tiny Qwen3.5")
-        .u32("general.file_type", 7)
-        .u32("general.quantization_version", 2)
-        .u32("qwen35.block_count", static_cast<uint32_t>(layers + 1))
-        .u32("qwen35.context_length", 4096)
-        .u32("qwen35.embedding_length", static_cast<uint32_t>(h))
-        .u32("qwen35.feed_forward_length", static_cast<uint32_t>(m.ffn))
-        .u32("qwen35.attention.head_count", static_cast<uint32_t>(m.heads))
-        .u32("qwen35.attention.head_count_kv", static_cast<uint32_t>(m.kv_heads))
-        .i32s("qwen35.rope.dimension_sections", {11, 11, 10, 0})
-        .f32("qwen35.rope.freq_base", 1e7f)
-        .f32("qwen35.attention.layer_norm_rms_epsilon", 1e-6f)
-        .u32("qwen35.attention.key_length", static_cast<uint32_t>(m.head_dim))
-        .u32("qwen35.attention.value_length", static_cast<uint32_t>(m.head_dim))
-        .u32("qwen35.ssm.conv_kernel", static_cast<uint32_t>(m.conv))
-        .u32("qwen35.ssm.state_size", static_cast<uint32_t>(m.lin_dim))
-        .u32("qwen35.ssm.group_count", static_cast<uint32_t>(hk))
-        .u32("qwen35.ssm.time_step_rank", static_cast<uint32_t>(hv))
-        .u32("qwen35.ssm.inner_size", static_cast<uint32_t>(value_width))
-        .u32("qwen35.full_attention_interval", 4)
-        .u32("qwen35.rope.dimension_count", static_cast<uint32_t>(m.head_dim / 4))
-        .u32("qwen35.nextn_predict_layers", 1);
-    add_tokenizer_metadata(w, tokenizer, m.vocab, eos);
+    const auto key = [&](const char* rest) { return arch + "." + rest; };
+    w.u32(key("block_count"), static_cast<uint32_t>(layers + (mtp ? 1 : 0)))
+        .u32(key("context_length"), 4096)
+        .u32(key("embedding_length"), static_cast<uint32_t>(h))
+        .u32(key("feed_forward_length"), static_cast<uint32_t>(m.ffn))
+        .u32(key("attention.head_count"), static_cast<uint32_t>(m.heads))
+        .u32(key("attention.head_count_kv"), static_cast<uint32_t>(m.kv_heads))
+        .i32s(key("rope.dimension_sections"), {11, 11, 10, 0})
+        .f32(key("rope.freq_base"), 1e7f)
+        .f32(key("attention.layer_norm_rms_epsilon"), 1e-6f)
+        .u32(key("attention.key_length"), static_cast<uint32_t>(m.head_dim))
+        .u32(key("attention.value_length"), static_cast<uint32_t>(m.head_dim))
+        .u32(key("ssm.conv_kernel"), static_cast<uint32_t>(m.conv))
+        .u32(key("ssm.state_size"), static_cast<uint32_t>(m.lin_dim))
+        .u32(key("ssm.group_count"), static_cast<uint32_t>(hk))
+        .u32(key("ssm.time_step_rank"), static_cast<uint32_t>(hv))
+        .u32(key("ssm.inner_size"), static_cast<uint32_t>(value_width))
+        .u32(key("full_attention_interval"), 4)
+        .u32(key("rope.dimension_count"), static_cast<uint32_t>(m.head_dim / 4));
+    if (mtp) w.u32(key("nextn_predict_layers"), 1);
+    add_tokenizer_metadata(w, tiny_tokenizer_json(), m.vocab, tiny_eos());
 
-    const auto source = SafetensorsWeights::open_dir(dir / "hf");
+    const auto source = SafetensorsWeights::open_dir(checkpoint);
     const auto values = [&](const std::string& name) {
         const TensorView& v = source->get(name);
         std::vector<float> out(static_cast<size_t>(v.numel()));
@@ -309,7 +324,6 @@ inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t see
             x += 1.0f;
         return v;
     };
-    TinyGgufBuilder b(w);
     int matrices = 0;
     const auto next_block = [&] { return matrices++ % 2 == 0 ? Storage::Q8_0 : Storage::Q4_0; };
     // A matrix in the Hugging Face layout, stored without reordering.
@@ -407,6 +421,7 @@ inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t see
               next_block(), grouped({h, value_width}, 1, 0, dv), {{A + "out_proj.weight", {h, value_width}}});
     }
 
+    if (!mtp) return;
     // The MTP head: block `layers`, a full-attention layer with nextn.* beside it.
     const std::string B = "blk." + std::to_string(layers) + ".", M = "mtp.layers.0.";
     const float in = 1.0f / std::sqrt(static_cast<float>(h));
@@ -431,17 +446,56 @@ inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t see
     norm(B + "nextn.enorm.weight", "mtp.pre_fc_norm_embedding.weight", random({h}, 0.1f));
     norm(B + "nextn.hnorm.weight", "mtp.pre_fc_norm_hidden.weight", random({h}, 0.1f));
     norm(B + "nextn.shared_head_norm.weight", "mtp.norm.weight", random({h}, 0.1f));
+}
 
+// Writes `dir`/twin: the twin's tensors in `b`, and hf/'s config (with `mtp_layers` and the file's stop token),
+// tokenizer and chat template.
+inline void write_tiny_twin(const std::filesystem::path& dir, const TinyGgufBuilder& b, int mtp_layers) {
+    namespace fs = std::filesystem;
     fs::create_directories(dir / "twin");
     write_safetensors(dir / "twin" / "model.safetensors", b.twin_units());
     nlohmann::json config = nlohmann::json::parse(std::ifstream(dir / "hf" / "config.json"));
-    config["mtp_num_hidden_layers"] = 1;
-    config["eos_token_id"] = eos;
+    config["mtp_num_hidden_layers"] = mtp_layers;
+    config["eos_token_id"] = tiny_eos();
     std::ofstream(dir / "twin" / "config.json") << config.dump(1);
     for (const char* f : {"tokenizer.json", "tokenizer_config.json", "chat_template.jinja"}) {
         fs::copy_file(dir / "hf" / f, dir / "twin" / f, fs::copy_options::overwrite_existing);
     }
+}
+
+// Writes, under `dir`: hf/ (the tiny checkpoint, its tokenizer and chat template), twin/ (the checkpoint the GGUF
+// stands for). Returns the GGUF's writer: the test writes the file, as it is or changed.
+inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t seed) {
+    write_tiny_hf(dir / "hf", seed);
+    GgufWriter w;
+    w.string("general.architecture", "qwen35")
+        .string("general.type", "model")
+        .string("general.name", "Tiny Qwen3.5")
+        .u32("general.file_type", 7)
+        .u32("general.quantization_version", 2);
+    TinyGgufBuilder b(w);
+    put_tiny_decoder(w, b, dir / "hf", "qwen35", true, seed);
+    write_tiny_twin(dir, b, 1);
     return w;
+}
+
+// A pack tensor's values in the twin's order: the import keeps linear attention's value heads tiled.
+inline std::vector<float> grouped_values(const std::string& name, const TensorView& v) {
+    const TinyQwen m = tiny_gguf_model();
+    const int64_t hk = m.lin_k_heads, hv = m.lin_v_heads, d = m.lin_dim;
+    std::vector<float> values(static_cast<size_t>(v.numel()));
+    quant::read_rows(v, 0, quant::matrix_rows(v.shape), values.data());
+    const auto ends_with = [&](std::string_view tail) { return name.ends_with(tail); };
+    const auto back = [&](int axis, int64_t first, int64_t unit) {
+        return retile(values, v.shape, axis, first, unit, hk, hv, false);
+    };
+    if (ends_with("in_proj_qkv.weight") || ends_with("conv1d.weight")) return back(0, 2 * hk * d, d);
+    if (ends_with("in_proj_z.weight")) return back(0, 0, d);
+    if (ends_with("in_proj_a.weight") || ends_with("in_proj_b.weight") || ends_with("A_log") || ends_with("dt_bias")) {
+        return back(0, 0, 1);
+    }
+    if (name.find("linear_attn.out_proj.weight") != std::string::npos) return back(1, 0, d);
+    return values;
 }
 
 // The tiny GGUF of build_tiny_gguf as unsloth publishes the small files of a model: the model without its MTP head

@@ -89,12 +89,10 @@ inline DecisionQuestion score(std::string id, std::string instructions, std::vec
     return q;
 }
 
-// A tiny Qwen3.5 with a joint schema head beside it, as Cloudflare/clef-flash is laid out (torch's tensor names). The
-// head's output scales are large enough for answers to spread.
-inline void write_tiny_clef(const fs::path& dir, uint32_t seed) {
-    const TinyQwen qwen;
-    write_tiny_qwen(dir, qwen, seed);
-    const int64_t hidden = qwen.hidden, width = 64, ffn = 96;
+// A joint schema head over a decoder of width `hidden`, as Cloudflare/clef-flash lays it out (joint_head_config.json,
+// joint_head.safetensors with torch's tensor names). Its output scales are large enough for answers to spread.
+inline void write_tiny_clef_head(const fs::path& dir, int64_t hidden, uint32_t seed) {
+    const int64_t width = 64, ffn = 96;
     std::ofstream(dir / "joint_head_config.json")
         << nlohmann::json{{"hidden_size", hidden}, {"width", width}, {"routing_layers", 2},
                           {"layers", 2},           {"heads", 4},     {"feedforward", ffn}}
@@ -151,7 +149,14 @@ inline void write_tiny_clef(const fs::path& dir, uint32_t seed) {
     specs.push_back({"prior_logit_scale", {1}, 1.5f, 1.5f});
     specs.push_back({"joint_logit_scale", {1}, 2.0f, 2.0f});
     specs.push_back({"residual_gate", {1}, 0.7f, 0.7f});
-    write_random(dir / "joint_head.safetensors", specs, seed + 1);
+    write_random(dir / "joint_head.safetensors", specs, seed);
+}
+
+// A tiny Qwen3.5 with a joint schema head beside it, as Cloudflare/clef-flash is laid out.
+inline void write_tiny_clef(const fs::path& dir, uint32_t seed) {
+    const TinyQwen qwen;
+    write_tiny_qwen(dir, qwen, seed);
+    write_tiny_clef_head(dir, qwen.hidden, seed + 1);
 }
 
 // A tiny Qwen3.5 with a read-out of answer codes beside it, as perplexity-ai/pplx-decider-flash-v1.2 is laid out.

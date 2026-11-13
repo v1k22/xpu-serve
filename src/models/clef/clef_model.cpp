@@ -69,10 +69,35 @@ private:
     std::map<std::string, TensorView> views_;
 };
 
-float scalar(const WeightStore& weights, const std::string& name) {
+std::vector<float> floats(const WeightStore& weights, const std::string& name, int64_t count) {
     const TensorView& v = weights.get(name);
-    XS_CHECK(v.numel() == 1 && is_float(v.dtype), "clef: ", name, " is not a float scalar");
-    return HostTensor::borrow(v.dtype, v.shape, const_cast<void*>(v.data)).to_f32()[0];
+    XS_CHECK(v.numel() == count && is_float(v.dtype), "clef: ", name, " is not ", count, " float value(s)");
+    return HostTensor::borrow(v.dtype, v.shape, const_cast<void*>(v.data)).to_f32();
+}
+
+// What the logits are made with: the prior's and the joint score's scales and the residual gate.
+struct Scales {
+    float prior = 1.0f, joint = 1.0f, gate = 0.5f;
+};
+
+// From the checkpoint's parameters (prior_logit_scale and joint_logit_scale through exp(min(x, ln 100)), residual_gate
+// through a sigmoid), or as a GGUF file stores them, computed already (`scales`: prior, joint, gate).
+Scales read_scales(const WeightStore& weights) {
+    const std::string stored = std::string(kHead) + "scales";
+    const char* params[] = {"prior_logit_scale", "joint_logit_scale", "residual_gate"};
+    if (weights.contains(stored)) {
+        for (const char* p : params) {
+            XS_CHECK(!weights.contains(kHead + std::string(p)), "clef: the weights hold both ", stored, " and ", kHead,
+                     p);
+        }
+        const std::vector<float> s = floats(weights, stored, 3);
+        return {s[0], s[1], s[2]};
+    }
+    float x[3];
+    for (int i = 0; i < 3; ++i)
+        x[i] = floats(weights, kHead + std::string(params[i]), 1)[0];
+    return {std::exp(std::min(x[0], std::log(100.0f))), std::exp(std::min(x[1], std::log(100.0f))),
+            1.0f / (1.0f + std::exp(-x[2]))};
 }
 
 // The row of the head's type embedding.
@@ -171,9 +196,7 @@ public:
         build_route(route_);
         build_fields(fields_);
         build_score(score_);
-        prior_scale_ = std::exp(std::min(scalar(*weights_, name("prior_logit_scale")), std::log(100.0f)));
-        joint_scale_ = std::exp(std::min(scalar(*weights_, name("joint_logit_scale")), std::log(100.0f)));
-        residual_gate_ = 1.0f / (1.0f + std::exp(-scalar(*weights_, name("residual_gate"))));
+        scales_ = read_scales(*weights_);
         log::debug("clef: programs of ", encode_.nodes().size(), ", ", route_.nodes().size(), ", ",
                    fields_.nodes().size(), " and ", score_.nodes().size(), " nodes");
     }
@@ -191,9 +214,7 @@ public:
 
     const qwen3_5::Decoder& decoder() const { return dec_; }
     const HeadConfig& head() const { return head_; }
-    float prior_scale() const { return prior_scale_; }
-    float joint_scale() const { return joint_scale_; }
-    float residual_gate() const { return residual_gate_; }
+    const Scales& scales() const { return scales_; }
     // The mean row of the output layer over `ids`: an option's lexical vector.
     void lexical(std::span<const int32_t> ids, float* out) const {
         const TensorView& table = weights_->get(dec_.lm_head_name());
@@ -334,7 +355,7 @@ private:
     std::unique_ptr<WeightStore> weights_;
     qwen3_5::Decoder dec_;
     Graph encode_, route_, fields_, score_;
-    float prior_scale_ = 1.0f, joint_scale_ = 1.0f, residual_gate_ = 0.5f;
+    Scales scales_;
 };
 
 ClefRun::ClefRun(const ClefModel& model, const DecisionRequest& request, EncodedRecord record, int64_t chunk)
@@ -531,12 +552,12 @@ void ClefRun::finish(const TensorMap& outputs) {
         for (size_t j = 0; j < e.options.size(); ++j) {
             const int64_t o = first + static_cast<int64_t>(j);
             const float* lexical = lexical_.data<float>() + o * hidden;
-            const double prior = model_.prior_scale() * dot(lexical, anchor.data(), hidden) /
+            const double prior = model_.scales().prior * dot(lexical, anchor.data(), hidden) /
                                  (std::max(norm(lexical, hidden), 1e-12) * anchor_norm);
             const float* option = option_.data<float>() + o * width;
             const double cosine = dot(field, option, width) / std::max(field_norm * norm(option, width), 1e-8);
-            const double joint = model_.joint_scale() * cosine + residual.data<float>()[o];
-            logits[j] = prior + model_.residual_gate() * joint;
+            const double joint = model_.scales().joint * cosine + residual.data<float>()[o];
+            logits[j] = prior + model_.scales().gate * joint;
             top = std::max(top, logits[j]);
         }
         double total = 0;

@@ -55,15 +55,7 @@ TEST_SUITE("gguf real file") {
 
         // Token by token against the checkpoint's tokenizer: the same text and the same special flag for every id.
         const auto original = tok::Tokenizer::load(real->hf);
-        REQUIRE(imported->vocab_size() == original->vocab_size());
-        int differ = 0;
-        for (int32_t id = 0; id < original->vocab_size(); ++id) {
-            if (imported->token_text(id) != original->token_text(id) ||
-                imported->is_special(id) != original->is_special(id)) {
-                ++differ;
-            }
-        }
-        CHECK(differ == 0);
+        CHECK(xs::test::differing_tokens(*imported, *original) == 0);
 
         // The parts the file names only by tokenizer.ggml.pre are the checkpoint's.
         const nlohmann::json written = nlohmann::json::parse(std::ifstream(work.path / "tokenizer.json"));
@@ -93,29 +85,8 @@ TEST_SUITE("gguf real file") {
         const nlohmann::json theirs = cfg::read_json(real->hf / "config.json");
         const qwen3_5::Config a = qwen3_5::parse_config(ours);
         const qwen3_5::Config b = qwen3_5::parse_config(theirs);
-        CHECK(a.vocab_size == b.vocab_size);
-        CHECK(a.hidden_size == b.hidden_size);
-        CHECK(a.intermediate_size == b.intermediate_size);
-        CHECK(a.num_experts == b.num_experts);
-        CHECK(a.num_layers == b.num_layers);
-        CHECK(static_cast<float>(a.rms_norm_eps) == static_cast<float>(b.rms_norm_eps));
-        CHECK(a.rms_norm_eps == b.rms_norm_eps);
-        CHECK(a.max_position == b.max_position);
-        CHECK(a.layer_kinds == b.layer_kinds);
-        CHECK(a.num_heads == b.num_heads);
-        CHECK(a.num_kv_heads == b.num_kv_heads);
-        CHECK(a.head_dim == b.head_dim);
-        CHECK(a.attn_output_gate == b.attn_output_gate);
-        CHECK(a.rope_theta == b.rope_theta);
-        CHECK(a.rotary_dim == b.rotary_dim);
-        CHECK(a.linear_key_heads == b.linear_key_heads);
-        CHECK(a.linear_value_heads == b.linear_value_heads);
-        CHECK(a.linear_key_dim == b.linear_key_dim);
-        CHECK(a.linear_value_dim == b.linear_value_dim);
-        CHECK(a.conv_kernel == b.conv_kernel);
-        // What differs, by construction: the value heads' order, and an MTP head only when the file holds one.
-        CHECK(a.value_head_order == qwen3_5::ValueHeadOrder::Tiled);
-        CHECK(b.value_head_order == qwen3_5::ValueHeadOrder::Grouped);
+        xs::test::check_decoder_config(a, b);
+        // An MTP head only when the file holds one.
         const int64_t nextn =
             file.find("qwen35.nextn_predict_layers") ? file.get_int("qwen35.nextn_predict_layers") : 0;
         CHECK(a.mtp_layers == nextn);

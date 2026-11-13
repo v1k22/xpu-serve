@@ -295,6 +295,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       computes (the file has no centroid head)
 - [x] GGUF: a `qwen35` file without its MTP head, with the head's own file (`convert --mtp`, llama.cpp's draft
       model): the pack a file with the head gives, byte for byte
+- [x] GGUF: architecture `clef` (ggml-org/Clef-Flash-GGUF, ggml-org/Clef-GGUF): the decoder read as a `qwen35`
+      file's under `clef.*`, the joint schema head as a pack of the checkpoint holds it, its scales as the file stores
+      them; a tiny file answers as the checkpoint its blocks decode to
+- [ ] GGUF: Clef's files measured end to end (decision parity and the 25 test decisions against the checkpoint, on
+      the GPU; results in docs/gguf_models.md)
 - [ ] GGUF: more architectures (`qwen35moe`, Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
 - [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
 - [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)
