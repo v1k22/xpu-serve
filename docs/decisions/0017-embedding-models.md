@@ -28,7 +28,13 @@ The first three checkpoints are sentence-transformers checkpoints: an encoder, t
   module is listed (vLLM does the same), the longest input from `sentence_bert_config.json` (for BERT never more than
   its position table). Everything else that would change an embedding is refused by name: other pooling modes (max,
   mean_sqrt_len_tokens, weightedmean, lasttoken) or several at once, Dense and other modules, a module of the
-  checkpoint's own code, a default prompt, `do_lower_case` with a tokenizer that does not lowercase.
+  checkpoint's own code, a default prompt, settings of another tokenizer or of the model, `do_lower_case` with a
+  tokenizer that does not lowercase.
+- **`do_lower_case` (bge-small-en-v1.5) is what sentence-transformers 6 does**: it puts tokenizers' `Lowercase`
+  normalizer in front of the tokenizer's own, which changes no token in front of bge's BertNormalizer, itself
+  lowercasing (none, over every code point between a cased letter and a word-final Σ). Older sentence-transformers
+  and vLLM (its synchronous path; not its asynchronous one) call Python's `str.lower()` first, which writes a
+  word-final Σ as ς where the tokenizer writes σ: a Greek word ending in a capital Σ gets other tokens there.
 - **The encoders share BERT's post-norm layer** (`models/common/encoder`) and differ in their parts: BERT with its
   position table and biases; NomicBERT with one fused QKV projection (sliced), rotary queries and keys, SwiGLU. Past
   the positions NomicBERT was trained on, its reference rotates on unchanged unless a `rotary_scaling_factor` asks for
@@ -56,15 +62,16 @@ The first three checkpoints are sentence-transformers checkpoints: an encoder, t
 ## What was measured
 
 Against sentence-transformers 6.3 in float32 on the CPU (`tests/parity/embedding/reference.py`; nomic-embed-text-v1.5
-with its own modeling code), the engine on cpu-ref at f32 (`tests/unit/model/embedding_parity.cpp`): 11 texts of 3 to
-50 tokens (accents, CJK, emoji, code, literal special tokens) and filler passages cut to the lengths below. The worst
-case of each checkpoint:
+with its own modeling code), the engine on cpu-ref at f32 (`tests/unit/model/embedding_parity.cpp`): 14 texts of 3 to
+50 tokens (accents, CJK, emoji, code, literal special tokens, Greek words ending in a capital Σ, Turkish İ, Greek and
+Cyrillic in both cases) and filler passages cut to the lengths below. Each text, through the engine's tokenizer, is
+read as the ids sentence-transformers embeds. The worst case of each checkpoint:
 
 | Checkpoint | Longest inputs | Hidden states: 1 - cosine, max \|difference\| (largest value) | Embedding: 1 - cosine, max \|difference\| | cpu-ref, longest input |
 |---|---|---|---|---|
 | all-MiniLM-L6-v2 | 256 | 6.0e-13, 2.6e-6 (6.2) | 3.1e-13, 1.5e-7 | 0.46 s |
-| bge-small-en-v1.5 | 512 | 3.6e-13, 2.4e-6 (4.3) | 2.1e-13, 1.2e-7 | 1.5 s |
-| nomic-embed-text-v1.5, up to 50 tokens | 50 | 9.8e-13, 1.4e-5 (11.4) | 6.5e-13, 2.6e-6 | |
+| bge-small-en-v1.5 | 512 | 5.6e-13, 2.9e-6 (4.3) | 2.7e-13, 1.8e-7 | 1.5 s |
+| nomic-embed-text-v1.5, up to 50 tokens | 50 | 9.8e-13, 1.4e-5 (11.6) | 6.5e-13, 2.6e-6 | |
 | nomic-embed-text-v1.5 | 2,000 | 2.2e-11, 2.2e-4 (13.3) | 5.2e-13, 2.4e-6 | 7.4 s |
 | nomic-embed-text-v1.5 | 8,192 | 6.1e-10, 6.6e-3 (14.7) | 6.0e-11, 2.4e-5 | 69 s |
 

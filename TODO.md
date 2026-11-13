@@ -441,8 +441,8 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       training on 2048): parity with sentence-transformers on cpu-ref (tiny and released checkpoints, up to 8192 tokens)
 - [x] `POST /v1/embeddings` as OpenAI's (text, token ids, float or base64, OpenAI's 400s naming the field; `dimensions`
       only the model's own; over-long inputs refused); `run --prompt`, `bench` (latency by length, throughput)
-- [ ] Text through the checkpoints' WordPiece tokenizers (the tokenizer work), then the text cases of
-      `embedding_parity.cpp` (`XS_EMBEDDING_TEXTS=1`)
+- [x] Text through the checkpoints' WordPiece tokenizers: each text's ids are sentence-transformers'
+      (`embedding_parity.cpp` with `XS_EMBEDDING_TEXTS=1`; bge's `do_lower_case` as sentence-transformers 6 applies it)
 - [ ] Parity and timing on the Arc Pro B60 (f16 and f32)
 - [ ] Several inputs of a request in one step (padded with a key bias, or Attention's `block` for inputs of one length)
 - [ ] Shorter embeddings (`dimensions`) for checkpoints that declare them (Matryoshka)

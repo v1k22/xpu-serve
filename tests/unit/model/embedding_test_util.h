@@ -63,10 +63,57 @@ inline void write_sentence_transformers_files(const fs::path& dir, const TinyEnc
     }
 }
 
-// A whole checkpoint: config.json, model.safetensors and the sentence-transformers files.
+// A BERT-style WordPiece tokenizer.json, laid out as all-MiniLM-L6-v2's: [PAD] [UNK] [CLS] [SEP] [MASK] are 0 to 4, a
+// few words, every lowercase letter alone and as a word's continuation; [CLS] ... [SEP] around a sequence.
+inline nlohmann::json tiny_wordpiece_tokenizer() {
+    std::vector<std::string> pieces = {"[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "the", "cat", "sat", "on",
+                                       "mat", "dog", "##s", ",", "."};
+    for (char c = 'a'; c <= 'z'; ++c) {
+        pieces.emplace_back(1, c);
+        pieces.push_back(std::string("##") + c);
+    }
+    nlohmann::json vocab = nlohmann::json::object();
+    nlohmann::json added = nlohmann::json::array();
+    for (size_t id = 0; id < pieces.size(); ++id) {
+        vocab[pieces[id]] = id;
+        if (id < 5) {
+            added.push_back({{"id", id}, {"content", pieces[id]}, {"single_word", false}, {"lstrip", false},
+                             {"rstrip", false}, {"normalized", false}, {"special", true}});
+        }
+    }
+    return {{"version", "1.0"},
+            {"truncation", nullptr},
+            {"padding", nullptr},
+            {"added_tokens", added},
+            {"normalizer",
+             {{"type", "BertNormalizer"},
+              {"clean_text", true},
+              {"handle_chinese_chars", true},
+              {"strip_accents", nullptr},
+              {"lowercase", true}}},
+            {"pre_tokenizer", {{"type", "BertPreTokenizer"}}},
+            {"post_processor", nlohmann::json::parse(R"({"type": "TemplateProcessing",
+                "single": [{"SpecialToken": {"id": "[CLS]", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                           {"SpecialToken": {"id": "[SEP]", "type_id": 0}}],
+                "pair": [{"SpecialToken": {"id": "[CLS]", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                         {"SpecialToken": {"id": "[SEP]", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}},
+                         {"SpecialToken": {"id": "[SEP]", "type_id": 1}}],
+                "special_tokens": {"[CLS]": {"id": "[CLS]", "ids": [2], "tokens": ["[CLS]"]},
+                                   "[SEP]": {"id": "[SEP]", "ids": [3], "tokens": ["[SEP]"]}}})")},
+            {"decoder", {{"type", "WordPiece"}, {"prefix", "##"}, {"cleanup", true}}},
+            {"model",
+             {{"type", "WordPiece"},
+              {"unk_token", "[UNK]"},
+              {"continuing_subword_prefix", "##"},
+              {"max_input_chars_per_word", 100},
+              {"vocab", vocab}}}};
+}
+
+// A whole checkpoint: config.json, model.safetensors, tokenizer.json and the sentence-transformers files.
 inline void write_tiny_encoder(const fs::path& dir, const TinyEncoder& m, uint32_t seed) {
     fs::create_directories(dir);
     std::ofstream(dir / "config.json") << tiny_encoder_config(m).dump(1);
+    std::ofstream(dir / "tokenizer.json") << tiny_wordpiece_tokenizer().dump();
     write_sentence_transformers_files(dir, m);
     std::vector<TinyTensor> specs;
     const auto matrix = [&](const std::string& name, int64_t out, int64_t in) {

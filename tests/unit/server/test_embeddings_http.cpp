@@ -1,6 +1,6 @@
 // The embeddings API against a fake model: every input form, each refusal a 400 naming its field, the float and
 // base64 encodings, and the server around it (models, health, no chat routes, concurrent clients); then a tiny model
-// with a tokenizer of its own behind it.
+// with a WordPiece tokenizer of its own behind it.
 
 #include <doctest/doctest.h>
 
@@ -10,7 +10,6 @@
 #include <httplib/httplib.h>
 #include <nlohmann/json.hpp>
 
-#include "convert/tiny_gguf.h"
 #include "embedding/service.h"
 #include "model/embedding_test_util.h"
 #include "server/embedding_handlers.h"
@@ -259,12 +258,12 @@ TEST_SUITE("embeddings api") {
         xs::test::TinyEncoder m;
         m.normalize = true;
         xs::test::write_tiny_encoder(dir.path, m, 31);
-        std::ofstream(dir.path / "tokenizer.json") << xs::test::tiny_tokenizer_json().dump();
         xs::EmbeddingRunnerOptions o;
         o.backend = "cpu-ref";
         o.session.precision = xs::DType::F32;
         const auto tokenizer = xs::tok::Tokenizer::load(dir.path);
         const std::vector<int32_t> ids = xs::embedding_tokens(*tokenizer, "the cat");
+        CHECK(ids == std::vector<int32_t>{2, 5, 6, 3});  // [CLS] the cat [SEP]
         const auto runner = xs::EmbeddingRunner::create(dir.path, o);
         const xs::EmbeddingResult expected = runner->embed({ids, {5, 6, 7}});
         const auto service = xs::EmbeddingService::create(xs::tok::Tokenizer::load(dir.path),

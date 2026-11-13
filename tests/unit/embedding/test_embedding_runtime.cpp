@@ -8,7 +8,6 @@
 #include <fstream>
 #include <thread>
 
-#include "convert/tiny_gguf.h"
 #include "embedding/pooling.h"
 #include "embedding/runner.h"
 #include "embedding/service.h"
@@ -97,14 +96,11 @@ TEST_SUITE("embedding runtime") {
     TEST_CASE("the service reads text through the checkpoint's tokenizer and embeds on its own thread") {
         const TempDir dir("xs_embedding_service");
         xs::test::write_tiny_encoder(dir.path, TinyEncoder{}, 22);
-        std::ofstream(dir.path / "tokenizer.json") << xs::test::tiny_tokenizer_json().dump();
-        auto tokenizer = xs::tok::Tokenizer::load(dir.path);
-        const std::vector<int32_t> expected = tokenizer->with_special_tokens(tokenizer->encode("the cat sat"));
-        const auto service = xs::EmbeddingService::create(std::move(tokenizer),
+        const auto service = xs::EmbeddingService::create(xs::tok::Tokenizer::load(dir.path),
                                                           xs::EmbeddingRunner::create(dir.path, cpu_options()));
         CHECK(service->spec().dimension == 64);
-        const std::vector<int32_t> ids = service->tokenize("the cat sat");
-        CHECK(ids == expected);
+        const std::vector<int32_t> ids = service->tokenize("The cat SAT");
+        CHECK(ids == std::vector<int32_t>{2, 5, 6, 7, 3});  // [CLS] the cat sat [SEP]
         const auto runner = xs::EmbeddingRunner::create(dir.path, cpu_options());
         const std::vector<float> direct = runner->embed({ids}).embeddings[0];
         std::vector<std::thread> clients;

@@ -123,7 +123,20 @@ void read_transformer(const fs::path& dir, Pipeline& out) {
         const std::string task = cfg::get_string(c, "transformer_task", where);
         if (task != "feature-extraction") fail(where, ": transformer_task '", task, "' is not supported");
     }
-    // sentence-transformers lowercases the text first when the tokenizer would not; this tokenizer must.
+    if (c.contains("module_output_name") && !c.at("module_output_name").is_null()) {
+        const std::string output = cfg::get_string(c, "module_output_name", where);
+        if (output != "token_embeddings") fail(where, ": module_output_name '", output, "' is not supported");
+    }
+    // Another tokenizer, its settings, the model's settings, or several vectors a text.
+    for (const char* key : {"tokenizer_name_or_path", "tokenizer_args", "processor_kwargs", "processing_kwargs",
+                            "model_args", "model_kwargs", "config_args", "config_kwargs", "query_length",
+                            "document_length", "query_expansion"}) {
+        if (c.contains(key) && !c.at(key).is_null() && !(c.at(key).is_object() && c.at(key).empty())) {
+            fail(where, ": ", key, " is not supported");
+        }
+    }
+    // sentence-transformers 6 puts tokenizers' Lowercase normalizer in front of a tokenizer whose normalizer is not
+    // one, which changes no token in front of a normalizer that lowercases already. Without one it would: refused.
     if (cfg::get_bool_or(c, "do_lower_case", false, where)) {
         const json tokenizer = cfg::read_json(dir / "tokenizer.json");
         if (!tokenizer.is_object() || !lowercases(tokenizer.value("normalizer", json()))) {

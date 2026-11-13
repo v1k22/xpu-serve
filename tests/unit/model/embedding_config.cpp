@@ -232,6 +232,19 @@ TEST_SUITE("embedding config") {
              "transformer_task 'text-generation'"},
             {[&] { write_json(dir.path / "sentence_bert_config.json", {{"max_seq_length", 0}}); },
              "max_seq_length must be positive"},
+            {[&] { write_json(dir.path / "sentence_bert_config.json", {{"module_output_name", "cls_embedding"}}); },
+             "module_output_name 'cls_embedding'"},
+            {[&] { write_json(dir.path / "sentence_bert_config.json", {{"tokenizer_name_or_path", "other/model"}}); },
+             "tokenizer_name_or_path is not supported"},
+            {[&] {
+                 write_json(dir.path / "sentence_bert_config.json",
+                            {{"processor_kwargs", {{"add_prefix_space", true}}}});
+             },
+             "processor_kwargs is not supported"},
+            {[&] { write_json(dir.path / "sentence_bert_config.json", {{"config_kwargs", {{"hidden_act", "relu"}}}}); },
+             "config_kwargs is not supported"},
+            {[&] { write_json(dir.path / "sentence_bert_config.json", {{"query_length", 32}}); },
+             "query_length is not supported"},
             {[&] {
                  write_json(dir.path / "config_sentence_transformers.json",
                             {{"prompts", {{"query", "search_query: "}}}, {"default_prompt_name", "query"}});
@@ -247,6 +260,12 @@ TEST_SUITE("embedding config") {
             c.edit();
             CHECK(error_of([&] { xs::st::read_pipeline(dir.path); }).find(c.what) != std::string::npos);
         }
+        reset();  // what sentence-transformers 6 writes by default changes nothing
+        write_json(dir.path / "sentence_bert_config.json",
+                   {{"max_seq_length", 48}, {"transformer_task", "feature-extraction"},
+                    {"module_output_name", "token_embeddings"}, {"processor_kwargs", json::object()},
+                    {"query_length", nullptr}});
+        CHECK_NOTHROW(xs::st::read_pipeline(dir.path));
         reset();  // prompts without a default are the client's to send, in the text
         write_json(dir.path / "config_sentence_transformers.json",
                    {{"prompts", {{"query", "search_query: "}}}, {"default_prompt_name", nullptr}});
