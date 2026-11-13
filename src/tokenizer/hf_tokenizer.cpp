@@ -9,9 +9,9 @@
 
 #include "models/config_util.h"
 #include "tokenizer/added_vocabulary.h"
-#include "tokenizer/bpe_model.h"
 #include "tokenizer/decoder.h"
 #include "tokenizer/json_fields.h"
+#include "tokenizer/model.h"
 #include "tokenizer/normalizer.h"
 #include "tokenizer/pre_tokenizer.h"
 #include "tokenizer/tokenizer.h"
@@ -76,11 +76,11 @@ public:
         : added_(merged_added_tokens(tokenizer_json, tokenizer_config)),
           normalizer_(make_normalizer(tokenizer_json.value("normalizer", nlohmann::json()))),
           pre_tokenizer_(make_pre_tokenizer(tokenizer_json.value("pre_tokenizer", nlohmann::json()))),
-          model_(tokenizer_json.contains("model") ? tokenizer_json.at("model") : nlohmann::json()),
+          model_(make_model(tokenizer_json.contains("model") ? tokenizer_json.at("model") : nlohmann::json(),
+                            pre_tokenizer_ && pre_tokenizer_->byte_level())),
           decoder_(make_decoder(tokenizer_json.value("decoder", nlohmann::json()))) {
         check_post_processor(tokenizer_json.value("post_processor", nlohmann::json()));
-        if (pre_tokenizer_ && pre_tokenizer_->byte_level()) model_.use_byte_level_alphabet();
-        id_limit_ = model_.id_limit();
+        id_limit_ = model_->id_limit();
         for (const AddedToken& token : added_.tokens()) {
             id_limit_ = std::max(id_limit_, token.id + 1);
             added_by_id_.emplace(token.id, &token);
@@ -128,7 +128,7 @@ public:
 
     std::string token_text(int32_t id) const override {
         if (const auto it = added_by_id_.find(id); it != added_by_id_.end()) return it->second->content;
-        const auto piece = model_.piece(id);
+        const auto piece = model_->piece(id);
         if (!piece) fail("token id ", id, " is not in the vocabulary (size ", id_limit_, ")");
         return std::string(*piece);
     }
@@ -136,7 +136,7 @@ public:
     std::optional<int32_t> token_id(std::string_view piece) const override {
         const auto it = added_by_content_.find(std::string(piece));
         if (it != added_by_content_.end()) return it->second;
-        return model_.id(piece);
+        return model_->id(piece);
     }
 
     bool is_special(int32_t id) const override { return special_ids_.contains(id); }
@@ -152,10 +152,10 @@ private:
 
     void encode_plain(std::string_view text, std::vector<int32_t>& ids) const {
         if (!pre_tokenizer_) {
-            model_.tokenize(text, ids);
+            model_->tokenize(text, ids);
             return;
         }
-        for (const std::string_view piece : pre_tokenizer_->split({text})) model_.tokenize(piece, ids);
+        for (const std::string_view piece : pre_tokenizer_->split({text})) model_->tokenize(piece, ids);
     }
 
     std::optional<int32_t> config_token_id(const nlohmann::json& config, const char* key) const {
@@ -178,7 +178,7 @@ private:
     AddedVocabulary added_;
     std::unique_ptr<Normalizer> normalizer_;
     std::unique_ptr<PreTokenizer> pre_tokenizer_;
-    BpeModel model_;
+    std::unique_ptr<Model> model_;
     std::unique_ptr<Decoder> decoder_;
     int32_t id_limit_ = 0;
     std::unordered_map<int32_t, const AddedToken*> added_by_id_;  // points into added_, which never changes
