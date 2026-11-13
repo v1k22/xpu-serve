@@ -66,8 +66,8 @@ nlohmann::json merged_added_tokens(const nlohmann::json& tokenizer_json, const n
 class HfTokenizer final : public Tokenizer {
 public:
     HfTokenizer(const nlohmann::json& tokenizer_json, const nlohmann::json& tokenizer_config)
-        : added_(merged_added_tokens(tokenizer_json, tokenizer_config)),
-          normalizer_(make_normalizer(tokenizer_json.value("normalizer", nlohmann::json()))),
+        : normalizer_(make_normalizer(tokenizer_json.value("normalizer", nlohmann::json()))),
+          added_(merged_added_tokens(tokenizer_json, tokenizer_config), normalizer_.get()),
           pre_tokenizer_(make_pre_tokenizer(tokenizer_json.value("pre_tokenizer", nlohmann::json()))),
           model_(make_model(tokenizer_json.contains("model") ? tokenizer_json.at("model") : nlohmann::json(),
                             pre_tokenizer_ && pre_tokenizer_->byte_level())),
@@ -124,7 +124,7 @@ public:
     int32_t vocab_size() const override { return id_limit_; }
 
     std::string token_text(int32_t id) const override {
-        if (const auto it = added_by_id_.find(id); it != added_by_id_.end()) return it->second->content;
+        if (const auto it = added_by_id_.find(id); it != added_by_id_.end()) return it->second->pattern;
         const auto piece = model_->piece(id);
         if (!piece) fail("token id ", id, " is not in the vocabulary (size ", id_limit_, ")");
         return std::string(*piece);
@@ -172,8 +172,8 @@ private:
         return text;
     }
 
-    AddedVocabulary added_;
     std::unique_ptr<Normalizer> normalizer_;
+    AddedVocabulary added_;
     std::unique_ptr<PreTokenizer> pre_tokenizer_;
     std::unique_ptr<Model> model_;
     std::unique_ptr<PostProcessor> post_processor_;

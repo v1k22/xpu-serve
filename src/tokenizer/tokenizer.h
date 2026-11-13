@@ -35,7 +35,9 @@ public:
     virtual std::string decode(std::span<const int32_t> ids, bool skip_special = false) const = 0;
 
     virtual int32_t vocab_size() const = 0;
-    virtual std::string token_text(int32_t id) const = 0;               // the vocab piece, verbatim
+    // The vocab piece, verbatim; for an added token matched in normalized text, its content normalized (as Hugging
+    // Face's id_to_token gives it, while token_id takes the content).
+    virtual std::string token_text(int32_t id) const = 0;
     virtual std::optional<int32_t> token_id(std::string_view piece) const = 0;
     virtual bool is_special(int32_t id) const = 0;
     virtual std::optional<int32_t> bos_id() const = 0;

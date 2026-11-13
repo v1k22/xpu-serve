@@ -13,6 +13,8 @@
 
 namespace xs::tok {
 
+class Normalizer;
+
 struct AddedToken {
     int32_t id = 0;
     std::string content;
@@ -21,6 +23,9 @@ struct AddedToken {
     bool rstrip = false;       // ... and on its right
     bool single_word = false;  // only matches when not inside a word
     bool normalized = false;   // matched in normalized text instead of the raw input
+    // The text matched, and the token's text (decoding included): content, through the normalizer when `normalized`,
+    // as Hugging Face does.
+    std::string pattern;
 };
 
 // A piece of input: either an added token or plain text for the normalizer and model.
@@ -31,7 +36,8 @@ struct TextSegment {
 
 class AddedVocabulary {
 public:
-    explicit AddedVocabulary(const nlohmann::json& added_tokens);
+    // `normalizer` (may be null) is the tokenizer's: it rewrites the pattern of each normalized token.
+    AddedVocabulary(const nlohmann::json& added_tokens, const Normalizer* normalizer);
 
     // Splits `text` on the added tokens whose `normalized` flag equals `normalized_pass` (Hugging Face matches the
     // others on raw text first). Special tokens match only with parse_special. Leftmost-longest, non-overlapping.
