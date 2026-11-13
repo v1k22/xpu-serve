@@ -10,7 +10,12 @@ namespace xs::blocks {
 using graph::kT;
 
 Value activation(Graph& g, Act act, Value x) {
-    return act == Act::Silu ? g.silu(x) : g.gelu_tanh(x);
+    switch (act) {
+        case Act::Silu: return g.silu(x);
+        case Act::GeluTanh: return g.gelu_tanh(x);
+        case Act::Gelu: return g.gelu(x);
+    }
+    fail("blocks: unknown activation");
 }
 
 Value gated_mlp(Graph& g, Value x, const Linear& gate, const Linear& up, const Linear& down, Act act) {

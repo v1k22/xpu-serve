@@ -1,10 +1,11 @@
 #pragma once
 
-// What a GGUF architecture's importer provides (one file per architecture: qwen35.cpp, gemma4.cpp, clef.cpp): from the
-// file's metadata the config.json the model code reads (and any other JSON file of the pack), and for every tensor of
-// the file the pack tensors it becomes, under the names the model code reads. The import driver (gguf_import.cpp)
-// writes them: a tensor in a block format byte for byte, a float tensor as stored or through a value-by-value
-// transform. A quantized tensor is never decoded, re-encoded or reordered; it can only be cut into runs of whole rows.
+// What a GGUF architecture's importer provides (one file per architecture: qwen35.cpp, gemma4.cpp, clef.cpp,
+// modern_bert.cpp): from the file's metadata the config.json the model code reads (and any other JSON file of the
+// pack), and for every tensor of the file the pack tensors it becomes, under the names the model code reads. The
+// import driver (gguf_import.cpp) writes them: a tensor in a block format byte for byte, a float tensor as stored or
+// through a value-by-value transform. A quantized tensor is never decoded, re-encoded or reordered; it can only be
+// cut into runs of whole rows.
 //
 // A model's MTP head can come in a file of its own (`convert --mtp`): the plan then draws its tensors from two files,
 // and is the plan of a model file that held the head.
@@ -39,12 +40,20 @@ struct PackTensor {
 };
 
 struct ImportPlan {
+    // What the pack is. A language model: config.json, the weights, the tokenizer, the chat template, the stop tokens
+    // (config.json's eos_token_id) and sampling defaults. A drafter beside a target model: it is served with the
+    // target's tokenizer, chat template and stop tokens, so its pack holds config.json and the weights only. A decision
+    // model that writes its own prompts: config.json, `files`, the weights and the tokenizer in `tokenizer_dir`.
+    enum class Kind { Language, Drafter, Decision };
+    Kind kind = Kind::Language;
     nlohmann::ordered_json config;  // config.json, without eos_token_id (the import adds the tokenizer's)
-    // The pack's other JSON files, by file name (a decision model's head: joint_head_config.json).
+    // The pack's other JSON files, by their path in it (a decision model's head: joint_head_config.json; Laya's
+    // encoder/config.json).
     std::map<std::string, nlohmann::ordered_json> files;
     // Named chat templates of the file (tokenizer.chat_template.<name>) the model has no use for, with the reason; left
     // out of the pack like any named template, but not warned about.
     std::map<std::string, std::string, std::less<>> unused_templates;
+    std::string tokenizer_dir;  // the pack's folder of tokenizer.json and tokenizer_config.json; empty: its root
     // With `derived` and `copies`, every row of every tensor of the files exactly once.
     std::vector<PackTensor> tensors;
     // Tensors the converter computed from the config (not the checkpoint's), which the architecture checked against
@@ -54,9 +63,6 @@ struct ImportPlan {
     // output head and final norm), which the architecture checked against the model's shapes: not imported, since
     // the head reads the model's.
     std::vector<const gguf::TensorInfo*> copies;
-    // A drafter beside a target model: it is served with the target's tokenizer, chat template and stop tokens, so its
-    // pack holds config.json and the weights only.
-    bool drafter = false;
 };
 
 class Architecture {
@@ -77,6 +83,7 @@ const Architecture& qwen35();
 const Architecture& gemma4();
 const Architecture& gemma4_assistant();
 const Architecture& clef();
+const Architecture& modern_bert();
 
 // The importer of general.architecture `name`; a named error listing the supported ones otherwise.
 const Architecture& find_architecture(std::string_view name);

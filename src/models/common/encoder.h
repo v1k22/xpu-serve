@@ -17,9 +17,6 @@ namespace xs::encoder {
 using graph::Graph;
 using graph::Value;
 
-// LayerNorm over the last dim with the weights <stem>.weight and <stem>.bias.
-Value layer_norm(Graph& g, const WeightStore& weights, Value x, const std::string& stem, float eps);
-
 // Row `row` of a float table [rows, width] as a constant [width]: a token type's embedding, which every token of a
 // single sequence adds (its type is 0).
 Value table_row(Graph& g, const WeightStore& weights, const std::string& name, int64_t row);
@@ -29,7 +26,7 @@ Value table_row(Graph& g, const WeightStore& weights, const std::string& name, i
 blocks::AttentionSpec attention_spec(int64_t heads, int64_t head_dim);
 
 // One post-norm layer, BERT's order: x = norm1(x + attention(x)); x = norm2(x + mlp(x)), norm1 and norm2 the stems of
-// LayerNorms.
+// LayerNorms with a bias.
 struct Layer {
     std::function<Value(Value)> attention;
     std::string norm1;

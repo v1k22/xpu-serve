@@ -152,7 +152,7 @@ public:
             plan.config["use_ordered_embeddings"] = false;
             plan.config["tie_word_embeddings"] = f.find_tensor("output.weight") == nullptr;
             plan.config["text_config"] = text_config(f, d);
-            plan.drafter = true;
+            plan.kind = ImportPlan::Kind::Drafter;
         } else {
             plan.config["architectures"] = {"Gemma4ForCausalLM"};
             plan.config.update(text_config(f, d));

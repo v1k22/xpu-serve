@@ -340,7 +340,7 @@ TEST_SUITE("gguf real file") {
         if (!drafter_gguf || dir == nullptr || *dir == '\0') return;
         const gguf::File file(*drafter_gguf);
         const gguf_import::ImportPlan plan = gguf_import::find_architecture("gemma4-assistant").plan(file);
-        CHECK(plan.drafter);
+        CHECK(plan.kind == gguf_import::ImportPlan::Kind::Drafter);
         const gemma4::AssistantConfig a = gemma4::parse_assistant_config(nlohmann::json::parse(plan.config.dump()));
         const gemma4::AssistantConfig b = gemma4::parse_assistant_config(cfg::read_json(fs::path(dir) / "config.json"));
         CHECK(a.backbone_hidden_size == b.backbone_hidden_size);

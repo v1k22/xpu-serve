@@ -72,7 +72,8 @@ public:
     virtual std::optional<int32_t> token_id(std::string_view piece) const = 0;
     // The text of every special token (the tokenizer's added tokens marked special).
     virtual std::vector<std::string> special_tokens() const = 0;
-    // The checkpoint's chat template over OpenAI-style `messages`, with the generation prompt and thinking off.
+    // The checkpoint's chat template over OpenAI-style `messages`, with the generation prompt and thinking off. Only a
+    // model whose spec asks for the template (DecisionSpec::chat_template) may call it.
     virtual std::string chat(const Json& messages) const = 0;
 };
 
@@ -104,6 +105,10 @@ struct DecisionSpec {
     std::string arch;           // e.g. "clef"
     int64_t max_tokens = 0;     // the longest sequence the model reads
     int64_t rewind_tokens = 0;  // SessionOptions::rewind_tokens the model's steps need (DecisionRun::Step::keep)
+    // The folder of the checkpoint that holds its tokenizer (tokenizer.json, tokenizer_config.json) and chat template;
+    // empty: the checkpoint's own directory.
+    std::filesystem::path tokenizer_dir;
+    bool chat_template = true;  // the model writes its prompts through the checkpoint's chat template
 };
 
 // What the session a run's steps go to can take, and what it holds as the run starts.

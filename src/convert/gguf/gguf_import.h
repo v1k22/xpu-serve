@@ -13,7 +13,9 @@
 //
 // The architecture (general.architecture) decides names, config and transforms (convert/gguf/architecture.h); one
 // it does not know is refused by name. A drafter's pack (a Gemma 4 assistant, for --drafter) is config.json, the
-// weights and the manifest: the target's pack has the tokenizer and chat template.
+// weights and the manifest: the target's pack has the tokenizer and chat template. A decision model's pack (Laya,
+// Julia-1) is laid out as its original checkpoint, configuration files and tokenizer folder included, without a chat
+// template: the model writes its prompts itself.
 //
 // A model file without its MTP head can be imported with a second file that holds the head (`--mtp`, llama.cpp's
 // draft model of it): the pack is the one a file that held the head gives. Only the head is read from the second

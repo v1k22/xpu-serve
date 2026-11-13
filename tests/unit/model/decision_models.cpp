@@ -12,11 +12,14 @@
 
 #include "../backend/device_test_support.h"
 #include "convert/convert.h"
+#include "decision/runner.h"
 #include "decision_test_util.h"
+#include "embedding_test_util.h"
 #include "io/safetensors_writer.h"
 #include "models/clef/clef.h"
 #include "models/config_util.h"
 #include "models/d1/d1.h"
+#include "models/laya/laya.h"
 #include "models/letter_readout/letter_readout.h"
 #include "models/model.h"
 #include "models/policy.h"
@@ -25,6 +28,7 @@
 namespace {
 
 using xs::DecisionLimits;
+using xs::DecisionQuestion;
 using xs::DecisionRequest;
 using xs::Json;
 using xs::test::choice;
@@ -37,6 +41,21 @@ DecisionRequest ticket() {
     r.questions = {choice("team", "Which team?", {{"billing", "payments"}, {"access", "logins"}, {"other", nullptr}}),
                    noul("urgent", "Is it urgent?"), score("effort", "How much work?", {"minutes", "hours", "days"})};
     return r;
+}
+
+// ticket() with every option described, as Julia-1 needs.
+DecisionRequest described_ticket() {
+    DecisionRequest r = ticket();
+    r.questions[0].options[2].description = Json("anything else");
+    return r;
+}
+
+// The bytes of a ByteTools sequence.
+std::string text_of(const std::vector<int32_t>& ids) {
+    std::string out;
+    for (const int32_t id : ids)
+        out += static_cast<char>(id);
+    return out;
 }
 
 double max_diff(const std::vector<std::vector<double>>& a, const std::vector<std::vector<double>>& b) {
@@ -649,6 +668,303 @@ TEST_SUITE("decision models") {
         omni["model_type"] = "lfm3_omni";
         std::ofstream(dir.path / "config.json") << omni.dump();
         CHECK_THROWS_WITH_AS(xs::load_decision_model(dir.path), doctest::Contains("lfm3_omni"), xs::Error);
+    }
+
+    TEST_CASE("laya and julia-1: a sequence per question, each answered as if asked alone") {
+        for (const bool julia : {false, true}) {
+            CAPTURE(julia);
+            const xs::test::TempDir dir(julia ? "xs_tiny_julia" : "xs_tiny_laya");
+            xs::test::TinyLaya m;
+            m.julia = julia;
+            xs::test::write_tiny_laya(dir.path, m, 9);
+            CHECK(xs::model_kind(dir.path) == xs::ModelKind::Decision);
+            const auto model = xs::load_decision_model(dir.path);
+            CHECK(model->spec().arch == (julia ? "julia" : "laya"));
+            CHECK(model->spec().max_tokens == 256);
+            CHECK(model->spec().tokenizer_dir == "tokenizer");
+            CHECK_FALSE(model->spec().chat_template);
+            REQUIRE(model->programs().size() == 1);
+            CHECK_FALSE(model->programs()[0]->stateful());
+            const auto session = xs::make_backend("cpu-ref")->compile(model->programs(), model->weights(),
+                                                                      xs::SessionOptions{.precision = xs::DType::F32});
+            const DecisionLimits whole{4096, 4096};
+            int steps = 0;
+            size_t sequences = 0;
+            const auto p = xs::test::decide(*model, *session, described_ticket(), whole, &steps, &sequences);
+            CHECK(steps == 3);
+            CHECK(sequences == 3);
+            REQUIRE(p.size() == 3);
+            for (const auto& question : p) {
+                double total = 0;
+                for (const double v : question)
+                    total += v;
+                CHECK(total == doctest::Approx(1.0));
+            }
+            CHECK(*std::max_element(p[0].begin(), p[0].end()) - *std::min_element(p[0].begin(), p[0].end()) > 0.02);
+
+            // Each question alone, and the questions in the other order.
+            for (size_t q = 0; q < 3; ++q) {
+                DecisionRequest alone = described_ticket();
+                alone.questions = {alone.questions[q]};
+                CHECK(max_diff({p[q]}, xs::test::decide(*model, *session, alone, whole)) < 1e-9);
+            }
+            DecisionRequest reversed = described_ticket();
+            std::reverse(reversed.questions.begin(), reversed.questions.end());
+            const auto r = xs::test::decide(*model, *session, reversed, whole);
+            CHECK(max_diff({p[0], p[1], p[2]}, {r[2], r[1], r[0]}) < 1e-9);
+            // A noul's prompt lists "false" before "true" (its answer lists true first), in each model's wording.
+            const xs::test::ByteTools tools;
+            const std::string noul = text_of(model->start(described_ticket(), tools, whole)->sequences()[1]);
+            CHECK(noul.find(julia ? "\x03 false\x03 true" : "\x03 false: no, the statement does not hold\x03 true: ") !=
+                  std::string::npos);
+
+            namespace dev = xs::test::device;
+            if (!dev::enabled()) continue;
+            const auto gpu = dev::backend().compile(model->programs(), model->weights(), dev::options());
+            CHECK(max_diff(p, xs::test::decide(*model, *gpu, described_ticket(), whole)) <
+                  (dev::is_f16() ? 1e-2 : 1e-4));
+        }
+    }
+
+    TEST_CASE("laya: what does not fit is cut as its reference cuts it; its wording of options and instructions") {
+        const xs::test::TempDir dir("xs_tiny_laya_cuts"), wide("xs_tiny_laya_wording");
+        xs::test::TinyLaya m;
+        m.max_tokens = 160;
+        m.head_tokens = 48;
+        m.root_config = false;  // as a variant's folder: the model is found by its rl_agent_config.json
+        xs::test::write_tiny_laya(dir.path, m, 10);
+        CHECK(xs::model_kind(dir.path) == xs::ModelKind::Decision);
+        const auto model = xs::load_decision_model(dir.path);
+        const auto session = xs::make_backend("cpu-ref")->compile(model->programs(), model->weights(),
+                                                                  xs::SessionOptions{.precision = xs::DType::F32});
+        const xs::test::ByteTools tools;
+        const DecisionLimits whole{4096, 4096};
+        const auto sequence = [&](const DecisionRequest& r) {
+            return model->start(r, tools, whole)->sequences()[0];
+        };
+        DecisionRequest r;
+        r.questions = {noul("q", "Is it late?")};
+
+        // A long state keeps the tokens that fit the 160 of the sequence; the answer is that of the shorter state.
+        const std::string long_state(300, 'x');
+        r.state = long_state;
+        const std::vector<int32_t> cut = sequence(r);
+        CHECK(cut.size() == 160);
+        CHECK(cut.back() == 2);  // [SEP] closes it
+        const size_t prefix = text_of(cut).find(std::string(1, '\x02') + "x") + 1;  // the state starts after [SEP]
+        DecisionRequest shorter = r;
+        shorter.state = std::string(159 - prefix, 'x');
+        CHECK(sequence(shorter) == cut);
+        const auto long_answers = xs::test::decide(*model, *session, r, whole);
+        CHECK(max_diff(long_answers, xs::test::decide(*model, *session, shorter, whole)) < 1e-12);
+
+        // Ten options of 17 tokens do not fit the question budget of 48: each is cut to 4 (its marker and 3 bytes),
+        // and the question to 8 bytes.
+        std::vector<std::pair<std::string, Json>> options;
+        for (int i = 0; i < 10; ++i)
+            options.push_back({"option" + std::to_string(i), "number " + std::to_string(i) + " of ten"});
+        r.state = "s";
+        r.questions = {choice("c", "Which of the ten options fits?", options)};
+        std::string expected = "\x01" "choice q\x02";
+        for (int i = 0; i < 10; ++i)
+            expected += "\x03 op";
+        CHECK(text_of(sequence(r)) == expected + "\x02s\x02");
+
+        // Sixty options at four tokens each pass the sequence's 160 tokens: refused, as its reference refuses them.
+        options.resize(60, {"o", "x"});
+        r.questions = {choice("c", "Pick", options)};
+        CHECK_THROWS_AS(sequence(r), xs::DecisionRefused);
+
+        // Names, descriptions and instructions as its reference writes them: json.dumps (ASCII only) for instructions
+        // that are not text, str() for descriptions that are not, a name alone without a description; its mask token
+        // in user text becomes a space. A model whose question budget holds them whole.
+        m.max_tokens = 400;
+        m.head_tokens = 120;
+        xs::test::write_tiny_laya(wide.path, m, 10);
+        const auto wording = xs::load_decision_model(wide.path);
+        const auto written = [&](const DecisionRequest& req) { return wording->start(req, tools, whole)->sequences(); };
+        DecisionQuestion q = choice("c", "", {{"a", nullptr}, {"b", ""}, {"c", Json{{"k", 1}}}, {"d", "x\x03y"}});
+        q.instructions = Json{{"lang", "fran\xc3\xa7" "ais"}};
+        r.questions = {q};
+        CHECK(text_of(written(r)[0]) ==
+              "\x01" "choice question: {\"lang\": \"fran\\u00e7ais\"}\x02"
+              "\x03 a\x03 b\x03 c: {'k': 1}\x03 d: x y\x02s\x02");
+        DecisionQuestion level = score("s", "Rate", {"low"});
+        level.options.push_back({"1", Json::array({"high", 2})});
+        q = noul("n", "Odd?");
+        q.options[0].description = Json("It is.");
+        r.questions = {level, q};
+        const auto both = written(r);
+        CHECK(text_of(both[0]).find("\x03 level 0: low\x03 level 1: ['high', 2]\x02") != std::string::npos);
+        CHECK(text_of(both[1]).find("\x03 false: no, the statement does not hold\x03 true: It is.\x02") !=
+              std::string::npos);
+        q.options[1].description = Json{{"not", "text"}};  // its reference adds it to a string and fails
+        r.questions = {q};
+        CHECK_THROWS_WITH_AS(written(r), doctest::Contains("an object or array is not supported"), xs::DecisionRefused);
+    }
+
+    TEST_CASE("laya: a request whose every question has a single option is refused; beside two options, answered") {
+        const xs::test::TempDir dir("xs_tiny_laya_single");
+        xs::test::write_tiny_laya(dir.path, xs::test::TinyLaya{}, 12);
+        const auto model = xs::load_decision_model(dir.path);
+        const auto session = xs::make_backend("cpu-ref")->compile(model->programs(), model->weights(),
+                                                                  xs::SessionOptions{.precision = xs::DType::F32});
+        const DecisionLimits whole{4096, 4096};
+        DecisionRequest r;
+        r.state = "s";
+        r.questions = {choice("c", "Pick", {{"only", "the one there is"}}), score("s", "Rate", {"low"})};
+        CHECK_THROWS_WITH_AS(xs::test::decide(*model, *session, r, whole), doctest::Contains("single option"),
+                             xs::DecisionRefused);
+        r.questions.push_back(noul("n", "Odd?"));  // as its reference reads them: a lone option's probability is 1
+        const auto p = xs::test::decide(*model, *session, r, whole);
+        REQUIRE(p.size() == 3);
+        CHECK(p[0] == std::vector<double>{1.0});
+        CHECK(p[1] == std::vector<double>{1.0});
+    }
+
+    TEST_CASE("laya: the temperature of a question's type, or of its type and option count, divides its logits") {
+        const xs::test::TempDir plain("xs_tiny_laya_t1"), fitted("xs_tiny_laya_t2");
+        xs::test::TinyLaya m;
+        xs::test::write_tiny_laya(plain.path, m, 11);
+        m.temperature = {2.0, 3.0, 4.0};
+        m.temperature_by_options = {{"choice:3-5", 0.5}, {"noul:2", 1.5}};
+        xs::test::write_tiny_laya(fitted.path, m, 11);
+        const auto answers = [](const xs::test::fs::path& dir) {
+            const auto model = xs::load_decision_model(dir);
+            const auto session = xs::make_backend("cpu-ref")->compile(model->programs(), model->weights(),
+                                                                      xs::SessionOptions{.precision = xs::DType::F32});
+            return xs::test::decide(*model, *session, ticket(), DecisionLimits{4096, 4096});
+        };
+        const auto p = answers(plain.path), q = answers(fitted.path);
+        const double temperature[] = {0.5, 1.5, 3.0};  // choice of 3 options, noul, score of 3 levels (by type)
+        for (size_t i = 0; i < 3; ++i) {
+            CAPTURE(i);
+            for (size_t o = 1; o < p[i].size(); ++o)
+                CHECK(std::log(q[i][o] / q[i][0]) * temperature[i] == doctest::Approx(std::log(p[i][o] / p[i][0])));
+        }
+    }
+
+    TEST_CASE("julia-1: what its strict encoding cannot read whole is refused by name") {
+        const xs::test::TempDir dir("xs_tiny_julia_refusals");
+        xs::test::TinyLaya m;
+        m.julia = true;
+        xs::test::write_tiny_laya(dir.path, m, 12);
+        const auto model = xs::load_decision_model(dir.path);
+        const xs::test::ByteTools tools;
+        const auto refusal = [&](const DecisionRequest& r) -> std::string {
+            try {
+                model->start(r, tools, DecisionLimits{4096, 4096});
+            } catch (const xs::DecisionRefused& e) {
+                return e.what();
+            }
+            return "accepted";
+        };
+        const DecisionRequest ok = described_ticket();
+        CHECK(refusal(ok) == "accepted");
+        DecisionRequest r = ok;
+        r.questions[1].instructions = Json(nullptr);
+        CHECK(refusal(r) == "question 'urgent': Julia-1 takes its instructions as text");
+        r = ok;
+        r.questions[0].options.resize(1);
+        CHECK(refusal(r) == "question 'team': Julia-1 takes 2 to 20 options; the question has 1");
+        r = ok;
+        r.questions[0].options[2].description = Json(nullptr);
+        CHECK(refusal(r) ==
+              "question 'team': Julia-1 reads each option as its description, a non-empty text; 'other' has none");
+        r = ok;
+        r.questions[1].options[0].description = Json("yes");
+        CHECK(refusal(r) ==
+              "question 'urgent': Julia-1 takes a noul's criteria for both 'false' and 'true', or neither");
+        r = ok;
+        r.state = "a \x03 in the state";
+        CHECK(refusal(r).find("refuses a request that spells its marker") != std::string::npos);
+        r = ok;
+        r.questions[0].options[0].description = Json(std::string(60, 'x'));
+        CHECK(refusal(r) == "question 'team': Julia-1 reads at most 48 tokens of an option; one has 61");
+        r = ok;
+        for (xs::DecisionOption& o : r.questions[0].options)
+            o.description = Json(std::string(40, 'x'));
+        CHECK(refusal(r).find("reads a question and its options in 96 tokens") != std::string::npos);
+        r = ok;
+        r.state = std::string(300, 's');
+        CHECK(refusal(r).find("tokens with the state; the limit is 256") != std::string::npos);
+        // Without strict encoding, the state is cut instead.
+        const xs::test::TempDir loose("xs_tiny_julia_loose");
+        m.strict = false;
+        xs::test::write_tiny_laya(loose.path, m, 12);
+        const auto cutting = xs::load_decision_model(loose.path);
+        CHECK(cutting->start(r, tools, DecisionLimits{4096, 4096})->sequences()[0].size() == 256);
+    }
+
+    TEST_CASE("laya and julia-1: the runtime reads their tokenizer from its folder, with no chat template") {
+        for (const bool julia : {false, true}) {
+            CAPTURE(julia);
+            const xs::test::TempDir dir("xs_tiny_laya_runner");
+            xs::test::TinyLaya m;
+            m.julia = julia;
+            xs::test::write_tiny_laya(dir.path, m, 14);
+            std::ofstream(dir.path / "tokenizer" / "tokenizer.json") << xs::test::tiny_wordpiece_tokenizer().dump();
+            std::ofstream(dir.path / "tokenizer" / "tokenizer_config.json")
+                << nlohmann::json{{"cls_token", "[CLS]"}, {"sep_token", "[SEP]"}, {"mask_token", "[MASK]"}}.dump();
+            xs::DecisionRunnerOptions o;
+            o.backend = "cpu-ref";
+            o.session.precision = xs::DType::F32;
+            const auto runner = xs::DecisionRunner::create(dir.path, o);  // warms up on the sample request
+            DecisionRequest r;
+            r.state = "the cat sat on the mat.";
+            r.questions = {noul("sat", "the cat sat"), choice("pet", "the pet", {{"cat", "a cat"}, {"dog", "a dog"}})};
+            const xs::DecisionResult result = runner->decide(r);
+            REQUIRE(result.sequences.size() == 2);
+            // [CLS] noul question : the cat sat [SEP] [MASK] false [MASK] true [SEP] the cat ... [SEP]
+            CHECK(result.sequences[0].front() == 2);
+            CHECK(std::count(result.sequences[0].begin(), result.sequences[0].end(), 4) == 2);
+            CHECK(result.sequences[0].back() == 3);
+            CHECK(result.answers[1].probabilities.size() == 2);
+        }
+    }
+
+    TEST_CASE("laya and julia-1: what they do not implement is refused by name") {
+        using nlohmann::json;
+        const xs::test::TempDir dir("xs_tiny_laya_refusals"), out("xs_tiny_laya_pack");
+        const auto load_error = [&]() {
+            try {
+                xs::load_decision_model(dir.path);
+            } catch (const xs::Error& e) {
+                return std::string(e.what());
+            }
+            return std::string("loaded");
+        };
+        xs::test::TinyLaya m;
+        xs::test::write_tiny_laya(dir.path, m, 13);
+        std::ofstream(dir.path / "rl_agent_config.json")
+            << json{{"head_layers", 2}, {"max_len", 256}, {"head_max_len", 96},
+                    {"temperature_by_options", {{"choice:big", 1.0}}}}.dump();
+        CHECK(load_error() ==
+              "rl_agent_config.json: temperature_by_options key 'choice:big' is not a question type and option count");
+        std::ofstream(dir.path / "rl_agent_config.json")
+            << json{{"head_layers", 2}, {"max_len", 9000}, {"head_max_len", 96}}.dump();
+        CHECK(load_error().find("laya: a sequence of 9000 tokens with a question of 96 does not fit the encoder's 512 "
+                                "positions") != std::string::npos);
+        // A pack would leave the tokenizer and encoder folders behind.
+        std::ofstream(dir.path / "rl_agent_config.json")
+            << json{{"head_layers", 2}, {"max_len", 256}, {"head_max_len", 96}}.dump();
+        xs::ConvertOptions o;
+        o.source = dir.path;
+        o.output = out.path;
+        o.format = xs::DType::Q8;
+        CHECK_THROWS_WITH(xs::convert_model(o), doctest::Contains("a pack does not carry yet"));
+
+        xs::test::fs::remove_all(dir.path);
+        m.julia = true;
+        xs::test::write_tiny_laya(dir.path, m, 13);
+        std::ofstream(dir.path / "inference-policy.json")
+            << json{{"max_length", 256}, {"head_length", 96}, {"strict_encoding", true}, {"calibration", {1.5}}}.dump();
+        CHECK(load_error() == "inference-policy.json: a calibration is not supported");
+        xs::test::fs::remove(dir.path / "inference-policy.json");
+        CHECK(load_error().find("inference-policy.json is missing") != std::string::npos);
+        std::ofstream(dir.path / "rl_agent_config.json") << json{{"head_layers", 2}}.dump();
+        CHECK(load_error().find("holds both Laya's rl_agent_config.json and Julia's julia_config.json") !=
+              std::string::npos);
     }
 
     TEST_CASE("decision checkpoints convert to packs that answer alike") {

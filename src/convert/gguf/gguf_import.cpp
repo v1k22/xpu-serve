@@ -208,7 +208,7 @@ ImportPlan Architecture::plan_with_mtp(const gguf::File&, const gguf::File&) con
 }
 
 const Architecture& find_architecture(std::string_view name) {
-    const std::vector<const Architecture*> all{&qwen35(), &gemma4(), &gemma4_assistant(), &clef()};
+    const std::vector<const Architecture*> all{&qwen35(), &gemma4(), &gemma4_assistant(), &clef(), &modern_bert()};
     std::string list;
     for (const Architecture* a : all) {
         if (a->name() == name) return *a;
@@ -236,12 +236,14 @@ ImportReport import_gguf(const ImportOptions& o) {
     const std::string architecture(file.get_string("general.architecture"));
     const Architecture& arch = find_architecture(architecture);
     ImportPlan plan = mtp ? arch.plan_with_mtp(file, *mtp) : arch.plan(file);
-    // A language model's tokenizer, chat template and sampling defaults (a drafter has the target's).
+    // A language model's tokenizer, chat template and sampling defaults (a drafter has the target's); a decision
+    // model's tokenizer.
+    const bool language = plan.kind == ImportPlan::Kind::Language;
     std::optional<TokenizerFiles> tokenizer;
     std::string chat;
     std::optional<nlohmann::ordered_json> generation;
-    if (!plan.drafter) {
-        tokenizer = tokenizer_files(file);
+    if (plan.kind != ImportPlan::Kind::Drafter) tokenizer = tokenizer_files(file);
+    if (language) {
         chat = chat_template(file, plan.unused_templates);
         generation = generation_config(file);
         const std::vector<int32_t>& stops = tokenizer->stop_ids;
@@ -270,19 +272,24 @@ ImportReport import_gguf(const ImportOptions& o) {
     log::info("gguf: writing ", units.size(), " tensors to ", (o.output / "model.safetensors").string());
     write_safetensors(o.output / "model.safetensors", units, {{"format", "pt"}});
     write_json(o.output / "config.json", plan.config, 2);
-    for (const auto& [name, json] : plan.files)
-        write_json(o.output / name, json, 2);
+    for (const auto& [path, json] : plan.files) {
+        fs::create_directories((o.output / path).parent_path());
+        write_json(o.output / path, json, 2);
+    }
     if (tokenizer) {
-        write_json(o.output / "tokenizer.json", tokenizer->tokenizer, -1);
-        write_json(o.output / "tokenizer_config.json", tokenizer->config, 2);
+        const fs::path dir = o.output / plan.tokenizer_dir;
+        fs::create_directories(dir);
+        write_json(dir / "tokenizer.json", tokenizer->tokenizer, -1);
+        write_json(dir / "tokenizer_config.json", tokenizer->config, 2);
         if (generation) write_json(o.output / "generation_config.json", *generation, 2);
-        std::ofstream out(o.output / "chat_template.jinja", std::ios::binary);
-        out << chat;
-        if (!out) fail("gguf import: writing chat_template.jinja failed");
-        out.close();
+        if (language) {
+            std::ofstream out(o.output / "chat_template.jinja", std::ios::binary);
+            out << chat;
+            if (!out) fail("gguf import: writing chat_template.jinja failed");
+        }
         // The tokenizer as the engine will load it: one whose merges do not fit its vocabulary is refused now rather
         // than when the pack is served.
-        tok::Tokenizer::load(o.output);
+        tok::Tokenizer::load(dir);
     }
 
     nlohmann::ordered_json manifest;

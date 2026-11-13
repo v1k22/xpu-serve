@@ -460,8 +460,6 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
     const int64_t kv_heads = k_all.dim(1);
     const bool positioned = attrs.causal || attrs.sliding_window > 0;  // queries are the cache's last rows
     XS_CHECK(!positioned || kv_len >= tokens, "attention has ", kv_len, " keys for ", tokens, " queries");
-    XS_CHECK(attrs.causal || attrs.sliding_window == 0 || tokens <= attrs.sliding_window, "non-causal attention of ",
-             tokens, " queries with a window of ", attrs.sliding_window);
     XS_CHECK(k_all.shape() == v_all.shape() && k_all.dim(2) == head_dim && q_heads % kv_heads == 0,
              "attention shapes q ", dims_to_string(q.shape()), ", k ", dims_to_string(k_all.shape()), ", v ",
              dims_to_string(v_all.shape()), " do not fit");
@@ -476,6 +474,7 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
         const int64_t pos = kv_len - tokens + t;
         int64_t first = attrs.sliding_window > 0 ? std::max<int64_t>(0, pos - attrs.sliding_window + 1) : 0;
         int64_t last = attrs.causal ? pos : kv_len - 1;
+        if (attrs.sliding_window > 0) last = std::min(last, pos + attrs.sliding_window - 1);
         if (attrs.block > 0) {  // the keys of the query's own block
             first = t / attrs.block * attrs.block;
             last = first + attrs.block - 1;

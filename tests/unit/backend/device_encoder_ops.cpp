@@ -2,7 +2,9 @@
 // stateless sessions, on the GPU backend under test (XS_DEVICE_TEST_DEVICE).
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <limits>
+#include <string>
 
 #include "device_test_support.h"
 #include "reference_ops.h"
@@ -118,6 +120,49 @@ TEST_SUITE("device encoder ops" * doctest::skip(!dev::enabled())) {
                 spec.causal = true;
                 CHECK_FALSE(test::all_close(out, test::ref::attention(to_f64(q), to_f64(k), to_f64(v), spec), tol.atol,
                                             tol.rtol));
+            }
+        }
+    }
+
+    TEST_CASE("non-causal attention with a window over the step's own tokens, every lowering, head dims 32 and 64") {
+        test::TensorRng rng(16);
+        for (const int64_t dim : {32, 64}) {
+            for (const auto& [q_heads, kv_heads] : {std::pair<int64_t, int64_t>{4, 4}, {6, 2}}) {
+                for (const auto& [tokens, window] : {std::pair<int64_t, int64_t>{5, 2}, {200, 65}, {301, 4}}) {
+                    for (const std::string& impl : dev::attention_impls()) {
+                        CAPTURE(dim);
+                        CAPTURE(q_heads);
+                        CAPTURE(tokens);
+                        CAPTURE(window);
+                        CAPTURE(impl);
+                        const HostTensor q = rng.uniform(DType::F32, {tokens, q_heads, dim});
+                        const HostTensor k = rng.uniform(DType::F32, {tokens, kv_heads, dim});
+                        const HostTensor v = rng.uniform(DType::F32, {tokens, kv_heads, dim});
+                        AttentionAttrs attrs;
+                        attrs.causal = false;
+                        attrs.scale = 1.0f / std::sqrt(static_cast<float>(dim));
+                        attrs.sliding_window = window;
+                        Graph g;
+                        g.output("out", g.attention(g.input("q", DType::F32, {kT, q_heads, dim}),
+                                                    g.input("k", DType::F32, {kT, kv_heads, dim}),
+                                                    g.input("v", DType::F32, {kT, kv_heads, dim}), attrs));
+                        SessionOptions options = dev::options();
+                        options.extra["attention"] = impl;
+                        const HostTensor out =
+                            dev::run(g, test::MemoryWeights{}, {{"q", q}, {"k", k}, {"v", v}}, options).at("out");
+                        test::ref::AttentionSpec spec;
+                        spec.scale = attrs.scale;
+                        spec.sliding_window = window;
+                        spec.causal = false;
+                        const dev::Tolerance tol = dev::tolerance({1e-5, 1e-5}, {4e-3, 4e-3});
+                        CHECK(dev::close("attention_local", out,
+                                         test::ref::attention(to_f64(q), to_f64(k), to_f64(v), spec), tol));
+                        test::ref::AttentionSpec planted = spec;  // the keys after a query left unbounded
+                        planted.one_sided = true;
+                        CHECK_FALSE(test::all_close(
+                            out, test::ref::attention(to_f64(q), to_f64(k), to_f64(v), planted), tol.atol, tol.rtol));
+                    }
+                }
             }
         }
     }

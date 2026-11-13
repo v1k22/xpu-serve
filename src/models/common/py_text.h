@@ -16,9 +16,12 @@ struct JsonStyle {
     // json.dumps(indent=N) for N >= 0: each member on a line of its own, N spaces deeper per level, and "," between
     // members (Python's default separators with an indent).
     int indent = -1;
+    // json.dumps' default: DEL and every code point past ASCII as \uxxxx (a surrogate pair past U+FFFF); otherwise
+    // as it is (ensure_ascii=False).
+    bool ensure_ascii = false;
 };
 
-// json.dumps(value, ensure_ascii=False, ...): floats as Python's repr writes them (1250.0, 1e-05, 1e+16).
+// json.dumps(value, ...): floats as Python's repr writes them (1250.0, 1e-05, 1e+16).
 std::string json_dumps(const nlohmann::ordered_json& value, JsonStyle style = {});
 
 // str(value) of what json.loads gives for it: {'a': 1, 'b': [True, None]}. A string at the top level is itself.

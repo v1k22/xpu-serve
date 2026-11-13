@@ -458,8 +458,8 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     } else {
         XS_CHECK(ks.size() == 3 && ks == vs, "attention k/v must be [N, kv_heads, head_dim] and equal, got ",
                  shape_to_string(ks), " and ", shape_to_string(vs));
-        XS_CHECK(attrs.sliding_window == 0 || (qs[0] == kT && ks[0] == kL),
-                 "non-causal attention with a sliding window takes q [T, ...] and k/v [L, ...], got ",
+        XS_CHECK(attrs.sliding_window == 0 || (qs[0] == kT && (ks[0] == kL || ks[0] == kT)),
+                 "non-causal attention with a sliding window takes q [T, ...] and k/v [L, ...] or [T, ...], got ",
                  shape_to_string(qs), " and ", shape_to_string(ks));
     }
     XS_CHECK(ks[2] == qs[2], "attention head_dim differs: q ", qs[2], ", k ", ks[2]);

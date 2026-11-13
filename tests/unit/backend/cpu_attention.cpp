@@ -123,6 +123,15 @@ TEST_SUITE("cpu-ref attention") {
             test::all_close(last.out, test::ref::attention(last.q, last.k_all, last.v_all, off_by_one), kAtol, kRtol));
     }
 
+    TEST_CASE("not causal with a window, steps longer than it: a query sees as far after it as before") {
+        const AttentionCase c{4, 2, 8, {0.3f, 3, 0.0f, false}};
+        const LastStep last = check_steps(c, {7, 2, 9}, 20);
+        test::ref::AttentionSpec one_sided = spec_of(c.attrs);
+        one_sided.one_sided = true;
+        CHECK_FALSE(
+            test::all_close(last.out, test::ref::attention(last.q, last.k_all, last.v_all, one_sided), kAtol, kRtol));
+    }
+
     TEST_CASE("logit softcap with and without a window") {
         check_steps({4, 2, 8, {0.5f, 0, 2.0f}}, {4, 1, 2}, 13);
         check_steps({4, 2, 8, {0.5f, 4, 2.0f}}, {6, 1, 3}, 14);

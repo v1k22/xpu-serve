@@ -12,8 +12,9 @@ namespace xs {
 
 class DecisionRunner::Tools final : public PromptTools {
 public:
-    explicit Tools(const std::filesystem::path& dir)
-        : tokenizer_(tok::Tokenizer::load(dir)), template_(chat::ChatTemplate::load(dir)) {
+    // The tokenizer in `dir`, and its chat template when `chat_template`.
+    Tools(const std::filesystem::path& dir, bool chat_template)
+        : tokenizer_(tok::Tokenizer::load(dir)), template_(chat_template ? chat::ChatTemplate::load(dir) : nullptr) {
         for (int32_t id = 0; id < tokenizer_->vocab_size(); ++id) {
             if (tokenizer_->is_special(id)) special_.push_back(tokenizer_->token_text(id));
         }
@@ -23,6 +24,7 @@ public:
     std::optional<int32_t> token_id(std::string_view piece) const override { return tokenizer_->token_id(piece); }
     std::vector<std::string> special_tokens() const override { return special_; }
     std::string chat(const Json& messages) const override {
+        XS_CHECK(template_ != nullptr, "this decision model writes its prompts without a chat template");
         return template_->render(messages, Json(nullptr), true, Json{{"enable_thinking", false}});
     }
 
@@ -40,9 +42,10 @@ std::unique_ptr<DecisionRunner> DecisionRunner::create(const std::filesystem::pa
                                                        std::unique_ptr<DecisionModel> model) {
     std::unique_ptr<DecisionRunner> r(new DecisionRunner());
     Timer timer;
-    r->tools_ = std::make_unique<Tools>(dir);
     r->model_ = model ? std::move(model) : load_decision_model(dir);
     r->spec_ = r->model_->spec();
+    r->tools_ = std::make_unique<Tools>(r->spec_.tokenizer_dir.empty() ? dir : dir / r->spec_.tokenizer_dir,
+                                        r->spec_.chat_template);
     if (!options.model_id.empty()) r->spec_.id = options.model_id;
     const std::vector<const graph::Graph*> programs = r->model_->programs();
     XS_CHECK(!programs.empty(), "decision model ", r->spec_.id, " has no program");
@@ -142,7 +145,7 @@ DecisionRequest sample_decision_request() {
     route.instructions = "Which team should handle this?";
     route.options = {{"billing", Json("Charges and refunds")},
                      {"shipping", Json("Delivery and tracking")},
-                     {"technical", Json(nullptr)}};
+                     {"technical", Json("Bugs and outages")}};
     DecisionQuestion angry;
     angry.id = "angry";
     angry.type = QuestionType::Noul;
