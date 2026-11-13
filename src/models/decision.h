@@ -70,6 +70,8 @@ public:
     virtual std::vector<int32_t> encode(std::string_view text) const = 0;
     // The id of the token whose vocabulary piece is exactly `piece`.
     virtual std::optional<int32_t> token_id(std::string_view piece) const = 0;
+    // The text of every special token (the tokenizer's added tokens marked special).
+    virtual std::vector<std::string> special_tokens() const = 0;
     // The checkpoint's chat template over OpenAI-style `messages`, with the generation prompt and thinking off. Only a
     // model whose spec asks for the template (DecisionSpec::chat_template) may call it.
     virtual std::string chat(const Json& messages) const = 0;

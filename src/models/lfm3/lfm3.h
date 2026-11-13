@@ -1,13 +1,14 @@
 #pragma once
 
-// LFM3 (Liquid AI; Hugging Face model_type "lfm3"). Reference: the checkpoint's modeling_lfm3.py (Lfm3Model,
-// Lfm3DecoderLayer, Lfm3ShortConv, Lfm3Attention).
+// LFM3 (Liquid AI; Hugging Face model_type "lfm3", and the text decoder of "lfm3_vl"). Reference: the checkpoint's
+// modeling_lfm3.py (Lfm3Model, Lfm3DecoderLayer, Lfm3ShortConv, Lfm3Attention).
 //
 // A hybrid decoder: most layers are gated short convolutions (one projection gives B, C and x; the causal depthwise
 // conv of B * x, times C, then a projection: a window of conv_L_cache tokens, a fixed-size state per sequence), the
 // others attention with q/k norms and a sigmoid gate per head, over the whole context ("full_attention", the first
 // half of each head rotary) or a sliding window. Every layer's operator and MLP outputs are normed again before they
-// join the residual stream (sandwich norms); the head is tied to the embedding. Served: the text decoder.
+// join the residual stream (sandwich norms); the head is tied to the embedding. Served: the text decoder
+// (lfm3_decoder.h builds its layers), as a language model and under the d1 decision model (models/d1/).
 
 #include <filesystem>
 #include <memory>
@@ -46,7 +47,12 @@ struct Config {
     int64_t conv_kernel = 0;
 };
 
-Config parse_config(const nlohmann::json& config_json);
+// `text`: the text decoder's part of config.json (text_config()).
+Config parse_config(const nlohmann::json& text);
+
+// The text decoder's part of config.json: all of an lfm3 checkpoint's, the text_config of an lfm3_vl one (its vision
+// tower and projector are not read). Throws naming any other model_type.
+const nlohmann::json& text_config(const nlohmann::json& config_json);
 
 std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
                             const LoadOptions& options);

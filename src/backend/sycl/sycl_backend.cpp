@@ -1542,7 +1542,7 @@ private:
         for (const Node& n : graph_.nodes()) {
             if (n.kind != OpKind::Gather || graph_.node(n.inputs[1]).kind != OpKind::Input) continue;
             const HostTensor& ids = inputs.at(input_name(n.inputs[1]));
-            const int64_t rows = graph_.type(n.inputs[0]).shape[0];
+            const int64_t rows = resolve(graph_.type(n.inputs[0]).shape, step)[0];  // a computed table may be T rows
             for (int64_t i = 0; i < ids.numel(); ++i) {
                 const int64_t id = ids.dtype() == DType::I32 ? ids.data<int32_t>()[i] : ids.data<int64_t>()[i];
                 if (id < 0 || id >= rows) {

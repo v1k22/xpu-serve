@@ -31,6 +31,7 @@ code.
 | Clef-Flash | decision | f16, q8, q4, GGUF files | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens; its GGUF files: 96 ms (BF16, 15.0 GiB), 147 ms (Q8_0, 8.0 GiB), 150 ms (Q4_K_M, 5.3 GiB) | Arc Pro B60 |
 | pplx-decider-flash-v1.2 | decision | f16, q8, q4 | 39 ms per decision (p50; 57 ms p95) on prompts of 92 to 230 tokens; 214 ms at 1,024 tokens | Arc Pro B60 |
 | OpenJev | decision (a language model read at the option letters) | q4 | 266 ms per decision (p50; 478 ms p95) on prompts of 67 to 198 tokens, 143 ms for another question about the state just read; 1.46 s for three questions on a 1,024-token prompt | Arc Pro B60 |
+| d1-2B | decision | f16, q8, q4 | 14 ms per decision (p50; 72 ms p95) on prompts of 35 to 209 tokens; 37 ms for three questions about a 170-token state; 3.2 / 1.7 / 1.1 GiB (f16 / q8 / q4) | Arc Pro B60 |
 | all-MiniLM-L6-v2 | embedding | f16 | 1.9 ms per text (16 to 256 tokens); 651 texts/s of 128 tokens | Arc Pro B60 |
 | bge-small-en-v1.5 | embedding | f16 | 1.9 ms per text of 16 tokens, 2.1 ms at 128, 5.3 ms at 512; 471 texts/s of 128 tokens | Arc Pro B60 |
 | nomic-embed-text-v1.5 | embedding | f16 | 2.0 ms per text of 16 tokens, 3.1 ms at 128, 9.6 ms at 512, 627 ms at 8,192; 306 texts/s of 128 tokens | Arc Pro B60 |
@@ -48,6 +49,7 @@ code.
 | Clef-Flash | `Cloudflare/clef-flash` (`qwen3_5` with a joint schema head) | its own Python code in fp32: the same prompt tokens, probabilities within 0.0007 (GPU f16); 25 of 25 test decisions right and equal to that code's |
 | pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (`qwen3_5` with a read-out per question) | its own Python package in fp32: the same prompt tokens, probabilities within 0.0009 (GPU f16); 25 of 25 test decisions right and equal to that code's |
 | OpenJev | `openjev/openjev` (`qwen3_5`, Qwen3.8-27B; weights CC BY-NC 4.0) | its own helper code over transformers in fp32: tiny-checkpoint parity (the same prompts, probabilities within 0.0024 on the GPU at f16); the q4 pack against the checkpoint in fp32: 25 of 25 test decisions right and equal, probabilities within 0.0095 |
+| d1-2B | `LiquidAI/d1-2B` (LFM3-VL's text model; weights under the LFM Open License v1.0, commercial use only below $10M annual revenue) | its own code in fp32 at one question a prompt: the same prompt tokens, probabilities within 0.0004 (GPU f16) and 2e-6 (f32); 25 of 25 test decisions right and equal; 299 of 300 MMLU-Pro answers equal at f16, 295 at q8, 257 at q4 |
 | all-MiniLM-L6-v2 | `sentence-transformers/all-MiniLM-L6-v2` (`bert`) | sentence-transformers in fp32 on 15 texts up to 256 tokens: the same token ids from the text; embeddings within 1 - cosine 3.4e-7 (GPU f16), 4e-13 (GPU f32) |
 | bge-small-en-v1.5 | `BAAI/bge-small-en-v1.5` (`bert`) | the same on 15 texts up to 512 tokens: 6.9e-8 (f16), 5e-13 (f32) |
 | nomic-embed-text-v1.5 | `nomic-ai/nomic-embed-text-v1.5` (`nomic_bert`) | the same with its own modeling code on 16 texts up to 8,192 tokens: 5.4e-7 (f16), 1.1e-10 (f32) |
@@ -235,6 +237,7 @@ header. Images (`assets`, box questions) are refused by name: the Qwen3.5 vision
 | Clef-Flash | `Cloudflare/clef-flash` (9B) | every question of a request in one pass; a transformer head scores the options | f16, 15.0 GiB; 89 ms per decision at about 180 tokens |
 | pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (4B) | every question of a request in one pass, each read at a marker after its options; calibrated with the checkpoint's temperature | f16, 7.8 GiB; 39 ms per decision at about 110 tokens |
 | OpenJev | `openjev/openjev` (27B, a tuned Qwen3.8-27B; weights CC BY-NC 4.0) | a prompt per question; the output layer's scores of the option letters at the first output position, calibrated as its helper does | q4 pack, 16.2 GiB; 266 ms per decision at about 90 tokens, 143 ms for another question about the same state |
+| d1-2B | `LiquidAI/d1-2B` (2B, LFM3-VL's text model; LFM Open License v1.0) | a prompt per question, its full-attention layers reading the prompt both ways; the output layer's scores of each option's code tokens at the answer, calibrated (T = 1.3374). Its own code packs up to 16 questions after one state, which moves some unsure answers: packing is next | f16, 3.2 GiB; 14 ms per decision on prompts of 35 to 209 tokens |
 
 The per-decision times are medians over 25 test decisions, one question a request, all of which the three models
 answer right. Questions sent together share one pass in Clef and pplx-decider and can move each other's answers;

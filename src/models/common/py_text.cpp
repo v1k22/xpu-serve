@@ -151,9 +151,15 @@ std::vector<std::pair<const std::string*, const Json*>> members(const Json& obje
     return out;
 }
 
-void dump_json(std::string& out, const Json& v, const JsonStyle& style) {
-    const char* item_sep = style.compact ? "," : ", ";
+void dump_json(std::string& out, const Json& v, const JsonStyle& style, int depth = 0) {
+    const char* item_sep = style.compact || style.indent >= 0 ? "," : ", ";
     const char* key_sep = style.compact ? ":" : ": ";
+    // Before a member of a non-empty container, and before its closing bracket (`inner` false).
+    const auto line = [&](bool inner) {
+        if (style.indent < 0) return;
+        out += '\n';
+        out.append(static_cast<size_t>(style.indent * (depth + (inner ? 1 : 0))), ' ');
+    };
     if (v.is_null()) {
         out += "null";
     } else if (v.is_boolean()) {
@@ -168,8 +174,10 @@ void dump_json(std::string& out, const Json& v, const JsonStyle& style) {
         for (const Json& item : v) {
             if (!first) out += item_sep;
             first = false;
-            dump_json(out, item, style);
+            line(true);
+            dump_json(out, item, style, depth + 1);
         }
+        if (!v.empty()) line(false);
         out += ']';
     } else if (v.is_object()) {
         out += '{';
@@ -177,10 +185,12 @@ void dump_json(std::string& out, const Json& v, const JsonStyle& style) {
         for (const auto& [key, value] : members(v, style.sort_keys)) {
             if (!first) out += item_sep;
             first = false;
+            line(true);
             json_string(out, *key, style.ensure_ascii);
             out += key_sep;
-            dump_json(out, *value, style);
+            dump_json(out, *value, style, depth + 1);
         }
+        if (!v.empty()) line(false);
         out += '}';
     } else {
         fail("a JSON value of type ", v.type_name(), " has no Python text");

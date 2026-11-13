@@ -279,7 +279,10 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] LFM3 (`lfm3`, text): gated short convolutions and gated attention from the shared blocks (a per-head gate added
       to `blocks::attention`; no new op), its tokenizer and chat template byte-exact, the `qwen3_5` output parser;
       HF parity on cpu-ref and the B60, q8 / q4 packs (`docs/decisions/0013`)
-- [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`); conv-window snapshots for prefix
+- [x] LFM3's layers as shared builders (`lfm3::Decoder`: a probed weight prefix, `lfm3_vl`'s `text_config`,
+      full-attention layers causal or over the whole step), for d1
+- [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`; `lfm3_vl`'s text decoder is read
+      for d1 only); conv-window snapshots for prefix
       reuse after a turn with reasoning; the small ops of a q4 decode step (119 norms and 48 residual adds rank
       right after the matmuls under `XS_SYCL_PROFILE`)
 - [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
@@ -429,6 +432,14 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       the logits of the option letters, its helper's calibration and many-option composition; the state read once
       (the last step undone whole: `Session::truncate`); parity with the helper on a tiny checkpoint, the q4 pack
       against the checkpoint in fp32 on 25 test decisions
+- [x] d1 (`LiquidAI/d1-2B`, LFM3-VL's text decoder, docs/decisions/0019): `prompt.py`'s prompt token for token,
+      whole-step full attention, each option's best logit from the output layer's rows on the host, the calibrated
+      temperature by bucket; a question at a time after the state (the reference at a set size of 1); parity with
+      its own code on cpu-ref (tiny and released checkpoints), 25 test decisions end to end on cpu-ref
+- [ ] d1 packing: up to `d1_set_size` (16) questions after one state, as its code reads a request by default (an
+      attention mask by question on the full-attention layers: a graph op attribute, cpu-ref and SYCL kernels); until
+      then the answers of a request of several questions are the reference's at a set size of 1
+- [ ] d1 on the Arc Pro B60: parity at f16 and f32, latency, packs
 - [ ] Decisions and chat from one server for a language model read with `--readout`
 - [ ] OpenJev's question parts of 65 to about 200 tokens take about 345 ms on the Arc Pro B60 where parts of up to
       64 take about 140 ms: above `few_rows` (64 at most) a q4 step dequantizes every weight for its GEMMs

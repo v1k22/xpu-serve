@@ -13,6 +13,9 @@ namespace xs::py {
 struct JsonStyle {
     bool sort_keys = false;  // json.dumps(sort_keys=True): keys in code point order, at every depth
     bool compact = false;    // separators=(",", ":"); otherwise Python's default ", " and ": "
+    // json.dumps(indent=N) for N >= 0: each member on a line of its own, N spaces deeper per level, and "," between
+    // members (Python's default separators with an indent).
+    int indent = -1;
     // json.dumps' default: DEL and every code point past ASCII as \uxxxx (a surrogate pair past U+FFFF); otherwise
     // as it is (ensure_ascii=False).
     bool ensure_ascii = false;

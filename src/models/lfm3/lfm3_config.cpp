@@ -25,6 +25,20 @@ Rope parse_rope(const nlohmann::json& rope_parameters, const char* kind, int64_t
 
 }  // namespace
 
+const nlohmann::json& text_config(const nlohmann::json& config_json) {
+    const std::string type = cfg::get_string(config_json, "model_type", "config.json");
+    if (type == "lfm3") return config_json;
+    if (type != "lfm3_vl") fail("lfm3: model_type '", type, "' is not supported (lfm3, lfm3_vl are)");
+    if (!config_json.contains("text_config") || !config_json.at("text_config").is_object()) {
+        fail("config.json: an lfm3_vl checkpoint without a text_config");
+    }
+    const nlohmann::json& text = config_json.at("text_config");
+    const std::string text_type =
+        text.contains("model_type") ? cfg::get_string(text, "model_type", "config.json text_config") : "lfm3";
+    if (text_type != "lfm3") fail("config.json: text_config model_type '", text_type, "' is not supported (lfm3 is)");
+    return text;
+}
+
 Config parse_config(const nlohmann::json& t) {
     const std::string where = "config.json";
     if (cfg::get_bool_or(t, "conv_bias", false, where)) fail(where, ": conv_bias is not supported");
