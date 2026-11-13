@@ -1,9 +1,11 @@
 #pragma once
 
 // Hugging Face tokenizer.json tokenizers, implemented natively (no Python, no Rust).
-// Scope: BPE models as used by Gemma (Replace normalizer, Split pre-tokenizer, byte fallback, fuse_unk) and byte-level
-// BPE as used by Qwen (NFC, regex Split, ByteLevel), with added/special tokens. Unsupported components are refused
-// by name.
+// Scope: BPE models as used by Gemma (Replace normalizer, Split pre-tokenizer, byte fallback, fuse_unk), byte-level
+// BPE as used by Qwen (NFC, regex Split, ByteLevel) and WordPiece as used by BERT-family encoders (BertNormalizer,
+// BertPreTokenizer, WordPiece decoder), with added/special tokens and TemplateProcessing post-processors.
+// Unsupported components are refused by name. tokenizer.json's truncation and padding are not applied: callers own
+// sequence lengths.
 
 #include <cstdint>
 #include <filesystem>
@@ -25,11 +27,12 @@ public:
     // Encodes text. With parse_special, added tokens written in the text (e.g. "<|turn>") become their ids; without
     // it they are tokenized as plain text. Never adds bos/eos (chat templates do that).
     virtual std::vector<int32_t> encode(std::string_view text, bool parse_special = true) const = 0;
-    // Decodes ids to UTF-8 (invalid byte sequences become U+FFFD). skip_special drops special tokens.
-    virtual std::string decode(std::span<const int32_t> ids, bool skip_special = false) const = 0;
     // The ids with the special tokens tokenizer.json's post-processor puts around one sequence (TemplateProcessing's
     // `single` template, e.g. [CLS] ... [SEP]); unchanged when the post-processor adds none.
+    // with_special_tokens(encode(text)) is Hugging Face's encode(text, add_special_tokens=True).
     virtual std::vector<int32_t> with_special_tokens(std::vector<int32_t> ids) const = 0;
+    // Decodes ids to UTF-8 (invalid byte sequences become U+FFFD). skip_special drops special tokens.
+    virtual std::string decode(std::span<const int32_t> ids, bool skip_special = false) const = 0;
 
     virtual int32_t vocab_size() const = 0;
     virtual std::string token_text(int32_t id) const = 0;               // the vocab piece, verbatim

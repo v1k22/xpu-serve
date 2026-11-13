@@ -39,12 +39,9 @@ struct LaterCandidate {
 };
 }  // namespace
 
-BpeModel::BpeModel(const nlohmann::json& config) {
-    if (const std::string type = component_type(config, kWhat); type != "BPE") refuse_component(kWhat, type);
+BpeModel::BpeModel(const nlohmann::json& config, bool byte_level) : vocab_(config, "BPE") {
     for (const char* key : {"dropout", "continuing_subword_prefix", "end_of_word_suffix"}) refuse_option(config, key);
-    if (!config.contains("vocab") || !config.at("vocab").is_object()) fail("tokenizer.json BPE model has no 'vocab'");
     if (!config.contains("merges") || !config.at("merges").is_array()) fail("tokenizer.json BPE model has no 'merges'");
-    load_vocab(config.at("vocab"));
     load_merges(config.at("merges"));
 
     byte_fallback_ = bool_field_or(config, "byte_fallback", false, kWhat);
@@ -60,30 +57,7 @@ BpeModel::BpeModel(const nlohmann::json& config) {
         std::snprintf(name, sizeof(name), "<0x%02X>", b);
         byte_ids_[b] = id(name).value_or(-1);
     }
-}
-
-void BpeModel::load_vocab(const nlohmann::json& vocab) {
-    size_t total_bytes = 0;
-    int64_t max_id = -1;
-    for (const auto& [piece, value] : vocab.items()) {
-        if (!value.is_number_integer() || value.get<int64_t>() < 0 || value.get<int64_t>() > INT32_MAX) {
-            fail("tokenizer.json BPE vocab entry '", piece, "' has an invalid id");
-        }
-        total_bytes += piece.size();
-        max_id = std::max(max_id, value.get<int64_t>());
-    }
-    storage_.reserve(total_bytes);  // reserved up front so the views taken below stay valid
-    pieces_.assign(static_cast<size_t>(max_id + 1), std::nullopt);
-    ids_.reserve(vocab.size());
-    for (const auto& [piece, value] : vocab.items()) {
-        const auto id_value = value.get<int32_t>();
-        const size_t offset = storage_.size();
-        storage_.insert(storage_.end(), piece.begin(), piece.end());
-        const std::string_view view(storage_.data() + offset, piece.size());
-        if (pieces_[id_value]) fail("tokenizer.json BPE vocab id ", id_value, " is assigned twice");
-        pieces_[id_value] = view;
-        ids_.emplace(view, id_value);
-    }
+    if (byte_level) use_byte_level_alphabet();
 }
 
 void BpeModel::load_merges(const nlohmann::json& merges) {
@@ -130,17 +104,6 @@ void BpeModel::use_byte_level_alphabet() {
 
 bool BpeModel::has_byte_tokens(std::string_view ch) const {
     return std::all_of(ch.begin(), ch.end(), [this](char b) { return byte_ids_[static_cast<uint8_t>(b)] >= 0; });
-}
-
-std::optional<int32_t> BpeModel::id(std::string_view piece) const {
-    const auto it = ids_.find(piece);
-    if (it == ids_.end()) return std::nullopt;
-    return it->second;
-}
-
-std::optional<std::string_view> BpeModel::piece(int32_t id) const {
-    if (id < 0 || id >= id_limit()) return std::nullopt;
-    return pieces_[id];
 }
 
 const BpeModel::Merge* BpeModel::find_merge(int32_t left, int32_t right) const {

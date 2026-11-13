@@ -26,12 +26,12 @@ public:
     std::vector<int32_t> encode(std::string_view text, bool) const override {
         return {text.begin(), text.end()};
     }
+    std::vector<int32_t> with_special_tokens(std::vector<int32_t> ids) const override { return ids; }
     std::string decode(std::span<const int32_t> ids, bool) const override {
         std::string out;
         for (int32_t id : ids) out.push_back(char(id));
         return out;
     }
-    std::vector<int32_t> with_special_tokens(std::vector<int32_t> ids) const override { return ids; }
     int32_t vocab_size() const override { return 256; }
     std::string token_text(int32_t id) const override { return std::string(1, char(id)); }
     std::optional<int32_t> token_id(std::string_view piece) const override {

@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include "parity_cases.h"
+#include "scratch_model_dir.h"
 #include "tokenizer/byte_level.h"
 #include "tokenizer/pre_tokenizer.h"
 #include "tokenizer/tokenizer.h"
@@ -24,6 +25,7 @@
 
 namespace {
 using Ids = std::vector<int32_t>;
+using xs::test::ScratchModelDir;
 using xs::test::stream_decode;
 
 const nlohmann::json& fixture() {
@@ -46,24 +48,6 @@ std::optional<std::filesystem::path> qwen35_dir() {
 double seconds_since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
-
-// A scratch model directory holding one tokenizer.json, removed on destruction.
-class ScratchModelDir {
-public:
-    explicit ScratchModelDir(const nlohmann::json& tokenizer_json)
-        : path_(std::filesystem::temp_directory_path() /
-                ("xs_tok_bl_test_" + std::to_string(reinterpret_cast<uintptr_t>(this)))) {
-        std::filesystem::create_directories(path_);
-        std::ofstream(path_ / "tokenizer.json") << tokenizer_json.dump();
-    }
-    ~ScratchModelDir() { std::filesystem::remove_all(path_); }
-    ScratchModelDir(const ScratchModelDir&) = delete;
-    ScratchModelDir& operator=(const ScratchModelDir&) = delete;
-    const std::filesystem::path& path() const { return path_; }
-
-private:
-    std::filesystem::path path_;
-};
 
 std::string chars(std::string_view bytes) {
     std::string out;

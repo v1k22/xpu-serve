@@ -44,4 +44,31 @@ extern const size_t kDecompositionCount;
 extern const CodePointRange kNfcUnsafeRanges[];
 extern const size_t kNfcUnsafeRangeCount;
 
+struct BertClassRange {
+    char32_t first;
+    char32_t last;
+    uint8_t classes;  // unicode::BertClass bits
+};
+
+// Code points first, first + stride, ..., last lowercase to code point + delta (Rust's char::to_lowercase).
+struct LowercaseRun {
+    char32_t first;
+    char32_t last;
+    int32_t delta;
+    uint8_t stride;
+};
+
+// A code point whose lowercase is several code points (0-padded).
+struct LowercaseExpansion {
+    char32_t code_point;
+    char32_t lower[3];
+};
+
+extern const BertClassRange kBertClassRanges[];
+extern const size_t kBertClassRangeCount;
+extern const LowercaseRun kLowercaseRuns[];
+extern const size_t kLowercaseRunCount;
+extern const LowercaseExpansion kLowercaseExpansions[];
+extern const size_t kLowercaseExpansionCount;
+
 }  // namespace xs::tok::unicode::tables

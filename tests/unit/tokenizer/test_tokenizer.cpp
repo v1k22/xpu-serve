@@ -10,11 +10,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include "scratch_model_dir.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
 
 namespace {
 using Ids = std::vector<int32_t>;
+using xs::test::ScratchModelDir;
 
 std::filesystem::path tiny_dir() { return std::filesystem::path(XS_SOURCE_DIR) / "tests/fixtures/tokenizer/tiny"; }
 
@@ -22,24 +24,6 @@ nlohmann::json tiny_json() {
     std::ifstream in(tiny_dir() / "tokenizer.json");
     return nlohmann::json::parse(in);
 }
-
-// A scratch model directory holding one tokenizer.json, removed on destruction.
-class ScratchModelDir {
-public:
-    explicit ScratchModelDir(const nlohmann::json& tokenizer_json)
-        : path_(std::filesystem::temp_directory_path() /
-                ("xs_tok_test_" + std::to_string(reinterpret_cast<uintptr_t>(this)))) {
-        std::filesystem::create_directories(path_);
-        std::ofstream(path_ / "tokenizer.json") << tokenizer_json.dump();
-    }
-    ~ScratchModelDir() { std::filesystem::remove_all(path_); }
-    ScratchModelDir(const ScratchModelDir&) = delete;
-    ScratchModelDir& operator=(const ScratchModelDir&) = delete;
-    const std::filesystem::path& path() const { return path_; }
-
-private:
-    std::filesystem::path path_;
-};
 
 std::string load_error(const nlohmann::json& tokenizer_json) {
     const ScratchModelDir dir(tokenizer_json);
@@ -130,6 +114,29 @@ TEST_SUITE("tokenizer") {
         CHECK_THROWS_AS(tok->token_text(31), xs::Error);
     }
 
+    TEST_CASE("tokenizer: with_special_tokens puts the post-processor's special tokens around one sequence") {
+        const auto with_special = [](const nlohmann::json& j, const Ids& ids) {
+            const ScratchModelDir dir(j);
+            return xs::tok::Tokenizer::load(dir.path())->with_special_tokens(ids);
+        };
+        nlohmann::json j = tiny_json();
+        const Ids hello = {21, 26};
+        CHECK(with_special(j, hello) == hello);  // a single template of the sequence alone, as Gemma 4's
+        j["post_processor"] = nlohmann::json::parse(R"({"type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}},
+                       {"SpecialToken": {"id": "<end>", "type_id": 0}}],
+            "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+                               "<end>": {"id": "<end>", "ids": [2, 3], "tokens": ["</s>", "<mark>"]}}})");
+        CHECK(with_special(j, hello) == Ids{1, 21, 26, 2, 3});
+        CHECK(with_special(j, {}) == Ids{1, 2, 3});
+        j["post_processor"] = {
+            {"type", "ByteLevel"}, {"add_prefix_space", false}, {"trim_offsets", false}, {"use_regex", false}};
+        CHECK(with_special(j, hello) == hello);
+        j["post_processor"] = nullptr;
+        CHECK(with_special(j, hello) == hello);
+    }
+
     TEST_CASE("tokenizer: stream decoding matches full decoding") {
         const auto tok = xs::tok::Tokenizer::load(tiny_dir());
         for (const std::string text : {"hello world", "é€é€xyz", " hello  <mark>  world", "hello<s>é</s>"}) {
@@ -149,8 +156,8 @@ TEST_SUITE("tokenizer") {
         CHECK(load_error(j) == "tokenizer.json pre_tokenizer 'Metaspace' is not supported");
 
         j = tiny_json();
-        j["decoder"]["decoders"][1] = {{"type", "WordPiece"}};
-        CHECK(load_error(j) == "tokenizer.json decoder 'WordPiece' is not supported");
+        j["decoder"]["decoders"][1] = {{"type", "CTC"}};
+        CHECK(load_error(j) == "tokenizer.json decoder 'CTC' is not supported");
 
         j = tiny_json();
         j["model"]["type"] = "Unigram";
@@ -167,5 +174,16 @@ TEST_SUITE("tokenizer") {
         j = tiny_json();
         j["post_processor"] = {{"type", "RobertaProcessing"}};
         CHECK(load_error(j) == "tokenizer.json post_processor 'RobertaProcessing' is not supported");
+
+        const std::string kTemplate = "tokenizer.json post_processor 'TemplateProcessing': ";
+        j = tiny_json();
+        j["post_processor"]["single"] = nlohmann::json::parse(
+            R"([{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}])");
+        CHECK(load_error(j) == kTemplate + "special token '<s>' is not in 'special_tokens'");
+        j["post_processor"]["single"] = nlohmann::json::parse(R"([{"Sequence": {"id": "B", "type_id": 0}}])");
+        CHECK(load_error(j) == kTemplate + "the single template names sequence 'B' (one sequence is A)");
+        j["post_processor"]["single"] = nlohmann::json::parse(
+            R"([{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 1}}])");
+        CHECK(load_error(j) == kTemplate + "the single template must hold sequence A exactly once");
     }
 }

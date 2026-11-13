@@ -84,6 +84,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 ### 0.7 Tokenizer and chat templates
 - [x] `tokenizer.json` reader: BPE with byte fallback (Gemma), byte-level BPE (Qwen, Llama 3), normalizers,
       pre-tokenizer regex, added/special tokens
+- [x] WordPiece (BERT-family encoders: BertNormalizer, BertPreTokenizer, WordPiece decoder) and TemplateProcessing's
+      special tokens (`with_special_tokens`); parity on all-MiniLM-L6-v2, bge-small-en-v1.5, nomic-embed-text-v1.5
 - [ ] Decide regex engine (PCRE2 vs port) → `docs/decisions/`
 - [x] Parity corpus vs Hugging Face (code, CJK, emoji, whitespace runs, special tokens)
 - [x] Jinja renderer (minja candidate) → `docs/decisions/`; parity vs `apply_chat_template` incl. tools

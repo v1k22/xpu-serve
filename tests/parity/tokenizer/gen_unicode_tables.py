@@ -1,4 +1,5 @@
-"""Writes src/tokenizer/unicode_tables.cpp: the Unicode data behind the NFC normalizer and the Split regex matcher.
+"""Writes src/tokenizer/unicode_tables.cpp: the Unicode data behind the NFC normalizer, the Split regex matcher and the
+BERT normalizer and pre-tokenizer.
 
 Run: python -I tests/parity/tokenizer/gen_unicode_tables.py
 
@@ -7,7 +8,10 @@ it is the goal and its Rust dependencies carry other Unicode versions:
 - Regex classes (\\p{L}, \\p{M}, \\p{N}) are read from the Oniguruma build inside `tokenizers` (newer than
   unicodedata), and checked against unicodedata for every code point unicodedata assigns.
 - NFC data (canonical decompositions, combining classes, compositions) is unicodedata's, minus the entries that the
-  normalizer inside `tokenizers` (an older Unicode) does not know, found by asking it.
+  normalizer inside `tokenizers` (an older Unicode) does not know, found by asking it. NFD is the same data.
+- The BERT classes (control characters, the CJK blocks, nonspacing marks, punctuation) and the lowercase mapping are
+  read from the BertNormalizer and BertPreTokenizer inside `tokenizers`, one code point at a time: their Unicode data
+  (the unicode_categories crate, older than unicodedata, and Rust's char::to_lowercase, newer) is no Python version's.
 """
 
 import sys
@@ -27,6 +31,9 @@ WHITE_SPACE |= set(range(0x2000, 0x200B))
 
 S_BASE, L_BASE, V_BASE, T_BASE = 0xAC00, 0x1100, 0x1161, 0x11A7
 L_COUNT, V_COUNT, T_COUNT = 19, 21, 28
+
+# unicode::BertClass bits (unicode.h).
+BERT_CONTROL, BERT_CHINESE, BERT_NONSPACING_MARK, BERT_PUNCTUATION = 1, 2, 4, 8
 
 
 def code_points():
@@ -138,6 +145,78 @@ def nfc_data():
     return ccc, decomposition, primary, unsafe, unknown_ccc, unknown_decomp
 
 
+def bert_data():
+    """cp -> BertClass bits, and cp -> its lowercase (when it changes), per tokenizers' BERT components."""
+
+    def bert(clean=False, chinese=False, strip=False, lower=False):
+        return normalizers.BertNormalizer(
+            clean_text=clean, handle_chinese_chars=chinese, strip_accents=strip, lowercase=lower
+        )
+
+    clean, chinese, strip, lower = bert(clean=True), bert(chinese=True), bert(strip=True), bert(lower=True)
+    hf_nfd = normalizers.NFD()
+    pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+    classes, lowercase, decomposed = {}, {}, []
+    for cp in code_points():
+        c = chr(cp)
+        bits = 0
+        # clean_text drops U+0000, U+FFFD and control characters, then maps whitespace to a space.
+        cleaned = clean.normalize_str(c)
+        if cleaned == "" and cp != 0xFFFD:
+            bits |= BERT_CONTROL
+        elif cleaned not in ("", " " if cp in WHITE_SPACE else c):
+            sys.exit(f"U+{cp:04X}: BertNormalizer clean_text gives {cleaned!r}")
+        spaced = chinese.normalize_str(c)
+        if spaced == f" {c} ":
+            bits |= BERT_CHINESE
+        elif spaced != c:
+            sys.exit(f"U+{cp:04X}: BertNormalizer handle_chinese_chars gives {spaced!r}")
+        # strip_accents is NFD, then nonspacing marks removed: a character NFD leaves alone tells its own class.
+        if hf_nfd.normalize_str(c) == c:
+            stripped = strip.normalize_str(c)
+            if stripped == "":
+                bits |= BERT_NONSPACING_MARK
+            elif stripped != c:
+                sys.exit(f"U+{cp:04X}: BertNormalizer strip_accents gives {stripped!r}")
+        else:
+            decomposed.append(cp)
+        lowered = lower.normalize_str(c)
+        if lowered != c:
+            lowercase[cp] = lowered
+        pieces = [piece for piece, _ in pre_tokenizer.pre_tokenize_str(f"a{c}b")]
+        if pieces == ["a", c, "b"]:
+            bits |= BERT_PUNCTUATION
+        elif pieces != (["a", "b"] if cp in WHITE_SPACE else [f"a{c}b"]):
+            sys.exit(f"U+{cp:04X}: BertPreTokenizer splits 'a', it, 'b' into {pieces}")
+        if bits:
+            classes[cp] = bits
+    for cp in decomposed:
+        kept = "".join(x for x in hf_nfd.normalize_str(chr(cp)) if not classes.get(ord(x), 0) & BERT_NONSPACING_MARK)
+        if strip.normalize_str(chr(cp)) != kept:
+            sys.exit(f"U+{cp:04X}: BertNormalizer strip_accents is not NFD without nonspacing marks")
+    return classes, lowercase
+
+
+def lowercase_runs(lowercase: dict):
+    """Single-character mappings as (first, last, delta, stride) runs, and the longer ones as (cp, lower)."""
+    runs, expansions = [], []
+    for cp in sorted(lowercase):
+        lowered = lowercase[cp]
+        if len(lowered) > 1:
+            if len(lowered) > 3:
+                sys.exit(f"U+{cp:04X} lowercases to more than three characters")
+            expansions.append((cp, lowered))
+            continue
+        delta = ord(lowered) - cp
+        if runs and runs[-1][2] == delta:
+            first, last, _, stride = runs[-1]
+            if (first == last and cp - last in (1, 2)) or cp - last == stride:
+                runs[-1] = [first, cp, delta, cp - last]
+                continue
+        runs.append([cp, cp, delta, 1])
+    return runs, expansions
+
+
 def fmt_rows(items) -> str:
     """Joins items into lines of at most 120 columns."""
     lines = ["   "]
@@ -151,6 +230,7 @@ def fmt_rows(items) -> str:
 def main() -> None:
     classes = category_classes()
     ccc, decomposition, primary, unsafe, unknown_ccc, unknown_decomp = nfc_data()
+    bert_classes, lowercase = bert_data()
 
     cat_ranges = ranges(classes)
     ccc_ranges = ranges(ccc)
@@ -160,12 +240,20 @@ def main() -> None:
         d = decomposition[cp]
         second = d[1] if len(d) == 2 else 0
         decomp_rows.append(f"{{0x{cp:X},0x{d[0]:X},0x{second:X},{int(cp in primary)}}},")
+    bert_ranges = ranges(bert_classes)
+    case_runs, case_expansions = lowercase_runs(lowercase)
+    expansion_rows = []
+    for cp, lowered in case_expansions:
+        chars = ",".join(f"0x{ord(x):X}" for x in lowered.ljust(3, chr(0)))
+        expansion_rows.append(f"{{0x{cp:X},{{{chars}}}}},")
 
     text = f"""// Generated by tests/parity/tokenizer/gen_unicode_tables.py; do not edit.
 // Regex classes: the Oniguruma inside Hugging Face tokenizers {tokenizers.__version__}, checked against Unicode
 // {unicodedata.unidata_version} (Python unicodedata) on every code point that version assigns.
 // NFC: Unicode {unicodedata.unidata_version} (Python unicodedata) minus what the tokenizers {tokenizers.__version__} normalizer
 // does not know: {unknown_ccc} combining classes and {unknown_decomp} decomposition(s) of newer characters.
+// BERT classes and lowercase: the BertNormalizer and BertPreTokenizer of tokenizers
+// {tokenizers.__version__}, asked about every code point.
 
 #include "tokenizer/unicode_tables.h"
 
@@ -191,6 +279,21 @@ const CodePointRange kNfcUnsafeRanges[] = {{
 {fmt_rows([f"{{0x{a:X},0x{b:X}}}," for a, b, _ in unsafe_ranges])}
 }};
 const size_t kNfcUnsafeRangeCount = sizeof(kNfcUnsafeRanges) / sizeof(kNfcUnsafeRanges[0]);
+
+const BertClassRange kBertClassRanges[] = {{
+{fmt_rows([f"{{0x{a:X},0x{b:X},{v}}}," for a, b, v in bert_ranges])}
+}};
+const size_t kBertClassRangeCount = sizeof(kBertClassRanges) / sizeof(kBertClassRanges[0]);
+
+const LowercaseRun kLowercaseRuns[] = {{
+{fmt_rows([f"{{0x{a:X},0x{b:X},{d},{st}}}," for a, b, d, st in case_runs])}
+}};
+const size_t kLowercaseRunCount = sizeof(kLowercaseRuns) / sizeof(kLowercaseRuns[0]);
+
+const LowercaseExpansion kLowercaseExpansions[] = {{
+{fmt_rows(expansion_rows)}
+}};
+const size_t kLowercaseExpansionCount = sizeof(kLowercaseExpansions) / sizeof(kLowercaseExpansions[0]);
 // clang-format on
 
 }}  // namespace xs::tok::unicode::tables
@@ -198,7 +301,8 @@ const size_t kNfcUnsafeRangeCount = sizeof(kNfcUnsafeRanges) / sizeof(kNfcUnsafe
     OUT.write_text(text, encoding="utf-8")
     print(
         f"wrote {OUT} ({OUT.stat().st_size} bytes): {len(cat_ranges)} category ranges, {len(ccc_ranges)} combining "
-        f"ranges, {len(decomp_rows)} decompositions ({len(primary)} compose), {len(unsafe_ranges)} NFC-unsafe ranges"
+        f"ranges, {len(decomp_rows)} decompositions ({len(primary)} compose), {len(unsafe_ranges)} NFC-unsafe ranges, "
+        f"{len(bert_ranges)} BERT class ranges, {len(case_runs)} lowercase runs, {len(expansion_rows)} expansion(s)"
     )
 
 

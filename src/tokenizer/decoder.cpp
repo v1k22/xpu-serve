@@ -128,6 +128,36 @@ private:
     size_t stop_;
 };
 
+// Hugging Face's WordPiece decoder: each token after the first loses the continuing-subword prefix, or else gains a
+// leading space. Cleanup removes the spaces tokenization put before punctuation and contractions, token by token as
+// Hugging Face does (so " do not" changes only within one token).
+class WordPieceDecoder final : public Decoder {
+public:
+    WordPieceDecoder(std::string prefix, bool cleanup) : prefix_(std::move(prefix)), cleanup_(cleanup) {}
+    void decode(std::vector<std::string>& tokens) const override {
+        static constexpr std::pair<std::string_view, std::string_view> kCleanups[] = {
+            {" .", "."},   {" ?", "?"},           {" !", "!"},   {" ,", ","},     {" ' ", "'"},   {" n't", "n't"},
+            {" 'm", "'m"}, {" do not", " don't"}, {" 's", "'s"}, {" 've", "'ve"}, {" 're", "'re"},
+        };
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            std::string& token = tokens[i];
+            if (i != 0) {
+                if (token.starts_with(prefix_)) {
+                    token.erase(0, prefix_.size());
+                } else {
+                    token.insert(0, 1, ' ');
+                }
+            }
+            if (!cleanup_) continue;
+            for (const auto& [from, to] : kCleanups) token = replace_all(token, from, to);
+        }
+    }
+
+private:
+    std::string prefix_;
+    bool cleanup_;
+};
+
 class SequenceDecoder final : public Decoder {
 public:
     explicit SequenceDecoder(std::vector<std::unique_ptr<Decoder>> steps) : steps_(std::move(steps)) {}
@@ -179,6 +209,10 @@ std::unique_ptr<Decoder> make_decoder(const nlohmann::json& config) {
     if (type == "Fuse") return std::make_unique<FuseDecoder>();
     if (type == "ByteLevel") return std::make_unique<ByteLevelDecoder>();
     if (type == "Strip") return make_strip(config);
+    if (type == "WordPiece") {
+        return std::make_unique<WordPieceDecoder>(string_field(config, "prefix", kWhat),
+                                                  bool_field(config, "cleanup", kWhat));
+    }
     if (type == "Sequence") return make_sequence(config);
     refuse_component(kWhat, type);
 }

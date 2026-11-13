@@ -1,7 +1,7 @@
 #pragma once
 
 // tokenizer.json pre-tokenizers: Split (a string pattern, or one of the regexes in regex_split.h; every split
-// behavior), ByteLevel (without its own regex) and Sequence. Others are refused by name.
+// behavior), ByteLevel (without its own regex), BertPreTokenizer and Sequence. Others are refused by name.
 
 #include <memory>
 #include <string_view>

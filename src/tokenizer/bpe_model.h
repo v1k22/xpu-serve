@@ -12,25 +12,19 @@
 
 #include <nlohmann/json.hpp>
 
+#include "tokenizer/model.h"
+
 namespace xs::tok {
 
-class BpeModel {
+class BpeModel final : public Model {
 public:
-    explicit BpeModel(const nlohmann::json& config);
-    BpeModel(const BpeModel&) = delete;
-    BpeModel& operator=(const BpeModel&) = delete;
+    // `byte_level`: pieces are raw bytes to map through the byte-level alphabet (a ByteLevel pre-tokenizer).
+    BpeModel(const nlohmann::json& config, bool byte_level);
 
-    // From now on, pieces are raw bytes to map through the byte-level alphabet (a ByteLevel pre-tokenizer).
-    void use_byte_level_alphabet();
-
-    // Appends the ids of one pre-tokenized piece to `out`.
-    void tokenize(std::string_view piece, std::vector<int32_t>& out) const;
-
-    std::optional<int32_t> id(std::string_view piece) const;
-    // The piece of `id`, or nullopt for an id with no vocab entry.
-    std::optional<std::string_view> piece(int32_t id) const;
-    // One past the largest vocab id.
-    int32_t id_limit() const { return static_cast<int32_t>(pieces_.size()); }
+    void tokenize(std::string_view piece, std::vector<int32_t>& out) const override;
+    std::optional<int32_t> id(std::string_view piece) const override { return vocab_.id(piece); }
+    std::optional<std::string_view> piece(int32_t id) const override { return vocab_.piece(id); }
+    int32_t id_limit() const override { return vocab_.id_limit(); }
 
 private:
     struct Merge {
@@ -44,7 +38,7 @@ private:
         bool merged_away;
     };
 
-    void load_vocab(const nlohmann::json& vocab);
+    void use_byte_level_alphabet();
     void load_merges(const nlohmann::json& merges);
     void add_merge(std::string_view left, std::string_view right, int32_t rank);
     bool has_byte_tokens(std::string_view ch) const;
@@ -52,9 +46,7 @@ private:
     void merge_all(std::vector<Symbol>& symbols) const;
     const Merge* find_merge(int32_t left, int32_t right) const;
 
-    std::vector<char> storage_;  // all vocab pieces, back to back; views below point into it
-    std::vector<std::optional<std::string_view>> pieces_;
-    std::unordered_map<std::string_view, int32_t> ids_;
+    Vocab vocab_;
     std::unordered_map<uint64_t, Merge> merges_;  // key: left id << 32 | right id
     std::array<int32_t, 256> byte_ids_{};          // "<0xXX>" ids for byte fallback; -1 when absent
     std::array<int32_t, 256> byte_level_ids_{};    // ids of the byte-level characters
