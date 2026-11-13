@@ -201,6 +201,8 @@ constexpr int64_t kScoreCacheBytes = int64_t{4} << 20;
 // GEMV's grows with them (Arc Pro B60, Qwen3.8-27B q4 decode steps of 1 to 6 tokens: 44.7, 48.0, 52.4, 62.0, 68.5,
 // 78.1 ms; with it from 4 rows 56.0, 56.5, 56.8).
 constexpr int64_t kXmxGemvRows = 4;
+// The same for the GGUF block formats (gemv_block_xmx), whose GEMV costs more with every row than the q4 one.
+constexpr int64_t kXmxBlockRows = 2;
 
 // How quantized matmuls run (the GEMV option: auto, vector = the GEMV only, xmx = its matrix-engine version from one
 // row, where it fits; few_rows: the most rows quant_gemm takes, the device's own choice when negative).
@@ -210,7 +212,10 @@ sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::Attent
     p.f32 = precision == DType::F32;
     p.block_float = block_float;
     p.compute_units = attention.compute_units;
-    if (attention.xmx && !p.f32 && gemv != "vector") p.xmx_gemv_rows = gemv == "xmx" ? 1 : kXmxGemvRows;
+    if (attention.xmx && !p.f32 && gemv != "vector") {
+        p.xmx_gemv_rows = gemv == "xmx" ? 1 : kXmxGemvRows;
+        p.xmx_block_rows = gemv == "xmx" ? 1 : kXmxBlockRows;
+    }
     if (attention.xmx) {
         p.few_rows = few_rows >= 0 ? few_rows : sycl_be::kQuantGemmMaxRows;
         if (integrated_gpu(d)) p.tiled_rows = kTiledMaxRows;

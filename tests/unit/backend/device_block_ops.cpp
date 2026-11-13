@@ -1,7 +1,8 @@
 // The GPU backend with weights in GGUF block formats: MatMul at every row count the GEMV's variants take and past
 // them (the weight written out for a GEMM), a residual folded into that GEMM, and Gather, against fp64 over the values
 // the host decodes (quant/block_decode.h). Blocks are random bytes, so every code and scale field takes every value.
-// The reference option block=f16 (weights decoded as they are uploaded) is held to the same values.
+// The reference option block=f16 (weights decoded as they are uploaded) is held to the same values, and so are both
+// GEMVs at every row count they take (gemv=vector, gemv=xmx).
 
 #include <doctest/doctest.h>
 
@@ -32,10 +33,23 @@ std::vector<uint8_t> blocks(BlockFormat f, const Dims& shape, uint32_t seed) {
     return test::random_blocks(f, numel(shape) / block_layout(f).weights, seed);
 }
 
-// The formats the backend reads through a pack's q8 / q4 kernels, whose matrix-engine GEMV (from four rows) reads x
-// in f16.
+// The formats the backend reads through a pack's q8 / q4 kernels.
 bool pack_kernels(BlockFormat f) {
     return f == BlockFormat::Q4_0 || f == BlockFormat::Q4_1 || f == BlockFormat::Q8_0;
+}
+
+// How the weights are uploaded (block=auto: as stored, f16: decoded) and which GEMV reads up to 8 rows.
+struct Mode {
+    std::string block;
+    std::string gemv;
+};
+
+// From how many rows a matmul reads x in f16 (the matrix-engine GEMVs: a pack's from four rows, the block formats'
+// from two, both from one with gemv=xmx; and past 8 rows, the GEMM).
+int64_t f16_x_from(BlockFormat f, const Mode& mode) {
+    if (mode.gemv == "vector") return 9;
+    if (mode.gemv == "xmx") return 1;
+    return pack_kernels(f) ? 4 : 2;
 }
 
 double max_abs(const Tensor64& t) {
@@ -61,26 +75,29 @@ TEST_SUITE("device ops") {
                 w.add_block("table", f, {21, k}, blocks(f, {21, k}, 12));
                 const Tensor64 w64 = to_f64(w.tensor("w"));
                 const double w_max = max_abs(w64);
-                for (const char* mode : {"auto", "f16"}) {
-                    CAPTURE(mode);
+                for (const Mode& mode : {Mode{"auto", "auto"}, Mode{"f16", "auto"}, Mode{"auto", "vector"},
+                                         Mode{"auto", "xmx"}}) {
+                    CAPTURE(mode.block);
+                    CAPTURE(mode.gemv);
                     SessionOptions o = dev::options();
-                    o.extra["block"] = mode;
+                    o.extra["block"] = mode.block;
+                    o.extra["gemv"] = mode.gemv;
                     for (const int64_t m : {1, 2, 3, 5, 8, 12, 70}) {
                         CAPTURE(m);
                         const HostTensor x = rng.uniform(DType::F32, {m, k});
                         Graph g;
                         g.output("out", g.matmul(g.input("x", DType::F32, {m, k}), g.weight(w, "w")));
                         const TensorMap out = dev::run(g, w, {{"x", x}}, o);
-                        // up to 8 rows the GEMV reads the exact values; past them (and with block=f16) the weight is
-                        // rounded to the session's precision first
-                        const bool exact = m <= (pack_kernels(f) ? 3 : 8) && std::string(mode) == "auto";
+                        // the GEMV reads the exact values and x in f32; with block=f16 the weight is rounded to the
+                        // session's precision first
+                        const bool exact = m < f16_x_from(f, mode) && mode.block == "auto";
                         const double scale = w_max * std::sqrt(static_cast<double>(k));
                         const dev::Tolerance tol = exact ? dev::Tolerance{2e-5 * scale, 2e-5}
                                                          : dev::tolerance({2e-5 * scale, 2e-5}, {3e-3 * scale, 3e-3});
                         CHECK(dev::close(str_cat("matmul ", block_format_name(f)), out.at("out"),
                                          test::ref::matmul(to_f64(x), w64), tol));
                     }
-                    {
+                    if (mode.gemv == "auto") {
                         const std::vector<int32_t> ids{20, 0, 7, 7, 13};
                         Graph g;
                         g.output("rows", g.gather(g.weight(w, "table"), g.input("ids", DType::I32, {5})));
@@ -92,7 +109,7 @@ TEST_SUITE("device ops") {
                             for (int64_t c = 0; c < k; ++c)
                                 want.data.push_back(table.data<float>()[id * k + c]);
                         }
-                        const bool exact = std::string(mode) == "auto";
+                        const bool exact = mode.block == "auto";
                         CHECK(dev::close(str_cat("gather ", block_format_name(f)), out.at("rows"), want,
                                          exact ? dev::Tolerance{0, 2e-6} : dev::tolerance({0, 2e-6}, {0, 1e-3})));
                     }

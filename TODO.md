@@ -289,8 +289,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] GGUF: more architectures (`qwen35moe`, Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
 - [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
 - [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)
-- [ ] GGUF: a matrix-engine GEMV over block formats (a speculative verify of several rows runs at a third of a
-      pack's speed), and the 9 to 64 row kernel
+- [x] GGUF: a matrix-engine GEMV over block formats (`gemv_block_xmx`, from 2 rows: a speculative verify)
+- [ ] GGUF: the 9 to 64 row kernel over block formats (past 8 rows the weight is dequantized for a GEMM)
 - [ ] GGUF: Q4_0 at its file's size (its q4 form stores a bias per group it does not need)
 - [ ] GGUF: `serve <file.gguf>` (an import into a cache), split files
 - [ ] GGUF: the tiled value-head order inside GatedDelta (four small transposes per linear layer now: 1 % of a

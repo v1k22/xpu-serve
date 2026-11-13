@@ -17,6 +17,7 @@
 // taking a run of the work-groups: a launch alone costs as much as streaming about a megabyte.
 
 #include "backend/sycl/sycl_kernels.h"
+#include "backend/sycl/sycl_xmx.h"
 #include "util/error.h"
 
 #include <algorithm>
@@ -32,45 +33,7 @@ namespace {
 namespace syclex = sycl::ext::oneapi::experimental;
 namespace intelex = sycl::ext::intel::experimental;
 
-typedef float float8_v __attribute__((ext_vector_type(8)));
 typedef float float8_u __attribute__((ext_vector_type(8), aligned(4)));  // in memory, at any float's address
-typedef short short8_v __attribute__((ext_vector_type(8)));
-typedef int int8_v __attribute__((ext_vector_type(8)));
-typedef int int2_v __attribute__((ext_vector_type(2)));
-typedef unsigned short ushort8_v __attribute__((ext_vector_type(8)));
-typedef unsigned short ushort32_v __attribute__((ext_vector_type(32)));
-
-}  // namespace
-}  // namespace xs::sycl_be
-
-#ifdef __SYCL_DEVICE_ONLY__
-// acc + A (8 x 16 f16: lane l holds column l of each row) * B (16 x 16 f16: lane l holds column l, K in pairs).
-SYCL_EXTERNAL extern "C" xs::sycl_be::float8_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(
-    xs::sycl_be::float8_v acc, xs::sycl_be::short8_v a, xs::sycl_be::int8_v b);
-// An 8 x 16 tile of 16-bit elements at (coord.x, coord.y) of a surface (width and pitch in bytes, minus one), in the
-// DPAS A layout; elements past the surface read as zero.
-SYCL_EXTERNAL extern "C" xs::sycl_be::ushort8_v __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(
-    long base, int width_minus_one, int height_minus_one, int pitch_minus_one, xs::sycl_be::int2_v coord);
-// The same for 32 rows: four 8 x 16 tiles, rows 8 j .. 8 j + 7 in elements 8 j .. 8 j + 7.
-SYCL_EXTERNAL extern "C" xs::sycl_be::ushort32_v __builtin_IB_subgroup_block_read_flat_u16_m32k16v1(
-    long base, int width_minus_one, int height_minus_one, int pitch_minus_one, xs::sycl_be::int2_v coord);
-#else
-inline xs::sycl_be::float8_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(xs::sycl_be::float8_v acc,
-                                                                          xs::sycl_be::short8_v, xs::sycl_be::int8_v) {
-    return acc;
-}
-inline xs::sycl_be::ushort8_v __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(long, int, int, int,
-                                                                                xs::sycl_be::int2_v) {
-    return {};
-}
-inline xs::sycl_be::ushort32_v __builtin_IB_subgroup_block_read_flat_u16_m32k16v1(long, int, int, int,
-                                                                                  xs::sycl_be::int2_v) {
-    return {};
-}
-#endif
-
-namespace xs::sycl_be {
-namespace {
 
 constexpr int kSg = 16;
 constexpr int kTm = 8;    // rows of x per tile
@@ -83,8 +46,6 @@ int64_t ceil_div(int64_t a, int64_t b) {
 inline int pack_half2(half lo, half hi) {
     return static_cast<int>(sycl::bit_cast<uint32_t>(sycl::vec<half, 2>(lo, hi)));
 }
-
-typedef _Float16 h2_v __attribute__((ext_vector_type(2)));
 
 // q8 codes to f16 two at a time: a code c < 1024 OR'ed under the exponent of 1024 (0x6400) is exactly the f16
 // 1024 + c, so one packed subtract recovers it and one packed multiply scales it: a few 32-bit operations per pair
@@ -317,7 +278,7 @@ void quant_gemm_q(sycl::queue& q, const half* x, const GemmParts<Y>& parts, int6
 // (one 2D block load, rows past M read as zero) is the A operand, and the codes become the B operand as f16
 // 1 + q / 1024: a byte holds two codes, and byte * 0x1001 puts them 16 bits apart. The group's scale and bias then
 // apply to its sums: with d = x . (1 + q / 1024) and s = sum(x), x . (q scale + bias) = 1024 scale d + (bias - 1024
-// scale) s. x in f16 and s per group come from one small launch before (gemv_xmx_prep), shared by the weights that
+// scale) s. x in f16 and s per group come from one small launch before (xmx_prep), shared by the weights that
 // read the same x: converting x and summing it (a DPAS by ones) in every sub-group was a third of the kernel's
 // arithmetic, and the f32 x twice the bytes a sub-group reads beside the weight. Dequantizing every code first cost
 // a fifth more time; the weight as the A operand (lanes along K, as the GEMV reads it) reloaded x per DPAS and ran
@@ -334,10 +295,19 @@ struct XmxParts {  // the weights of one launch, each one's x (f16 [M, K]) and g
     int count = 0;
 };
 
-// x [M, K] f32 (times the weight's AWQ input scales) to f16, and per group of `group` columns the sum of each row's
-// f16 values: xs [K / group][8], zero in the rows past M.
-void gemv_xmx_prep(sycl::queue& q, const float* x, const float* in_scales, half* xh, float* xs, int64_t m, int64_t k,
-                   int group) {
+}  // namespace
+
+size_t xmx_x_bytes(int64_t m, int64_t k) {
+    return (static_cast<size_t>(m * k) * sizeof(half) + 63) / 64 * 64;
+}
+
+size_t xmx_prep_bytes(int64_t m, int64_t k, int group) {
+    return xmx_x_bytes(m, k) + (static_cast<size_t>(k / group * kTm) * sizeof(float) + 63) / 64 * 64;
+}
+
+void xmx_prep(sycl::queue& q, const float* x, const float* in_scales, void* out, int64_t m, int64_t k, int group) {
+    auto* xh = static_cast<half*>(out);
+    auto* xs = reinterpret_cast<float*>(static_cast<char*>(out) + xmx_x_bytes(m, k));
     // a work-item per group and row: the launch is over in a few microseconds, and a verify step runs hundreds
     syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(k / group), kTm), [=](sycl::item<2> it) {
         const auto g = static_cast<int64_t>(it[0]);
@@ -359,6 +329,9 @@ void gemv_xmx_prep(sycl::queue& q, const float* x, const float* in_scales, half*
         xs[g * kTm + r] = sum;
     });
 }
+
+
+namespace {
 
 template <int G>
 struct GemvXmxKernel {
@@ -739,19 +712,8 @@ bool gemv_quant_xmx_fits(const QuantGemvPart* parts, int count, int64_t k) {
     return true;
 }
 
-namespace {
-
-// One prepared x (f16 [M, K], then its group sums) in the scratch: all the parts share it, unless they carry AWQ
-// input scales, which make each part's x its own.
-size_t xmx_x_bytes(int64_t m, int64_t k) {
-    return (static_cast<size_t>(m * k) * sizeof(half) + 63) / 64 * 64;
-}
-size_t xmx_prep_bytes(int64_t m, int64_t k, int group) {
-    return xmx_x_bytes(m, k) + (static_cast<size_t>(k / group * kTm) * sizeof(float) + 63) / 64 * 64;
-}
-
-}  // namespace
-
+// One prepared x per launch: all the parts share it, unless they carry AWQ input scales, which make each part's x its
+// own.
 size_t gemv_quant_xmx_scratch(const QuantGemvPart* parts, int count, int64_t m, int64_t k) {
     return (parts[0].w.input_scales != nullptr ? count : 1) * xmx_prep_bytes(m, k, parts[0].w.group);
 }
@@ -768,11 +730,10 @@ void gemv_quant_xmx(sycl::queue& q, const float* x, const QuantGemvPart* parts, 
         p.y[j] = parts[j].y;
         p.n[j] = parts[j].n;
         if (j == 0 || parts[j].w.input_scales != nullptr) {
-            auto* xh = reinterpret_cast<half*>(static_cast<char*>(scratch) + j * xmx_prep_bytes(m, k, group));
-            auto* xs = reinterpret_cast<float*>(reinterpret_cast<char*>(xh) + xmx_x_bytes(m, k));
-            gemv_xmx_prep(q, x, parts[j].w.input_scales, xh, xs, m, k, group);
-            p.xh[j] = xh;
-            p.xs[j] = xs;
+            char* prep = static_cast<char*>(scratch) + j * xmx_prep_bytes(m, k, group);
+            xmx_prep(q, x, parts[j].w.input_scales, prep, m, k, group);
+            p.xh[j] = reinterpret_cast<const half*>(prep);
+            p.xs[j] = reinterpret_cast<const float*>(prep + xmx_x_bytes(m, k));
         } else {
             p.xh[j] = p.xh[0];
             p.xs[j] = p.xs[0];

@@ -6,6 +6,7 @@
 
 #include <oneapi/mkl/blas.hpp>
 
+#include "backend/sycl/sycl_block_kernels.h"
 #include "util/error.h"
 
 namespace xs::sycl_be {
@@ -120,7 +121,12 @@ bool xmx_gemv(int64_t m, const QuantGemvPart* parts, int count, int64_t k, const
 }
 
 QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const QuantMatmulPlan& plan) {
-    if (w.block != nullptr) return m <= kGemvMaxRows ? QuantPath::Gemv : QuantPath::Dequant;
+    if (w.block != nullptr) {
+        if (m > kGemvMaxRows) return QuantPath::Dequant;
+        const bool xmx = !plan.f32 && plan.xmx_block_rows > 0 && m >= plan.xmx_block_rows &&
+                         gemv_block_xmx_fits(*w.block, k);
+        return xmx ? QuantPath::GemvXmx : QuantPath::Gemv;
+    }
     if (m <= kGemvMaxRows) {
         const QuantGemvPart part{w, nullptr, n};
         return xmx_gemv(m, &part, 1, k, plan) ? QuantPath::GemvXmx : QuantPath::Gemv;
@@ -142,7 +148,10 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeigh
     XS_CHECK(!add || !kHalfY, "sycl matmul_quant: adding into an f16 y");
     if (gemv) {
         if constexpr (!kHalfX && !kHalfY) {
-            if (path == QuantPath::GemvXmx) {
+            if (path == QuantPath::GemvXmx && w.block != nullptr) {
+                gemv_block_xmx(q, x, *w.block, y, m, n, k, plan.compute_units,
+                               scratch.get(gemv_block_xmx_scratch(m, k)));
+            } else if (path == QuantPath::GemvXmx) {
                 const QuantGemvPart part{w, y, n};
                 gemv_quant_xmx(q, x, &part, 1, m, k, plan.compute_units,
                                scratch.get(gemv_quant_xmx_scratch(&part, 1, m, k)));

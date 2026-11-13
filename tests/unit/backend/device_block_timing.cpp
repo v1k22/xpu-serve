@@ -3,7 +3,8 @@
 // decode step's speed follows) and as bytes of the weight streamed per second.
 // Opt-in: XS_DEVICE_BENCH=1. XS_BENCH_BLOCK lists formats by GGUF name (default: every format the kernels read, and
 // q4, q8), XS_BENCH_HIDDEN and XS_BENCH_INTER are the two sides of the matmuls (default 2560 and 9216),
-// XS_BENCH_ROWS the row counts (default 1,4,8), XS_BENCH_PAIRS the chain's length in up / down pairs (default 8).
+// XS_BENCH_ROWS the row counts (default 1,4,8), XS_BENCH_PAIRS the chain's length in up / down pairs (default 8),
+// XS_BENCH_OPTS backend options as key=value,... (e.g. gemv=vector).
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -92,7 +93,13 @@ TEST_SUITE("device timing" * doctest::skip(!dev::enabled())) {
                              g.weight(w, "down" + std::to_string(i)));
             }
             g.output("out", h);
-            const auto session = dev::backend().compile(g, w, dev::options());
+            SessionOptions options = dev::options();
+            for (const std::string& item : list_of(env("XS_BENCH_OPTS", ""))) {
+                const size_t eq = item.find('=');
+                REQUIRE(eq != std::string::npos);
+                options.extra[item.substr(0, eq)] = item.substr(eq + 1);
+            }
+            const auto session = dev::backend().compile(g, w, options);
             std::string line = str_cat("device-timing ", name, " matmul chain ", hidden, " x ", inter, " (",
                                        weights / 1e6, " M weights, ", bytes / 1e6, " MB, ", 8 * bytes / weights,
                                        " bits a weight) on ", dev::device(), ":");
