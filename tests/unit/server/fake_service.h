@@ -31,6 +31,7 @@ public:
         for (int32_t id : ids) out.push_back(char(id));
         return out;
     }
+    std::vector<int32_t> with_special_tokens(std::vector<int32_t> ids) const override { return ids; }
     int32_t vocab_size() const override { return 256; }
     std::string token_text(int32_t id) const override { return std::string(1, char(id)); }
     std::optional<int32_t> token_id(std::string_view piece) const override {

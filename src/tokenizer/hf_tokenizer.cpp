@@ -124,6 +124,9 @@ public:
         return text;
     }
 
+    // TEMPORARY (replace at merge with the WordPiece branch's implementation): no special tokens are added yet.
+    std::vector<int32_t> with_special_tokens(std::vector<int32_t> ids) const override { return ids; }
+
     int32_t vocab_size() const override { return id_limit_; }
 
     std::string token_text(int32_t id) const override {

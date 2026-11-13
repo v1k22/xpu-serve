@@ -27,6 +27,9 @@ public:
     virtual std::vector<int32_t> encode(std::string_view text, bool parse_special = true) const = 0;
     // Decodes ids to UTF-8 (invalid byte sequences become U+FFFD). skip_special drops special tokens.
     virtual std::string decode(std::span<const int32_t> ids, bool skip_special = false) const = 0;
+    // The ids with the special tokens tokenizer.json's post-processor puts around one sequence (TemplateProcessing's
+    // `single` template, e.g. [CLS] ... [SEP]); unchanged when the post-processor adds none.
+    virtual std::vector<int32_t> with_special_tokens(std::vector<int32_t> ids) const = 0;
 
     virtual int32_t vocab_size() const = 0;
     virtual std::string token_text(int32_t id) const = 0;               // the vocab piece, verbatim
