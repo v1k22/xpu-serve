@@ -1,8 +1,9 @@
 #pragma once
 
-// The decision runtime: one decision model on one device. It holds the checkpoint's tokenizer and chat template (what
-// the model writes its prompt with), compiles the model's programs into one session and runs a request's steps as the
-// model asks for them. Requests run one at a time.
+// The decision runtime: one decision model on one device. It holds the checkpoint's tokenizer and, when the model
+// asks for it, its chat template (what the model writes its prompt with; in the folder the model's spec names),
+// compiles the model's programs into one session and runs a request's steps as the model asks for them. Requests run
+// one at a time.
 
 #include <cstdint>
 #include <filesystem>
@@ -67,7 +68,7 @@ private:
     std::vector<size_t> writers_;  // the programs that write state: what a step's `keep` cuts back
 };
 
-// A small request of every question type: for warm-up and timing.
+// A small request of every question type, which every model takes (each option described): for warm-up and timing.
 DecisionRequest sample_decision_request();
 
 }  // namespace xs

@@ -129,7 +129,7 @@ area).
 | `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming; the policy API; the System One API (`decision_handlers`); the embeddings API (`embedding_handlers`) |
 | `service/` | xs_service | `EngineService`: loads tokenizer + template + model, compiles on a backend, owns the engine thread |
 | `policy/` | xs_policy | `PolicyRunner`: a policy, its tokenizer and one compiled program per call shape; warm-up; per-call timings (`xpu-serve bench <policy-dir>`) |
-| `decision/` | xs_decision | `DecisionRunner`: a decision model, its tokenizer and chat template (`PromptTools`), its programs in one session, a request's steps run as the model names them; `answers` (probabilities -> choice, score, confidence); `DecisionService` (one device thread, requests in arrival order) |
+| `decision/` | xs_decision | `DecisionRunner`: a decision model, its tokenizer and chat template (`PromptTools`; from the folder the model names, the template only when it asks for one), its programs in one session, a request's steps run as the model names them; `answers` (probabilities -> choice, score, confidence); `DecisionService` (one device thread, requests in arrival order) |
 | `embedding/` | xs_embedding | `EmbeddingRunner`: an embedding model and its one stateless session, a run per token sequence, timings; `pooling` (mean or CLS, then the L2 norm, on the host); `EmbeddingService` (the tokenizer for text, one device thread) |
 | `cli/` | (exe) | `main.cpp` (commands serve, run, bench, convert, info), `args` (flag parser) |
 
