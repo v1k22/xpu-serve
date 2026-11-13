@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +20,8 @@
 #include "convert/gguf/gguf_import.h"
 #include "decision/runner.h"
 #include "decision/service.h"
+#include "embedding/runner.h"
+#include "embedding/service.h"
 #include "io/gguf.h"
 #include "models/letter_readout/letter_readout.h"
 #include "models/policy.h"
@@ -42,9 +45,12 @@ const char* kUsage =
     "xpu-serve " XS_VERSION " - LLM serving on Intel GPUs\n"
     "\n"
     "usage:\n"
-    "  xpu-serve serve <model-dir> [options]   OpenAI-compatible server (a decision model: the System One API)\n"
-    "  xpu-serve run   <model-dir> [options]   chat in the terminal (--prompt for one shot)\n"
-    "  xpu-serve bench <model-dir> [options]   prefill / decode speed, or a decision model's latency\n"
+    "  xpu-serve serve <model-dir> [options]   OpenAI-compatible server (a decision model: the System One API; an\n"
+    "                                          embedding model: /v1/embeddings)\n"
+    "  xpu-serve run   <model-dir> [options]   chat in the terminal (--prompt for one shot; an embedding model: the\n"
+    "                                          embedding of --prompt)\n"
+    "  xpu-serve bench <model-dir> [options]   prefill / decode speed, a decision model's latency, or an embedding\n"
+    "                                          model's latency and throughput\n"
     "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--method rtn|awq]   quantized pack\n"
     "  xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>]   a GGUF file as a pack, its tensors as the file\n"
     "                                          stores them (--mtp: its MTP head from a file of its own)\n"
@@ -177,6 +183,25 @@ DecisionRunnerOptions decision_options(const ServiceOptions& so) {
     o.model_id = so.model_id;
     if (!so.spec.empty()) fail("--spec is for language models: a decision model generates no text");
     return o;
+}
+
+// The runtime of an embedding model; --ctx can lower its longest input.
+EmbeddingRunnerOptions embedding_options(const Args& a, const ServiceOptions& so) {
+    if (!so.spec.empty()) fail("--spec is for language models: an embedding model generates no text");
+    if (a.has("readout")) fail("--readout reads a language model as a decision model, not an embedding model");
+    EmbeddingRunnerOptions o;
+    o.backend = so.backend;
+    o.session = so.session;
+    o.session.max_context = so.engine.max_context;
+    o.model_id = so.model_id;
+    return o;
+}
+
+// Flags of other kinds of model, refused by name rather than ignored.
+void refuse_flags(const Args& a, std::initializer_list<const char*> flags, const char* kind) {
+    for (const char* flag : flags) {
+        if (a.has(flag)) fail("--", flag, " does not apply to ", kind);
+    }
 }
 
 std::string model_dir_arg(const Args& a, const char* command) {
@@ -355,6 +380,14 @@ int cmd_serve(const std::vector<std::string>& argv) {
         srv.run();
         return 0;
     }
+    if (model_kind(dir) == ModelKind::Embedding) {  // the embeddings API
+        auto embeddings = EmbeddingService::create(tok::Tokenizer::load(dir),
+                                                   EmbeddingRunner::create(dir, embedding_options(a, so)));
+        server::Server srv(*embeddings, opts);
+        log::info("serving embedding model ", embeddings->spec().id, " on http://", opts.host, ":", opts.port);
+        srv.run();
+        return 0;
+    }
     if (decides(a, dir)) {  // the System One API
         auto decisions = DecisionService::create(decision_runner(a, dir, decision_options(so)));
         server::Server srv(*decisions, opts);
@@ -471,10 +504,32 @@ int run_decision(const Args& a, const std::string& dir) {
     return 0;
 }
 
+// One text through an embedding model: the embedding on stdout as a JSON array; its size, norm, tokens and time on
+// stderr.
+int run_embedding(const Args& a, const std::string& dir) {
+    refuse_flags(a, {"image", "request", "system", "raw", "think", "max-tokens", "temperature", "top-k", "top-p", "seed"},
+                 "an embedding model");
+    XS_CHECK(a.has("prompt"), "an embedding model embeds a text: --prompt \"...\"");
+    const auto tokenizer = tok::Tokenizer::load(dir);
+    const std::vector<int32_t> ids = embedding_tokens(*tokenizer, a.get("prompt"));
+    auto runner = EmbeddingRunner::create(dir, embedding_options(a, service_options(a)));
+    if (const auto problem = sequence_problem(runner->spec(), ids)) fail("--prompt has ", *problem);
+    const EmbeddingResult r = runner->embed({ids});
+    const std::vector<float>& e = r.embeddings[0];
+    std::printf("%s\n", nlohmann::json(e).dump().c_str());
+    std::fflush(stdout);
+    double norm = 0;
+    for (const float v : e)
+        norm += static_cast<double>(v) * v;
+    std::fprintf(stderr, "[%zu values, norm %.4f, %lld tokens, %.1f ms (device %.1f)]\n", e.size(), std::sqrt(norm),
+                 static_cast<long long>(r.tokens), r.timing.total_ms, r.timing.device_ms);
+    return 0;
+}
+
 int cmd_run(const std::vector<std::string>& argv) {
     Args a;
     add_engine_options(a);
-    a.value("prompt", "one-shot prompt (default: interactive chat on stdin)")
+    a.value("prompt", "one-shot prompt (default: interactive chat on stdin); an embedding model: the text to embed")
         .value("system", "system prompt")
         .value("max-tokens", "maximum new tokens per turn", "1024")
         .value("temperature", "sampling temperature (default: the model's)")
@@ -490,6 +545,7 @@ int cmd_run(const std::vector<std::string>& argv) {
     a.parse(argv);
     if (wants_help(a, "run", "<model-dir> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
+    if (model_kind(model_dir_arg(a, "run")) == ModelKind::Embedding) return run_embedding(a, model_dir_arg(a, "run"));
     if (decides(a, model_dir_arg(a, "run"))) return run_decision(a, model_dir_arg(a, "run"));
     auto service = EngineService::create(model_dir_arg(a, "run"), service_options(a));
     const SamplingParams sampling = sampling_from(a, service->model().default_sampling);
@@ -655,6 +711,68 @@ int bench_decision(const Args& a, const std::string& dir) {
     return 0;
 }
 
+// Speed of an embedding model: the latency of one text a request at a few lengths up to the model's limit (median
+// and 90th percentile after untimed runs), then the throughput of a request of --batch texts. A text of n tokens is
+// filler text's tokens cut to n less the special tokens, inside them.
+int bench_embedding(const Args& a, const std::string& dir) {
+    refuse_flags(a, {"prompt-tokens", "gen-tokens", "prompts", "cameras", "steps", "request", "state-tokens"},
+                 "an embedding model");
+    const ServiceOptions so = service_options(a);
+    const auto tokenizer = tok::Tokenizer::load(dir);
+    auto runner = EmbeddingRunner::create(dir, embedding_options(a, so));
+    const EmbeddingSpec& spec = runner->spec();
+    const int runs = a.has("runs") ? a.get_int("runs") : 20;
+    const int warmup = a.get_int("warmup");
+    const int batch = a.get_int("batch");
+    XS_CHECK(runs >= 1 && warmup >= 0 && batch >= 1, "--runs and --batch must be at least 1, --warmup at least 0");
+    const auto specials = static_cast<int64_t>(tokenizer->with_special_tokens({}).size());
+    std::string text;
+    std::vector<int32_t> filler;
+    while (static_cast<int64_t>(filler.size()) + specials < spec.max_tokens) {
+        text += "Embedding models turn text into vectors, so that a search can compare a query with every document. ";
+        filler = tokenizer->encode(text);
+    }
+    const auto sequence = [&](int64_t n) {
+        return tokenizer->with_special_tokens({filler.begin(), filler.begin() + (n - specials)});
+    };
+    std::vector<int64_t> lengths;
+    for (const int64_t n : {int64_t{16}, int64_t{128}, int64_t{512}, spec.max_tokens}) {
+        if (n > specials && n <= spec.max_tokens && std::find(lengths.begin(), lengths.end(), n) == lengths.end()) {
+            lengths.push_back(n);
+        }
+    }
+    std::printf("%s (%s): %lld values, %s pooling%s, up to %lld tokens; %s %s %s\n", spec.id.c_str(), spec.arch.c_str(),
+                static_cast<long long>(spec.dimension), pooling_name(spec.pooling), spec.normalize ? ", normalized" : "",
+                static_cast<long long>(spec.max_tokens), so.backend.c_str(),
+                so.session.device.empty() ? "default" : so.session.device.c_str(),
+                std::string(dtype_name(so.session.precision)).c_str());
+    std::printf("one text a request, p50 / p90 of %d runs after %d untimed:\n", runs, warmup);
+    for (const int64_t n : lengths) {
+        const std::vector<std::vector<int32_t>> one = {sequence(n)};
+        for (int i = 0; i < warmup; ++i)
+            runner->embed(one);
+        std::vector<double> total, device;
+        for (int i = 0; i < runs; ++i) {
+            const EmbeddingResult r = runner->embed(one);
+            total.push_back(r.timing.total_ms);
+            device.push_back(r.timing.device_ms);
+        }
+        std::printf("  %6lld tokens: %8.2f / %8.2f ms (device p50 %.2f) | %.0f tokens/s\n", static_cast<long long>(n),
+                    percentile(total, 0.5), percentile(total, 0.9), percentile(device, 0.5),
+                    static_cast<double>(n) * 1000.0 / percentile(total, 0.5));
+    }
+    const int64_t n = std::min<int64_t>(128, spec.max_tokens);
+    const std::vector<std::vector<int32_t>> texts(static_cast<size_t>(batch), sequence(n));
+    runner->embed(texts);
+    std::vector<double> total;
+    for (int i = 0; i < runs; ++i)
+        total.push_back(runner->embed(texts).timing.total_ms);
+    const double ms = percentile(total, 0.5);
+    std::printf("%d texts of %lld tokens a request: %.1f texts/s, %.0f tokens/s (p50 %.2f ms a request)\n", batch,
+                static_cast<long long>(n), batch * 1000.0 / ms, static_cast<double>(batch * n) * 1000.0 / ms, ms);
+    return 0;
+}
+
 // Greedy decode speed over real prompts (what speculative decoding is measured on: its acceptance depends on the text).
 int bench_prompts(EngineService& service, const std::string& path, int n_gen, int runs) {
     std::ifstream in(path);
@@ -711,10 +829,11 @@ int cmd_bench(const std::vector<std::string>& argv) {
         .value("prompts", "language models: a file of prompts, one per line, each a user message through the chat "
                "template (thinking off) generating up to --gen-tokens until the end of the turn; instead of "
                "--prompt-tokens")
-        .value("runs", "timed runs", "3")
+        .value("runs", "timed runs (embedding models: per length, 20 by default)", "3")
         .value("cameras", "policies: cameras present, the first N (default: all)", "0")
         .value("steps", "policies: flow steps (default: the checkpoint's)", "0")
-        .value("warmup", "policies: untimed runs after compiling", "3")
+        .value("warmup", "policies and embedding models: untimed runs after compiling", "3")
+        .value("batch", "embedding models: texts in the request that measures throughput", "32")
         .value("request",
                "decision models: a file holding a System One request (default: a short sample of each "
                "question type)")
@@ -728,6 +847,7 @@ int cmd_bench(const std::vector<std::string>& argv) {
     log::set_level(log::parse_level(a.get("log-level")));
     const std::string dir = model_dir_arg(a, "bench");
     if (model_kind(dir) == ModelKind::Policy) return bench_policy(a, dir);
+    if (model_kind(dir) == ModelKind::Embedding) return bench_embedding(a, dir);
     if (decides(a, dir)) return bench_decision(a, dir);
     auto service = EngineService::create(dir, service_options(a));
     const int n_gen = a.get_int("gen-tokens");

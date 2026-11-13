@@ -49,6 +49,7 @@ build/src/xpu-serve run   <hf-model-dir> --device GPU --image photo.jpg --prompt
 build/src/xpu-serve serve <hf-model-dir> --device GPU     # http://127.0.0.1:8080/v1
 build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen-tokens 128
 build/src/xpu-serve run   <decision-model-dir> --device GPU --request request.json   # a System One request's answers
+build/src/xpu-serve run   <embedding-model-dir> --device GPU --prompt "text"        # its embedding, a JSON array
 ```
 
 - icpx turns the SYCL backend on (`XS_WITH_SYCL`); `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` compiles its kernels ahead
