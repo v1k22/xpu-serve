@@ -25,7 +25,7 @@ code.
 | Qwen3.5 4B | language | f16, q8, q4, GGUF files | 43 / 77 / 101 tok/s decode (f16 / q8 / q4); q4: 149 with MTP; 5,000 tok/s prefill; its GGUF files (2 to 16 bits): 58 to 99 tok/s decode | Arc Pro B60 |
 | Qwen3.5 9B | language | f16, q8, q4 | 21 / 38 / 62 tok/s decode (f16 / q8 / q4); q4: 108 with MTP; 3,200 tok/s prefill | Arc Pro B60 |
 | Qwen3.6-35B-A3B | language, MoE | q4 | 62 tok/s decode, 94 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
-| Qwen3.8-27B | language | q4 | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
+| Qwen3.8-27B | language | q4, GGUF files | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; its GGUF files (1.8 to 6.8 bits, 6 to 23 GB): 15 to 21 tok/s decode, 25 to 47 with MTP; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
 | π0.5 | robot policy | f16, q8 | 215 / 198 ms per call (f16 / q8); 115 / 113 ms on the Arc Pro B60 | Arc B390, 3 cameras |
 | Clef-Flash | decision | f16, q8, q4 | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
@@ -340,7 +340,8 @@ Qwen3.5-4B is 57 % Q4_K, 24 % Q6_K and 18 % Q5_K, and a "dynamic" (`UD-`) file m
 
 Measured on an Arc Pro B60 with every file of
 [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) (22) and
-[unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF) (21, and its drafter files).
+[unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF) (21, and its drafter files), and the
+20 files of [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) that fit the card.
 **[docs/gguf_models.md](docs/gguf_models.md) has every file's numbers**, what each file holds, the checks behind them
 and the kernel rates; a few of them here. "Same as f16" is how many of 300 MMLU-Pro questions get the answer the
 original checkpoint gives at f16.
@@ -358,18 +359,36 @@ original checkpoint gives at f16.
 | *original, f16* | | 7.83 GiB | 44 tok/s | 300 | | 4.25 GiB | 61 tok/s | 300 |
 | *our q4 pack* | | 2.49 GiB | 109 tok/s | 194 | | 1.43 GiB | 121 tok/s | 227 |
 
+Qwen3.8-27B, whose original does not fit one card: "same as the reference" counts the answers the original gives in
+float32 on the CPU (190 of 300 of them right). MTP is greedy decode over six chat prompts with the file's MTP head at
+the best of 1 to 5 drafts a round.
+
+| Variant | File | GPU memory | Decode | With MTP | Same as the reference | MMLU-Pro right (300) |
+|---|---|---|---|---|---|---|
+| UD-Q6_K_M | 23.09 GB | 21.16 GiB | 16 tok/s | 33 tok/s | 293 | 193 |
+| UD-Q5_K_XL | 20.98 GB | 19.20 GiB | 17 tok/s | 33 tok/s | 288 | 193 |
+| UD-Q4_K_XL | 17.66 GB | 16.11 GiB | 16 tok/s | 38 tok/s | 280 | 187 |
+| Q4_0 | 16.06 GB | 16.01 GiB | 21 tok/s | 47 tok/s | 251 | 180 |
+| UD-IQ4_XS | 14.35 GB | 13.03 GiB | 15 tok/s | 41 tok/s | 259 | 187 |
+| UD-IQ3_XXS | 10.93 GB | 9.84 GiB | 18 tok/s | 37 tok/s | 236 | 182 |
+| UD-Q2_K_XL | 9.95 GB | 8.93 GiB | 18 tok/s | 39 tok/s | 219 | 171 |
+| UD-IQ2_XXS (head from `--mtp`) | 7.21 GB | 6.70 GiB | 17 tok/s | 32 tok/s | 174 | 154 |
+| *our q4 pack* | | 16.21 GiB | 22 tok/s | 51 tok/s | 245 | 185 |
+
 - **Memory is the file's.** A Qwen file takes its size on the GPU (2.74 GB is 2.55 GiB); a Gemma 4 E2B file under
   half of it, because its per-layer embedding table is read on the host.
 - **The import is exact.** Both BF16 files give the original checkpoint's answer on all 300 questions.
 - **The kernels keep the file's values.** Read by the block kernels or decoded to f16 on upload
   (`--backend-opt block=f16`), a file gives the same answer on 298 to 300 of 300.
 - **Accuracy follows the bits**, and is the file's: from 5 bits up a file answers like the original on about 9
-  questions in 10, the 4-bit K-quants on about 4 in 5, the 2-bit files on fewer than half.
+  questions in 10, the 4-bit K-quants on about 4 in 5 (Qwen3.8-27B's on 9 in 10), the 2-bit files on fewer than half
+  (Qwen3.8-27B's on about 3 in 5).
 - **Speed.** Files decode at 1.3 to 2.3 times f16's speed. No format is bound by memory at these sizes, so a smaller
   file is not a faster one; the IQ4 formats are the slowest per weight.
-- **Drafters.** Gemma's `MTP/` files import as a drafter (`--spec mtp --drafter <its dir>`): the same text, at 243
-  tok/s on the Q4_0 file (128 without) and 183 on Q4_K_M (119). A K-quant target gains less: a verify of several
-  rows has no matrix-engine kernel over block formats yet.
+- **Drafters.** A verify of several rows over a block format runs on the matrix engines (from 2 rows), so MTP pays
+  over any file: 1.65 to 2.8 times on Qwen3.8-27B's, with the greedy text unchanged. Gemma's `MTP/` files import as a
+  drafter (`--spec mtp --drafter <its dir>`): the same text, at 230 to 270 tok/s on the Q4_0 file (125 without) and
+  200 to 235 on Q4_K_M (117), from session to session.
 - **Tool calls and chat templates.** A pack renders the GGUF's own template. On the 23 tool-calling cases of
   `tests/e2e/tool_calls.py` (one turn and several, graded by a stronger model against `tool_calls_rubric.md`), the
   original checkpoint, its BF16 GGUF and its Q4_K_M GGUF score alike: Qwen3.5-4B 23 of 23 well-formed and right,

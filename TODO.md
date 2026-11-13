@@ -292,6 +292,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
 - [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)
 - [x] GGUF: a matrix-engine GEMV over block formats (`gemv_block_xmx`, from 2 rows: a speculative verify)
+- [x] GGUF: Qwen3.8-27B's files that fit a 24 GB card (20 of unsloth's), with MTP; results in docs/gguf_models.md
+- [ ] GGUF: one six-prompt bench of Qwen3.8-27B UD-Q6_K_M (1.5 GiB left beside its weights) lost the device once and
+      not in eight runs after; check what a step allocates when the card is that full
 - [ ] GGUF: the 9 to 64 row kernel over block formats (past 8 rows the weight is dequantized for a GEMM)
 - [ ] GGUF: Q4_0 at its file's size (its q4 form stores a bias per group it does not need)
 - [ ] GGUF: `serve <file.gguf>` (an import into a cache), split files
