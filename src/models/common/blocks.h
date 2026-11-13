@@ -30,10 +30,10 @@ inline Linear matmul_by(Graph& g, Value w) {
 
 // ---- Activations and MLPs
 
-enum class Act : uint8_t { Silu, GeluTanh };
+enum class Act : uint8_t { Silu, GeluTanh, Gelu };  // Gelu: the exact one (erf)
 Value activation(Graph& g, Act act, Value x);
 
-// down(act(gate(x)) * up(x)): SwiGLU with Silu, GeGLU with GeluTanh.
+// down(act(gate(x)) * up(x)): SwiGLU with Silu, GeGLU with GeluTanh or Gelu.
 Value gated_mlp(Graph& g, Value x, const Linear& gate, const Linear& up, const Linear& down, Act act);
 
 // ---- Mixture of experts
