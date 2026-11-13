@@ -14,7 +14,10 @@ which ask about the state just read (a model that keeps a state's prefix answers
 split comes from its Server-Timing header.
 --save keeps every probability of the run in the reference's format, so that a later run (other weights, another
 precision) can be compared with it through --reference: answers that changed, and how far probabilities moved.
-Exit status 1 when a response breaks the API or (with --reference) a probability is off by more than --tolerance.
+A request the model refuses (400) counts its questions as not answered; with --reference, it must be one the
+reference refused too (a case with "refused"), and the other way round.
+Exit status 1 when a response breaks the API or (with --reference) a probability is off by more than --tolerance or a
+refusal differs.
 """
 
 import argparse
@@ -22,16 +25,23 @@ import json
 import statistics
 import sys
 import time
+import urllib.error
 import urllib.request
 
 
 def post(url, body):
+    """The response's body (a refusal: {"refused": its detail}), the wall time in ms and its Server-Timing."""
     data = json.dumps(body).encode()
     request = urllib.request.Request(url + "/v1/systemone", data=data, headers={"Content-Type": "application/json"})
     start = time.perf_counter()
-    with urllib.request.urlopen(request, timeout=600) as response:
-        text = response.read()
-        timing = response.headers.get("Server-Timing", "")
+    try:
+        with urllib.request.urlopen(request, timeout=600) as response:
+            text = response.read()
+            timing = response.headers.get("Server-Timing", "")
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            raise
+        return {"refused": json.loads(e.read()).get("detail")}, (time.perf_counter() - start) * 1000, ""
     return json.loads(text), (time.perf_counter() - start) * 1000, timing
 
 
@@ -108,11 +118,23 @@ def main():
             reference = json.load(f)["cases"]
         assert len(reference) == len(data["requests"]), "the reference is for another file"
 
-    rows, broken, off, saved = [], 0, 0, []
+    rows, broken, off, saved, refused = [], 0, 0, [], 0
     for index, request in enumerate(data["requests"]):
         saved.append({"probabilities": {}})
         sends = [post(args.url, request) for _ in range(args.repeat)]
         response, first, timing = sends[0]
+        if "refused" in response:
+            refused += 1
+            saved[-1] = {"refused": response["refused"]}
+            if not args.quiet:
+                print(f"request {index}: refused: {response['refused']}")
+            if reference is not None and "refused" not in reference[index]:
+                broken += 1
+                print(f"request {index}: refused, which the reference answers")
+            continue
+        if reference is not None and "refused" in reference[index]:
+            broken += 1
+            print(f"request {index}: answered, which the reference refuses ({reference[index]['refused']})")
         again = sends[1:] or sends
         wall = statistics.median(ms for _, ms, _ in again)
         problems = [k for k in ("model", "answers", "usage") if k not in response]
@@ -157,7 +179,7 @@ def main():
         return {"p50": statistics.median(values), "p95": values[min(len(values) - 1, int(0.95 * len(values)))],
                 "min": values[0], "max": values[-1]}
 
-    summary = {"questions": len(rows), "api_problems": broken,
+    summary = {"questions": len(rows), "refused_requests": refused, "api_problems": broken,
                "latency_ms": {"new_state": spread(r["first_ms"] for r in rows), "same_state": spread(r["ms"] for r in rows),
                               "server_p50": statistics.median(r["server_ms"] for r in rows),
                               "device_p50": statistics.median(r["device_ms"] for r in rows)},
