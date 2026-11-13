@@ -164,7 +164,11 @@ struct FlashKernel {
         // Row r is token t0 + r; the tile's span of visible keys; its split's share in whole blocks.
         const int64_t last = std::min<int64_t>(a.tokens - 1, t0 + kRows - 1);
         int64_t hi = a.causal ? past + last + 1 : a.kv_len;
-        int64_t lo = a.window > 0 ? std::max<int64_t>(0, past + t0 - a.window + 1) : 0;
+        int64_t lo = 0;
+        if (a.window > 0) {
+            lo = std::max<int64_t>(0, past + t0 - a.window + 1);
+            hi = std::min<int64_t>(hi, past + last + a.window);
+        }
         if (a.block > 0) {  // the tile's rows share a block (flash_attention_fits): its keys
             lo = t0 / a.block * a.block;
             hi = lo + a.block;
@@ -226,7 +230,8 @@ struct FlashKernel {
                         if (a.softcap > 0.0f) y = cap2 * (1.0f - 2.0f / (sycl::native::exp2(2.0f * kLog2e * y) + 1.0f));
                         const int pos = pos0 + r0 + i;
                         bool ok = key_ok && r0 + i < rows_valid;
-                        ok = ok && (!a.causal || j <= pos) && (a.window <= 0 || j > pos - a.window);
+                        ok = ok && (!a.causal || j <= pos) &&
+                             (a.window <= 0 || (j > pos - a.window && j < pos + a.window));
                         y = ok ? y + bias : kNegInf;
                         x = y;
                         mb[i] = sycl::fmax(mb[i], y);
@@ -377,8 +382,7 @@ bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v)
 int64_t flash_attention_split(const AttentionShape& s, int64_t compute_units) {
     const FlashConfig c = flash_config(s.head_dim);
     const int64_t tiles = s.q_heads * ceil_div(s.tokens, int64_t{kTm} * c.mt);
-    const int64_t keys = s.block > 0 ? s.block : s.window > 0 ? std::min(s.window, s.kv_len) : s.kv_len;
-    const int64_t blocks = ceil_div(keys, c.bc);
+    const int64_t blocks = ceil_div(attention_visible_keys(s), c.bc);
     // about 2.5 sub-groups per execution unit in flight (4 threads each in the large register file)
     const int64_t want = compute_units * 5 / 2 / std::max<int64_t>(tiles, 1);
     return std::clamp<int64_t>(std::min(want, blocks / 2), 1, 64);

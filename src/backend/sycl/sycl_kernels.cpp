@@ -444,7 +444,8 @@ void attention_rows_t(sycl::queue& q, const float* qp, const KV* k, const KV* v,
             const int lane = static_cast<int>(sg.get_local_linear_id());
             const int64_t pos = n - tokens + t;
             const int64_t first = window > 0 ? std::max<int64_t>(0, pos - window + 1) : 0;
-            const int64_t visible_last = causal ? pos : n - 1;
+            const int64_t visible_last =
+                window > 0 ? std::min<int64_t>(causal ? pos : n - 1, pos + window - 1) : (causal ? pos : n - 1);
             // This work-group's share of the visible keys [first, visible_last].
             const int64_t chunk = (visible_last - first + split) / split;
             const int64_t lo = first + sp * chunk;
@@ -1821,7 +1822,10 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
         int64_t lo = 0;
         int64_t hi = keys - 1;
         if (causal) hi = std::min<int64_t>(hi, pos - k_lo);
-        if (window > 0) lo = std::max<int64_t>(lo, pos - window + 1 - k_lo);
+        if (window > 0) {
+            lo = std::max<int64_t>(lo, pos - window + 1 - k_lo);
+            hi = std::min<int64_t>(hi, pos + window - 1 - k_lo);
+        }
         const float* sr = scores + r * keys;
         CT* pr = probs + r * keys;
         const int64_t lid = static_cast<int64_t>(it.get_local_id(0));

@@ -162,6 +162,26 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
         CHECK_FALSE(attention_matches(c, {scale_of(c), c.window, 0.0, 0, true}, kAttention, 950));
     }
 
+    TEST_CASE("not causal with a window, steps longer than it: as far after a query as before, every lowering") {
+        for (const std::string& impl : dev::attention_impls()) {
+            for (const bool kv_i8 : {false, true}) {
+                AttentionCase c;
+                c.heads = 8;
+                c.kv_heads = 2;
+                c.window = 16;
+                c.causal = false;
+                c.impl = impl;
+                c.kv_i8 = kv_i8;
+                c.steps = {70, 1, 37};
+                CAPTURE(describe(c));
+                CHECK(attention_matches(c, 960));
+                test::ref::AttentionSpec one_sided{scale_of(c), c.window, 0.0, 0, false};
+                one_sided.one_sided = true;
+                CHECK_FALSE(attention_matches(c, one_sided, c.kv_i8 ? kAttentionI8 : kAttention, 960));
+            }
+        }
+    }
+
     TEST_CASE("decode over a long cache, whole and windowed (split across work-groups on SYCL)") {
         for (const int64_t window : {0, 1100}) {
             for (const std::string& impl : dev::attention_impls()) {

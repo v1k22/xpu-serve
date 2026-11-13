@@ -84,15 +84,18 @@ TEST_CASE("mixture-of-experts ops: shapes and refusals") {
     CHECK_THROWS_AS(g.expert_matmul(up, g.weight(w, "experts"), indices), xs::Error);  // inner dims 24 vs 16
 }
 
-TEST_CASE("attention that is not causal takes a window only over a step's rows and a cache") {
+TEST_CASE("attention that is not causal takes a window only over a step's rows: its own, or a cache") {
     Graph g;
     const Value q = g.input("q", DType::F32, {kT, 4, 8});
     const Value k = g.input("k", DType::F32, {kT, 1, 8});
+    const AttentionAttrs window{1.0f, 16, 0.0f, false};
     const auto [ka, va] = g.kv_cache(g.add_kv_slot(1, 8, 16, "block"), k, k);
-    CHECK(g.type(g.attention(q, ka, va, AttentionAttrs{1.0f, 16, 0.0f, false})).shape == (xs::Dims{kT, 4, 8}));
-    CHECK_THROWS_AS(g.attention(q, k, k, AttentionAttrs{1.0f, 16, 0.0f, false}), xs::Error);
+    CHECK(g.type(g.attention(q, ka, va, window)).shape == (xs::Dims{kT, 4, 8}));
+    CHECK(g.type(g.attention(q, k, k, window)).shape == (xs::Dims{kT, 4, 8}));
     const Value fixed = g.input("fixed", DType::F32, {3, 4, 8});
-    CHECK_THROWS_AS(g.attention(fixed, ka, va, AttentionAttrs{1.0f, 16, 0.0f, false}), xs::Error);
+    CHECK_THROWS_AS(g.attention(fixed, ka, va, window), xs::Error);
+    CHECK_THROWS_AS(g.attention(q, g.input("kf", DType::F32, {3, 1, 8}), g.input("vf", DType::F32, {3, 1, 8}), window),
+                    xs::Error);
 }
 
 TEST_CASE("attention within blocks takes non-causal operands of one static length, a multiple of the block") {

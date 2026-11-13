@@ -241,7 +241,8 @@ sequence. Model code builds it once at load time; a backend compiles it once.
   Clamp, RmsNorm, Softmax, TopK, ReduceSum, Reshape, Slice, Transpose, PrevRow (each row of a step replaced by the row
   before it), Rope (1-D or axial, optionally partial), KvCache, KvRead (another program's KV slot, read only),
   Attention (causal with optional window, or non-causal: every key, the keys of the query's own block of tokens, or
-  a step that sees itself whole and a window before it), CausalConv and GatedDelta (stateful, for linear attention),
+  a window as wide after each query as before it: a drafter's block over a cache, an encoder's local attention),
+  CausalConv and GatedDelta (stateful, for linear attention),
   ExpertMatMul (each token's chosen experts from a stacked `[E, N, K]` bank, for mixture of experts), SignMatMul (a
   matmul by a one-bit weight: the cheap score of every row that a shortlist starts from). The exact semantics
   are the comments in `graph.h`.

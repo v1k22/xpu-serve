@@ -4,6 +4,7 @@
 // Activations are f32; weights and the KV cache are f16 or f32 (the W / KV template parameters). Shapes follow the
 // step-graph op spec (graph/graph.h); callers have checked them.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 
@@ -144,11 +145,17 @@ struct AttentionShape {
     int64_t kv_len = 0;    // N, keys
     float scale = 1.0f;
     float softcap = 0.0f;
-    int64_t window = 0;
+    int64_t window = 0;  // > 0: keys within window - 1 of the query, before it (and after it when not causal)
     bool causal = true;
     const float* key_bias = nullptr;  // [N], added to key j's scores (non-causal only); null: none
     int64_t block = 0;                // > 0: queries see the keys of their own run of `block` tokens (T == N)
 };
+// The most keys one query sees.
+inline int64_t attention_visible_keys(const AttentionShape& s) {
+    if (s.block > 0) return s.block;
+    if (s.window <= 0) return s.kv_len;
+    return std::min(s.causal ? s.window : 2 * s.window - 1, s.kv_len);
+}
 // The per-row kernels cover these head dims; others take the GEMM path.
 inline bool attention_rows_head_dim(int64_t d) {
     return d == 16 || d == 32 || d == 64 || d == 128 || d == 192 || d == 256 || d == 512;

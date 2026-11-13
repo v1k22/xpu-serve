@@ -152,9 +152,10 @@ struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op'
 // Not causal (encoders, policy prefixes): every key is visible to every query; q may have a static length and k, v
 // any length N (e.g. kT for self-attention over the step's own tokens). The optional key_bias [N] is added to every
 // query's score of key j (0 keeps it, -inf masks it: prompt padding).
-// Not causal with a sliding_window (a block drafter: its block sees itself whole, and the window of the cache before
-// it): q is [T, ...], k and v are KvCache outputs and positions are the causal ones; key j is visible to query i iff
-// p_i - j < sliding_window, with T <= sliding_window.
+// Not causal with a sliding_window: q is [T, ...], k and v are KvCache outputs [L, ...] or the step's own [T, ...],
+// positions are the causal ones, and key j is visible to query i iff |p_i - j| < sliding_window: the window reaches as
+// far after a query as before it. A block drafter's block sees itself whole and the window of the cache before it
+// (T <= sliding_window); an encoder's local attention sees the keys within sliding_window - 1 of it (ModernBERT).
 // Not causal with a block (an encoder over several images at once): q, k and v have one static length, a multiple of
 // `block`, and key j is visible to query i iff both fall in the same run of `block` tokens.
 // scores = scale * q.k (f32); if softcap > 0: scores = softcap * tanh(scores / softcap); softmax in f32.

@@ -278,8 +278,9 @@ struct AttentionSpec {
     int64_t sliding_window = 0;
     double softcap = 0.0;
     int64_t window_slack = 0;  // planted-bug control: > 0 lets queries see that many keys beyond the window
-    bool causal = true;        // false: keys after a query are visible too (every key, without a window)
+    bool causal = true;        // false: keys after a query are visible too (within the window, when there is one)
     std::vector<double> key_bias;  // empty, or one per key: added to every query's score of that key
+    bool one_sided = false;        // planted-bug control: a non-causal window that leaves every key after a query
 };
 
 // Builds the full [T, L] mask and score matrix per head, then a max-subtracted softmax.
@@ -293,8 +294,10 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
             const int64_t p = l_len - t_len + i;
             std::vector<double> scores(static_cast<size_t>(l_len), -std::numeric_limits<double>::infinity());
             for (int64_t j = 0; j < l_len; ++j) {
-                const bool visible = (!spec.causal || j <= p) &&
-                                     (spec.sliding_window == 0 || p - j < spec.sliding_window + spec.window_slack);
+                const int64_t reach = spec.sliding_window + spec.window_slack;
+                const bool visible =
+                    (!spec.causal || j <= p) &&
+                    (spec.sliding_window == 0 || (p - j < reach && (spec.causal || spec.one_sided || j - p < reach)));
                 if (!visible) continue;
                 double s = 0;
                 for (int64_t d = 0; d < dim; ++d)

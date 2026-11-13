@@ -118,6 +118,48 @@ TEST_SUITE("cpu-ref encoder ops") {
         }
     }
 
+    TEST_CASE("non-causal attention with a window over the step's own tokens sees as far after a query as before") {
+        test::TensorRng rng(16);
+        for (const auto& [q_heads, kv_heads] : {std::pair<int64_t, int64_t>{4, 4}, {6, 2}}) {
+            for (const int64_t window : {1, 4, 30}) {  // a window wider than the step sees every key
+                CAPTURE(q_heads);
+                CAPTURE(window);
+                const int64_t dim = 16, tokens = 23;
+                const HostTensor q = rng.uniform(DType::F32, {tokens, q_heads, dim}, 2.0f);
+                const HostTensor k = rng.uniform(DType::F32, {tokens, kv_heads, dim}, 2.0f);
+                const HostTensor v = rng.uniform(DType::F32, {tokens, kv_heads, dim});
+                AttentionAttrs attrs;
+                attrs.causal = false;
+                attrs.scale = 0.3f;
+                attrs.sliding_window = window;
+                Graph g;
+                g.output("out", g.attention(g.input("q", DType::F32, {kT, q_heads, dim}),
+                                            g.input("k", DType::F32, {kT, kv_heads, dim}),
+                                            g.input("v", DType::F32, {kT, kv_heads, dim}), attrs));
+                const HostTensor out = run_out(g, {{"q", q}, {"k", k}, {"v", v}});
+                test::ref::AttentionSpec spec;
+                spec.scale = 0.3;
+                spec.sliding_window = window;
+                spec.causal = false;
+                const auto matches = [&](const test::ref::AttentionSpec& s) {
+                    return test::all_close(out, test::ref::attention(to_f64(q), to_f64(k), to_f64(v), s), kAtol,
+                                           kRtol);
+                };
+                CHECK(matches(spec));
+                if (window >= tokens) continue;
+                test::ref::AttentionSpec planted = spec;  // planted bugs: a window one key wider, or only behind
+                planted.window_slack = 1;
+                CHECK_FALSE(matches(planted));
+                planted = spec;
+                planted.one_sided = true;
+                CHECK_FALSE(matches(planted));
+                planted = spec;
+                planted.causal = true;
+                if (window > 1) CHECK_FALSE(matches(planted));  // a window of one key is the query's own either way
+            }
+        }
+    }
+
     TEST_CASE("a graph without KV slots is stateless: runs do not accumulate tokens") {
         Graph g;
         g.output("out", g.scale(g.input("x", DType::F32, {kT, 4}), 2.0f));
@@ -133,13 +175,14 @@ TEST_SUITE("cpu-ref encoder ops") {
         }
     }
 
-    TEST_CASE("graph refuses a sliding window on non-causal attention and malformed axial positions") {
+    TEST_CASE("graph refuses a window over static non-causal queries and malformed axial positions") {
         Graph g;
         const Value q = g.input("q", DType::F32, {kT, 2, 8});
         AttentionAttrs attrs;
         attrs.causal = false;
         attrs.sliding_window = 4;
-        CHECK_THROWS_AS(g.attention(q, q, q, attrs), xs::Error);
+        const Value fixed = g.input("fixed", DType::F32, {6, 2, 8});
+        CHECK_THROWS_AS(g.attention(fixed, fixed, fixed, attrs), xs::Error);
         const Value freq = g.constant(HostTensor(DType::F32, {2}));
         CHECK_THROWS_AS(g.rope(q, g.input("pos3", DType::I32, {kT, 3}), freq), xs::Error);  // 8 % 6 != 0
         CHECK_THROWS_AS(g.rope(q, g.input("pos2", DType::I32, {kT, 2}), g.constant(HostTensor(DType::F32, {4}))),
