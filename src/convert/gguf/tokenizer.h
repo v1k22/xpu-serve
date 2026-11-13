@@ -12,6 +12,8 @@
 // converter's [PAD<id>] placeholders for ids the original tokenizer does not have, and are left out.
 
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -34,7 +36,9 @@ struct TokenizerFiles {
 // vocabulary.
 TokenizerFiles tokenizer_files(const gguf::File& file);
 
-// tokenizer.chat_template; a named error when the file has none (the engine renders every prompt with it).
-std::string chat_template(const gguf::File& file);
+// tokenizer.chat_template; a named error when the file has none (the engine renders every prompt with it). Named
+// templates (tokenizer.chat_template.<name>) are not imported: a warning for each, but for those `unused` gives the
+// reason for (by name).
+std::string chat_template(const gguf::File& file, const std::map<std::string, std::string, std::less<>>& unused = {});
 
 }  // namespace xs::gguf_import

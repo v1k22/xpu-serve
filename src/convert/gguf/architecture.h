@@ -1,14 +1,16 @@
 #pragma once
 
-// What a GGUF architecture's importer provides (one file per architecture: qwen35.cpp, gemma4.cpp): from the file's
-// metadata the config.json the model code reads, and for every tensor of the file the pack tensors it becomes, under
-// the names the model code reads. The import driver (gguf_import.cpp) writes them: a tensor in a block format byte for
-// byte, a float tensor as stored or through a value-by-value transform. A quantized tensor is never decoded, re-encoded
-// or reordered; it can only be cut into runs of whole rows.
+// What a GGUF architecture's importer provides (one file per architecture: qwen35.cpp, gemma4.cpp, clef.cpp): from the
+// file's metadata the config.json the model code reads (and any other JSON file of the pack), and for every tensor of
+// the file the pack tensors it becomes, under the names the model code reads. The import driver (gguf_import.cpp)
+// writes them: a tensor in a block format byte for byte, a float tensor as stored or through a value-by-value
+// transform. A quantized tensor is never decoded, re-encoded or reordered; it can only be cut into runs of whole rows.
 //
 // A model's MTP head can come in a file of its own (`convert --mtp`): the plan then draws its tensors from two files,
 // and is the plan of a model file that held the head.
 
+#include <functional>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,6 +40,11 @@ struct PackTensor {
 
 struct ImportPlan {
     nlohmann::ordered_json config;  // config.json, without eos_token_id (the import adds the tokenizer's)
+    // The pack's other JSON files, by file name (a decision model's head: joint_head_config.json).
+    std::map<std::string, nlohmann::ordered_json> files;
+    // Named chat templates of the file (tokenizer.chat_template.<name>) the model has no use for, with the reason; left
+    // out of the pack like any named template, but not warned about.
+    std::map<std::string, std::string, std::less<>> unused_templates;
     // With `derived` and `copies`, every row of every tensor of the files exactly once.
     std::vector<PackTensor> tensors;
     // Tensors the converter computed from the config (not the checkpoint's), which the architecture checked against
@@ -69,6 +76,7 @@ public:
 const Architecture& qwen35();
 const Architecture& gemma4();
 const Architecture& gemma4_assistant();
+const Architecture& clef();
 
 // The importer of general.architecture `name`; a named error listing the supported ones otherwise.
 const Architecture& find_architecture(std::string_view name);

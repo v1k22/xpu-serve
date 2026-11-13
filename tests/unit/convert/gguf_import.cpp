@@ -61,27 +61,6 @@ std::vector<float> draft_logits(const Model& model) {
     return {l.data<float>(), l.data<float>() + l.numel()};
 }
 
-bool ends_with(const std::string& s, const std::string& tail) {
-    return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
-}
-
-// A pack tensor's values in the twin's (grouped) order: the import keeps linear attention's value heads tiled.
-std::vector<float> grouped_values(const std::string& name, const TensorView& v) {
-    const xs::test::TinyQwen m = xs::test::tiny_gguf_model();
-    const int64_t hk = m.lin_k_heads, hv = m.lin_v_heads, d = m.lin_dim;
-    const auto back = [&](int axis, int64_t first, int64_t unit) {
-        return xs::test::retile(values(v), v.shape, axis, first, unit, hk, hv, false);
-    };
-    if (ends_with(name, "in_proj_qkv.weight") || ends_with(name, "conv1d.weight")) return back(0, 2 * hk * d, d);
-    if (ends_with(name, "in_proj_z.weight")) return back(0, 0, d);
-    if (ends_with(name, "in_proj_a.weight") || ends_with(name, "in_proj_b.weight") || ends_with(name, "A_log") ||
-        ends_with(name, "dt_bias")) {
-        return back(0, 0, 1);
-    }
-    if (ends_with(name, "out_proj.weight")) return back(1, 0, d);
-    return values(v);
-}
-
 // The tiny GGUF with `change` applied, imported into a fresh directory: the error it gives, or "" when it imports.
 template <typename Change>
 std::string refusal(const fs::path& dir, Change change) {
@@ -152,7 +131,7 @@ TEST_SUITE("gguf import") {
             CAPTURE(name);
             const TensorView& a = pack->weights().get(name);
             REQUIRE(a.shape == twin->weights().get(name).shape);
-            CHECK(grouped_values(name, a) == values(twin->weights().get(name)));
+            CHECK(xs::test::grouped_values(name, a) == values(twin->weights().get(name)));
         }
         CHECK(pack->weights().get("model.embed_tokens.weight").dtype == DType::Block);
         CHECK(pack->weights().get("model.layers.1.mlp.down_proj.weight").dtype == DType::BF16);
@@ -398,7 +377,7 @@ TEST_SUITE("gguf import") {
             });
         };
         CHECK(architecture("llama").find(
-                  "GGUF architecture 'llama' is not supported (supported: qwen35, gemma4, gemma4-assistant)") !=
+                  "GGUF architecture 'llama' is not supported (supported: qwen35, gemma4, gemma4-assistant, clef)") !=
               std::string::npos);
         CHECK(architecture("qwen35moe").find("'qwen35moe' (Qwen3.5 mixture of experts) is not supported yet") !=
               std::string::npos);

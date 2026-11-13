@@ -361,9 +361,13 @@ TokenizerFiles tokenizer_files(const gguf::File& file) {
     return out;
 }
 
-std::string chat_template(const gguf::File& file) {
+std::string chat_template(const gguf::File& file, const std::map<std::string, std::string, std::less<>>& unused) {
+    constexpr std::string_view kNamed = "tokenizer.chat_template.";
     for (const gguf::Value& v : file.metadata()) {
-        if (starts_with(v.key(), "tokenizer.chat_template.") || v.key() == "tokenizer.chat_templates") {
+        if (!starts_with(v.key(), kNamed)) continue;  // tokenizer.chat_templates only lists their names
+        if (const auto it = unused.find(v.key().substr(kNamed.size())); it != unused.end()) {
+            log::info("gguf: ", v.key(), " is not imported: ", it->second);
+        } else {
             log::warn("gguf: ", v.key(),
                       " (a named chat template) is not imported; the engine renders with the "
                       "default one, tokenizer.chat_template");

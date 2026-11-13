@@ -208,7 +208,7 @@ ImportPlan Architecture::plan_with_mtp(const gguf::File&, const gguf::File&) con
 }
 
 const Architecture& find_architecture(std::string_view name) {
-    const std::vector<const Architecture*> all{&qwen35(), &gemma4(), &gemma4_assistant()};
+    const std::vector<const Architecture*> all{&qwen35(), &gemma4(), &gemma4_assistant(), &clef()};
     std::string list;
     for (const Architecture* a : all) {
         if (a->name() == name) return *a;
@@ -242,7 +242,7 @@ ImportReport import_gguf(const ImportOptions& o) {
     std::optional<nlohmann::ordered_json> generation;
     if (!plan.drafter) {
         tokenizer = tokenizer_files(file);
-        chat = chat_template(file);
+        chat = chat_template(file, plan.unused_templates);
         generation = generation_config(file);
         const std::vector<int32_t>& stops = tokenizer->stop_ids;
         plan.config["eos_token_id"] =
@@ -270,6 +270,8 @@ ImportReport import_gguf(const ImportOptions& o) {
     log::info("gguf: writing ", units.size(), " tensors to ", (o.output / "model.safetensors").string());
     write_safetensors(o.output / "model.safetensors", units, {{"format", "pt"}});
     write_json(o.output / "config.json", plan.config, 2);
+    for (const auto& [name, json] : plan.files)
+        write_json(o.output / name, json, 2);
     if (tokenizer) {
         write_json(o.output / "tokenizer.json", tokenizer->tokenizer, -1);
         write_json(o.output / "tokenizer_config.json", tokenizer->config, 2);
