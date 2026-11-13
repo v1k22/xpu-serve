@@ -282,6 +282,18 @@ row), MTP gained 1.2 to 1.4 times on the K-quant and i-quant files at their best
 over UD-Q4_K_XL and 74 over Q4_0 (its Q5_K and Q6_K tensors on the GEMV); it now takes 75 and 56, where a decode
 step takes 61 and 47.
 
+On an Arc B390 (Panther Lake, 30 GB of memory shared with the system) the Q4_0 file decodes at 6.4 tok/s, and with
+MTP (the same prompts; k = 1 to 5 the mean of two runs):
+
+| k | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| tok/s (tokens a verify keeps) | 11.1 (1.85) | 14.3 (2.48) | 15.9 (2.93) | 16.5 (3.21) | 17.2 (3.37) | 17.4 (3.50) | 16.9 (3.58) | 10.6 (3.65) |
+
+A verify there costs about a decode step up to 8 rows (162 ms at 2 rows, 173 at 8, against 156 for a decode step), so
+MTP gains more than on the B60: 2.7 times at k = 6. At k = 8 the verify's 9 rows leave the GEMV (302 ms). The greedy
+text is the same with MTP. Loading the 16 GiB pack right after another run lost the device in 2 of 8 loads, while the
+GPU driver still held the last run's pages; these numbers come from loads with that memory released first (TODO.md).
+
 What each file holds:
 
 | Variant | Weights | Formats | MTP head | Share of the weights |

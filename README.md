@@ -25,7 +25,7 @@ code.
 | Qwen3.5 4B | language | f16, q8, q4, GGUF files | 43 / 77 / 101 tok/s decode (f16 / q8 / q4); q4: 149 with MTP; 5,000 tok/s prefill; its GGUF files (2 to 16 bits): 58 to 99 tok/s decode | Arc Pro B60 |
 | Qwen3.5 9B | language | f16, q8, q4 | 21 / 38 / 62 tok/s decode (f16 / q8 / q4); q4: 108 with MTP; 3,200 tok/s prefill | Arc Pro B60 |
 | Qwen3.6-35B-A3B | language, MoE | q4 | 62 tok/s decode, 94 with MTP; 1,550 tok/s prefill | Arc Pro B60 |
-| Qwen3.8-27B | language | q4, GGUF files | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; its GGUF files (1.8 to 6.8 bits, 6 to 23 GB): 15 to 21 tok/s decode, 25 to 47 with MTP; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill | Arc Pro B60, Arc B390 |
+| Qwen3.8-27B | language | q4, GGUF files | 22 tok/s decode, 50 with MTP, 61 with a DFlash 2 drafter (53 and 62 at q4 g128); 830 tok/s prefill; its GGUF files (1.8 to 6.8 bits, 6 to 23 GB): 15 to 21 tok/s decode, 25 to 47 with MTP; on Arc B390 6.9 tok/s decode, 18 with MTP, 20 with a DFlash 2 drafter (20 and 23 at q4 g128), 460 prefill, its Q4_0 file 6.4 and 17 with MTP | Arc Pro B60, Arc B390 |
 | LFM3-1.7B | language | f16, q8, q4 | 99 / 159 / 206 tok/s decode (f16 / q8 / q4); 12,000 tok/s prefill | Arc Pro B60 |
 | π0.5 | robot policy | f16, q8 | 215 / 198 ms per call (f16 / q8); 115 / 113 ms on the Arc Pro B60 | Arc B390, 3 cameras |
 | Clef-Flash | decision | f16, q8, q4 | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
@@ -374,6 +374,9 @@ the best of 1 to 5 drafts a round.
 | UD-Q2_K_XL | 9.95 GB | 8.93 GiB | 18 tok/s | 39 tok/s | 219 | 171 |
 | UD-IQ2_XXS (head from `--mtp`) | 7.21 GB | 6.70 GiB | 17 tok/s | 32 tok/s | 174 | 154 |
 | *our q4 pack* | | 16.21 GiB | 22 tok/s | 51 tok/s | 245 | 185 |
+
+On an Arc B390 the Q4_0 file decodes at 6.4 tok/s and at 17.4 with MTP (k = 6, 2.7 times; 17.2 at k = 5): a verify
+of up to 8 rows costs about one decode step there.
 
 - **Memory is the file's.** A Qwen file takes its size on the GPU (2.74 GB is 2.55 GiB); a Gemma 4 E2B file under
   half of it, because its per-layer embedding table is read on the host.
