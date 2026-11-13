@@ -300,6 +300,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       them; a tiny file answers as the checkpoint its blocks decode to
 - [ ] GGUF: Clef's files measured end to end (decision parity and the 25 test decisions against the checkpoint, on
       the GPU; results in docs/gguf_models.md)
+- [x] GGUF: `modern-bert` decision files (ggml-org's Laya and Julia-1) into the original checkpoint's layout; the
+      tokenizers `modern-bert` and `mmbert`, equal to the originals over their whole vocabularies (docs/decisions/0018)
 - [ ] GGUF: more architectures (`qwen35moe`, Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
 - [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
 - [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)

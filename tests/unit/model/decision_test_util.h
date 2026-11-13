@@ -194,11 +194,13 @@ struct TinyLaya {
     bool strict = true;        // Julia's strict_encoding
     std::vector<double> temperature{1.0, 1.0, 1.0};
     nlohmann::json temperature_by_options = nlohmann::json::object();
-    bool root_config = true;  // Laya's root config.json (its variants' folders have none)
+    bool root_config = true;      // Laya's root config.json (its variants' folders have none)
+    int64_t vocab = 256;          // token ids
+    int64_t max_positions = 512;  // the encoder's max_position_embeddings
 };
 
 inline void write_tiny_laya(const fs::path& dir, const TinyLaya& m, uint32_t seed) {
-    const int64_t hidden = 128, inter = 48, layers = 4, vocab = 256;
+    const int64_t hidden = 128, inter = 48, layers = 4, vocab = m.vocab;
     fs::create_directories(dir / "encoder");
     fs::create_directories(dir / "tokenizer");
     const nlohmann::json kinds = {"full_attention", "sliding_attention", "sliding_attention", "full_attention"};
@@ -210,7 +212,7 @@ inline void write_tiny_laya(const fs::path& dir, const TinyLaya& m, uint32_t see
                                                                      {"num_hidden_layers", layers},
                                                                      {"num_attention_heads", 4},
                                                                      {"vocab_size", vocab},
-                                                                     {"max_position_embeddings", 512},
+                                                                     {"max_position_embeddings", m.max_positions},
                                                                      {"hidden_activation", "gelu"},
                                                                      {"norm_eps", 1e-5},
                                                                      {"norm_bias", false},

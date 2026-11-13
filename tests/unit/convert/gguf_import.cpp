@@ -376,9 +376,8 @@ TEST_SUITE("gguf import") {
                 w.drop_value("general.architecture").string("general.architecture", name);
             });
         };
-        CHECK(architecture("llama").find(
-                  "GGUF architecture 'llama' is not supported (supported: qwen35, gemma4, gemma4-assistant, clef)") !=
-              std::string::npos);
+        CHECK(architecture("llama").find("GGUF architecture 'llama' is not supported (supported: qwen35, gemma4, "
+                                         "gemma4-assistant, clef, modern-bert)") != std::string::npos);
         CHECK(architecture("qwen35moe").find("'qwen35moe' (Qwen3.5 mixture of experts) is not supported yet") !=
               std::string::npos);
         CHECK(
@@ -410,7 +409,8 @@ TEST_SUITE("gguf import") {
               }).find("tokenizer.ggml.model 'llama' is not supported (supported: gpt2, gemma4)") != std::string::npos);
         CHECK(refusal(work.path, [](GgufWriter& w) {
                   w.drop_value("tokenizer.ggml.pre").string("tokenizer.ggml.pre", "llama-bpe");
-              }).find("tokenizer.ggml.pre 'llama-bpe' is not supported (supported: qwen35)") != std::string::npos);
+              }).find("tokenizer.ggml.pre 'llama-bpe' is not supported (supported: qwen35, modern-bert, mmbert)") !=
+              std::string::npos);
         CHECK(refusal(work.path, [](GgufWriter& w) { w.boolean("tokenizer.ggml.add_space_prefix", true); })
                   .find("tokenizer.ggml.add_space_prefix is true, which disagrees with the tokenizer 'qwen35'") !=
               std::string::npos);

@@ -8,8 +8,10 @@
 // tokenizer.ggml.pre), so they come from a table of the tokenizers this importer knows. Token types: normal and byte
 // tokens are the BPE vocabulary; control tokens are added special tokens and user-defined ones added tokens that are
 // not special (Qwen's <think> and <tool_call> stay non-special, so the output parser sees them), each with the
-// exceptions the table names where the converter's typing departs from the original's; unused ones are the
-// converter's [PAD<id>] placeholders for ids the original tokenizer does not have, and are left out.
+// exceptions the table names where the converter's typing departs from the original's (and the added tokens' lstrip
+// and normalized flags it does not keep); unused ones are the converter's [PAD<id>] placeholders for ids the original
+// tokenizer does not have, and are left out. A BERT-style post-processor ([CLS] ... [SEP]) is built from the file's
+// own special tokens.
 
 #include <cstdint>
 #include <functional>
