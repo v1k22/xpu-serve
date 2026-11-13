@@ -444,4 +444,40 @@ inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t see
     return w;
 }
 
+// The tiny GGUF of build_tiny_gguf as unsloth publishes the small files of a model: the model without its MTP head
+// (block_count and nextn_predict_layers say so), and the head in a file of its own, llama.cpp's draft model of it.
+// That file has the qwen35.* metadata of a file that holds the head and no tokenizer; its tensors are the head's block,
+// with the same bytes, and a token_embd, output and output_norm of its own (Q4_0, Q4_0 and F16, where the model's are
+// Q8_0, tied to the embedding and F32).
+struct TinyMtpFiles {
+    GgufWriter model, mtp;
+};
+
+inline TinyMtpFiles split_tiny_gguf(const GgufWriter& with_head) {
+    const TinyQwen m = tiny_gguf_model();
+    const auto layers = static_cast<uint32_t>(m.layers.size());
+    const std::string head = "blk." + std::to_string(layers) + ".";
+    const auto in_head = [&](const std::string& name) { return name.rfind(head, 0) == 0; };
+    TinyMtpFiles out{with_head, with_head};
+    out.model.drop_tensors_if(in_head)
+        .drop_value("qwen35.block_count")
+        .u32("qwen35.block_count", layers)
+        .drop_value("qwen35.nextn_predict_layers")
+        .u32("qwen35.nextn_predict_layers", 0);
+    out.mtp.drop_tensors_if([&](const std::string& name) { return !in_head(name); })
+        .drop_values_if([](const std::string& key) { return key.rfind("tokenizer.", 0) == 0 || key == "general.name"; })
+        .string("general.name", "Tiny Qwen3.5 MTP");
+    const int64_t n = m.vocab * m.hidden;
+    std::vector<float> table(static_cast<size_t>(n)), decoded(static_cast<size_t>(n));
+    for (int64_t i = 0; i < n; ++i)
+        table[static_cast<size_t>(i)] = 0.05f * std::sin(0.71f * static_cast<float>(i));
+    std::string norm;
+    for (int64_t i = 0; i < m.hidden; ++i)
+        norm += pod_bytes(f32_to_f16(1.0f + 0.01f * static_cast<float>(i % 7)));
+    out.mtp.tensor("token_embd.weight", {m.hidden, m.vocab}, kGgmlQ4_0, encode_q4_0(table.data(), n, decoded.data()))
+        .tensor("output.weight", {m.hidden, m.vocab}, kGgmlQ4_0, encode_q4_0(table.data(), n, decoded.data()))
+        .tensor("output_norm.weight", {m.hidden}, kGgmlF16, norm);
+    return out;
+}
+
 }  // namespace xs::test

@@ -2,7 +2,8 @@
 // (tiny_gguf.h: Q8_0 / Q4_0 / F16 / BF16 / F32 tensors, tiled value heads with 2 key heads and 4 value heads, merged
 // input projections in one layer, an MTP head, a byte-level BPE vocabulary) imports as the model its blocks decode
 // to: the same weights, logits, greedy tokens and drafts as its twin checkpoint on cpu-ref, the same tokenizer as the
-// original; and what the importer does not implement is refused by name.
+// original; the same model as a file without the head and the head's own file (--mtp) imports as the same pack; and
+// what the importer does not implement is refused by name.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -27,6 +28,7 @@
 using namespace xs;
 namespace fs = std::filesystem;
 using xs::test::GgufWriter;
+using xs::test::has;
 using xs::test::import_into;
 using xs::test::relative_gap;
 using xs::test::TempDir;
@@ -84,6 +86,27 @@ std::vector<float> grouped_values(const std::string& name, const TensorView& v) 
 template <typename Change>
 std::string refusal(const fs::path& dir, Change change) {
     return xs::test::refusal(dir, [](const fs::path& src) { return xs::test::build_tiny_gguf(src, 11); }, change);
+}
+
+// The tiny model file and its head's file with `change(model, mtp)` applied, imported with --mtp into a fresh
+// directory: the error it gives, or "" when it imports.
+template <typename Change>
+std::string mtp_refusal(const fs::path& dir, xs::test::TinyMtpFiles files, Change change) {
+    change(files.model, files.mtp);
+    files.model.write(dir / "model.gguf");
+    files.mtp.write(dir / "mtp.gguf");
+    fs::remove_all(dir / "variant");
+    try {
+        import_into(dir / "model.gguf", dir / "variant", dir / "mtp.gguf");
+    } catch (const Error& e) {
+        return e.what();
+    }
+    return "";
+}
+
+std::string file_bytes(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(in), {}};
 }
 
 }  // namespace
@@ -152,6 +175,151 @@ TEST_SUITE("gguf import") {
         grouped.erase("linear_value_head_order");
         std::ofstream(work.path / "grouped" / "config.json") << grouped.dump(1);
         CHECK(relative_gap(step_logits(*load_model(work.path / "grouped")), reference) > 1e-2);
+    }
+
+    TEST_CASE("a model file without its MTP head and the head's own file import as the file that holds both") {
+        const TempDir work("xs_gguf_import_mtp_test");
+        const GgufWriter whole = xs::test::build_tiny_gguf(work.path / "src", 11);
+        whole.write(work.path / "whole.gguf");
+        xs::test::TinyMtpFiles split = xs::test::split_tiny_gguf(whole);
+        // The pack's tokenizer, chat template and sampling defaults are the model file's, whatever the head's file has.
+        split.mtp.string("tokenizer.chat_template", "{{ 'the draft model file' }}").f32("general.sampling.temp", 0.1f);
+        split.model.write(work.path / "model.gguf");
+        split.mtp.write(work.path / "mtp.gguf");
+        const gguf_import::ImportReport one = import_into(work.path / "whole.gguf", work.path / "one");
+        const gguf_import::ImportReport two =
+            import_into(work.path / "model.gguf", work.path / "two", work.path / "mtp.gguf");
+
+        // The same files, byte for byte, but the manifest, which names its sources.
+        std::vector<std::string> names, other_names;
+        for (const auto& e : fs::directory_iterator(work.path / "one"))
+            names.push_back(e.path().filename().string());
+        for (const auto& e : fs::directory_iterator(work.path / "two"))
+            other_names.push_back(e.path().filename().string());
+        std::sort(names.begin(), names.end());
+        std::sort(other_names.begin(), other_names.end());
+        CHECK(other_names == names);
+        CHECK(std::find(names.begin(), names.end(), "generation_config.json") == names.end());
+        for (const std::string& name : names) {
+            CAPTURE(name);
+            if (name == kPackManifest) continue;
+            CHECK(file_bytes(work.path / "two" / name) == file_bytes(work.path / "one" / name));
+        }
+        const nlohmann::json config = nlohmann::json::parse(std::ifstream(work.path / "two" / "config.json"));
+        CHECK(config["mtp_num_hidden_layers"] == 1);
+        CHECK(config["tie_word_embeddings"] == true);  // the head file's own output head is not the model's
+        const nlohmann::json m1 = nlohmann::json::parse(std::ifstream(work.path / "one" / kPackManifest));
+        const nlohmann::json m2 = nlohmann::json::parse(std::ifstream(work.path / "two" / kPackManifest));
+        CHECK(m2["tensors"] == m1["tensors"]);
+        CHECK(m2["source"]["name"] == "model.gguf");
+        CHECK(m2["source"]["mtp"] == "mtp.gguf");
+        CHECK_FALSE(m1["source"].contains("mtp"));
+
+        // The report counts the tensors the import read: the head file's copies are not among them.
+        CHECK(two.tensors == one.tensors);
+        CHECK(two.weights == one.weights);
+        REQUIRE(two.formats.size() == one.formats.size());
+        for (size_t i = 0; i < one.formats.size(); ++i) {
+            CHECK(two.formats[i].format == one.formats[i].format);
+            CHECK(two.formats[i].tensors == one.formats[i].tensors);
+            CHECK(two.formats[i].bytes == one.formats[i].bytes);
+        }
+
+        // The same drafts on cpu-ref.
+        const LoadOptions spec{.speculation = true, .draft_shortlist = 0};
+        const xs::test::Drafts reference = xs::test::drafts(*load_model(work.path / "one", spec), kPrompt);
+        const xs::test::Drafts ours = xs::test::drafts(*load_model(work.path / "two", spec), kPrompt);
+        MESSAGE("drafts: " << ours.tokens[0] << " " << ours.tokens[1] << " " << ours.tokens[2]);
+        CHECK(ours.logits == reference.logits);
+        CHECK(ours.tokens == reference.tokens);
+
+        // Planted: the head of another model of the same shapes imports, and is another drafter.
+        const GgufWriter other = xs::test::build_tiny_gguf(work.path / "src2", 12);
+        xs::test::split_tiny_gguf(other).mtp.write(work.path / "other.gguf");
+        import_into(work.path / "model.gguf", work.path / "other", work.path / "other.gguf");
+        CHECK(file_bytes(work.path / "other" / "model.safetensors") !=
+              file_bytes(work.path / "two" / "model.safetensors"));
+        CHECK(xs::test::drafts(*load_model(work.path / "other", spec), kPrompt).logits != reference.logits);
+    }
+
+    TEST_CASE("--mtp: refusals name what is wrong") {
+        const TempDir work("xs_gguf_import_mtp_refusal_test");
+        const GgufWriter whole = xs::test::build_tiny_gguf(work.path / "src", 11);
+        const xs::test::TinyMtpFiles files = xs::test::split_tiny_gguf(whole);
+        const auto refused = [&](auto change) { return mtp_refusal(work.path, files, change); };
+        using W = GgufWriter;
+        CHECK(refused([](W&, W&) {}).empty());
+        // The head file needs no copies of the model's tensors.
+        CHECK(refused([](W&, W& mtp) {
+                  mtp.drop_tensor("token_embd.weight").drop_tensor("output.weight").drop_tensor("output_norm.weight");
+              }).empty());
+        // Per-block layer lists: the model's blocks, then the head's.
+        CHECK(refused([](W& model, W& mtp) {
+                  model.bools("qwen35.attention.recurrent_layers", {true, true, true, false});
+                  mtp.bools("qwen35.attention.recurrent_layers", {true, true, true, false, false});
+              }).empty());
+
+        CHECK(has(refused([&](W& model, W&) { model = whole; }),
+                  "qwen35: --mtp: the model file already has an MTP head (nextn_predict_layers 1)"));
+        CHECK(has(refused([](W&, W& mtp) {
+                      mtp.drop_value("general.architecture").string("general.architecture", "gemma4");
+                  }),
+                  "qwen35: the MTP file is general.architecture 'gemma4', not qwen35"));
+        CHECK(has(refused([](W&, W& mtp) {
+                      mtp.drop_value("qwen35.nextn_predict_layers").u32("qwen35.nextn_predict_layers", 2);
+                  }),
+                  "the MTP file has nextn_predict_layers 2; an MTP file holds one MTP layer"));
+        CHECK(has(refused([](W&, W& mtp) { mtp.drop_value("qwen35.block_count").u32("qwen35.block_count", 6); }),
+                  "the MTP file has block_count 6, not the model file's 4 blocks and the head"));
+        CHECK(has(refused([](W&, W& mtp) {
+                      mtp.drop_value("qwen35.embedding_length").u32("qwen35.embedding_length", 256);
+                  }),
+                  "the MTP file's qwen35.embedding_length (u32 256) differs from the model file's (u32 128): it is "
+                  "the head of another model"));
+        CHECK(has(refused([](W&, W& mtp) {
+                      mtp.drop_value("qwen35.attention.layer_norm_rms_epsilon")
+                          .f32("qwen35.attention.layer_norm_rms_epsilon", 1e-5f);
+                  }),
+                  "qwen35.attention.layer_norm_rms_epsilon (f32 1e-05) differs from the model file's (f32 1e-06)"));
+        CHECK(has(refused([](W&, W& mtp) {
+                      mtp.drop_value("qwen35.rope.dimension_sections")
+                          .i32s("qwen35.rope.dimension_sections", {11, 11, 10, 1});
+                  }),
+                  "qwen35.rope.dimension_sections (i32 [11, 11, 10, 1]) differs from the model file's (i32 [11, 11, "
+                  "10, 0])"));
+        CHECK(has(refused([](W&, W& mtp) { mtp.drop_value("qwen35.full_attention_interval"); }),
+                  "qwen35.full_attention_interval (absent) differs from the model file's (u32 4)"));
+        CHECK(has(refused([](W&, W& mtp) { mtp.u32("qwen35.vocab_size", 288); }),
+                  "qwen35.vocab_size (u32 288) differs from the model file's (absent)"));
+        CHECK(has(refused([](W& model, W& mtp) {
+                      model.bools("qwen35.attention.recurrent_layers", {true, true, true, false});
+                      mtp.bools("qwen35.attention.recurrent_layers", {true, true, false, true, false});
+                  }),
+                  "qwen35.attention.recurrent_layers (an array of 5 bool) differs"));
+        CHECK(has(refused([](W&, W& mtp) { mtp.boolean("prism.hadamard.gdn_v_grouped", true); }),
+                  "weights with transforms folded into them"));
+
+        CHECK(has(refused([](W&, W& mtp) { mtp.f32_tensor("blk.0.attn_norm.weight", {128}, std::vector<float>(128)); }),
+                  "the MTP file's tensor 'blk.0.attn_norm.weight' is neither in the head's block 4 nor one of the "
+                  "model's token_embd, output and output_norm"));
+        CHECK(has(refused([](W&, W& mtp) { mtp.f32_tensor("rope_freqs.weight", {16}, std::vector<float>(16)); }),
+                  "the MTP file's tensor 'rope_freqs.weight' is neither in the head's block 4"));
+        CHECK(has(refused([](W&, W& mtp) {
+                      mtp.drop_tensor("output.weight")
+                          .f32_tensor("output.weight", {128, 256}, std::vector<float>(32768));
+                  }),
+                  "the MTP file's 'output.weight' has shape [256, 128]; the model's is [288, 128]"));
+        CHECK(has(refused([](W&, W& mtp) { mtp.drop_tensor("blk.4.nextn.eh_proj.weight"); }),
+                  "qwen35: the file has no tensor for 'mtp.fc.weight' (block 4, an MTP layer)"));
+        CHECK(has(refused([](W&, W& mtp) {
+                      mtp.drop_tensor("blk.4.nextn.enorm.weight")
+                          .f32_tensor("blk.4.nextn.enorm.weight", {64}, std::vector<float>(64, 1.0f));
+                  }),
+                  "tensor 'blk.4.nextn.enorm.weight' has shape [64]; the metadata gives [128]"));
+        CHECK(has(refused([](W& model, W&) {
+                      model.f32_tensor("blk.4.attn_norm.weight", {128}, std::vector<float>(128, 1.0f));
+                  }),
+                  "qwen35: tensor 'blk.4.attn_norm.weight' is not in one of the model file's 4 blocks"));
     }
 
     TEST_CASE("the tokenizer written from the GGUF encodes and decodes like the original") {

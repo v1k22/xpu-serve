@@ -14,6 +14,10 @@
 // The architecture (general.architecture) decides names, config and transforms (convert/gguf/architecture.h); one
 // it does not know is refused by name. A drafter's pack (a Gemma 4 assistant, for --drafter) is config.json, the
 // weights and the manifest: the target's pack has the tokenizer and chat template.
+//
+// A model file without its MTP head can be imported with a second file that holds the head (`--mtp`, llama.cpp's
+// draft model of it): the pack is the one a file that held the head gives. Only the head is read from the second
+// file; tokenizer, chat template and sampling defaults are the model file's.
 
 #include <cstdint>
 #include <filesystem>
@@ -25,10 +29,12 @@ namespace xs::gguf_import {
 struct ImportOptions {
     std::filesystem::path source;         // the .gguf file
     std::filesystem::path output;         // created; must not exist or be empty
+    std::filesystem::path mtp;            // a .gguf file of the source's MTP head, or empty
     std::string converter = "xpu-serve";  // recorded in the manifest
 };
 
-// The file's tensors of one storage format.
+// The tensors of one storage format the import reads from the files (every tensor but an MTP file's copies of the
+// model's).
 struct FormatShare {
     std::string format;  // "Q4_K", "F32", ...
     int64_t tensors = 0;
@@ -40,7 +46,7 @@ struct ImportReport {
     std::string architecture;          // general.architecture
     std::string model_name;            // general.name, when the file has one
     std::vector<FormatShare> formats;  // most weights first
-    int64_t tensors = 0;               // of the file
+    int64_t tensors = 0;               // of the files, as `formats` counts them
     int64_t weights = 0;
     uint64_t output_bytes = 0;  // every file of the pack
 };

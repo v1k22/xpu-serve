@@ -286,6 +286,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       unsloth/Qwen3.5-4B-GGUF runs at its size
 - [x] GGUF: the Gemma 4 assistant (`gemma4-assistant`) as a drafter, with the whole-vocabulary head llama.cpp
       computes (the file has no centroid head)
+- [x] GGUF: a `qwen35` file without its MTP head, with the head's own file (`convert --mtp`, llama.cpp's draft
+      model): the pack a file with the head gives, byte for byte
 - [ ] GGUF: more architectures (`qwen35moe`, Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
 - [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
 - [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)

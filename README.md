@@ -314,6 +314,10 @@ takes the file's size in GPU memory:
 ```bash
 xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M    # a few seconds
 xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
+# A file without the MTP head, with the head's own file (MTP/mtp-*.gguf)
+xpu-serve convert ~/models/Qwen3.8-27B-UD-IQ2_XXS.gguf ~/models/Qwen3.8-27B-UD-IQ2_XXS \
+    --mtp ~/models/mtp-Qwen3.8-27B-Q4_0.gguf
+xpu-serve serve ~/models/Qwen3.8-27B-UD-IQ2_XXS --device GPU --spec mtp
 # Gemma 4 and its drafter
 xpu-serve convert ~/models/gemma-4-E2B-it-Q4_K_M.gguf ~/models/gemma-4-E2B-it-Q4_K_M
 xpu-serve convert ~/models/mtp-gemma-4-E2B-it-Q8_0.gguf ~/models/gemma-4-E2B-it-mtp
@@ -323,7 +327,9 @@ xpu-serve serve ~/models/gemma-4-E2B-it-Q4_K_M --device GPU --drafter ~/models/g
 The architecture comes from the file (`general.architecture`). Supported: `qwen35`, the Qwen3.5 / Qwen3.6 / Qwen3.8
 dense text models, and `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
 images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
-drafter; others are refused by name. config.json, the tokenizer and the chat template are
+drafter; others are refused by name. A Qwen3.5-family file that comes without its MTP head (the smallest files of
+Qwen3.8-27B) takes the head from its `MTP/mtp-*.gguf` file with `--mtp`: the pack is the one a file with the head
+gives, and `--spec mtp` drafts with it. config.json, the tokenizer and the chat template are
 written from the file's metadata (on Qwen3.5-4B and Gemma 4 E2B the tokenizer equals the original's token by token),
 and the template is the file's, which a publisher may have changed from the original checkpoint's. Thinking, tool
 calls and streaming work as with the original checkpoint. The quantization options do not apply.

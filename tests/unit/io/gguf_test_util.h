@@ -110,6 +110,17 @@ public:
         std::erase_if(tensors_, [&](const Tensor& t) { return t.name == name; });
         return *this;
     }
+    // Leaves out every value whose key, or tensor whose name, `drop` holds for (a file made from part of another).
+    template <typename Pred>
+    GgufWriter& drop_values_if(Pred drop) {
+        std::erase_if(kvs_, [&](const Kv& kv) { return drop(kv.key); });
+        return *this;
+    }
+    template <typename Pred>
+    GgufWriter& drop_tensors_if(Pred drop) {
+        std::erase_if(tensors_, [&](const Tensor& t) { return drop(t.name); });
+        return *this;
+    }
     // A string value's text (the first of that key), for a test that rewrites it.
     std::string string_value(std::string_view key) const {
         for (const Kv& kv : kvs_) {

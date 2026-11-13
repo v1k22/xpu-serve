@@ -284,6 +284,10 @@ TEST_SUITE("gguf import gemma4") {
                   "tensor 'masked_embd_centroids.weight' has no counterpart in the model"));
         CHECK(has(assistant_refusal(work.path, [](GgufWriter& w) { w.u32("gemma4-assistant.expert_count", 4); }),
                   "mixture-of-experts Gemma 4 (26B-A4B) is not supported yet"));
+        xs::test::build_tiny_gemma4_assistant_gguf(work.path / "src", 9).write(work.path / "assistant.gguf");
+        CHECK_THROWS_WITH_AS(
+            import_into(work.path / "assistant.gguf", work.path / "with-mtp", work.path / "assistant.gguf"),
+            doctest::Contains("gemma4-assistant: an MTP head in a file of its own (--mtp) is not supported"), Error);
     }
 
     TEST_CASE("gemma4: refusals name what is wrong") {
@@ -354,5 +358,9 @@ TEST_SUITE("gguf import gemma4") {
                               w.drop_value("tokenizer.ggml.unknown_token_id").u32("tokenizer.ggml.unknown_token_id", 4);
                           }),
                   "tokenizer.ggml.unknown_token_id is '<mask>', which disagrees"));
+        xs::test::build_tiny_gemma4_gguf(work.path / "src", 7).write(work.path / "tiny.gguf");
+        CHECK_THROWS_WITH_AS(import_into(work.path / "tiny.gguf", work.path / "with-mtp", work.path / "tiny.gguf"),
+                             doctest::Contains("gemma4: an MTP head in a file of its own (--mtp) is not supported"),
+                             Error);
     }
 }

@@ -28,9 +28,18 @@ void refuse_unknown_keys(const gguf::File& file, std::string_view architecture,
 }
 
 void map_tensors(const gguf::File& file, std::string_view architecture, const Layout& layout, ImportPlan& plan) {
+    std::vector<const gguf::TensorInfo*> tensors;
+    for (const gguf::TensorInfo& t : file.tensors())
+        tensors.push_back(&t);
+    map_tensors(tensors, architecture, layout, plan);
+}
+
+void map_tensors(const std::vector<const gguf::TensorInfo*>& tensors, std::string_view architecture,
+                 const Layout& layout, ImportPlan& plan) {
     const auto blocks = static_cast<int64_t>(layout.blocks.size());
     std::map<std::string, int, std::less<>> made;  // pack tensor name -> how many tensors of the file made it
-    for (const gguf::TensorInfo& t : file.tensors()) {
+    for (const gguf::TensorInfo* tensor : tensors) {
+        const gguf::TensorInfo& t = *tensor;
         const Entry* e = nullptr;
         if (t.name.rfind("blk.", 0) == 0) {
             const size_t dot = t.name.find('.', 4);

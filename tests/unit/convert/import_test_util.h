@@ -22,10 +22,13 @@
 
 namespace xs::test {
 
-inline gguf_import::ImportReport import_into(const std::filesystem::path& gguf, const std::filesystem::path& out) {
+// `gguf` imported into `out`, with its MTP head from the file `mtp` when one is given.
+inline gguf_import::ImportReport import_into(const std::filesystem::path& gguf, const std::filesystem::path& out,
+                                             const std::filesystem::path& mtp = {}) {
     gguf_import::ImportOptions o;
     o.source = gguf;
     o.output = out;
+    o.mtp = mtp;
     return gguf_import::import_gguf(o);
 }
 
