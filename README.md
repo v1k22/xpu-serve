@@ -31,6 +31,9 @@ code.
 | Clef-Flash | decision | f16, q8, q4 | 89 ms per decision (p50; 109 ms p95) on prompts of 150 to 262 tokens; 323 ms at 1,024 tokens | Arc Pro B60 |
 | pplx-decider-flash-v1.2 | decision | f16, q8, q4 | 39 ms per decision (p50; 57 ms p95) on prompts of 92 to 230 tokens; 214 ms at 1,024 tokens | Arc Pro B60 |
 | OpenJev | decision (a language model read at the option letters) | q4 | 266 ms per decision (p50; 478 ms p95) on prompts of 67 to 198 tokens, 143 ms for another question about the state just read; 1.46 s for three questions on a 1,024-token prompt | Arc Pro B60 |
+| all-MiniLM-L6-v2 | embedding | f16 | 1.9 ms per text (16 to 256 tokens); 651 texts/s of 128 tokens | Arc Pro B60 |
+| bge-small-en-v1.5 | embedding | f16 | 1.9 ms per text of 16 tokens, 2.1 ms at 128, 5.3 ms at 512; 471 texts/s of 128 tokens | Arc Pro B60 |
+| nomic-embed-text-v1.5 | embedding | f16 | 2.0 ms per text of 16 tokens, 3.1 ms at 128, 9.6 ms at 512, 627 ms at 8,192; 306 texts/s of 128 tokens | Arc Pro B60 |
 
 | Model | Checkpoint (`model_type`) | Checked against |
 |---|---|---|
@@ -45,6 +48,9 @@ code.
 | Clef-Flash | `Cloudflare/clef-flash` (`qwen3_5` with a joint schema head) | its own Python code in fp32: the same prompt tokens, probabilities within 0.0007 (GPU f16); 25 of 25 test decisions right and equal to that code's |
 | pplx-decider-flash-v1.2 | `perplexity-ai/pplx-decider-flash-v1.2` (`qwen3_5` with a read-out per question) | its own Python package in fp32: the same prompt tokens, probabilities within 0.0009 (GPU f16); 25 of 25 test decisions right and equal to that code's |
 | OpenJev | `openjev/openjev` (`qwen3_5`, Qwen3.8-27B; weights CC BY-NC 4.0) | its own helper code over transformers in fp32: tiny-checkpoint parity (the same prompts, probabilities within 0.0024 on the GPU at f16); the q4 pack against the checkpoint in fp32: 25 of 25 test decisions right and equal, probabilities within 0.0095 |
+| all-MiniLM-L6-v2 | `sentence-transformers/all-MiniLM-L6-v2` (`bert`) | sentence-transformers in fp32 on 15 texts up to 256 tokens: the same token ids from the text; embeddings within 1 - cosine 3.4e-7 (GPU f16), 4e-13 (GPU f32) |
+| bge-small-en-v1.5 | `BAAI/bge-small-en-v1.5` (`bert`) | the same on 15 texts up to 512 tokens: 6.9e-8 (f16), 5e-13 (f32) |
+| nomic-embed-text-v1.5 | `nomic-ai/nomic-embed-text-v1.5` (`nomic_bert`) | the same with its own modeling code on 16 texts up to 8,192 tokens: 5.4e-7 (f16), 1.1e-10 (f32) |
 
 Qwen3.5's q4 can be calibrated with AWQ; Qwen3.6-35B-A3B and Qwen3.8-27B at q4 fit one 24 GB card, and their FP8
 releases (half the download) load and convert like the originals; LFM3 thinks by
@@ -152,6 +158,38 @@ xpu-serve serve ~/models/pi05_base --device GPU.0 --cameras 2    # warm up for t
 seed, the flow steps or fixed noise) and returns the action chunk with per-stage timings; `GET /ready` answers 200 once
 warmed up. Calls run one at a time and the latest observation wins: a call still waiting when a newer one arrives is
 answered 409. Requests fail by name (an unknown camera, a wrong state length, an image of the wrong size).
+
+## Embedding models (`/v1/embeddings`)
+
+A sentence-transformers checkpoint of a BERT or NomicBERT encoder is served behind OpenAI's embeddings API, the one
+vLLM and llama.cpp serve too:
+
+```bash
+xpu-serve serve ~/models/bge-small-en-v1.5 --device GPU
+curl -s http://127.0.0.1:8080/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"input": ["What is a GPU?", "A graphics processing unit runs many threads at once."]}'
+```
+
+```json
+{"object": "list", "model": "bge-small-en-v1.5",
+ "data": [{"object": "embedding", "index": 0, "embedding": [0.0113, 0.0305, -0.0081, ...]},
+          {"object": "embedding", "index": 1, "embedding": [-0.0246, -0.0259, 0.0025, ...]}],
+ "usage": {"prompt_tokens": 20, "total_tokens": 20}}
+```
+
+(bge-small-en-v1.5's answer on an Arc Pro B60, 384 values each, shortened and rounded here.)
+
+- `input` is a string, a list of strings, a list of token ids or a list of such lists (ids are read as given).
+  `encoding_format` is `float` or `base64` (float32, little-endian: what the OpenAI Python client asks for).
+- The pipeline is the checkpoint's own (`modules.json`): its pooling (mean for MiniLM and nomic, CLS for bge) and L2
+  normalization only when it lists a Normalize module (MiniLM, bge; not nomic), as sentence-transformers and vLLM do;
+  llama.cpp normalizes every model.
+- An input longer than the model reads (256, 512 and 8,192 tokens) is refused with its token count, not cut;
+  `dimensions` is accepted only at the model's own size. Each input is one run of the encoder.
+- nomic-embed-text-v1.5 expects its task prefixes in the text (`search_query: `, `search_document: `).
+
+`xpu-serve bench <dir>` reports the latency of one text at several lengths and the throughput of a batch; `run <dir>
+--prompt "..."` prints one embedding. Decision [0017](docs/decisions/0017-embedding-models.md) has the details.
 
 ## Decision models (the System One API)
 
