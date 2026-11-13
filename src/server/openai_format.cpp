@@ -132,10 +132,14 @@ json text_usage_chunk_json(const ResponseMeta& meta, const GenerateStats& stats)
     return out;
 }
 
-json model_list_json(const ModelCard& card, int64_t created) {
-    json model = {{"id", card.id}, {"object", "model"}, {"created", created}, {"owned_by", "xpu-serve"}};
-    if (card.context_length > 0) model["context_length"] = card.context_length;
+json model_list_json(std::string_view id, int64_t context_length, int64_t created) {
+    json model = {{"id", id}, {"object", "model"}, {"created", created}, {"owned_by", "xpu-serve"}};
+    if (context_length > 0) model["context_length"] = context_length;
     return {{"object", "list"}, {"data", json::array({std::move(model)})}};
+}
+
+json model_list_json(const ModelCard& card, int64_t created) {
+    return model_list_json(card.id, card.context_length, created);
 }
 
 }  // namespace xs::server

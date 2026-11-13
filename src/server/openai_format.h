@@ -55,6 +55,8 @@ nlohmann::json text_chunk_json(const ResponseMeta& meta, std::string_view text,
                                std::optional<std::string_view> finish_reason = std::nullopt);
 nlohmann::json text_usage_chunk_json(const ResponseMeta& meta, const GenerateStats& stats);
 
+// GET /v1/models for the one model served; context_length 0 is left out.
+nlohmann::json model_list_json(std::string_view id, int64_t context_length, int64_t created);
 nlohmann::json model_list_json(const ModelCard& card, int64_t created);
 
 }  // namespace xs::server

@@ -119,7 +119,7 @@ area).
 | `backend/` | xs_backends | `backend.h` (Backend/Session interfaces), `registry.cpp`, `cpu_ref/`, `sycl/` |
 | `tokenizer/` | xs_tokenizer | Hugging Face `tokenizer.json` BPE, natively: normalizers (Replace, NFC with generated Unicode tables), pre-tokenizers (Split with hand-written GPT-style regexes, ByteLevel), byte fallback or byte-level decoding, added tokens, streaming decoder |
 | `chat/` | xs_chat | `ChatTemplate` (renders the model's Jinja template with vendored jinja.cpp, in the request's key order), output parsers per dialect: `gemma4`, `qwen3_5` (thinking, tool calls; LFM3 writes the same format), `plain` |
-| `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming; the policy API; the System One API (`decision_handlers`) |
+| `server/` | xs_server | HTTP (cpp-httplib), OpenAI request parsing and response formatting, stop strings, streaming; the policy API; the System One API (`decision_handlers`); the embeddings API (`embedding_handlers`) |
 | `service/` | xs_service | `EngineService`: loads tokenizer + template + model, compiles on a backend, owns the engine thread |
 | `policy/` | xs_policy | `PolicyRunner`: a policy, its tokenizer and one compiled program per call shape; warm-up; per-call timings (`xpu-serve bench <policy-dir>`) |
 | `decision/` | xs_decision | `DecisionRunner`: a decision model, its tokenizer and chat template (`PromptTools`), its programs in one session, a request's steps run as the model names them; `answers` (probabilities -> choice, score, confidence); `DecisionService` (one device thread, requests in arrival order) |
@@ -148,6 +148,7 @@ area).
 | `src/server/decision_handlers.cpp` | `POST /v1/systemone`: the request schema (422 bodies naming the field), the answers, `Server-Timing` |
 | `src/models/embedding.h` | What an embedding model provides: `spec()`, `weights()`, `graph()` (the encoder, its final hidden states as "hidden") and `prepare_inputs(ids)` |
 | `src/models/common/sentence_transformers.cpp` | A sentence-transformers checkpoint's pipeline (`modules.json`, the Pooling config in both spellings, `sentence_bert_config.json`), as sentence-transformers 6 reads it; every other module, pooling mode or setting refused by name |
+| `src/server/embedding_handlers.cpp` | `POST /v1/embeddings`: text, token ids or lists of them; float or base64; 400s naming the field (`input[2]`), over-long inputs refused |
 | `src/models/lfm3/lfm3_model.cpp` | LFM3: gated short convolutions (`causal_conv` between two gates of one projection), attention with q/k norms and a sigmoid gate per head (full layers rotate half of each head, sliding layers all of it within their window), every operator and MLP output normed again before the residual add, the head tied to the embedding |
 | `src/models/drafters/dflash.cpp` | Block drafters (DFlash, DFlash 2, DSpine): their config (refusals by name), the context a target's prefill and verify programs append for them, and the block program (DFlash 2's convolutions and candidate selector, DSpine's code bridge and refined last write) |
 | `src/backend/backend.h` | `Backend::compile(graphs, weights, options) -> Session` (programs sharing weights by name and state slots by label); `Session::run(program, inputs, outputs, only)` (every output, or just the ones asked for), `reset`, `truncate` (inside a step of up to `rewind_tokens` tokens too) |
@@ -205,6 +206,18 @@ HTTP POST /v1/systemone                                            server/decisi
            Session::run(program, inputs) -> outputs                backend/<name>/
          DecisionRun::probabilities() -> make_answer per question  decision/answers.cpp
   -> answers as JSON, timings in Server-Timing                     server/decision_handlers.cpp
+```
+
+An embedding model's:
+
+```text
+HTTP POST /v1/embeddings                                           server/embedding_handlers.cpp
+  -> parse + validate (400 names the field); a text -> encode + the special tokens around it   tokenizer/
+  -> EmbeddingService::embed (queues to the device thread)         embedding/service.cpp
+       EmbeddingRunner::embed, one run per input                   embedding/runner.cpp
+         EmbeddingModel::prepare_inputs(ids) -> Session::run -> hidden [T, D]   models/<arch>/, backend/<name>/
+         pool: mean or CLS, then the L2 norm when the checkpoint lists Normalize   embedding/pooling.cpp
+  -> {"data": [embedding per input], "usage"}, floats or base64; timings in Server-Timing
 ```
 
 ## 6. The step graph and the backends
@@ -293,6 +306,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/model/embedding_models.cpp` | encoders on tiny checkpoints the test writes (`embedding_test_util.h`): runs that keep nothing, every token seeing every other, BERT's absolute and NomicBERT's relative positions; the GPU against cpu-ref | the same model run differently |
 | `tests/unit/model/embedding_parity.cpp` | an embedding model (`XS_TEST_EMBEDDING_DIR`): hidden states, pooled vector and embedding of each case's ids, up to the model's longest input; with `XS_EMBEDDING_TEXTS=1` each text's ids too | sentence-transformers fp32, from `tests/parity/embedding/reference.py` (`make_tiny.py --arch bert|nomic_bert` writes tiny checkpoints) |
 | `tests/unit/embedding/` | pooling; the runner (a run per sequence, the limits it refuses, `--ctx` below the model's); the service (text through a tokenizer, clients on several threads) | values computed by hand; the runner on its own |
+| `tests/unit/server/test_embeddings_http.cpp` | the embeddings API: every input form, each 400 naming its field, float and base64 (decoded), models / health / no chat routes, concurrent clients, a tiny model and its tokenizer end to end | a fake embedding function; the runner |
 | `tests/e2e/` | a running chat server: 23 tool-calling cases with simulated tools, one turn and several (`tool_calls.py`, graded against `tool_calls_rubric.md`; an original checkpoint and its GGUF import compared call by call). A running decision server: 25 decisions with one accepted answer each (`decisions25.json`), the API's shape, latency (`systemone_eval.py`, also against reference answers or another run's saved ones: what a pack or a setting changes); `make_mmlu_pro.py` writes a larger, harder set from MMLU-Pro (not kept here) | accepted answers; the model's reference code; another run |
 
 - `tests/parity/**/*.py` generate fixtures from Hugging Face (run with a Python venv that has `transformers`,
