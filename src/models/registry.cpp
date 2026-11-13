@@ -1,11 +1,15 @@
 #include <algorithm>
 
+#include "models/bert/bert.h"
 #include "models/clef/clef.h"
+#include "models/common/sentence_transformers.h"
 #include "models/config_util.h"
 #include "models/decision.h"
+#include "models/embedding.h"
 #include "models/gemma4/gemma4.h"
 #include "models/lfm3/lfm3.h"
 #include "models/model.h"
+#include "models/nomic_bert/nomic_bert.h"
 #include "models/pi05/pi05.h"
 #include "models/policy.h"
 #include "models/pplx_decider/pplx_decider.h"
@@ -13,6 +17,15 @@
 #include "util/error.h"
 
 namespace xs {
+
+namespace {
+
+bool is_embedding_type(const std::string& type) {
+    const std::vector<std::string> types = supported_embedding_models();
+    return std::find(types.begin(), types.end(), type) != types.end();
+}
+
+}  // namespace
 
 std::vector<std::string> supported_model_types() {
     return {"gemma4", "gemma4_text", "lfm3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"};
@@ -28,6 +41,10 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
         return qwen3_5::load(dir, config, options);
     }
     if (type == "lfm3") return lfm3::load(dir, config, options);
+    if (is_embedding_type(type)) {
+        fail("model_type '", type, "' is served as an embedding model, from a sentence-transformers checkpoint ",
+             "(modules.json with a Pooling module); '", dir.string(), "' has none");
+    }
     if (config.contains("dflash_config")) {
         fail("'", dir.string(), "' is a block drafter checkpoint: it drafts for the model it was trained with ",
              "(--drafter beside that model; convert --target)");
@@ -41,6 +58,11 @@ ModelKind model_kind(const std::filesystem::path& dir) {
     const auto config = cfg::read_json(dir / "config.json");
     // LeRobot policies name their type under "type"; Hugging Face models under "model_type".
     if (config.contains("type") && !config.contains("model_type")) return ModelKind::Policy;
+    // An embedding model is an encoder that sentence-transformers pools (modules.json).
+    if (config.contains("model_type") && config.at("model_type").is_string() &&
+        is_embedding_type(config.at("model_type").get<std::string>()) && st::has_pooling(dir)) {
+        return ModelKind::Embedding;
+    }
     // A decision model's config.json is its decoder's: the head beside it tells.
     return clef::is_checkpoint(dir) || pplx_decider::is_checkpoint(dir) ? ModelKind::Decision : ModelKind::Language;
 }
@@ -67,6 +89,33 @@ std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& 
     std::string list;
     for (const auto& t : supported_decision_models()) list += (list.empty() ? "" : ", ") + t;
     fail("'", dir.string(), "' is not a decision model this build serves (", list, ")");
+}
+
+const char* pooling_name(Pooling pooling) {
+    switch (pooling) {
+        case Pooling::Mean: return "mean";
+        case Pooling::Cls: return "cls";
+    }
+    return "?";
+}
+
+std::vector<std::string> supported_embedding_models() {
+    return {"bert", "nomic_bert"};
+}
+
+std::unique_ptr<EmbeddingModel> load_embedding_model(const std::filesystem::path& dir) {
+    if (!std::filesystem::is_directory(dir)) fail("model directory '", dir.string(), "' does not exist");
+    const auto config = cfg::read_json(dir / "config.json");
+    const std::string type = cfg::get_string(config, "model_type", "config.json");
+    cfg::check_quantization(config);
+    if (!is_embedding_type(type)) {
+        std::string list;
+        for (const auto& t : supported_embedding_models()) list += (list.empty() ? "" : ", ") + t;
+        fail("model_type '", type, "' is not an embedding model this build serves (supported: ", list, ")");
+    }
+    const st::Pipeline pipeline = st::read_pipeline(dir);
+    if (type == "bert") return bert::load(dir, config, pipeline);
+    return nomic_bert::load(dir, config, pipeline);
 }
 
 std::vector<std::string> supported_policy_types() { return {"pi05"}; }

@@ -82,9 +82,9 @@ public:
     std::vector<int> camera_indices(const Observation& obs) const;
 };
 
-// What a checkpoint directory holds: a language model (models/model.h), a robot policy, or a decision model
-// (models/decision.h).
-enum class ModelKind : uint8_t { Language, Policy, Decision };
+// What a checkpoint directory holds: a language model (models/model.h), a robot policy, a decision model
+// (models/decision.h) or an embedding model (models/embedding.h).
+enum class ModelKind : uint8_t { Language, Policy, Decision, Embedding };
 ModelKind model_kind(const std::filesystem::path& dir);
 
 // Reads <dir>/config.json (LeRobot layout: "type") and dispatches on the policy type. Throws xs::Error naming

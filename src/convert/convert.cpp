@@ -289,6 +289,10 @@ ConvertReport convert_model(const ConvertOptions& o) {
 
     const bool drafter = !o.target.empty();
     const ModelKind kind = drafter ? ModelKind::Language : model_kind(o.source);
+    if (kind == ModelKind::Embedding) {
+        fail("convert: '", o.source.string(), "' is an embedding model, served from its checkpoint: packs of one are ",
+             "not supported");
+    }
     const bool policy = kind == ModelKind::Policy, decision = kind == ModelKind::Decision;
     XS_CHECK(!policy || o.method == QuantMethod::Rtn, "convert: AWQ calibrates on text; policies take round to nearest");
     XS_CHECK(!drafter || o.method == QuantMethod::Rtn, "convert: AWQ calibrates a model; a drafter takes round to nearest");

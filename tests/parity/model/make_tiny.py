@@ -3,6 +3,8 @@
 
     python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3 --tokenizer-from <dir>
         --out <dir>
+    python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
+        [--pooling mean|cls] [--normalize] [--max-seq-length N]
     python -I tests/parity/model/make_tiny.py --drafter dflash|dflash2|dspine --target <tiny dir> --dflash-repo <clone
         of github.com/z-lab/dflash> --out <dir>
 
@@ -12,6 +14,13 @@ The tokenizer files are copied from a real checkpoint, so the vocabulary is the 
 transformers does not ship (lfm3) is built from the modeling code in that checkpoint, which is copied too. Router
 weights are scaled up so each token's top-k experts win by a clear margin: a near tie could route differently at f16
 and fail parity for a reason that is not a bug. Then run hf_reference.py on the output.
+
+An embedding model (bert, nomic_bert) is the encoder of a sentence-transformers checkpoint, with its modules.json,
+1_Pooling/config.json and sentence_bert_config.json: --pooling and --normalize pick the pipeline, --max-seq-length the
+longest input. nomic_bert's modeling code comes from the --tokenizer-from checkpoint (nomic-ai/nomic-bert-2048 holds
+both); the tiny one is trained on fewer positions than it reads (max_trained_positions), as nomic-embed-text-v1.5 reads
+8192 tokens after training on 2048. Norms and the token type rows are away from their defaults, so a skipped one
+shows. Then run tests/parity/embedding/reference.py on the output.
 
 A drafter is a block drafter for a tiny target, in the released checkpoints' layout (config keys and tensor names):
 z-lab's DFlash model, DFlash 2 with its convolutions and candidate selector, or DSpine with its code bridge. Its
@@ -130,7 +139,95 @@ def lfm3(vocab_size, source):
     return model
 
 
-ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3}
+def bert(vocab_size, source):
+    """BERT as all-MiniLM-L6-v2 and bge-small-en-v1.5 are: post-norm layers, biases everywhere, the exact GELU,
+    absolute positions; head_dim 32 as theirs."""
+    from transformers import BertConfig, BertModel
+
+    config = BertConfig(
+        vocab_size=vocab_size, hidden_size=128, num_hidden_layers=2, num_attention_heads=4, intermediate_size=256,
+        hidden_act="gelu", max_position_embeddings=192, type_vocab_size=2, layer_norm_eps=1e-12,
+        initializer_range=0.05,
+    )
+    return perturbed(BertModel(config, add_pooling_layer=False))
+
+
+def nomic_bert(vocab_size, source):
+    """NomicBERT as nomic-embed-text-v1.5 is: post-norm, fused Wqkv, rotary over the whole head (base 1000), SwiGLU, no
+    biases but the norms'; trained on 64 positions, read up to the sentence-transformers limit."""
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    config_cls = get_class_from_dynamic_module("configuration_hf_nomic_bert.NomicBertConfig", source)
+    model_cls = get_class_from_dynamic_module("modeling_hf_nomic_bert.NomicBertModel", source)
+    config = config_cls(
+        vocab_size=vocab_size, n_embd=128, n_head=4, n_layer=2, n_inner=256, activation_function="swiglu",
+        rotary_emb_fraction=1.0, rotary_emb_base=1000, qkv_proj_bias=False, mlp_fc1_bias=False, mlp_fc2_bias=False,
+        prenorm=False, causal=False, layer_norm_epsilon=1e-12, n_positions=8192, max_trained_positions=64,
+        type_vocab_size=2, pad_vocab_size_multiple=64, initializer_range=0.05, attn_pdrop=0.0, resid_pdrop=0.0,
+        embd_pdrop=0.0,
+    )
+    return perturbed(model_cls(config, add_pooling_layer=False))
+
+
+def perturbed(model):
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dim() == 1 and name.endswith("weight"):
+                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
+            elif p.dim() == 1:
+                p.normal_(0.0, 0.2)
+            elif "token_type_embeddings" in name:
+                p.normal_(0.0, 0.5)  # every token adds row 0: it must show
+    return model.eval()
+
+
+ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3, "bert": bert,
+         "nomic_bert": nomic_bert}
+ENCODERS = {"bert", "nomic_bert"}
+ENCODER_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]
+
+
+def embedding_model(args):
+    """An encoder in a sentence-transformers checkpoint's layout."""
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(args.tokenizer_from)
+    model = ARCHS[args.arch](len(tok), args.tokenizer_from)
+    os.makedirs(args.out, exist_ok=True)
+    model.config.save_pretrained(args.out)
+    tensors = {k: v.contiguous() for k, v in model.state_dict().items()}
+    save_file(tensors, os.path.join(args.out, "model.safetensors"), metadata={"format": "pt"})
+    if args.arch == "nomic_bert":  # the modeling code beside the weights, named in config.json
+        for f in ("configuration_hf_nomic_bert.py", "modeling_hf_nomic_bert.py"):
+            shutil.copy(os.path.join(args.tokenizer_from, f), os.path.join(args.out, f))
+        path = os.path.join(args.out, "config.json")
+        with open(path) as f:
+            config = json.load(f)
+        config["auto_map"] = {"AutoConfig": "configuration_hf_nomic_bert.NomicBertConfig",
+                              "AutoModel": "modeling_hf_nomic_bert.NomicBertModel"}
+        with open(path, "w") as f:
+            json.dump(config, f, indent=2)
+    for f in ENCODER_TOKENIZER_FILES:
+        src = os.path.join(args.tokenizer_from, f)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(args.out, f))
+    modules = [{"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
+               {"idx": 1, "name": "1", "path": "1_Pooling", "type": "sentence_transformers.models.Pooling"}]
+    if args.normalize:
+        modules.append({"idx": 2, "name": "2", "path": "2_Normalize", "type": "sentence_transformers.models.Normalize"})
+    with open(os.path.join(args.out, "modules.json"), "w") as f:
+        json.dump(modules, f, indent=2)
+    os.makedirs(os.path.join(args.out, "1_Pooling"), exist_ok=True)
+    hidden = model.config.hidden_size
+    with open(os.path.join(args.out, "1_Pooling", "config.json"), "w") as f:
+        json.dump({"word_embedding_dimension": hidden, "pooling_mode_cls_token": args.pooling == "cls",
+                   "pooling_mode_mean_tokens": args.pooling == "mean", "pooling_mode_max_tokens": False,
+                   "pooling_mode_mean_sqrt_len_tokens": False}, f, indent=2)
+    max_seq_length = args.max_seq_length or (192 if args.arch == "bert" else 256)
+    with open(os.path.join(args.out, "sentence_bert_config.json"), "w") as f:
+        json.dump({"max_seq_length": max_seq_length, "do_lower_case": False}, f, indent=2)
+    print(f"{args.arch}: {sum(v.numel() for v in tensors.values()) / 1e6:.1f} M parameters, {args.pooling} pooling"
+          f"{', normalized' if args.normalize else ''}, up to {max_seq_length} tokens -> {args.out}")
 
 
 def mtp_head(model):
@@ -260,6 +357,9 @@ def main():
     ap.add_argument("--dflash-repo", help="--drafter: a clone of github.com/z-lab/dflash")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--pooling", choices=["mean", "cls"], default="mean", help="bert, nomic_bert: the Pooling mode")
+    ap.add_argument("--normalize", action="store_true", help="bert, nomic_bert: a Normalize module after the pooling")
+    ap.add_argument("--max-seq-length", type=int, help="bert, nomic_bert: the longest input")
     args = ap.parse_args()
     torch.manual_seed(args.seed)
     if args.drafter:
@@ -269,6 +369,9 @@ def main():
         return
     if not args.arch or not args.tokenizer_from:
         ap.error("--arch and --tokenizer-from are required")
+    if args.arch in ENCODERS:
+        embedding_model(args)
+        return
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer_from, trust_remote_code=False)
