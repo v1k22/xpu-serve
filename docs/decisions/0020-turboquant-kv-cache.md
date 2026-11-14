@@ -82,7 +82,20 @@ last 256 positions of each (1,024 positions, each attending to about 8,000 round
 | `turbo2` | 0.87628 | 2 | 10.279 (+6.46 %) | 0.092 | 89.4 % |
 
 Over 1,024 positions a perplexity moves by about a percent from the choice of positions alone, so the KL divergence
-and the top token are the sharper columns.
+and the top token are the sharper columns. Over 16 windows of 512 tokens (4,096 positions) the perplexity rises by
+0.76 % (turbo4), 1.84 % (turbo3) and 8.07 % (turbo2), and stays where it was with int8 (-0.01 %).
+
+Answers: 300 MMLU-Pro questions read at the option letters, and a fact planted in texts of 8k, 33k and 101k tokens
+and asked for (`tests/e2e/needle.py`, six probes):
+
+| `--kv-dtype` | MMLU-Pro right, of 300 | Same answer as f16 | Planted facts found |
+|---|---|---|---|
+| `auto` (f16) | 144 | | 6 of 6 |
+| `i8` | 143 | 295 | 6 of 6 |
+| `i8:turbo4` | 144 | 276 | 6 of 6 |
+| `turbo4` | 140 | 266 | 6 of 6 |
+| `turbo3` | 133 | 233 | 6 of 6 |
+| `turbo2` | 115 | 162 | 6 of 6 |
 
 **Speed** (`xpu-serve bench`: a prompt that fills the context but 80 tokens, then 64 tokens generated). Prefill is
 within 4 % of f16's at every length (turbo4: 4,738, 2,805 and 944 tok/s at 4k, 32k and 128k tokens against 4,764,
@@ -108,9 +121,12 @@ MMLU-Pro checks, and a GGUF pack of Qwen3.8-27B.
   perplexity (theirs: +0.23 %), turbo2 six and a half (theirs: +6.48 %). int8 stays the near-lossless step (KL
   0.00008); turbo4 moves the next-token distribution about fifty times as far as int8, turbo3 eight times as far as
   turbo4, turbo2 three times as far again. The most likely token changes on 2.6 %, 6.4 % and 10.6 % of positions.
-- **int8 keys help at every width**: with the keys at int8 the KL divergence halves (turbo4, turbo2) or drops to a
-  third (turbo3), for 1.5 to 2.4 times the cache. On short prompts the values matter as much as the keys (the worst
-  logit cosine barely moves with int8 keys); over 8,000 tokens the keys matter more.
+- **What is lost is close calls, not retrieval.** Every format finds every planted fact up to 101k tokens. On
+  MMLU-Pro, where this model is right half the time and often unsure, turbo4 changes one answer in nine (about what a
+  Q5_K_M file of the weights does), turbo3 one in four or five, turbo2 nearly half, with 29 fewer right.
+- **int8 keys help at every width**: with the keys at int8 the KL divergence falls by 40 to 70 % and turbo4 keeps
+  276 MMLU-Pro answers instead of 266, for 1.5 to 2.4 times the cache. On short prompts the values matter as much as
+  the keys (the worst logit cosine barely moves with int8 keys); over 8,000 tokens the keys matter more.
 - **A quantized cache amplifies what happens upstream.** A coordinate near an edge takes the other code after the
   slightest change in a key, and a code is a whole centroid apart. A tiny decoder whose weights are moved by 5e-4 moves
   its own logits by 0.013 with a float cache, 0.03 with int8 and 0.10 to 0.22 with the TurboQuant formats. This is why

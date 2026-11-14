@@ -101,7 +101,9 @@ The original checkpoint at f16 on an Arc Pro B60. Its cache is 32 KiB a token at
 heads; the other 24 layers keep a fixed-size state).
 
 <!-- KV-Q35-TABLES -->
-Memory. The cache takes exactly the formats' bytes; peak GPU memory is the whole process as the driver reports it during `xpu-serve bench` (weights, cache, and the scratch of a prefill: one layer's keys and values decoded to f16 for a quantized cache):
+Memory. The cache takes exactly the formats' bytes. Peak GPU memory is the whole process as the driver reports it
+during `xpu-serve bench`: the model, the cache, and a prefill's scratch (for a quantized cache, one layer's keys and
+values decoded to f16).
 
 | `--kv-dtype` | Cache bytes a token | Against f16 | Cache at 32k tokens | Cache at 128k tokens | Peak GPU memory at 4k | Peak GPU memory at 32k | Peak GPU memory at 128k |
 |---|---|---|---|---|---|---|---|
@@ -123,33 +125,59 @@ Speed (`xpu-serve bench`: a prompt that fills the context but 80 tokens, then 64
 | `turbo3` | 42.1 tok/s | 35.6 tok/s | 24.2 tok/s | 4,749 tok/s | 2,784 tok/s | 946 tok/s |
 | `turbo2` | 42.2 tok/s | 36.5 tok/s | 25.2 tok/s | 4,739 tok/s | 2,774 tok/s | 947 tok/s |
 
-Accuracy. Against Hugging Face fp32 on six prompts of 5 to 1,691 tokens; and against the f16 cache on wikitext-2's test split (`tests/unit/model/kv_format_quality.cpp`), the next-token distribution at the last positions of each window, every one of them attending to keys and values the format rounded:
+Accuracy, in the next-token distribution. Against the f16 cache on wikitext-2's test split
+(`tests/unit/model/kv_format_quality.cpp`): the distribution at the last half of 16 windows of 512 tokens (4,096
+positions) and at the last 256 positions of 4 windows of 8,192 tokens (1,024 positions, where a perplexity moves by a
+percent from the choice of positions alone), every position attending to keys and values the format rounded:
 
-| `--kv-dtype` | Logits cosine against Hugging Face fp32, worst of 6 prompts | Greedy text equal, of 6 | Perplexity, 8,192-token windows (change) | Mean KL from f16 | Same top token |
+| `--kv-dtype` | 512-token windows: perplexity (change) | mean KL from f16 | same top token | 8,192-token windows: perplexity (change) | mean KL from f16 | same top token |
+|---|---|---|---|---|---|---|
+| `auto` (f16) | 10.747 | 0 | 100 % | 9.655 | 0 | 100 % |
+| `i8` | 10.746 (-0.01 %) | 0.00015 | 99.4 % | 9.657 (+0.02 %) | 0.00008 | 99.6 % |
+| `i8:turbo4` | 10.797 (+0.46 %) | 0.0025 | 97.7 % | 9.638 (-0.18 %) | 0.0020 | 98.0 % |
+| `turbo4` | 10.829 (+0.76 %) | 0.0044 | 97.0 % | 9.683 (+0.29 %) | 0.0037 | 97.4 % |
+| `i8:turbo3` | 10.850 (+0.96 %) | 0.0090 | 95.5 % | 9.528 (-1.32 %) | 0.0095 | 95.5 % |
+| `turbo3` | 10.944 (+1.84 %) | 0.015 | 94.2 % | 9.595 (-0.63 %) | 0.030 | 93.6 % |
+| `i8:turbo2` | 11.313 (+5.27 %) | 0.037 | 90.6 % | 9.890 (+2.43 %) | 0.044 | 91.4 % |
+| `turbo2` | 11.614 (+8.07 %) | 0.063 | 87.5 % | 10.279 (+6.46 %) | 0.092 | 89.4 % |
+
+Accuracy, in answers. Against Hugging Face fp32 on six prompts of 5 to 1,691 tokens (the logits after the prompt, and
+32 greedy tokens); 300 MMLU-Pro questions read at the option letters (`serve --readout letters`); and
+`tests/e2e/needle.py`, a fact planted at a quarter and at three quarters of texts of 8k, 33k and 101k tokens, then
+asked for:
+
+| `--kv-dtype` | Logits cosine against Hugging Face fp32, worst of 6 prompts | Greedy text equal, of 6 | MMLU-Pro right, of 300 | Same answer as f16, of 300 | Planted facts found |
 |---|---|---|---|---|---|
-| `auto` (f16) | 1.00000 | 6 | 9.655 | 0 | 100 % |
-| `i8` | 0.99949 | 6 | 9.657 (+0.02 %) | 0.00008 | 99.6 % |
-| `i8:turbo4` | 0.99347 | 5 | 9.638 (-0.18 %) | 0.0020 | 98.0 % |
-| `turbo4` | 0.99158 | 5 | 9.683 (+0.29 %) | 0.0037 | 97.4 % |
-| `i8:turbo3` | 0.97940 | 3 | 9.528 (-1.32 %) | 0.0095 | 95.5 % |
-| `turbo3` | 0.96621 | 3 | 9.595 (-0.63 %) | 0.030 | 93.6 % |
-| `i8:turbo2` | 0.89668 | 2 | 9.890 (+2.43 %) | 0.044 | 91.4 % |
-| `turbo2` | 0.87628 | 2 | 10.279 (+6.46 %) | 0.092 | 89.4 % |
+| `auto` (f16) | 1.00000 | 6 | 144 |  | 6 of 6 |
+| `i8` | 0.99949 | 6 | 143 | 295 | 6 of 6 |
+| `i8:turbo4` | 0.99347 | 5 | 144 | 276 | 6 of 6 |
+| `turbo4` | 0.99158 | 5 | 140 | 266 | 6 of 6 |
+| `i8:turbo3` | 0.97940 | 3 |  |  |  |
+| `turbo3` | 0.96621 | 3 | 133 | 233 | 6 of 6 |
+| `i8:turbo2` | 0.89668 | 2 |  |  |  |
+| `turbo2` | 0.87628 | 2 | 115 | 162 | 6 of 6 |
 <!-- /KV-Q35-TABLES -->
 
 What the numbers say:
 
 - **Memory.** The cache shrinks by exactly the format's factor: 3.88, 5.12 and 7.53 times against f16 for `turbo4`,
   `turbo3` and `turbo2`, twice to nearly four times against `i8`. At 128k tokens the whole process peaks at 13.0 GiB
-  with f16, 11.6 with `i8`, 10.6 with `turbo4` and 10.1 with `turbo2` (about 8.7 GiB of each is the model and its working buffers).
+  with f16, 11.6 with `i8`, 10.6 with `turbo4` and 10.1 with `turbo2` (about 8.7 GiB of each is the model and its
+  working buffers).
 - **Speed.** Prefill stays within 4 % of f16's and decode within 6 %, at every length and for every format.
-- **Accuracy follows the bits.** `i8` is next to lossless. `turbo4` costs a third of a percent of perplexity and
-  changes the most likely token at 2.6 % of positions; `turbo3` at 6.4 %; `turbo2` costs 6.5 % of perplexity and
-  changes it at 10.6 %. Greedy text diverges early with any of the three (the same text on 5, 3 and 2 of 6 prompts
-  over 32 tokens). These are the costs TurboQuant+ reports for the formats (+0.23 % and +6.48 % of perplexity for
-  `turbo4` and `turbo2`).
-- **int8 keys buy accuracy back**: with the keys at `i8` the divergence from f16 halves (`i8:turbo4`, `i8:turbo2`) or
-  drops to a third (`i8:turbo3`), for 1.5 to 2.4 times the cache.
+- **`i8` is next to lossless**: 295 of 300 MMLU-Pro answers stay, and the next-token distribution hardly moves.
+- **The TurboQuant formats cost accuracy by their bits.** `turbo4` raises perplexity by 0.3 to 0.8 %, changes the
+  most likely token at 3 % of positions and keeps 266 of 300 MMLU-Pro answers: about what a Q5_K_M file of the
+  weights costs this model (271 of 300, [Qwen3.5-4B GGUF](#qwen35-4b-gguf)). `turbo3` (+1.8 % at 512 tokens, 233 of
+  300) is near a Q4_0 file's 227. `turbo2` (+6.5 to 8 %, 162 of 300, 29 fewer right answers) is between a Q3 file and
+  a 2-bit one. Greedy text diverges early with any of the three. The perplexity costs are the ones TurboQuant+
+  reports for its formats on other models (+0.23 %, +1.06 % and +6.48 %), a little higher on this small Qwen.
+- **Long-context retrieval survives all of them**: every format finds the planted fact in all six texts, up to 101k
+  tokens. What the low-bit formats lose is close calls, not the ability to find what is in the context.
+- **int8 keys buy accuracy back**: with the keys at `i8`, `i8:turbo4` keeps 276 answers against `turbo4`'s 266, and
+  the divergence from f16 falls by 40 to 70 % at every width, for 1.5 to 2.4 times the cache.
+- **So**: `i8` first. `i8:turbo4` or `turbo4` when the cache must shrink further and a small loss is acceptable;
+  `turbo3` and `turbo2` when memory decides, with the answers checked on the task.
 
 <!-- KV-Q38-TABLES -->
 
