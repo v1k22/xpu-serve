@@ -14,6 +14,17 @@ Intel GPUs. **[model_recipes.md](model_recipes.md) has the commands for every mo
 optimized one) and what was measured**; this page says what is supported and how the APIs look.
 [CLAUDE.md](CLAUDE.md) maps the code.
 
+> **A 27B model's full context on one 24 GB card.** Qwen3.8-27B (its Q4_0 GGUF file, with its MTP drafter) reads all
+> 262,144 tokens it can take on a single Intel Arc Pro B60, with the KV cache in TurboQuant's `turbo4`. With an f16
+> cache the same card stops at 64k tokens, with int8 at 128k.
+>
+> ```bash
+> xpu-serve serve ~/models/Qwen3.8-27B-Q4_0 --device GPU --spec mtp --spec-k 4 --ctx 262144 --kv-dtype turbo4
+> ```
+>
+> The format is lossy and opt-in; what it costs and what was measured:
+> [model_recipes.md](model_recipes.md#measured-on-qwen38-27b-a-gguf-pack).
+
 ## What is supported
 
 - ✅ **OpenAI-compatible server**: `/v1/chat/completions` (streaming, tool calls, thinking), `/v1/completions`,
@@ -28,7 +39,8 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Speculative decoding**: Qwen's MTP heads, Gemma 4's assistants, DFlash 2 and DSpine block drafters
   (Qwen3.8-27B)
 - ✅ **int8 KV cache** (`--kv-dtype i8`)
-- ✅ **TurboQuant KV cache** (`--kv-dtype turbo4 | turbo3 | turbo2`, or int8 keys with TurboQuant values)
+- ✅ **TurboQuant KV cache** (`--kv-dtype turbo4 | turbo3 | turbo2`, or int8 keys with TurboQuant values): a cache
+  3.9 to 7.5 times smaller than f16
 - ✅ **Decision models** behind the System One API (`POST /v1/systemone`): Clef-Flash, Clef, pplx-decider-flash,
   OpenJev, d1, Laya, Julia-1, or any chat model read at the option letters
 - ✅ **Embedding models** behind `/v1/embeddings`: all-MiniLM-L6-v2, bge-small-en-v1.5, nomic-embed-text-v1.5
