@@ -62,7 +62,8 @@ its size: 32 KiB a token at f16.
 | `turbo2` | 4,352 | 7.53x | 0.13 GiB | 0.53 GiB |
 
 A prefill adds its scratch: one layer's keys and values in view decoded to f16 (0.5 GiB at 128k tokens for this
-model), as with int8.
+model), as with int8. The peaks of the whole process, about 8.7 GiB of which is the model and its working buffers, are in the
+speed table.
 
 **Accuracy.** Against Hugging Face fp32 on the six parity prompts (5 to 1,691 tokens): the worst cosine of the
 last-token logits, and on how many prompts 32 greedy tokens are the reference's. Against the f16 cache on wikitext-2's
@@ -83,15 +84,18 @@ last 256 positions of each (1,024 positions, each attending to about 8,000 round
 Over 1,024 positions a perplexity moves by about a percent from the choice of positions alone, so the KL divergence
 and the top token are the sharper columns.
 
-**Speed.** Prefill is within 3 % of f16's at every length (turbo4: 4,750, 2,760 and 946 tok/s at 4k, 32k and 128k
-tokens against 4,780, 2,835 and 961). Decode, tok/s, one run each:
+**Speed** (`xpu-serve bench`: a prompt that fills the context but 80 tokens, then 64 tokens generated). Prefill is
+within 4 % of f16's at every length (turbo4: 4,738, 2,805 and 944 tok/s at 4k, 32k and 128k tokens against 4,764,
+2,826 and 962). Decode, tok/s:
 
-| `--kv-dtype` | at 4k tokens | at 32k | at 128k |
-|---|---|---|---|
-| `auto` (f16) | 42.1 | 36.3 | 25.7 |
-| `i8` | 42.2 | 36.8 | 26.5 |
-| `turbo4` | 41.8 | 36.4 | 24.8 |
-| `turbo2` | | 37.0 | |
+| `--kv-dtype` | at 4k tokens | at 32k | at 128k | Peak GPU memory at 128k |
+|---|---|---|---|---|
+| `auto` (f16) | 42.1 | 36.3 | 25.7 | 12.99 GiB |
+| `i8` | 42.2 | 36.8 | 26.5 | 11.57 GiB |
+| `i8:turbo4` | 42.0 | 36.8 | 26.3 | 11.07 GiB |
+| `turbo4` | 42.0 | 36.6 | 24.8 | 10.55 GiB |
+| `turbo3` | 42.1 | 35.6 | 24.2 | 10.31 GiB |
+| `turbo2` | 42.2 | 36.5 | 25.2 | 10.05 GiB |
 
 [model_recipes.md](../../model_recipes.md#kv-cache-formats) carries the full tables, the long-context retrieval and
 MMLU-Pro checks, and a GGUF pack of Qwen3.8-27B.

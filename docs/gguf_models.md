@@ -2,7 +2,8 @@
 
 Every result behind xpu-serve's GGUF support, in one place: three language models and the decision models
 Clef-Flash, Clef, Laya and Julia-1, every file their publisher offers that fits one Intel Arc Pro B60 (24 GB).
-[Decision 0016](decisions/0016-gguf.md) has the design; the README's GGUF section has the short version.
+[Decision 0016](decisions/0016-gguf.md) has the design; [model_recipes.md](../model_recipes.md#gguf-imports) has the
+commands and the short version.
 
 ## How it was measured
 

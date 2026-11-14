@@ -102,7 +102,8 @@ build/src/xpu-serve run   <embedding-model-dir> --device GPU --prompt "text"    
 xpu-serve/
 ├── CMakeLists.txt          options XS_WITH_SYCL, XS_SYCL_TARGETS, XS_BUILD_TESTS, XS_WERROR; C++20; warnings target;
 │                           `cmake --install` puts the one binary in <prefix>/bin (src/CMakeLists.txt)
-├── README.md               user-facing intro and quick start
+├── README.md               user-facing intro: what is supported, the models, build, quick start, the APIs
+├── model_recipes.md        per model: the reference command, the optimized one, and every measured number
 ├── CLAUDE.md               this file
 ├── DESIGN.md               the design (why), roadmap, open questions
 ├── TODO.md                 phase checklists; [x] = done and tested
@@ -380,7 +381,8 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
    tables, and the loaded pack hands the same graph Q8 / Q4 weights. Only weights the model reads on the host (like
    Qwen3.5's norm weights or Gemma 4's per-layer embedding table) must stay out of matmuls and gathers, which they
    already are. Check quality with the parity test on a pack (`XS_TEST_MODEL_DIR=<pack>`).
-9. Update TODO.md, this file's map, and README if users see the change.
+9. Update TODO.md, this file's map, and for a change users see README (what is supported) and model_recipes.md (the
+   model's commands and what was measured).
 
 ### 8.2 Add a graph op
 
@@ -437,7 +439,7 @@ draft program, and one way of drafting. The engine needs nothing new.
 5. Tests: `tests/parity/decision/reference.py` learns to run the checkpoint's code, `make_tiny.py` to write a tiny
    one; `decision_parity.cpp` then checks tokens and probabilities, on cpu-ref and the GPU; invariants on a tiny
    checkpoint the test writes go in `decision_models.cpp`. End to end: `tests/e2e/systemone_eval.py --reference`.
-6. Update TODO.md, this file's map and the README's decision models table.
+6. Update TODO.md, this file's map, the README's model list and the model's recipe in model_recipes.md.
 
 ### 8.7 Add an embedding model
 
@@ -449,7 +451,7 @@ draft program, and one way of drafting. The engine needs nothing new.
    is refused today: teach `models/common/sentence_transformers` and `embedding/pooling` first.
 3. Tests: `make_tiny.py` learns to write a tiny one and `tests/parity/embedding/reference.py` runs it;
    `embedding_parity.cpp` then compares hidden states and embeddings; refusals in `embedding_config.cpp`.
-4. Update TODO.md, this file's map and the README.
+4. Update TODO.md, this file's map, the README's model list and the model's recipe in model_recipes.md.
 
 ### 8.8 Add a GGUF architecture
 
@@ -489,7 +491,7 @@ Hugging Face safetensors (8.1 first, if it does not).
 5. Tests: a tiny GGUF of the architecture written as the converter writes one, imported and compared with the
    checkpoint its blocks decode to (modeled on `tests/unit/convert/gguf_import.cpp`), with a planted control for every
    reordering; real-file checks behind an environment variable (`gguf_real_file.cpp`).
-6. Update this file (map, tests, section 10) and the README's GGUF line.
+6. Update this file (map, tests, section 10), the README's GGUF line and the GGUF recipes in model_recipes.md.
 
 ## 9. Conventions
 
