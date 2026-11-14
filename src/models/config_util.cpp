@@ -90,9 +90,16 @@ void check_quantization(const nlohmann::json& config) {
 }
 
 std::string model_id(const std::filesystem::path& model_dir) {
-    const std::filesystem::path dir = std::filesystem::absolute(model_dir).lexically_normal();
-    const std::string name = dir.filename().string();  // empty when the path ends in a separator
-    return name.empty() ? dir.parent_path().filename().string() : name;
+    std::filesystem::path dir = std::filesystem::absolute(model_dir).lexically_normal();
+    if (dir.filename().empty()) dir = dir.parent_path();  // the path ended in a separator
+    // A snapshot in the Hugging Face cache, <cache>/models--<org>--<name>/snapshots/<commit>: org/name.
+    const std::string repo = dir.parent_path().parent_path().filename().string();
+    if (dir.parent_path().filename() == "snapshots" && repo.rfind("models--", 0) == 0) {
+        std::string id = repo.substr(8);
+        if (const size_t sep = id.find("--"); sep != std::string::npos) id.replace(sep, 2, "/");
+        return id;
+    }
+    return dir.filename().string();
 }
 
 SamplingParams read_generation_defaults(const std::filesystem::path& model_dir, std::vector<int32_t>* eos_ids) {

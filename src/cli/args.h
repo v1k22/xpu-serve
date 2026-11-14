@@ -13,6 +13,8 @@ class Args {
 public:
     Args& value(const std::string& name, std::string help, std::string fallback = {});
     Args& flag(const std::string& name, std::string help);
+    // `spelling` (e.g. "-hf") stands for the declared option `name`.
+    Args& alias(const std::string& spelling, const std::string& name);
 
     // Throws xs::Error on an unknown flag or a missing value.
     void parse(const std::vector<std::string>& argv);
@@ -32,6 +34,7 @@ private:
         bool given = false;
     };
     std::map<std::string, Spec> specs_;
+    std::map<std::string, std::string> aliases_;
     std::vector<std::string> order_;
     std::vector<std::string> positionals_;
 };

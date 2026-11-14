@@ -52,12 +52,14 @@ build/src/xpu-serve info                                  # backends and devices
 build/src/xpu-serve run   <hf-model-dir> --device GPU --prompt "Hi"
 build/src/xpu-serve run   <hf-model-dir> --device GPU --image photo.jpg --prompt "Describe this image."
 build/src/xpu-serve serve <hf-model-dir> --device GPU     # http://127.0.0.1:8080/v1
+build/src/xpu-serve serve -hf Qwen/Qwen3.5-4B --device GPU   # the same, downloaded into the Hugging Face cache first
 build/src/xpu-serve bench <hf-model-dir> --device GPU --prompt-tokens 1024 --gen-tokens 128
 build/src/xpu-serve run   <decision-model-dir> --device GPU --request request.json   # a System One request's answers
 build/src/xpu-serve run   <embedding-model-dir> --device GPU --prompt "text"        # its embedding, a JSON array
 ```
 
-- icpx turns the SYCL backend on (`XS_WITH_SYCL`); `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` compiles its kernels ahead
+- OpenSSL 3 (`libssl-dev`) is needed: TLS and SHA-256 of the Hub downloads (`-hf`). icpx turns the SYCL backend on
+  (`XS_WITH_SYCL`); `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` compiles its kernels ahead
   of time for the Arc Pro B60. Any other C++20 compiler builds only the CPU reference backend (the test oracle).
 - Useful flags: `--backend sycl|cpu-ref` (default: sycl when built), `--device GPU|GPU.0|GPU.1`, `--precision f16|f32`,
   `--kv-dtype auto|i8|turbo4|turbo3|turbo2` (or `<keys>:<values>`, e.g. `i8:turbo4`), `--ctx N`, `--prefill-chunk N`, `--backend-opt attention=auto|rows|gemm`,
@@ -139,7 +141,8 @@ area).
 | `policy/` | xs_policy | `PolicyRunner`: a policy, its tokenizer and one compiled program per call shape; warm-up; per-call timings (`xpu-serve bench <policy-dir>`) |
 | `decision/` | xs_decision | `DecisionRunner`: a decision model, its tokenizer and chat template (`PromptTools`; from the folder the model names, the template only when it asks for one), its programs in one session, a request's steps run as the model names them; `answers` (probabilities -> choice, score, confidence); `DecisionService` (one device thread, requests in arrival order) |
 | `embedding/` | xs_embedding | `EmbeddingRunner`: an embedding model and its one stateless session, a run per token sequence, timings; `pooling` (mean or CLS, then the L2 norm, on the host); `EmbeddingService` (the tokenizer for text, one device thread) |
-| `cli/` | (exe) | `main.cpp` (commands serve, run, bench, convert, info), `args` (flag parser) |
+| `hub/` | xs_hub | `-hf`: models of the Hugging Face Hub. `http` (GETs through the environment's proxies, redirects followed by hand, a token only to the origin it is for), `download` (files in ranges over several connections, resumable from a list of the ranges written, checked against size and SHA-256), `hf_hub` (the Hub's listing API and the Hugging Face cache in huggingface_hub's own layout: blobs, snapshot links, refs, its lock files; offline use), `select` (which files of a repository a model needs; a GGUF file by its quantization tag; a drafter's `mtp-*.gguf`; the MTP head published apart), `model_source` (a spec to the directory a command reads: a snapshot, a GGUF file imported once into a pack in xpu-serve's cache, a checkpoint beside the files it reads from another repository: `missing_companion_files`), `file_lock.h`. docs/decisions/0021 |
+| `cli/` | (exe) | `main.cpp` (commands serve, run, bench, convert, info; `-hf` / `-hfd` resolved before anything loads), `args` (flag parser, with aliases like `-hf`) |
 
 ### 4.1 Files that matter most
 
@@ -302,6 +305,8 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/tokenizer/` | encode/decode, streaming, the post-processor's special tokens; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`); WordPiece, BertNormalizer, BertPreTokenizer and the WordPiece decoder on a hand-written vocabulary, and the BERT normalizer and pre-tokenizer over every code point (`test_tokenizer_wordpiece.cpp`); the GPT-2 regex, ByteLevel and Metaspace, the regex over every code point (`test_tokenizer_laya_julia.cpp`); whole tokenizers of Gemma 4, Qwen3.5, LFM3, the WordPiece embedding models and the Laya and Julia-1 decision models (ModernBERT's and mmBERT's) (`parity_cases.h`; each needs its checkpoint's `tokenizer.json`; `scratch_model_dir.h` writes a hand-written one to load) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`, `gen_lfm3_cases.py`, `gen_wordpiece_cases.py`, `gen_laya_julia_cases.py`; tables from `gen_unicode_tables.py`) |
 | `tests/unit/chat/` | template rendering (LFM3's template comes from `XS_LFM3_DIR`), Gemma 4 and Qwen3.5 output parsing, the latter on LFM3's prompts too | `apply_chat_template` outputs in `tests/fixtures/chat/` (`tests/parity/chat/gen_cases.py`) |
 | `tests/unit/server/` | request parsing, response format, stop strings, HTTP end to end | a fake `InferenceService` (`fake_service.h`) |
+| `tests/unit/hub/test_hub_select.cpp` | which files of a repository `-hf` fetches, on listings shaped as real ones (a sentence-transformers checkpoint beside other runtimes' weights, Laya's variants in subfolders, unsloth's GGUF repositories with dynamic quantizations, split files, projectors and MTP files); specs and their refusals | hand-written expectations |
+| `tests/unit/hub/test_hub_download.cpp` | the hub client against a Hub in the test process (`fake_hub.h`: listing API, resolve URLs redirecting to a second server standing for the CDN, ranges, tokens, gated repositories, faults): the cache layout huggingface_hub writes, nothing downloaded twice, offline and unreachable, a download resumed with the ranges it lacked, a corrupted byte caught and not kept, the token never sent to the CDN, refusals by name; a GGUF file imported once with the MTP head published apart, a checkpoint given its companion file, refused before its weights without a token | the files served; convert's import of the same files |
 | `tests/unit/io/gguf_reader.cpp` | the GGUF reader: every metadata value type, nested arrays, a vocabulary-sized string array, tensors at the file's alignment, versions 2 and 3, values compared exactly (`same_as`); refusals (big-endian, split files, tensor types it does not read, truncation, misalignment) | files written by `gguf_test_util.h` (which also encodes Q8_0 and Q4_0 blocks as ggml does) |
 | `tests/unit/quant/test_block_decode.cpp` | every GGUF block format decoded on the host, on random and edge blocks; the block layouts and codebook tables; planted wrong layouts | ggml's own `dequantize_row_*`, bit for bit, in `tests/fixtures/quant/blocks/` (`tests/parity/quant/gen_block_cases.py`) |
 | `tests/unit/quant/test_kv_formats.cpp` | the KV cache formats on the host: names and sizes; the TurboQuant formats' codes and norm of rows of every kind, their rotation, their error on Gaussian and on spiky rows; planted: codes read at another width, values left rotated | the reference implementation's blocks in `tests/fixtures/quant/turbo/` (`tests/parity/quant/gen_turbo_cases.py`), equal but where a coordinate sits on an edge; nearest centroids in fp64 |
@@ -582,5 +587,7 @@ Hugging Face safetensors (8.1 first, if it does not).
   with another is refused by name); keys and values take one format, or `i8` keys with TurboQuant values, other
   pairs are refused. Prefill decodes the keys and values in view of one layer to f16 at a time, so its scratch is
   one layer's f16 cache. Lossy and opt-in (docs/decisions/0010, 0020).
+- `-hf` reads the Hugging Face Hub's API and resolve URLs: a GGUF file is imported into a pack, so it takes its size
+  twice on disk; a file split into parts is refused, as the import refuses it; no Xet chunk deduplication.
 - One sequence at a time; no batching.
 - Sliding-window layers keep every key in memory (the kernels read only the window; memory still grows with context).

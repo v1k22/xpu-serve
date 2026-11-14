@@ -146,6 +146,14 @@ std::unique_ptr<Policy> load_policy(const std::filesystem::path& dir) {
     fail("policy type '", type, "' is not supported (supported: ", list, ")");
 }
 
+std::vector<CompanionFile> missing_companion_files(const std::filesystem::path& dir) {
+    const std::filesystem::path config = dir / "config.json";
+    if (!std::filesystem::exists(config) || std::filesystem::exists(dir / "tokenizer.json")) return {};
+    const auto j = cfg::read_json(config);
+    if (j.is_object() && j.value("type", "") == "pi05") return {{"google/paligemma-3b-pt-224", "tokenizer.json"}};
+    return {};
+}
+
 std::vector<int> Policy::camera_indices(const Observation& obs) const {
     const auto& cams = spec().cameras;
     std::vector<int> out;

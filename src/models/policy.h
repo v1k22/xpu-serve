@@ -92,4 +92,12 @@ ModelKind model_kind(const std::filesystem::path& dir);
 std::unique_ptr<Policy> load_policy(const std::filesystem::path& dir);
 std::vector<std::string> supported_policy_types();
 
+// A file a checkpoint needs beside it that its own repository does not publish: π0.5 reads PaliGemma's tokenizer.
+struct CompanionFile {
+    std::string repo;  // the Hugging Face repository that has it
+    std::string path;  // its path there, and beside the checkpoint
+};
+// The companion files `dir` lacks (none for most checkpoints).
+std::vector<CompanionFile> missing_companion_files(const std::filesystem::path& dir);
+
 }  // namespace xs

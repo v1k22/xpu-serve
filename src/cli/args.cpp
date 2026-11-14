@@ -18,9 +18,18 @@ Args& Args::flag(const std::string& name, std::string help) {
     return *this;
 }
 
+Args& Args::alias(const std::string& spelling, const std::string& name) {
+    XS_CHECK(specs_.count(name) != 0, "alias ", spelling, " of undeclared option ", name);
+    aliases_[spelling] = name;
+    return *this;
+}
+
 void Args::parse(const std::vector<std::string>& argv) {
     for (size_t i = 0; i < argv.size(); ++i) {
-        const std::string& a = argv[i];
+        std::string a = argv[i];
+        if (const auto alias = aliases_.find(a.substr(0, a.find('='))); alias != aliases_.end()) {
+            a = "--" + alias->second + a.substr(alias->first.size());
+        }
         if (a.size() < 3 || a.compare(0, 2, "--") != 0) {
             positionals_.push_back(a);
             continue;
@@ -80,6 +89,9 @@ std::string Args::usage() const {
     for (const auto& name : order_) {
         const Spec& s = specs_.at(name);
         std::string left = "  --" + name + (s.is_flag ? "" : " <value>");
+        for (const auto& [spelling, target] : aliases_) {
+            if (target == name) left += ", " + spelling;
+        }
         if (left.size() < 28) left.resize(28, ' ');
         out += left + " " + s.help;
         if (!s.is_flag && !s.value.empty()) out += " (default: " + s.value + ")";

@@ -19,7 +19,7 @@ optimized one) and what was measured**; this page says what is supported and how
 > cache the same card stops at 64k tokens, with int8 at 128k.
 >
 > ```bash
-> xpu-serve serve ~/models/Qwen3.8-27B-Q4_0 --device GPU --spec mtp --spec-k 4 --ctx 262144 --kv-dtype turbo4
+> xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --spec mtp --spec-k 4 --ctx 262144 --kv-dtype turbo4
 > ```
 >
 > The format is lossy and opt-in; what it costs and what was measured:
@@ -27,6 +27,8 @@ optimized one) and what was measured**; this page says what is supported and how
 
 ## What is supported
 
+- ✅ **Models straight from the Hugging Face Hub**: `-hf org/name`, or `-hf org/name:QUANT` for a GGUF file, into
+  the Hugging Face cache (shared with huggingface_hub), resumable and checked
 - ✅ **OpenAI-compatible server**: `/v1/chat/completions` (streaming, tool calls, thinking), `/v1/completions`,
   `/v1/models`
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
@@ -92,8 +94,8 @@ A model is added in `src/models/<arch>/` (language models: [CLAUDE.md](CLAUDE.md
 
 ## Build
 
-Needs CMake 3.22+, Ninja and the oneAPI toolkit 2026.2 (DPC++ compiler `icpx` and oneMKL), and an Intel GPU driver
-with Level Zero.
+Needs CMake 3.22+, Ninja, OpenSSL 3 (`libssl-dev`, for downloads over HTTPS) and the oneAPI toolkit 2026.2 (DPC++
+compiler `icpx` and oneMKL), and an Intel GPU driver with Level Zero.
 
 ```bash
 source /opt/intel/oneapi/setvars.sh                      # oneAPI 2026.2
@@ -113,19 +115,47 @@ backend: the CPU reference backend, which is the test oracle and far too slow to
 
 ## Run
 
-Any Hugging Face directory of a supported model works, e.g. `google/gemma-4-E2B-it` or `Qwen/Qwen3.5-4B`:
+Name a model on the Hugging Face Hub with `-hf`, or give the directory of one you have:
 
 ```bash
-xpu-serve info                                           # backends and devices (the first is the default)
-xpu-serve run   ~/models/gemma-4-E2B-it --device GPU     # chat in the terminal
-xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --image photo.jpg --prompt "What is in this picture?"
-xpu-serve serve ~/models/gemma-4-E2B-it --device GPU     # http://127.0.0.1:8080/v1
-xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1024 --gen-tokens 128
+xpu-serve info                                                # backends and devices (the first is the default)
+xpu-serve run   -hf google/gemma-4-E2B-it --device GPU        # downloads it, then chat in the terminal
+xpu-serve run   -hf google/gemma-4-E2B-it --device GPU --image photo.jpg --prompt "What is in this picture?"
+xpu-serve serve -hf Qwen/Qwen3.5-4B --device GPU              # http://127.0.0.1:8080/v1
+xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --spec mtp --spec-k 4   # one GGUF file of a repository
+xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1024 --gen-tokens 128   # a local directory
 ```
 
 That is the reference setting: the checkpoint's own weights at f16, an f16 KV cache. The steps below make a model
 smaller and faster; [model_recipes.md](model_recipes.md) has the combination to use for each model.
 `xpu-serve <command> --help` lists every option.
+
+### Downloading models (`-hf`)
+
+`-hf org/name` (or `--hf`) on `serve`, `run`, `bench` and `convert` takes the place of a model directory, and `-hfd`
+(`--hf-drafter`) the place of `--drafter <dir>`:
+
+- **Into the Hugging Face cache**, in its own layout (`~/.cache/huggingface/hub`, or `HF_HUB_CACHE` / `HF_HOME`), so a
+  model downloaded by huggingface_hub, `hf download` or another engine is found there and not downloaded again, and
+  theirs find the ones xpu-serve downloaded. The second run downloads nothing.
+- **Only what xpu-serve reads**: the safetensors and the files beside them, not the PyTorch, ONNX, OpenVINO or
+  TensorFlow copies of the weights, pictures, or subfolders that are other variants of the model.
+- **A GGUF file**: `-hf org/name:QUANT` names one file of a GGUF repository by its quantization (`Q4_K_M` by default;
+  `Q4_0`, `UD-Q4_K_XL`, `Q8_0`, ...). It is imported once into a pack in xpu-serve's cache (`~/.cache/xpu-serve`, or
+  `XS_CACHE_DIR`), so it takes its size twice on disk. A Qwen3.5-family file published without its MTP head gets the
+  head from the repository's `mtp-*.gguf`, so `--spec mtp` works. `-hfd org/name` picks a GGUF repository's drafter
+  file (`mtp-*.gguf`, `Q8_0` by default).
+- **Fast and resumable**: files come in ranges over eight connections, an interrupted download continues where it
+  stopped, and every file is checked against its SHA-256 before it is used.
+- **Gated and private repositories** need `HF_TOKEN` (or the token file `hf auth login` writes) from an account that
+  accepted the model's terms. π0.5 reads PaliGemma's tokenizer, which `-hf lerobot/pi05_base` fetches from the gated
+  `google/paligemma-3b-pt-224`.
+- **The rest as huggingface_hub reads it**: `@revision` after the name (a branch, tag or commit), `HF_ENDPOINT` for a
+  mirror, `HF_HUB_OFFLINE=1` for the cache alone (also used, with a warning, when the Hub cannot be reached), the
+  proxies of `https_proxy` and `no_proxy`.
+- `serve` names the model `org/name` (or `org/name:QUANT`) in `/v1/models`; `--model-id` changes that.
+
+The design: [docs/decisions/0021](docs/decisions/0021-hugging-face-downloads.md).
 
 ### Quantized packs (`convert`)
 
@@ -133,8 +163,8 @@ smaller and faster; [model_recipes.md](model_recipes.md) has the combination to 
 takes a pack wherever it takes a model directory; the model code is the same.
 
 ```bash
-xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q8 --quant q8
-xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --method awq
+xpu-serve convert -hf Qwen/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q8 --quant q8
+xpu-serve convert -hf Qwen/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --method awq
 xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
 ```
 
@@ -149,7 +179,7 @@ xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
   is quantized, because a smaller weight makes those matmuls faster; weights of compute-bound matmuls (an image
   encoder, a policy's prefix over hundreds of tokens) stay as they are. `--scope all` quantizes every matmul weight
   instead (the smallest pack). For π0.5 the rule picks the action expert, which runs 50 tokens per flow step.
-- The source can be the model's FP8 release instead of the original (`convert ~/models/Qwen3.8-27B-FP8 --out ...`):
+- The source can be the model's FP8 release instead of the original (`convert -hf Qwen/Qwen3.8-27B-FP8 --out ...`):
   half the download, the same pack layout and speed, and logits as close to Hugging Face's
   ([docs/decisions/0014](docs/decisions/0014-fp8-checkpoints.md)). An FP8 checkpoint also serves as it is, as f16 on
   the device like the original, so it fits where the original fits.
@@ -162,7 +192,8 @@ stores it (Q4_K, Q6_K, IQ3_S, ...: nothing is decoded or quantized again), so th
 takes the file's size in GPU memory:
 
 ```bash
-xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M
+xpu-serve serve -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M --device GPU            # the file, imported once into a pack
+xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M   # a file you have
 xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
 ```
 
@@ -197,7 +228,7 @@ output stays the model's own and sampling keeps its distribution (rejection samp
 
 ```bash
 xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4
-xpu-serve run   ~/models/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 --drafter ~/models/gemma-4-E2B-it-assistant
+xpu-serve run   -hf google/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 -hfd google/gemma-4-E2B-it-assistant
 ```
 
 A drafter is trained for one model, so a technique works only where a drafter for that model exists (elsewhere the
@@ -228,7 +259,7 @@ something unsupported is refused with the field's name, never served differently
 server:
 
 ```bash
-xpu-serve serve ~/models/Qwen3.5-4B --device GPU
+xpu-serve serve -hf Qwen/Qwen3.5-4B --device GPU
 curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "messages": [{"role": "user", "content": "What is the capital of France?"}],
   "max_tokens": 64,
@@ -254,13 +285,13 @@ A sentence-transformers checkpoint of a BERT or NomicBERT encoder is served behi
 vLLM and llama.cpp serve too:
 
 ```bash
-xpu-serve serve ~/models/bge-small-en-v1.5 --device GPU
+xpu-serve serve -hf BAAI/bge-small-en-v1.5 --device GPU
 curl -s http://127.0.0.1:8080/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": ["What is a GPU?", "A graphics processing unit runs many threads at once."]}'
 ```
 
 ```json
-{"object": "list", "model": "bge-small-en-v1.5",
+{"object": "list", "model": "BAAI/bge-small-en-v1.5",
  "data": [{"object": "embedding", "index": 0, "embedding": [0.0113, 0.0305, -0.0081, ...]},
           {"object": "embedding", "index": 1, "embedding": [-0.0246, -0.0259, 0.0025, ...]}],
  "usage": {"prompt_tokens": 20, "total_tokens": 20}}
@@ -288,9 +319,9 @@ nothing to parse. `serve` puts one behind TypeSafe's System One API, which clien
 `/v1/systemone` already speak:
 
 ```bash
-xpu-serve serve ~/models/clef-flash --device GPU --ctx 16384
+xpu-serve serve -hf Cloudflare/clef-flash --device GPU --ctx 16384
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' -d '{
-  "model": "clef-flash",
+  "model": "Cloudflare/clef-flash",
   "state": "Customer message: I was charged twice for my order last week and nobody has replied.",
   "questions": {
     "route":   {"type": "choice", "instructions": "Which team should handle this?",
@@ -302,7 +333,7 @@ curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' -
 ```
 
 ```json
-{"model": "clef-flash",
+{"model": "Cloudflare/clef-flash",
  "answers": {
   "route":   {"type": "choice", "choice": "billing", "confidence": 0.966,
               "probabilities": {"billing": 0.977, "shipping": 0.014, "technical": 0.009}},
@@ -328,13 +359,14 @@ curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' -
 
 ### Robot policy
 
-A robot policy runs from its LeRobot directory (with the tokenizer as `tokenizer.json` beside it); `bench` times
+A robot policy runs from its LeRobot checkpoint and PaliGemma's tokenizer, which `-hf` fetches beside it (from the
+gated `google/paligemma-3b-pt-224`: set `HF_TOKEN`; a local directory needs `tokenizer.json` in it); `bench` times
 calls on synthetic camera images after a warm-up, for the cameras present and the flow steps asked for, and `serve`
 puts it behind the policy API:
 
 ```bash
-xpu-serve bench ~/models/pi05_base --device GPU.0 --precision f16 --cameras 3 --steps 10 --runs 10
-xpu-serve serve ~/models/pi05_base --device GPU.0 --cameras 2    # warm up for the first 2 cameras
+xpu-serve bench -hf lerobot/pi05_base --device GPU.0 --precision f16 --cameras 3 --steps 10 --runs 10
+xpu-serve serve -hf lerobot/pi05_base --device GPU.0 --cameras 2    # warm up for the first 2 cameras
 ```
 
 `GET /v1/policy/info` describes the policy (cameras and their sizes, state and action sizes, flow steps);

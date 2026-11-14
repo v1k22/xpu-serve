@@ -22,6 +22,8 @@ option(XS_BUILD_TESTS "Build unit tests" ON)
 option(XS_WERROR "Treat warnings as errors" OFF)
 
 find_package(Threads REQUIRED)
+# TLS for downloads from the Hugging Face Hub (--hf), and its SHA-256.
+find_package(OpenSSL 3.0 REQUIRED)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
   add_compile_options(-fp-model=precise)  # icpx defaults to fast math

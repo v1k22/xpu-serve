@@ -47,9 +47,11 @@ APIs look; the numbers live here.
 
 ## How to read a recipe
 
-- `~/models/<name>` is the model's Hugging Face repository downloaded as it is (for example
-  `huggingface-cli download Qwen/Qwen3.5-4B --local-dir ~/models/Qwen3.5-4B`). `xpu-serve` is the installed binary
-  ([README, Build](README.md#build)).
+- The commands download what they need with `-hf <org/name>`: the checkpoint goes into the Hugging Face cache, where
+  a model huggingface_hub or `hf download` fetched before is found and not downloaded again; `-hf <org/name:QUANT>`
+  names one GGUF file of a repository ([README, Downloading models](README.md#downloading-models--hf)). A local
+  directory works wherever `-hf` is shown (`xpu-serve serve <dir>`), and `~/models/<name>` below is a pack `convert`
+  writes. `xpu-serve` is the installed binary ([README, Build](README.md#build)).
 - **Reference** is the original checkpoint with nothing lossy: weights and KV cache in f16, no drafter. It needs
   about two bytes of GPU memory per weight; where a model is larger than a 24 GB card, the recipe says so.
 - **Optimized** is the setting the measurements below recommend, in this order of steps:
@@ -247,6 +249,12 @@ What the numbers say:
 - **So, for this pack**: `--kv-dtype i8` up to 128k tokens; `i8:turbo4` for f16's speed with 2.3 GiB less at 64k;
   `turbo4` or `turbo3` past 128k.
 
+The whole context on one 24 GB card:
+
+```bash
+xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --spec mtp --spec-k 4 --ctx 262144 --kv-dtype turbo4
+```
+
 ## Language models
 
 All of them are served behind the OpenAI API ([README](README.md#chat-completions)). Where a model thinks by
@@ -259,15 +267,15 @@ default, `"chat_template_kwargs": {"enable_thinking": false}` in a request turns
 Reference:
 
 ```bash
-xpu-serve serve ~/models/gemma-4-E2B-it --device GPU
+xpu-serve serve -hf google/gemma-4-E2B-it --device GPU
 ```
 
 Optimized:
 
 ```bash
-xpu-serve convert ~/models/gemma-4-E2B-it --out ~/models/gemma-4-E2B-it-q4 --quant q4
+xpu-serve convert -hf google/gemma-4-E2B-it --out ~/models/gemma-4-E2B-it-q4 --quant q4
 xpu-serve serve ~/models/gemma-4-E2B-it-q4 --device GPU --kv-dtype i8 \
-    --spec mtp --spec-k 1 --drafter ~/models/gemma-4-E2B-it-assistant
+    --spec mtp --spec-k 1 -hfd google/gemma-4-E2B-it-assistant
 ```
 
 - Less VRAM: `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2` store the KV cache in fewer bits, each at a
@@ -294,15 +302,15 @@ Checked against Hugging Face fp32 logits, greedy text and image features, and it
 Reference:
 
 ```bash
-xpu-serve serve ~/models/gemma-4-E4B-it --device GPU
+xpu-serve serve -hf google/gemma-4-E4B-it --device GPU
 ```
 
 Optimized:
 
 ```bash
-xpu-serve convert ~/models/gemma-4-E4B-it --out ~/models/gemma-4-E4B-it-q4 --quant q4
+xpu-serve convert -hf google/gemma-4-E4B-it --out ~/models/gemma-4-E4B-it-q4 --quant q4
 xpu-serve serve ~/models/gemma-4-E4B-it-q4 --device GPU --kv-dtype i8 \
-    --spec mtp --spec-k 2 --drafter ~/models/gemma-4-E4B-it-assistant
+    --spec mtp --spec-k 2 -hfd google/gemma-4-E4B-it-assistant
 ```
 
 - Less VRAM: `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2` store the KV cache in fewer bits, each at a
@@ -319,15 +327,15 @@ Measured: at q4, decode 84 tok/s, and 126 tok/s with its assistant (k = 2).
 Reference (its f16 weights do not fit a 24 GB card; there the q4 pack below is the way to run it):
 
 ```bash
-xpu-serve serve ~/models/gemma-4-26B-A4B-it --device GPU
+xpu-serve serve -hf google/gemma-4-26B-A4B-it --device GPU
 ```
 
 Optimized:
 
 ```bash
-xpu-serve convert ~/models/gemma-4-26B-A4B-it --out ~/models/gemma-4-26B-A4B-it-q4 --quant q4
+xpu-serve convert -hf google/gemma-4-26B-A4B-it --out ~/models/gemma-4-26B-A4B-it-q4 --quant q4
 xpu-serve serve ~/models/gemma-4-26B-A4B-it-q4 --device GPU --kv-dtype i8 \
-    --spec mtp --spec-k 2 --drafter ~/models/gemma-4-26B-A4B-it-assistant
+    --spec mtp --spec-k 2 -hfd google/gemma-4-26B-A4B-it-assistant
 ```
 
 - Less VRAM: `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2` store the KV cache in fewer bits, each at a
@@ -346,13 +354,13 @@ Checked against Hugging Face on a tiny checkpoint of its layout (experts beside 
 Reference:
 
 ```bash
-xpu-serve serve ~/models/Qwen3.5-4B --device GPU
+xpu-serve serve -hf Qwen/Qwen3.5-4B --device GPU
 ```
 
 Optimized:
 
 ```bash
-xpu-serve convert ~/models/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --method awq
+xpu-serve convert -hf Qwen/Qwen3.5-4B --out ~/models/Qwen3.5-4B-q4 --quant q4 --method awq
 xpu-serve serve ~/models/Qwen3.5-4B-q4 --device GPU --spec mtp --spec-k 2 --kv-dtype i8
 ```
 
@@ -380,13 +388,13 @@ Checked against Hugging Face fp32 logits and greedy text.
 Reference:
 
 ```bash
-xpu-serve serve ~/models/Qwen3.5-9B --device GPU
+xpu-serve serve -hf Qwen/Qwen3.5-9B --device GPU
 ```
 
 Optimized:
 
 ```bash
-xpu-serve convert ~/models/Qwen3.5-9B --out ~/models/Qwen3.5-9B-q4 --quant q4
+xpu-serve convert -hf Qwen/Qwen3.5-9B --out ~/models/Qwen3.5-9B-q4 --quant q4
 xpu-serve serve ~/models/Qwen3.5-9B-q4 --device GPU --spec mtp --spec-k 4 --kv-dtype i8
 ```
 
@@ -413,13 +421,13 @@ of experts). Text; its MTP head is the drafter.
 Reference (its f16 weights do not fit a 24 GB card; an FP8 checkpoint also runs as f16 on the device):
 
 ```bash
-xpu-serve serve ~/models/Qwen3.6-35B-A3B --device GPU
+xpu-serve serve -hf Qwen/Qwen3.6-35B-A3B --device GPU
 ```
 
 Optimized (a q4 pack fits one 24 GB card):
 
 ```bash
-xpu-serve convert ~/models/Qwen3.6-35B-A3B-FP8 --out ~/models/Qwen3.6-35B-A3B-q4 --quant q4
+xpu-serve convert -hf Qwen/Qwen3.6-35B-A3B-FP8 --out ~/models/Qwen3.6-35B-A3B-q4 --quant q4
 xpu-serve serve ~/models/Qwen3.6-35B-A3B-q4 --device GPU --spec mtp --spec-k 3 --kv-dtype i8
 ```
 
@@ -442,13 +450,13 @@ MTP head (inside the checkpoint and its packs), and the block drafters `z-lab/Qw
 Reference (its f16 weights do not fit a 24 GB card; an FP8 checkpoint also runs as f16 on the device):
 
 ```bash
-xpu-serve serve ~/models/Qwen3.8-27B --device GPU
+xpu-serve serve -hf Qwen/Qwen3.8-27B --device GPU
 ```
 
 Optimized (a q4 pack fits one 24 GB card):
 
 ```bash
-xpu-serve convert ~/models/Qwen3.8-27B-FP8 --out ~/models/Qwen3.8-27B-q4 --quant q4
+xpu-serve convert -hf Qwen/Qwen3.8-27B-FP8 --out ~/models/Qwen3.8-27B-q4 --quant q4
 xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4 --kv-dtype i8
 ```
 
@@ -484,13 +492,13 @@ commercial use). Text; no drafter exists for it.
 Reference:
 
 ```bash
-xpu-serve serve ~/models/LFM3-1.7B --device GPU
+xpu-serve serve -hf LiquidAI/LFM3-1.7B --device GPU
 ```
 
 Optimized (its q8 pack: at q4 its reasoning runs long more often):
 
 ```bash
-xpu-serve convert ~/models/LFM3-1.7B --out ~/models/LFM3-1.7B-q8 --quant q8
+xpu-serve convert -hf LiquidAI/LFM3-1.7B --out ~/models/LFM3-1.7B-q8 --quant q8
 xpu-serve serve ~/models/LFM3-1.7B-q8 --device GPU --kv-dtype i8
 ```
 
@@ -513,9 +521,21 @@ Checked against Hugging Face fp32 logits and greedy text (the checkpoint's own m
 
 ### Importing a GGUF file
 
-`convert` imports a GGUF file (llama.cpp's format) into a pack in a few seconds. Each quantized tensor stays exactly
-as the file stores it (nothing is decoded or quantized again), so the model has the file's weights and takes the
-file's size in GPU memory. The pack is then served like any model, with the same `--spec` and `--kv-dtype` options.
+A GGUF file (llama.cpp's format) is imported into a pack in a few seconds. Each quantized tensor stays exactly as
+the file stores it (nothing is decoded or quantized again), so the model has the file's weights and takes the file's
+size in GPU memory. The pack is then served like any model, with the same `--spec` and `--kv-dtype` options.
+
+`-hf <org/name:QUANT>` names a file of a repository by its quantization (`Q4_K_M` when none is given): it is downloaded
+into the Hugging Face cache, imported once into a pack in xpu-serve's cache (`~/.cache/xpu-serve/packs`, or
+`XS_CACHE_DIR`) and run from there, so it takes the file's size twice on disk. A Qwen3.5-family file that comes without
+its MTP head gets the one its repository publishes apart (`MTP/mtp-*.gguf`), so `--spec mtp` works on it.
+
+```bash
+xpu-serve serve -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M --device GPU
+xpu-serve convert -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M <pack-dir>       # the pack in a directory of your choice
+```
+
+A file on disk imports with `convert`:
 
 ```bash
 xpu-serve convert <file.gguf> <pack-dir>
@@ -560,20 +580,19 @@ The decision models' files are in their own sections: [Clef-Flash](#clef-flash),
 Reference (the BF16 file is the original checkpoint):
 
 ```bash
-xpu-serve convert ~/models/Qwen3.5-4B-BF16.gguf ~/models/Qwen3.5-4B-BF16
-xpu-serve serve ~/models/Qwen3.5-4B-BF16 --device GPU
+xpu-serve serve -hf unsloth/Qwen3.5-4B-GGUF:BF16 --device GPU
 ```
 
 Optimized:
 
 ```bash
-xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M
-xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU --kv-dtype i8
+xpu-serve serve -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M --device GPU --kv-dtype i8
 ```
 
 - Less VRAM: a smaller file, and `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2`
   ([KV cache formats](#kv-cache-formats)).
-- A file that holds the model's MTP head drafts with it: add `--spec mtp --spec-k 2`.
+- These files hold no MTP head and the repository publishes none (`-hf` says so when it imports one), so
+  `--spec mtp` needs the original checkpoint or a pack of it ([Qwen3.5-4B](#qwen35-4b)).
 - A file is usually a mix of formats: `Q4_K_M` of Qwen3.5-4B is 57 % Q4_K, 24 % Q6_K and 18 % Q5_K, and a
   "dynamic" (`UD-`) file mixes up to fifteen.
 
@@ -601,17 +620,15 @@ need the original checkpoint. Gemma 4 E4B's files import the same way.
 Reference (the BF16 file is the original checkpoint's text model):
 
 ```bash
-xpu-serve convert ~/models/gemma-4-E2B-it-BF16.gguf ~/models/gemma-4-E2B-it-BF16
-xpu-serve serve ~/models/gemma-4-E2B-it-BF16 --device GPU
+xpu-serve serve -hf unsloth/gemma-4-E2B-it-GGUF:BF16 --device GPU
 ```
 
-Optimized, with its drafter:
+Optimized, with its drafter (`-hfd` of the repository takes its `MTP/mtp-*.gguf` file, Q8_0 by default, imported
+as a drafter pack):
 
 ```bash
-xpu-serve convert ~/models/gemma-4-E2B-it-Q4_K_M.gguf ~/models/gemma-4-E2B-it-Q4_K_M
-xpu-serve convert ~/models/mtp-gemma-4-E2B-it-Q8_0.gguf ~/models/gemma-4-E2B-it-mtp
-xpu-serve serve ~/models/gemma-4-E2B-it-Q4_K_M --device GPU --kv-dtype i8 \
-    --spec mtp --drafter ~/models/gemma-4-E2B-it-mtp
+xpu-serve serve -hf unsloth/gemma-4-E2B-it-GGUF:Q4_K_M --device GPU --kv-dtype i8 \
+    --spec mtp -hfd unsloth/gemma-4-E2B-it-GGUF
 ```
 
 - Less VRAM: a smaller file, and `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2`
@@ -646,25 +663,23 @@ that does: the larger the file, the closer.
 Closest to the reference on one card:
 
 ```bash
-xpu-serve convert ~/models/Qwen3.8-27B-UD-Q6_K_M.gguf ~/models/Qwen3.8-27B-UD-Q6_K_M
-xpu-serve serve ~/models/Qwen3.8-27B-UD-Q6_K_M --device GPU
+xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:UD-Q6_K_M --device GPU
 ```
 
 Optimized (the fastest file with its MTP head):
 
 ```bash
-xpu-serve convert ~/models/Qwen3.8-27B-Q4_0.gguf ~/models/Qwen3.8-27B-Q4_0
-xpu-serve serve ~/models/Qwen3.8-27B-Q4_0 --device GPU --spec mtp --spec-k 4 --kv-dtype i8
+xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --spec mtp --spec-k 4 --kv-dtype i8
 ```
 
-The smallest files come without the MTP head; `--mtp` takes it from the head's own file (`MTP/mtp-*.gguf`), and the
+The smallest files come without the MTP head; `-hf` takes it from the head's own file (`MTP/mtp-*.gguf`), and the
 pack is the one a file with the head gives:
 
 ```bash
-xpu-serve convert ~/models/Qwen3.8-27B-UD-IQ2_XXS.gguf ~/models/Qwen3.8-27B-UD-IQ2_XXS \
-    --mtp ~/models/mtp-Qwen3.8-27B-Q4_0.gguf
-xpu-serve serve ~/models/Qwen3.8-27B-UD-IQ2_XXS --device GPU --spec mtp
+xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ2_XXS --device GPU --spec mtp
 ```
+
+From files on disk, `convert <file.gguf> <pack-dir> --mtp <mtp-file.gguf>` does the same.
 
 - Less VRAM: a smaller file, and `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2`
   ([KV cache formats](#kv-cache-formats)).
@@ -673,7 +688,7 @@ xpu-serve serve ~/models/Qwen3.8-27B-UD-IQ2_XXS --device GPU --spec mtp
   ([measured on this pack](#measured-on-qwen38-27b-a-gguf-pack)):
 
 ```bash
-xpu-serve serve ~/models/Qwen3.8-27B-Q4_0 --device GPU --spec mtp --spec-k 4 --ctx 262144 --kv-dtype turbo4
+xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --spec mtp --spec-k 4 --ctx 262144 --kv-dtype turbo4
 ```
 
 Measured. "Same as the reference" counts the answers the original gives in float32 on the CPU (190 of 300 of them
@@ -689,7 +704,7 @@ Over all its files: 15 to 21 tok/s decode, 25 to 47 with MTP.
 | UD-IQ4_XS | 14.35 GB | 13.03 GiB | 15 tok/s | 41 tok/s | 259 | 187 |
 | UD-IQ3_XXS | 10.93 GB | 9.84 GiB | 18 tok/s | 37 tok/s | 236 | 182 |
 | UD-Q2_K_XL | 9.95 GB | 8.93 GiB | 18 tok/s | 39 tok/s | 219 | 171 |
-| UD-IQ2_XXS (head from `--mtp`) | 7.21 GB | 6.70 GiB | 17 tok/s | 32 tok/s | 174 | 154 |
+| UD-IQ2_XXS (head from its own file) | 7.21 GB | 6.70 GiB | 17 tok/s | 32 tok/s | 174 | 154 |
 | *our q4 pack* | | 16.21 GiB | 22 tok/s | 51 tok/s | 245 | 185 |
 
 On an Arc B390 the Q4_0 file decodes at 6.4 tok/s and at 17.4 with MTP (k = 6, 2.7 times; 17.2 at k = 5): a verify
@@ -705,9 +720,9 @@ output stays the model's own and sampling keeps its distribution (rejection samp
 | `--spec` | Drafter | Where it comes from |
 |---|---|---|
 | `mtp` | the MTP head of a Qwen3.5-family checkpoint | inside the model (and its pack) |
-| `mtp` | a Gemma 4 assistant | `--drafter <google/gemma-4-*-it-assistant>` |
-| `dflash` | a DFlash or DFlash 2 block drafter | `--drafter <z-lab/Qwen3.8-27B-DFlash2>` |
-| `dspine` | a DSpine block drafter | `--drafter <tencent/Qwen3.8-27B-DSpine-b16>` |
+| `mtp` | a Gemma 4 assistant | `-hfd google/gemma-4-*-it-assistant` (or `--drafter <dir>`) |
+| `dflash` | a DFlash or DFlash 2 block drafter | `-hfd z-lab/Qwen3.8-27B-DFlash2` (or `--drafter <dir>`) |
+| `dspine` | a DSpine block drafter | `-hfd tencent/Qwen3.8-27B-DSpine-b16` (or `--drafter <dir>`) |
 
 Which model takes which technique. A drafter is trained for one model, so a technique works only where a drafter
 for that model exists (`–`: none does, and the option is refused by name). Each cell is the decode speed in tok/s
@@ -730,8 +745,8 @@ assistants as their checkpoints. DFlash 2 and DSpine checkpoints are released fo
 DFlash format loads through the same code (`--spec dflash`), but no DFlash checkpoint exists for a model in this
 table.
 
-- A drafter checkpoint is served as it is, or from a pack of its own, which is smaller and drafts faster:
-  `convert <drafter> --target <model> --out <dir>`.
+- A drafter checkpoint is served as it is (`-hfd <org/name>`), or from a pack of its own, which is smaller and drafts
+  faster: `convert -hf <drafter> --target <model> --out <dir>`, then `--drafter <dir>`.
 - `--spec-k` is 3 by default and 7 for a block drafter, which proposes its whole block in one pass
   ([docs/design-spec-decode.md](docs/design-spec-decode.md)); the table has the value to pass per model.
 - An MTP head picks each draft among 64 tokens that a one-bit sketch of the output layer shortlists
@@ -745,21 +760,30 @@ table.
 drafts for its own model, from its checkpoint as it is.
 
 ```bash
-xpu-serve run ~/models/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 --drafter ~/models/gemma-4-E2B-it-assistant
+xpu-serve run -hf google/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 -hfd google/gemma-4-E2B-it-assistant
 ```
 
 `--spec-k`: 1 for E2B, 2 for E4B and 26B-A4B ([the table above](#speculative-decoding)).
 
 ### DFlash 2 and DSpine drafters for Qwen3.8-27B
 
-`z-lab/Qwen3.8-27B-DFlash2` (blocks of 8) and `tencent/Qwen3.8-27B-DSpine-b16` (blocks of 16). A drafter checkpoint is
-served as it is, or from a pack of its own, which is smaller and drafts faster:
+`z-lab/Qwen3.8-27B-DFlash2` (blocks of 8) and `tencent/Qwen3.8-27B-DSpine-b16` (blocks of 16), for the q4 pack of
+[Qwen3.8-27B](#qwen38-27b) (`~/models/Qwen3.8-27B-q4`). A drafter checkpoint is served as it is:
 
 ```bash
-xpu-serve convert ~/models/Qwen3.8-27B-DFlash2 --target ~/models/Qwen3.8-27B-q4 --out ~/models/Qwen3.8-27B-DFlash2-q4
+xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec dflash -hfd z-lab/Qwen3.8-27B-DFlash2
+xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec dspine -hfd tencent/Qwen3.8-27B-DSpine-b16
+```
+
+or from a pack of its own, which is smaller and drafts faster:
+
+```bash
+xpu-serve convert -hf z-lab/Qwen3.8-27B-DFlash2 --target ~/models/Qwen3.8-27B-q4 \
+    --out ~/models/Qwen3.8-27B-DFlash2-q4
 xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec dflash --drafter ~/models/Qwen3.8-27B-DFlash2-q4
 
-xpu-serve convert ~/models/Qwen3.8-27B-DSpine-b16 --target ~/models/Qwen3.8-27B-q4 --out ~/models/Qwen3.8-27B-DSpine-q4
+xpu-serve convert -hf tencent/Qwen3.8-27B-DSpine-b16 --target ~/models/Qwen3.8-27B-q4 \
+    --out ~/models/Qwen3.8-27B-DSpine-q4
 xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec dspine --drafter ~/models/Qwen3.8-27B-DSpine-q4
 ```
 
@@ -775,9 +799,9 @@ the request of the next section; where a model wants something else of it, its s
 ### The System One request
 
 ```bash
-xpu-serve serve ~/models/clef-flash --device GPU --ctx 16384
+xpu-serve serve -hf Cloudflare/clef-flash --device GPU --ctx 16384
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' -d '{
-  "model": "clef-flash",
+  "model": "Cloudflare/clef-flash",
   "state": "Customer message: I was charged twice for my order last week and nobody has replied.",
   "questions": {
     "route":   {"type": "choice", "instructions": "Which team should handle this?",
@@ -789,7 +813,7 @@ curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' -
 ```
 
 ```json
-{"model": "clef-flash",
+{"model": "Cloudflare/clef-flash",
  "answers": {
   "route":   {"type": "choice", "choice": "billing", "confidence": 0.966,
               "probabilities": {"billing": 0.977, "shipping": 0.014, "technical": 0.009}},
@@ -807,8 +831,8 @@ Without a server, `run` answers one request file and `bench` times one (its own 
 to grow the state):
 
 ```bash
-xpu-serve run   ~/models/clef-flash --device GPU --request request.json
-xpu-serve bench ~/models/clef-flash --device GPU --ctx 16384 --state-tokens 4096 --runs 7
+xpu-serve run   -hf Cloudflare/clef-flash --device GPU --request request.json
+xpu-serve bench -hf Cloudflare/clef-flash --device GPU --ctx 16384 --state-tokens 4096 --runs 7
 python3 tests/e2e/systemone_eval.py --url http://127.0.0.1:8080      # 25 decisions: answers, API shape, latency
 ```
 
@@ -822,16 +846,16 @@ one pass; a transformer head scores the options. Questions sent together can mov
 Reference:
 
 ```bash
-xpu-serve serve ~/models/clef-flash --device GPU --ctx 16384
+xpu-serve serve -hf Cloudflare/clef-flash --device GPU --ctx 16384
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' \
-  -d '{"model": "clef-flash", "state": "The build failed twice on the same test.",
+  -d '{"model": "Cloudflare/clef-flash", "state": "The build failed twice on the same test.",
        "questions": {"retry": {"type": "noul", "instructions": "Is it worth retrying the build?"}}}'
 ```
 
 Optimized for memory (f16 where it fits: on a discrete GPU a pack is smaller but slower):
 
 ```bash
-xpu-serve convert ~/models/clef-flash --out ~/models/clef-flash-q8 --quant q8
+xpu-serve convert -hf Cloudflare/clef-flash --out ~/models/clef-flash-q8 --quant q8
 xpu-serve serve ~/models/clef-flash-q8 --device GPU --ctx 16384
 ```
 
@@ -839,8 +863,7 @@ Or one of its GGUF files, [ggml-org/Clef-Flash-GGUF](https://huggingface.co/ggml
 Q4_K_M):
 
 ```bash
-xpu-serve convert ~/models/Clef-Flash-Q8_0.gguf ~/models/Clef-Flash-Q8_0
-xpu-serve serve ~/models/Clef-Flash-Q8_0 --device GPU --ctx 16384
+xpu-serve serve -hf ggml-org/Clef-Flash-GGUF:Q8_0 --device GPU --ctx 16384
 ```
 
 Measured:
@@ -866,10 +889,9 @@ test decisions right and equal to that code's.
 card and has not been run here; the Q4_K_M file is the form that fits (its Q8_0 and BF16 files do not).
 
 ```bash
-xpu-serve convert ~/models/Clef-Q4_K_M.gguf ~/models/Clef-Q4_K_M
-xpu-serve serve ~/models/Clef-Q4_K_M --device GPU --ctx 16384
+xpu-serve serve -hf ggml-org/Clef-GGUF:Q4_K_M --device GPU --ctx 16384
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' \
-  -d '{"model": "Clef-Q4_K_M", "state": "The build failed twice on the same test.",
+  -d '{"model": "ggml-org/Clef-GGUF:Q4_K_M", "state": "The build failed twice on the same test.",
        "questions": {"retry": {"type": "noul", "instructions": "Is it worth retrying the build?"}}}'
 ```
 
@@ -890,16 +912,16 @@ code does.
 Reference:
 
 ```bash
-xpu-serve serve ~/models/pplx-decider-flash-v1.2 --device GPU --ctx 16384
+xpu-serve serve -hf perplexity-ai/pplx-decider-flash-v1.2 --device GPU --ctx 16384
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' \
-  -d '{"model": "pplx-decider-flash-v1.2", "state": "The build failed twice on the same test.",
+  -d '{"model": "perplexity-ai/pplx-decider-flash-v1.2", "state": "The build failed twice on the same test.",
        "questions": {"retry": {"type": "noul", "instructions": "Is it worth retrying the build?"}}}'
 ```
 
 Optimized for memory (f16 where it fits: on a discrete GPU a pack is smaller but slower):
 
 ```bash
-xpu-serve convert ~/models/pplx-decider-flash-v1.2 --out ~/models/pplx-decider-flash-v1.2-q8 --quant q8
+xpu-serve convert -hf perplexity-ai/pplx-decider-flash-v1.2 --out ~/models/pplx-decider-flash-v1.2-q8 --quant q8
 xpu-serve serve ~/models/pplx-decider-flash-v1.2-q8 --device GPU --ctx 16384
 ```
 
@@ -925,13 +947,13 @@ first output position, calibrated as its helper does.
 Reference (its f16 weights do not fit a 24 GB card):
 
 ```bash
-xpu-serve serve ~/models/openjev --device GPU --ctx 16384 --readout openjev
+xpu-serve serve -hf openjev/openjev --device GPU --ctx 16384 --readout openjev
 ```
 
 Optimized (the q4 pack, the form a 24 GB card takes it in):
 
 ```bash
-xpu-serve convert ~/models/openjev --out ~/models/openjev-q4 --quant q4
+xpu-serve convert -hf openjev/openjev --out ~/models/openjev-q4 --quant q4
 xpu-serve serve ~/models/openjev-q4 --device GPU --ctx 16384 --readout openjev
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' \
   -d '{"model": "openjev-q4", "state": "The build failed twice on the same test.",
@@ -966,9 +988,9 @@ code tokens at its answer, calibrated (T = 1.3374).
 Reference:
 
 ```bash
-xpu-serve serve ~/models/d1-2B --device GPU
+xpu-serve serve -hf LiquidAI/d1-2B --device GPU
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' \
-  -d '{"model": "d1-2B", "state": "The build failed twice on the same test.",
+  -d '{"model": "LiquidAI/d1-2B", "state": "The build failed twice on the same test.",
        "questions": {"retry": {"type": "noul", "instructions": "Is it worth retrying the build?"},
                      "cause": {"type": "choice", "instructions": "What is the likely cause?",
                                "criteria": {"flaky": "A test that fails at random", "bug": "A defect in the change"}}}}'
@@ -977,7 +999,7 @@ curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' \
 Optimized for memory:
 
 ```bash
-xpu-serve convert ~/models/d1-2B --out ~/models/d1-2B-q8 --quant q8
+xpu-serve convert -hf LiquidAI/d1-2B --out ~/models/d1-2B-q8 --quant q8
 xpu-serve serve ~/models/d1-2B-q8 --device GPU
 ```
 
@@ -1007,9 +1029,9 @@ scores each mask, calibrated by the number of options.
 Reference:
 
 ```bash
-xpu-serve serve ~/models/laya --device GPU
+xpu-serve serve -hf convaiinnovations/laya --device GPU
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' \
-  -d '{"model": "laya", "state": "The build failed twice on the same test.",
+  -d '{"model": "convaiinnovations/laya", "state": "The build failed twice on the same test.",
        "questions": {"retry": {"type": "noul", "instructions": "Is it worth retrying the build?"}}}'
 ```
 
@@ -1017,8 +1039,7 @@ Optimized for memory, from its GGUF files [ggml-org/Laya-GGUF](https://huggingfa
 Q8_0); `convert` writes no q8 or q4 pack of it:
 
 ```bash
-xpu-serve convert ~/models/Laya-Q8_0.gguf ~/models/Laya-Q8_0
-xpu-serve serve ~/models/Laya-Q8_0 --device GPU
+xpu-serve serve -hf ggml-org/Laya-GGUF:Q8_0 --device GPU
 ```
 
 Measured: 8 ms per decision (p50) on the 25 test decisions; 19 ms for three questions (158 tokens in all); 0.78 GiB
@@ -1036,9 +1057,9 @@ description; what its own code would cut (a long state or option) is refused, as
 Reference (every option of a choice needs a description):
 
 ```bash
-xpu-serve serve ~/models/Julia-1 --device GPU
+xpu-serve serve -hf SupersonicLabs/Julia-1 --device GPU
 curl -s http://127.0.0.1:8080/v1/systemone -H 'Content-Type: application/json' -d '{
-  "model": "Julia-1",
+  "model": "SupersonicLabs/Julia-1",
   "state": "Customer message: I was charged twice for my order last week and nobody has replied.",
   "questions": {
     "route": {"type": "choice", "instructions": "Which team should handle this?",
@@ -1053,8 +1074,7 @@ Optimized for memory, from its GGUF files [ggml-org/Julia-1-GGUF](https://huggin
 (BF16, Q8_0); `convert` writes no q8 or q4 pack of it:
 
 ```bash
-xpu-serve convert ~/models/Julia-1-BF16.gguf ~/models/Julia-1-BF16
-xpu-serve serve ~/models/Julia-1-BF16 --device GPU
+xpu-serve serve -hf ggml-org/Julia-1-GGUF:BF16 --device GPU
 ```
 
 Measured: 7 ms per decision (p50) on the 25 test decisions; 9 ms for three questions (128 tokens in all); 0.27 GiB
@@ -1102,16 +1122,16 @@ changes four fewer answers of the 300: better, not q8
 ## Embedding models
 
 A sentence-transformers checkpoint, served behind OpenAI's embeddings API
-([README](README.md#embeddings)). f16 only: `convert` writes no pack of an embedding model. `xpu-serve bench <dir>`
-reports the latency of one text at several lengths and the throughput of a batch; `run <dir> --prompt "..."` prints
-one embedding.
+([README](README.md#embeddings)). f16 only: `convert` writes no pack of an embedding model. `xpu-serve bench -hf
+<org/name>` reports the latency of one text at several lengths and the throughput of a batch; `run -hf <org/name>
+--prompt "..."` prints one embedding.
 
 ### all-MiniLM-L6-v2
 
 `sentence-transformers/all-MiniLM-L6-v2` (`bert`). Mean pooling, normalized; inputs of up to 256 tokens.
 
 ```bash
-xpu-serve serve ~/models/all-MiniLM-L6-v2 --device GPU
+xpu-serve serve -hf sentence-transformers/all-MiniLM-L6-v2 --device GPU
 curl -s http://127.0.0.1:8080/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": ["What is a GPU?", "A graphics processing unit runs many threads at once."]}'
 ```
@@ -1126,13 +1146,13 @@ embeddings within 1 - cosine 3.4e-7 (GPU f16), 4e-13 (GPU f32).
 `BAAI/bge-small-en-v1.5` (`bert`). CLS pooling, normalized; inputs of up to 512 tokens.
 
 ```bash
-xpu-serve serve ~/models/bge-small-en-v1.5 --device GPU
+xpu-serve serve -hf BAAI/bge-small-en-v1.5 --device GPU
 curl -s http://127.0.0.1:8080/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": ["What is a GPU?", "A graphics processing unit runs many threads at once."]}'
 ```
 
 ```json
-{"object": "list", "model": "bge-small-en-v1.5",
+{"object": "list", "model": "BAAI/bge-small-en-v1.5",
  "data": [{"object": "embedding", "index": 0, "embedding": [0.0113, 0.0305, -0.0081, ...]},
           {"object": "embedding", "index": 1, "embedding": [-0.0246, -0.0259, 0.0025, ...]}],
  "usage": {"prompt_tokens": 20, "total_tokens": 20}}
@@ -1150,7 +1170,7 @@ Checked as all-MiniLM-L6-v2 on 15 texts up to 512 tokens: 6.9e-8 (f16), 5e-13 (f
 expects its task prefixes in the text (`search_query: `, `search_document: `).
 
 ```bash
-xpu-serve serve ~/models/nomic-embed-text-v1.5 --device GPU
+xpu-serve serve -hf nomic-ai/nomic-embed-text-v1.5 --device GPU
 curl -s http://127.0.0.1:8080/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": ["search_query: What is a GPU?", "search_document: A graphics processing unit runs many threads at once."]}'
 ```
@@ -1164,21 +1184,23 @@ Checked as all-MiniLM-L6-v2, with its own modeling code, on 16 texts up to 8,192
 
 ### π0.5
 
-`lerobot/pi05_base` (LeRobot `pi05`), with the tokenizer as `tokenizer.json` beside it. It maps camera images, the
-robot state and an instruction to 50 x 32 actions in 10 flow steps, behind the policy API
-([README](README.md#robot-policy)).
+`lerobot/pi05_base` (LeRobot `pi05`). It maps camera images, the robot state and an instruction to 50 x 32 actions
+in 10 flow steps, behind the policy API ([README](README.md#robot-policy)). It reads PaliGemma's tokenizer, which its
+repository does not publish: `-hf` puts `tokenizer.json` of `google/paligemma-3b-pt-224` beside it. That repository
+is gated, so set `HF_TOKEN` to an access token of an account that accepted PaliGemma's terms on the Hub; without one
+the download stops before the weights. (A local directory needs that `tokenizer.json` beside the checkpoint.)
 
 Reference:
 
 ```bash
-xpu-serve bench ~/models/pi05_base --device GPU.0 --precision f16 --cameras 3 --steps 10 --runs 10
-xpu-serve serve ~/models/pi05_base --device GPU.0 --cameras 2    # warm up for the first 2 cameras
+xpu-serve bench -hf lerobot/pi05_base --device GPU.0 --precision f16 --cameras 3 --steps 10 --runs 10
+xpu-serve serve -hf lerobot/pi05_base --device GPU.0 --cameras 2    # warm up for the first 2 cameras
 ```
 
 Optimized (its q8 pack quantizes the action expert, which runs 50 tokens per flow step):
 
 ```bash
-xpu-serve convert ~/models/pi05_base --out ~/models/pi05_base-q8 --quant q8
+xpu-serve convert -hf lerobot/pi05_base --out ~/models/pi05_base-q8 --quant q8
 xpu-serve serve ~/models/pi05_base-q8 --device GPU.0
 ```
 

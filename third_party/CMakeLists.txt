@@ -4,7 +4,9 @@ target_include_directories(xs_json SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_library(xs_httplib INTERFACE)
 target_include_directories(xs_httplib SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(xs_httplib INTERFACE Threads::Threads)
+# Every translation unit sees httplib with TLS, so its classes are the same in all of them.
+target_compile_definitions(xs_httplib INTERFACE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(xs_httplib INTERFACE Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 
 add_library(xs_doctest INTERFACE)
 target_include_directories(xs_doctest SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
