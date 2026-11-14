@@ -112,7 +112,8 @@ within 4 % of f16's at every length (turbo4: 4,738, 2,805 and 944 tok/s at 4k, 3
 
 **A GGUF import, Qwen3.8-27B Q4_0 with its MTP head** (16.3 GiB of weights on the 24 GB card; 64 KiB of cache a
 token at f16). The formats apply unchanged, since a cache does not depend on how the weights are stored. An f16 cache
-stops at 64k tokens (22.3 GiB at the peak; 96k runs out of memory) and int8 at 128k; with turbo4 the pack read all
+stops at 64k tokens (22.3 GiB at the peak; 96k runs out of memory) and int8 at 128k (22.9 GiB); with turbo4 the pack
+read all
 262,144 tokens the model takes (23.5 GiB at the peak, prefill 141 tok/s, decode 6.3 tok/s with MTP), and 128k at
 20.8 GiB (turbo3: 20.2). At 64k the process peaks at 20.5 (int8), 19.5 (turbo4) and 18.9 GiB (turbo2). Decode with
 MTP at 64k: 23.5 tok/s with f16, 22.4 with int8, 22.9 with int8 keys and turbo4 values, 19.7, 17.9 and 19.7 with

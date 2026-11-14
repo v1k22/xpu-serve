@@ -214,6 +214,7 @@ The longest contexts that ran on the one 24 GB card:
 | `--kv-dtype` | Context | Peak GPU memory | Prefill | Decode with MTP |
 |---|---|---|---|---|
 | `auto` (f16) | 64k tokens (out of memory at 96k) | 22.28 GiB | 440 tok/s | 23.5 tok/s |
+| `i8` | 128k tokens (out of memory at 192k) | 22.90 GiB | 255 tok/s | 13.0 tok/s |
 | `turbo3` | 128k tokens | 20.22 GiB | 257 tok/s | 10.4 tok/s |
 | `turbo4` | 128k tokens | 20.76 GiB | 256 tok/s | 11.5 tok/s |
 | `turbo4` | 256k tokens, all the model reads | 23.47 GiB | 141 tok/s | 6.3 tok/s |
