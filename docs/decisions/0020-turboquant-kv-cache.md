@@ -110,8 +110,17 @@ within 4 % of f16's at every length (turbo4: 4,738, 2,805 and 944 tok/s at 4k, 3
 | `turbo3` | 42.1 | 35.6 | 24.2 | 10.31 GiB |
 | `turbo2` | 42.2 | 36.5 | 25.2 | 10.05 GiB |
 
-[model_recipes.md](../../model_recipes.md#kv-cache-formats) carries the full tables, the long-context retrieval and
-MMLU-Pro checks, and a GGUF pack of Qwen3.8-27B.
+**A GGUF import, Qwen3.8-27B Q4_0 with its MTP head** (16.3 GiB of weights on the 24 GB card; 64 KiB of cache a
+token at f16). The formats apply unchanged, since a cache does not depend on how the weights are stored. An f16 cache
+stops at 64k tokens (22.3 GiB at the peak; 96k runs out of memory) and int8 at 128k; with turbo4 the pack read all
+262,144 tokens the model takes (23.5 GiB at the peak, prefill 141 tok/s, decode 6.3 tok/s with MTP), and 128k at
+20.8 GiB (turbo3: 20.2). At 64k the process peaks at 20.5 (int8), 19.5 (turbo4) and 18.9 GiB (turbo2). Decode with
+MTP at 64k: 23.5 tok/s with f16, 22.4 with int8, 22.9 with int8 keys and turbo4 values, 19.7, 17.9 and 19.7 with
+turbo4, turbo3 and turbo2. Against its f16 cache over 2,048 positions of 512-token windows: KL 0.00005 (int8), 0.0015
+(i8:turbo4), 0.0026 (turbo4), 0.0091 (turbo3), 0.037 (turbo2, +3.8 % perplexity): 0.6 times what the same formats
+cost Qwen3.5-4B.
+
+[model_recipes.md](../../model_recipes.md#kv-cache-formats) carries the full tables.
 
 ## Findings
 
@@ -137,6 +146,10 @@ MMLU-Pro checks, and a GGUF pack of Qwen3.8-27B.
   128k) brought turbo4 to f16's speed. The float and int8 caches gained or lost under 5 % from the shared read: at
   these lengths every format ends within a few percent of the others, so what bounds decode attention now is neither
   the cache's bytes nor its decoding.
+- **On a large model the formats buy context.** Qwen3.8-27B's weights leave 7 GiB of a 24 GB card: 64k tokens of
+  f16 cache, 128k of int8, and with turbo4 the whole 262,144 the model reads. A verify step of five tokens decodes
+  each key for five queries, so with a drafter the TurboQuant formats decode at 0.76 to 0.84 of f16's speed at 64k,
+  where int8 keys with turbo4 values keep f16's.
 - **Opt-in, with int8 as the first step.** `--kv-dtype i8` is the setting to try first; `i8:turbo4` and `turbo4` when
   the cache has to shrink further, `turbo3` and `turbo2` when memory decides and the answers are checked.
 

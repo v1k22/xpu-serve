@@ -180,6 +180,71 @@ What the numbers say:
   `turbo3` and `turbo2` when memory decides, with the answers checked on the task.
 
 <!-- KV-Q38-TABLES -->
+### Measured on Qwen3.8-27B (a GGUF pack)
+
+The formats over a GGUF import: the Q4_0 file of [Qwen3.8-27B GGUF](#qwen38-27b-gguf) with its MTP head at 4 drafts
+a round (`--spec mtp --spec-k 4`), on an Arc Pro B60. The weights take 16.3 GiB of the card's 24. The cache is 64 KiB
+a token at f16 (16 attention layers of 4 KV heads of 256 values), and the MTP head keeps one more layer's worth.
+
+Memory (peak GPU memory of the whole process during `xpu-serve bench`):
+
+| `--kv-dtype` | Cache bytes a token | Against f16 | Cache at 64k tokens | Peak GPU memory at 8k | Peak GPU memory at 64k |
+|---|---|---|---|---|---|
+| `auto` (f16) | 65,536 | 1.00x | 4.00 GiB | 18.62 GiB | 22.28 GiB |
+| `i8` | 33,280 | 1.97x | 2.03 GiB | 18.35 GiB | 20.48 GiB |
+| `i8:turbo4` | 25,088 | 2.61x | 1.53 GiB | 18.27 GiB | 19.96 GiB |
+| `turbo4` | 16,896 | 3.88x | 1.03 GiB | 18.22 GiB | 19.46 GiB |
+| `turbo3` | 12,800 | 5.12x | 0.78 GiB | 18.19 GiB | 19.19 GiB |
+| `turbo2` | 8,704 | 7.53x | 0.53 GiB | 18.15 GiB | 18.93 GiB |
+
+Speed (a prompt that fills the context but 80 tokens, then 64 tokens generated with MTP; the bench's prompt is easy to
+draft for, 4.85 tokens a verify, so these decode speeds are above a chat's):
+
+| `--kv-dtype` | Decode at 8k tokens | Decode at 64k tokens | Prefill at 8k | Prefill at 64k |
+|---|---|---|---|---|
+| `auto` (f16) | 57.8 tok/s | 23.5 tok/s | 816 tok/s | 440 tok/s |
+| `i8` | 59.5 tok/s | 22.4 tok/s | 807 tok/s | 435 tok/s |
+| `i8:turbo4` | 59.0 tok/s | 22.9 tok/s | 811 tok/s | 435 tok/s |
+| `turbo4` | 56.2 tok/s | 19.7 tok/s | 810 tok/s | 434 tok/s |
+| `turbo3` | 53.9 tok/s | 17.9 tok/s | 815 tok/s | 433 tok/s |
+| `turbo2` | 56.3 tok/s | 19.7 tok/s | 818 tok/s | 436 tok/s |
+
+The longest contexts that ran on the one 24 GB card:
+
+| `--kv-dtype` | Context | Peak GPU memory | Prefill | Decode with MTP |
+|---|---|---|---|---|
+| `auto` (f16) | 64k tokens (out of memory at 96k) | 22.28 GiB | 440 tok/s | 23.5 tok/s |
+| `turbo3` | 128k tokens | 20.22 GiB | 257 tok/s | 10.4 tok/s |
+| `turbo4` | 128k tokens | 20.76 GiB | 256 tok/s | 11.5 tok/s |
+| `turbo4` | 256k tokens, all the model reads | 23.47 GiB | 141 tok/s | 6.3 tok/s |
+
+Accuracy against the f16 cache, the next-token distribution at the last half of 8 windows of 512 tokens of
+wikitext-2 (2,048 positions):
+
+| `--kv-dtype` | 512-token windows: perplexity (change) | mean KL from f16 | same top token |
+|---|---|---|---|
+| `auto` (f16) | 6.394 | 0 | 100 % |
+| `i8` | 6.393 (-0.01 %) | 0.00005 | 99.7 % |
+| `i8:turbo4` | 6.384 (-0.17 %) | 0.0015 | 97.8 % |
+| `turbo4` | 6.378 (-0.26 %) | 0.0026 | 97.0 % |
+| `turbo3` | 6.439 (+0.70 %) | 0.0091 | 95.6 % |
+| `turbo2` | 6.636 (+3.78 %) | 0.037 | 90.2 % |
+<!-- /KV-Q38-TABLES -->
+
+What the numbers say:
+
+- **The formats work over a GGUF import as over any model**: the cache does not depend on how the weights are
+  stored.
+- **Context is what they buy here.** With an f16 cache this pack stops at 64k tokens (22.3 GiB; 96k runs out of
+  memory) and with `i8` at 128k. With `turbo4` it reads **all 262,144 tokens the model takes, on one 24 GB card**
+  (23.5 GiB at the peak, the card's limit; a `turbo3` cache is a gigabyte smaller at that length).
+- **Speed.** At 8k tokens every format decodes within 7 % of f16. At 64k `i8` and `i8:turbo4` stay within 5 %, and
+  `turbo4`, `turbo3` and `turbo2` decode at 0.84, 0.76 and 0.84 of f16's speed: a verify step of five tokens
+  decodes every key for five queries. Prefill is the same for every format.
+- **Accuracy.** The 27B tolerates the formats better than Qwen3.5-4B: `turbo4` moves the next-token distribution
+  0.6 times as far (KL 0.0026 against 0.0044), `turbo3` and `turbo2` likewise, and `i8` leaves it where it was.
+- **So, for this pack**: `--kv-dtype i8` up to 128k tokens; `i8:turbo4` for f16's speed with 2.3 GiB less at 64k;
+  `turbo4` or `turbo3` past 128k.
 
 ## Language models
 
@@ -602,6 +667,13 @@ xpu-serve serve ~/models/Qwen3.8-27B-UD-IQ2_XXS --device GPU --spec mtp
 
 - Less VRAM: a smaller file, and `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2`
   ([KV cache formats](#kv-cache-formats)).
+- Long contexts (`--ctx N`): an f16 cache fits 64k tokens beside this file on a 24 GB card, `--kv-dtype i8` 128k, and
+  `--kv-dtype turbo4` the model's whole 262,144
+  ([measured on this pack](#measured-on-qwen38-27b-a-gguf-pack)):
+
+```bash
+xpu-serve serve ~/models/Qwen3.8-27B-Q4_0 --device GPU --spec mtp --spec-k 4 --ctx 262144 --kv-dtype turbo4
+```
 
 Measured. "Same as the reference" counts the answers the original gives in float32 on the CPU (190 of 300 of them
 right). MTP is greedy decode over six chat prompts with the file's MTP head at the best of 1 to 5 drafts a round.
