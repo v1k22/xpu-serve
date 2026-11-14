@@ -22,6 +22,7 @@ struct DecisionRunnerOptions {
     SessionOptions session;       // max_context bounds a request's sequences
     int64_t chunk_tokens = 1024;  // DecisionLimits::chunk_tokens
     std::string model_id;         // empty = the model directory name
+    DecisionLoadOptions load;     // for the model the runner loads (none with a model already loaded)
 };
 
 struct DecisionTiming {

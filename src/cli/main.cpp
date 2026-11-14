@@ -100,6 +100,9 @@ void add_engine_options(Args& a) {
         .value("readout-noul-temperature",
                "--readout: the slope of a yes / no answer's calibration (default: the preset's)")
         .value("readout-noul-bias", "--readout: the bias of a yes / no answer's calibration (default: the preset's)")
+        .value("set-size",
+               "decision models that read questions packed after their state (d1): how many at most, 1 for each "
+               "alone (default: the checkpoint's)")
         .value("log-level", "debug | info | warn | error", "info")
         .flag("no-vision", "do not load the model's vision encoder (text only)")
         .flag("help", "show this help");
@@ -158,7 +161,12 @@ bool decides(const Args& a, const std::string& dir) {
 
 // The decision runtime for `dir`: its decision model, or with --readout its language model read at the option letters.
 std::unique_ptr<DecisionRunner> decision_runner(const Args& a, const std::string& dir, const DecisionRunnerOptions& o) {
-    if (!a.has("readout")) return DecisionRunner::create(dir, o);
+    if (!a.has("readout")) {
+        DecisionRunnerOptions with = o;
+        if (a.has("set-size")) with.load.set_size = a.get_int("set-size");
+        return DecisionRunner::create(dir, with);
+    }
+    if (a.has("set-size")) fail("--set-size is for a decision model that packs questions (d1), not --readout");
     if (model_kind(dir) != ModelKind::Language) fail("--readout reads a language model; '", dir, "' is not one");
     std::optional<letter_readout::Settings> settings = letter_readout::preset(a.get("readout"));
     if (!settings) {
@@ -189,6 +197,7 @@ DecisionRunnerOptions decision_options(const ServiceOptions& so) {
 EmbeddingRunnerOptions embedding_options(const Args& a, const ServiceOptions& so) {
     if (!so.spec.empty()) fail("--spec is for language models: an embedding model generates no text");
     if (a.has("readout")) fail("--readout reads a language model as a decision model, not an embedding model");
+    if (a.has("set-size")) fail("--set-size does not apply to an embedding model");
     EmbeddingRunnerOptions o;
     o.backend = so.backend;
     o.session = so.session;
@@ -371,6 +380,7 @@ int cmd_serve(const std::vector<std::string>& argv) {
     opts.api_key = a.get("api-key");
     opts.http_threads = a.get_int("http-threads");
     if (model_kind(dir) == ModelKind::Policy) {  // the policy API; /ready once warmed up
+        refuse_flags(a, {"set-size"}, "a robot policy");
         PolicyRunnerOptions ro;
         ro.backend = so.backend;
         ro.session = so.session;
@@ -395,6 +405,7 @@ int cmd_serve(const std::vector<std::string>& argv) {
         srv.run();
         return 0;
     }
+    refuse_flags(a, {"set-size"}, "a language model");
     auto service = EngineService::create(dir, so);
     server::Server srv(*service, opts);
     log::info("serving ", service->model().id, " on http://", opts.host, ":", opts.port);
@@ -547,6 +558,7 @@ int cmd_run(const std::vector<std::string>& argv) {
     log::set_level(log::parse_level(a.get("log-level")));
     if (model_kind(model_dir_arg(a, "run")) == ModelKind::Embedding) return run_embedding(a, model_dir_arg(a, "run"));
     if (decides(a, model_dir_arg(a, "run"))) return run_decision(a, model_dir_arg(a, "run"));
+    refuse_flags(a, {"set-size"}, "a language model");
     auto service = EngineService::create(model_dir_arg(a, "run"), service_options(a));
     const SamplingParams sampling = sampling_from(a, service->model().default_sampling);
     const int max_tokens = a.get_int("max-tokens");
@@ -609,6 +621,7 @@ double percentile(std::vector<double> v, double p) {
 
 // Latency of a robot policy: warm-up (compile, then untimed runs), then timed calls on a synthetic observation.
 int bench_policy(const Args& a, const std::string& dir) {
+    refuse_flags(a, {"set-size"}, "a robot policy");
     const ServiceOptions so = service_options(a);
     PolicyRunnerOptions ro;
     ro.backend = so.backend;
@@ -849,6 +862,7 @@ int cmd_bench(const std::vector<std::string>& argv) {
     if (model_kind(dir) == ModelKind::Policy) return bench_policy(a, dir);
     if (model_kind(dir) == ModelKind::Embedding) return bench_embedding(a, dir);
     if (decides(a, dir)) return bench_decision(a, dir);
+    refuse_flags(a, {"set-size"}, "a language model");
     auto service = EngineService::create(dir, service_options(a));
     const int n_gen = a.get_int("gen-tokens");
     if (!a.get("prompts").empty()) return bench_prompts(*service, a.get("prompts"), n_gen, a.get_int("runs"));

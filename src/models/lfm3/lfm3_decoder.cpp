@@ -23,8 +23,10 @@ std::string probe_prefix(const WeightStore& weights) {
 Decoder::Decoder(const Config& cfg, const WeightStore& weights)
     : cfg_(cfg), weights_(weights), prefix_(probe_prefix(weights)) {}
 
-Decoder::Inputs Decoder::inputs(Graph& g) const {
-    return {g.input("token_ids", DType::I32, {kT}), g.input("positions", DType::I32, {kT})};
+Decoder::Inputs Decoder::inputs(Graph& g, Attention attention) const {
+    Inputs in{g.input("token_ids", DType::I32, {kT}), g.input("positions", DType::I32, {kT}), {}};
+    if (attention == Attention::Grouped) in.groups = g.input("groups", DType::I32, {kT});
+    return in;
 }
 
 void Decoder::token_inputs(std::span<const int32_t> tokens, int64_t start_pos, TensorMap& inputs) const {
@@ -44,7 +46,7 @@ void Decoder::token_inputs(std::span<const int32_t> tokens, int64_t start_pos, T
     inputs["positions"] = std::move(pos);
 }
 
-Value Decoder::layers(Graph& g, const Inputs& in, Attention attention) const {
+Value Decoder::layers(Graph& g, const Inputs& in) const {
     Value h = g.gather(embedding(g), in.ids);
     const Value full_freq = inv_freq(g, cfg_.full_rope);
     const Value sliding_freq = inv_freq(g, cfg_.sliding_rope);
@@ -52,7 +54,7 @@ Value Decoder::layers(Graph& g, const Inputs& in, Attention attention) const {
         const std::string label = "layers." + std::to_string(i);
         const LayerKind kind = cfg_.layer_kinds[static_cast<size_t>(i)];
         h = layer(g, prefix_ + label + ".", label, kind, h, in.pos,
-                  kind == LayerKind::Sliding ? sliding_freq : full_freq, attention);
+                  kind == LayerKind::Sliding ? sliding_freq : full_freq, in.groups);
     }
     return h;
 }
@@ -74,11 +76,11 @@ Value Decoder::inv_freq(Graph& g, const Rope& rope) const {
 
 // Lfm3DecoderLayer: the operator and the MLP each read a normed stream and are normed again before joining it.
 Value Decoder::layer(Graph& g, const std::string& L, const std::string& label, LayerKind kind, Value h, Value pos,
-                     Value freq, Attention attention) const {
+                     Value freq, Value groups) const {
     Graph::Scope s(g, label);
     const Value x = norm(g, h, L + "operator_norm.weight");
     const Value mixed = kind == LayerKind::Conv ? short_conv(g, L, label, x)
-                                                : self_attention(g, L, label, kind, x, pos, freq, attention);
+                                                : self_attention(g, L, label, kind, x, pos, freq, groups);
     h = g.add(h, norm(g, mixed, L + "post_operator_norm.weight"));
     const Value y = norm(g, h, L + "ffn_norm.weight");
     const std::string M = L + "feed_forward.";  // w2(silu(w1 x) * w3 x)
@@ -110,7 +112,7 @@ Value Decoder::short_conv(Graph& g, const std::string& layer, const std::string&
 
 // Lfm3Attention: q/k norms per head, RoPE, and each head's output scaled by sigmoid(gate_proj(x)).
 Value Decoder::self_attention(Graph& g, const std::string& layer, const std::string& label, LayerKind kind, Value x,
-                              Value pos, Value freq, Attention attention) const {
+                              Value pos, Value freq, Value groups) const {
     Graph::Scope s(g, "self_attn");
     const std::string L = layer + "self_attn.";
     blocks::AttentionSpec spec;
@@ -121,9 +123,11 @@ Value Decoder::self_attention(Graph& g, const std::string& layer, const std::str
     spec.attrs.sliding_window = kind == LayerKind::Sliding ? cfg_.sliding_window : 0;
     spec.kv_window = spec.attrs.sliding_window;
     spec.kv_label = label;
-    if (kind == LayerKind::Full && attention == Attention::WholeStep) {
+    if (kind == LayerKind::Full && groups.valid()) {
         spec.kv_cache = false;
         spec.attrs.causal = false;
+        spec.attrs.grouped = true;
+        spec.groups = groups;
     }
     blocks::AttentionParts parts;
     parts.q = proj(g, L + "q_proj.weight");

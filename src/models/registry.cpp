@@ -86,13 +86,21 @@ std::vector<std::string> supported_decision_models() {
     return {"clef", "d1", "pplx_decider", "laya", "julia"};
 }
 
-std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& dir) {
+std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& dir,
+                                                   const DecisionLoadOptions& options) {
     if (!std::filesystem::is_directory(dir)) fail("model directory '", dir.string(), "' does not exist");
-    if (laya::is_checkpoint(dir)) return laya::load(dir);
+    const auto unpacked = [&] {
+        if (options.set_size) fail("'", dir.string(), "' reads no questions packed after a state: a set size is d1's");
+    };
+    if (laya::is_checkpoint(dir)) {
+        unpacked();
+        return laya::load(dir);
+    }
     const auto config = cfg::read_json(dir / "config.json");
     cfg::check_quantization(config);
+    if (d1::is_checkpoint(dir)) return d1::load(dir, config, options);
+    unpacked();
     if (clef::is_checkpoint(dir)) return clef::load(dir, config);
-    if (d1::is_checkpoint(dir)) return d1::load(dir, config);
     if (pplx_decider::is_checkpoint(dir)) return pplx_decider::load(dir, config);
     std::string list;
     for (const auto& t : supported_decision_models()) list += (list.empty() ? "" : ", ") + t;

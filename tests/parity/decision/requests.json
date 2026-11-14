@@ -546,6 +546,143 @@
      }
     }
    }
+  },
+  {
+   "model": "test",
+   "state": {
+    "order": 5521,
+    "customer": {
+     "name": "Ingrid",
+     "country": "NO",
+     "orders_before": 3
+    },
+    "items": [
+     {
+      "sku": "LAMP-02",
+      "qty": 1,
+      "price": 129.0,
+      "fragile": true
+     },
+     {
+      "sku": "BULB-10",
+      "qty": 4,
+      "price": 4.5
+     }
+    ],
+    "payment": "card",
+    "shipping": {
+     "method": "express",
+     "carrier": "dhl",
+     "weight_kg": 2.4
+    },
+    "placed": "2026-03-07T10:15:00",
+    "note": "Please leave at the door."
+   },
+   "questions": {
+    "fact_00": {
+     "type": "noul",
+     "instructions": "Does the record say the order was paid by card?"
+    },
+    "fact_01": {
+     "type": "noul",
+     "instructions": "Does the record say the order ships to Norway?"
+    },
+    "fact_02": {
+     "type": "noul",
+     "instructions": "Does the record say the order contains a fragile item?"
+    },
+    "fact_03": {
+     "type": "noul",
+     "instructions": "Does the record say the order was ordered on a weekend?"
+    },
+    "fact_04": {
+     "type": "noul",
+     "instructions": "Does the record say the order has a gift note?"
+    },
+    "fact_05": {
+     "type": "noul",
+     "instructions": "Does the record say the order was refunded?"
+    },
+    "fact_06": {
+     "type": "noul",
+     "instructions": "Does the record say the order weighs over 2 kg?"
+    },
+    "fact_07": {
+     "type": "noul",
+     "instructions": "Does the record say the order uses express shipping?"
+    },
+    "fact_08": {
+     "type": "noul",
+     "instructions": "Does the record say the order has a discount code?"
+    },
+    "fact_09": {
+     "type": "noul",
+     "instructions": "Does the record say the order was placed by a returning customer?"
+    },
+    "fact_10": {
+     "type": "noul",
+     "instructions": "Does the record say the order includes a battery?"
+    },
+    "fact_11": {
+     "type": "noul",
+     "instructions": "Does the record say the order needs a signature on delivery?"
+    },
+    "carrier": {
+     "type": "choice",
+     "instructions": "Which carrier takes the parcel?",
+     "criteria": {
+      "postnord": "PostNord",
+      "dhl": "DHL Express",
+      "ups": null
+     }
+    },
+    "value": {
+     "type": "score",
+     "instructions": "How valuable is the order?",
+     "criteria": [
+      "under 50 EUR",
+      "50 to 200 EUR",
+      "over 200 EUR"
+     ]
+    },
+    "risk": {
+     "type": "score",
+     "instructions": "How likely is a customs delay?",
+     "criteria": [
+      "unlikely",
+      "possible",
+      "likely",
+      "certain"
+     ]
+    },
+    "language": {
+     "type": "choice",
+     "instructions": "In which language should the customer be written to?",
+     "criteria": {
+      "norwegian": null,
+      "english": null,
+      "german": null
+     }
+    },
+    "priority": {
+     "type": "noul",
+     "instructions": "Should support look at this order today?",
+     "criteria": {
+      "true": "Something needs action now.",
+      "false": "Nothing needs action."
+     }
+    },
+    "channel": {
+     "type": "choice",
+     "instructions": "Where did the order come from?",
+     "criteria": {
+      "web": "the web shop",
+      "app": "the mobile app",
+      "phone": "a phone call",
+      "store": "a physical store"
+     }
+    }
+   }
   }
  ]
 }

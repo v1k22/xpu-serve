@@ -50,22 +50,26 @@ private:
 
 class D1Model final : public DecisionModel {
 public:
-    D1Model(lfm3::Config text, Config config, DecisionSpec spec, std::unique_ptr<WeightStore> weights)
+    D1Model(lfm3::Config text, Config config, DecisionSpec spec, std::unique_ptr<WeightStore> weights,
+            int64_t set_size)
         : text_(std::move(text)),
           config_(std::move(config)),
           spec_(std::move(spec)),
           weights_(std::move(weights)),
+          set_size_(set_size),
           dec_(text_, *weights_),
           embedding_(weights_->get(dec_.embedding_name())) {
+        XS_CHECK(set_size_ >= 1, "d1: a set size of ", set_size_, "; it is at least 1 (each question alone)");
         XS_CHECK(embedding_.shape == (Dims{text_.vocab_size, text_.hidden_size}), "d1: ", dec_.embedding_name(),
                  " is ", dims_to_string(embedding_.shape), ", expected [", text_.vocab_size, ", ", text_.hidden_size,
                  "]");
-        const lfm3::Decoder::Inputs in = dec_.inputs(graph_);
-        const Value h = dec_.layers(graph_, in, lfm3::Decoder::Attention::WholeStep);
-        const Value rows = graph_.input("answer_rows", DType::I32, {kQuestions});
+        const lfm3::Decoder::Inputs in = dec_.inputs(graph_, lfm3::Decoder::Attention::Grouped);
+        const Value h = dec_.layers(graph_, in);
+        const Value rows = graph_.input("answer_rows", DType::I32, {set_size_});
         graph_.output("hidden", dec_.final_norm(graph_, graph_.gather(h, rows)));
         graph_.validate();
-        log::debug("d1: a program of ", graph_.nodes().size(), " nodes; temperature ", config_.temperature);
+        log::debug("d1: a program of ", graph_.nodes().size(), " nodes; up to ", set_size_,
+                   " questions after a state; temperature ", config_.temperature);
     }
 
     const DecisionSpec& spec() const override { return spec_; }
@@ -75,12 +79,14 @@ public:
     std::unique_ptr<DecisionRun> start(const DecisionRequest& request, const PromptTools& tools,
                                        const DecisionLimits& limits) const override {
         return std::make_unique<D1Run>(
-            *this, request, plan(request, tools, config_, kQuestions, std::min(limits.max_tokens, spec_.max_tokens)));
+            *this, request, plan(request, tools, config_, set_size_, std::min(limits.max_tokens, spec_.max_tokens)));
     }
 
     const lfm3::Decoder& decoder() const { return dec_; }
     const Config& config() const { return config_; }
     int64_t width() const { return text_.hidden_size; }
+    // Questions a sequence holds at most: the rows of the program's "answer_rows".
+    int64_t set_size() const { return set_size_; }
 
     // The output layer's logits of `tokens` for a final hidden state: the rows of the embedding table it is tied to.
     std::vector<double> logits(const float* hidden, const std::vector<int32_t>& tokens) const {
@@ -97,14 +103,12 @@ public:
         return out;
     }
 
-    // Questions a sequence holds, the rows of the program's "answer_rows": one, read alone after the state (d1.h).
-    static constexpr int64_t kQuestions = 1;
-
 private:
     lfm3::Config text_;
     Config config_;
     DecisionSpec spec_;
     std::unique_ptr<WeightStore> weights_;
+    int64_t set_size_ = 0;
     lfm3::Decoder dec_;
     const TensorView& embedding_;
     Graph graph_;
@@ -119,8 +123,10 @@ std::optional<DecisionRun::Step> D1Run::next(TensorMap& outputs) {
     step.outputs = {"hidden"};
     step.keep = 0;  // every sequence is read from its start
     model_.decoder().token_inputs(s.ids, 0, step.inputs);
-    HostTensor rows(DType::I32, {D1Model::kQuestions});
-    for (int64_t r = 0; r < D1Model::kQuestions; ++r) {  // a sequence of fewer questions repeats its last
+    const std::vector<int32_t> groups = s.groups();
+    step.inputs["groups"] = HostTensor::from_vector(DType::I32, {static_cast<int64_t>(groups.size())}, groups);
+    HostTensor rows(DType::I32, {model_.set_size()});
+    for (int64_t r = 0; r < model_.set_size(); ++r) {  // a sequence of fewer questions repeats its last
         rows.data<int32_t>()[r] =
             static_cast<int32_t>(s.answers[std::min(static_cast<size_t>(r), s.answers.size() - 1)]);
     }
@@ -131,17 +137,17 @@ std::optional<DecisionRun::Step> D1Run::next(TensorMap& outputs) {
 // Each option's best logit among its tokens, over the question's temperature, through a softmax.
 void D1Run::take(const Sequence& s, const HostTensor& hidden) {
     const int64_t width = model_.width();
-    XS_CHECK(hidden.dtype() == DType::F32 && hidden.shape() == (Dims{D1Model::kQuestions, width}),
+    XS_CHECK(hidden.dtype() == DType::F32 && hidden.shape() == (Dims{model_.set_size(), width}),
              "d1: the hidden states are ", dtype_name(hidden.dtype()), dims_to_string(hidden.shape()), ", expected [",
-             D1Model::kQuestions, ", ", width, "]");
+             model_.set_size(), ", ", width, "]");
     for (size_t i = 0; i < s.questions.size(); ++i) {
         const size_t q = s.questions[i];
         const DecisionQuestion& question = request_.questions[q];
         const double t = temperature(model_.config(), question.type, question.options.size());
         std::vector<double> p;
         double top = -std::numeric_limits<double>::infinity(), total = 0;
-        for (const std::vector<int32_t>& group : plan_.groups[q]) {
-            const std::vector<double> l = model_.logits(hidden.data<float>() + static_cast<int64_t>(i) * width, group);
+        for (const std::vector<int32_t>& forms : plan_.option_tokens[q]) {
+            const std::vector<double> l = model_.logits(hidden.data<float>() + static_cast<int64_t>(i) * width, forms);
             top = std::max(top, p.emplace_back(*std::max_element(l.begin(), l.end()) / t));
         }
         for (double& v : p)
@@ -212,7 +218,8 @@ bool is_checkpoint(const std::filesystem::path& dir) {
     return config.contains("architectures") && config.at("architectures") == nlohmann::json::array({"D1Model"});
 }
 
-std::unique_ptr<DecisionModel> load(const std::filesystem::path& dir, const nlohmann::json& config_json) {
+std::unique_ptr<DecisionModel> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
+                                    const DecisionLoadOptions& options) {
     lfm3::Config text = lfm3::parse_config(lfm3::text_config(config_json));
     const std::filesystem::path calibration = dir / "calibration.json";
     Config config = parse_config(config_json,
@@ -222,8 +229,10 @@ std::unique_ptr<DecisionModel> load(const std::filesystem::path& dir, const nloh
     spec.id = cfg::model_id(dir);
     spec.arch = "d1";
     spec.max_tokens = text.max_position;
+    spec.chat_template = false;  // the prompt is ChatML written as prompt.py writes it
+    const int64_t set_size = options.set_size.value_or(config.set_size);
     return std::make_unique<D1Model>(std::move(text), std::move(config), std::move(spec),
-                                     SafetensorsWeights::open_dir(dir));
+                                     SafetensorsWeights::open_dir(dir), set_size);
 }
 
 }  // namespace xs::d1

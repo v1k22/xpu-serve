@@ -17,8 +17,8 @@ the one call it makes to a server (the log-probabilities of the option letters a
 answered by the model in transformers, and the answers are left unrounded.
 d1 (config.json's architectures: D1Model): the checkpoint's own model class and runner (AutoModel with its code): the
 sequences its runner lays out and the probabilities it reads, through calibration.json's temperature. --set-size is
-the runner's set_size, the questions read together after one state: the checkpoint's own (d1_set_size) by default; 1
-reads each question alone, as the engine does.
+the runner's set_size, the questions read together after one state: the checkpoint's own (d1_set_size) by default, 1
+for each question alone; the fixtures record it ("set_size"), and decision_parity.cpp reads the model at it.
 Laya (rl_agent_config.json): rl_agent_api.py's RLAgent.system_one, its probabilities left unrounded; a question
 without instructions is passed with null ones (the request schema does not tell them apart; the reference writes
 null as "null").
@@ -139,7 +139,7 @@ def d1(model_dir, requests, set_size):
         try:
             questions = list(engine.named(request["questions"]).values())
         except ValueError as e:
-            print(f"left out: {e}")
+            cases.append({"request": request, "refused": str(e)})
             continue
         asked = [(request["state"], questions, [])]
         sequences = engine._sequences(asked, set_size=set_size)
@@ -151,7 +151,7 @@ def d1(model_dir, requests, set_size):
             probabilities[name] = dict(zip(names, p))
         cases.append({"request": request, "input_ids": [list(s[2]) for s in sequences],
                       "probabilities": probabilities})
-    return cases
+    return cases, engine.set_size if set_size is None else set_size
 
 
 def is_d1(model_dir):
@@ -247,8 +247,9 @@ def main():
     with open(args.requests) as f:
         requests = json.load(f)["requests"]
     model_dir = os.path.abspath(args.model_dir)
+    set_size = None
     if is_d1(model_dir):
-        kind, cases = "d1", d1(model_dir, requests, args.set_size)
+        kind, (cases, set_size) = "d1", d1(model_dir, requests, args.set_size)
     elif os.path.exists(os.path.join(model_dir, "joint_head_config.json")):
         kind, cases = "clef", clef(model_dir, requests)
     elif os.path.exists(os.path.join(model_dir, "decision_config.json")):
@@ -264,6 +265,8 @@ def main():
     fixtures = {"kind": kind, "cases": cases}
     if kind == "letter_readout":
         fixtures["preset"] = "openjev"  # the settings the helper ran with
+    if set_size is not None:
+        fixtures["set_size"] = set_size
     with open(args.out, "w") as f:
         json.dump(fixtures, f, ensure_ascii=False)
     tokens = sum(len(ids) for c in cases for ids in c.get("input_ids", []))

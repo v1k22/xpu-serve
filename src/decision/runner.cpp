@@ -42,7 +42,8 @@ std::unique_ptr<DecisionRunner> DecisionRunner::create(const std::filesystem::pa
                                                        std::unique_ptr<DecisionModel> model) {
     std::unique_ptr<DecisionRunner> r(new DecisionRunner());
     Timer timer;
-    r->model_ = model ? std::move(model) : load_decision_model(dir);
+    XS_CHECK(!model || !options.load.set_size, "a set size is for the decision model the runner loads");
+    r->model_ = model ? std::move(model) : load_decision_model(dir, options.load);
     r->spec_ = r->model_->spec();
     r->tools_ = std::make_unique<Tools>(r->spec_.tokenizer_dir.empty() ? dir : dir / r->spec_.tokenizer_dir,
                                         r->spec_.chat_template);

@@ -98,7 +98,7 @@ std::vector<int32_t> single_tokens(const PromptTools& tools, std::initializer_li
 // What a question asks, as the prompt shows it, and the tokens each of its options is read at.
 struct Layout {
     std::string suffix;  // the question and the assistant header, up to the answer slot
-    std::vector<std::vector<int32_t>> groups;
+    std::vector<std::vector<int32_t>> option_tokens;
 };
 
 class Writer {
@@ -134,8 +134,9 @@ public:
                 body += str_cat("\nYes: ", described(q.options[0]), "\nNo: ", described(q.options[1]));
             }
             body += "\n\nReply with yes or no only.";
-            out.groups = {single_tokens(tools_, {"yes", "Yes", "YES"}), single_tokens(tools_, {"no", "No", "NO"})};
-            XS_CHECK(!out.groups[0].empty() && !out.groups[1].empty(),
+            out.option_tokens = {single_tokens(tools_, {"yes", "Yes", "YES"}),
+                                 single_tokens(tools_, {"no", "No", "NO"})};
+            XS_CHECK(!out.option_tokens[0].empty() && !out.option_tokens[1].empty(),
                      "d1: the tokenizer has no single-token yes / no");
         } else if (q.type == QuestionType::Score) {
             if (q.options.size() < 2 || q.options.size() > 10) refuse(q, "a score has 2 to 10 levels, lowest first");
@@ -144,8 +145,8 @@ public:
                 const std::optional<Json>& level = q.options[i].description;
                 if (!level || !level->is_string()) refuse(q, "a score's levels are text");
                 body += str_cat(i > 0 ? "\n" : "", i, " ", level->get_ref<const std::string&>());
-                out.groups.push_back(single_tokens(tools_, {std::to_string(i)}));
-                XS_CHECK(!out.groups.back().empty(), "d1: the digit ", i, " is not one token");
+                out.option_tokens.push_back(single_tokens(tools_, {std::to_string(i)}));
+                XS_CHECK(!out.option_tokens.back().empty(), "d1: the digit ", i, " is not one token");
             }
             body += str_cat("\n\nReply with a single digit 0-", q.options.size() - 1, " only.");
         } else {
@@ -163,11 +164,11 @@ public:
                     std::replace(text.begin(), text.end(), '_', ' ');
                 }
                 body += str_cat(i > 0 ? "\n" : "", codes[i].first, " ", text);
-                std::vector<int32_t> group{codes[i].second};
+                std::vector<int32_t> forms{codes[i].second};
                 for (const int32_t id : single_tokens(tools_, {" " + codes[i].first})) {
-                    if (id != codes[i].second) group.push_back(id);
+                    if (id != codes[i].second) forms.push_back(id);
                 }
-                out.groups.push_back(std::move(group));
+                out.option_tokens.push_back(std::move(forms));
             }
             body += "\n\nReply with the option code only.";
         }
@@ -275,6 +276,15 @@ std::vector<std::string> option_codes(const std::vector<std::string>& names, int
     return out;
 }
 
+std::vector<int32_t> Sequence::groups() const {
+    std::vector<int32_t> out(static_cast<size_t>(state), 0);
+    for (size_t k = 0; k < answers.size(); ++k)
+        out.resize(static_cast<size_t>(answers[k] + 1), static_cast<int32_t>(k + 1));
+    XS_CHECK(out.size() == ids.size(), "d1: the questions of a sequence end at ", out.size(), " of ", ids.size(),
+             " tokens");
+    return out;
+}
+
 Plan plan(const DecisionRequest& request, const PromptTools& tools, const Config& config, int64_t set_size,
           int64_t max_tokens) {
     XS_CHECK(set_size >= 1, "d1: a sequence holds at least one question");
@@ -285,7 +295,7 @@ Plan plan(const DecisionRequest& request, const PromptTools& tools, const Config
     for (const DecisionQuestion& q : request.questions) {
         Layout layout = writer.layout(q);
         suffixes.push_back(std::move(layout.suffix));
-        out.groups.push_back(std::move(layout.groups));
+        out.option_tokens.push_back(std::move(layout.option_tokens));
     }
     const size_t n = request.questions.size(), size = static_cast<size_t>(set_size);
     for (size_t first = 0; first < n; first += size) {
@@ -293,7 +303,9 @@ Plan plan(const DecisionRequest& request, const PromptTools& tools, const Config
         // the header (attention.py: pack_set).
         Sequence s;
         s.ids = tools.encode(prefix + suffixes[first]);
-        s.state = static_cast<int64_t>(s.ids.size() - tools.encode(suffixes[first]).size());
+        s.state = static_cast<int64_t>(s.ids.size()) - static_cast<int64_t>(tools.encode(suffixes[first]).size());
+        XS_CHECK(s.state > 0 && s.state < static_cast<int64_t>(s.ids.size()), "d1: a prompt of ", s.ids.size(),
+                 " tokens with a state of ", s.state);
         s.questions = {first};
         s.answers = {static_cast<int64_t>(s.ids.size()) - 1};
         for (size_t q = first + 1; q < std::min(n, first + size); ++q) {
@@ -303,8 +315,12 @@ Plan plan(const DecisionRequest& request, const PromptTools& tools, const Config
             s.answers.push_back(static_cast<int64_t>(s.ids.size()) - 1);
         }
         if (static_cast<int64_t>(s.ids.size()) > max_tokens) {
-            throw DecisionRefused(str_cat("question '", request.questions[first].id, "' needs ", s.ids.size(),
-                                          " tokens with the state; the limit is ", max_tokens),
+            const std::string& id = request.questions[first].id;
+            const std::string who = s.questions.size() == 1
+                                        ? str_cat("question '", id, "' needs ")
+                                        : str_cat("questions '", id, "' to '", request.questions[s.questions.back()].id,
+                                                  "', read together, need ");
+            throw DecisionRefused(str_cat(who, s.ids.size(), " tokens with the state; the limit is ", max_tokens),
                                   "max_tokens_exceeded");
         }
         out.sequences.push_back(std::move(s));

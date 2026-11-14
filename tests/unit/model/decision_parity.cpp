@@ -3,7 +3,7 @@
 // Opt-in:
 //
 //   XS_TEST_DECISION_DIR   the checkpoint (a released one, or tests/parity/decision/make_tiny.py's)
-//   XS_DECISION_FIXTURES   reference.py's output for it
+//   XS_DECISION_FIXTURES   reference.py's output for it (d1's: read at the set size it records)
 //   XS_PARITY_BACKEND      cpu-ref (default) | sycl
 //   XS_PARITY_DEVICE, XS_PARITY_PRECISION (f32 by default)
 //   XS_DECISION_CHUNK      tokens a step feeds (default 1024; a small one splits spans across steps)
@@ -53,6 +53,8 @@ TEST_CASE("decision model matches its reference code" * doctest::skip(!enabled()
         model = xs::letter_readout::make(xs::load_model(dir, xs::LoadOptions{.vision = false}),
                                          *xs::letter_readout::preset(fixtures.value("preset", "letters")));
     }
+    // The questions the reference read together after one state (d1).
+    if (fixtures.contains("set_size")) options.load.set_size = fixtures["set_size"].get<int64_t>();
     const auto runner = xs::DecisionRunner::create(dir, options, std::move(model));
 
     double worst = 0;

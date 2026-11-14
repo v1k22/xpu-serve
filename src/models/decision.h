@@ -135,9 +135,16 @@ public:
                                                const DecisionLimits& limits) const = 0;
 };
 
+// How a model reads requests where its reference code leaves the caller a choice the System One API has no field for.
+struct DecisionLoadOptions {
+    // Questions read together after one state, by a model that packs them (d1); unset: the checkpoint's own number.
+    std::optional<int64_t> set_size;
+};
+
 // Loads the decision model in `dir`: a checkpoint that model_kind() calls ModelKind::Decision. Throws xs::Error
-// naming what is not supported.
-std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& dir);
+// naming what is not supported, also an option the model has no use for.
+std::unique_ptr<DecisionModel> load_decision_model(const std::filesystem::path& dir,
+                                                   const DecisionLoadOptions& options = {});
 std::vector<std::string> supported_decision_models();
 
 }  // namespace xs

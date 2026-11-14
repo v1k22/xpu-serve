@@ -481,8 +481,8 @@ TEST_SUITE("decision models") {
         int steps = 0;
         size_t sequences = 0;
         const auto p = xs::test::decide(*model, *session, ticket(), whole, &steps, &sequences, &tools);
-        CHECK(sequences == 3);  // each question alone after the state
-        CHECK(steps == 3);
+        CHECK(sequences == 1);  // the three questions packed after the state (d1_set_size 16)
+        CHECK(steps == 1);
         REQUIRE(p.size() == 3);
         for (const auto& question : p) {
             double total = 0;
@@ -491,34 +491,93 @@ TEST_SUITE("decision models") {
             CHECK(total == doctest::Approx(1.0));
         }
         CHECK(*std::max_element(p[0].begin(), p[0].end()) - *std::min_element(p[0].begin(), p[0].end()) > 0.02);
+        // The same checkpoint reading each question alone after the state.
+        const auto alone = xs::load_decision_model(dir.path, {.set_size = 1});
+        const auto alone_session = compile(*alone);
 
-        SUBCASE("the prompt: the state, a question, the assistant's empty thought") {
-            const auto run = model->start(ticket(), tools, whole);
-            REQUIRE(run->sequences().size() == 3);
+        SUBCASE("the prompt: the state, each question after it, the assistant's empty thought after each") {
             const std::string head =
                 "<|startoftext|><|im_start|>user\n{\n  \"ticket\": 4411,\n  \"text\": \"cannot log in after the reset "
                 "email expired\",\n  \"vip\": true\n}\n\n\nQUESTION:\n";
             const std::string tail = "<|im_end|>\n<|im_start|>assistant\n<think></think>";
+            const std::string team =
+                "Which team?\n\nOptions:\nA payments\nB logins\nC other\n\nReply with the option code only." + tail;
+            const std::string urgent = "Is it urgent?\n\nReply with yes or no only." + tail;
+            const std::string effort =
+                "How much work?\n\n0 minutes\n1 hours\n2 days\n\nReply with a single digit 0-2 only." + tail;
+            const auto run = model->start(ticket(), tools, whole);
+            REQUIRE(run->sequences().size() == 1);
             CHECK(tools.text(run->sequences()[0]) ==
-                  head + "Which team?\n\nOptions:\nA payments\nB logins\nC other\n\nReply with the option code only." +
-                      tail);
-            CHECK(tools.text(run->sequences()[1]) == head + "Is it urgent?\n\nReply with yes or no only." + tail);
-            CHECK(tools.text(run->sequences()[2]) ==
-                  head + "How much work?\n\n0 minutes\n1 hours\n2 days\n\nReply with a single digit 0-2 only." + tail);
+                  head + team + "QUESTION:\n" + urgent + "QUESTION:\n" + effort);
+            const auto lone = alone->start(ticket(), tools, whole);
+            REQUIRE(lone->sequences().size() == 3);
+            CHECK(tools.text(lone->sequences()[0]) == head + team);
+            CHECK(tools.text(lone->sequences()[1]) == head + urgent);
+            CHECK(tools.text(lone->sequences()[2]) == head + effort);
             DecisionRequest text = ticket();
+            text.questions.resize(1);
             text.state = "plain text";
-            CHECK(tools.text(model->start(text, tools, whole)->sequences()[1]) ==
-                  "<|startoftext|><|im_start|>user\nplain text\n\n\nQUESTION:\nIs it urgent?\n\nReply with yes or no "
-                  "only." +
-                      tail);
-        }
-        SUBCASE("each answer is its question's alone") {
-            for (size_t q = 0; q < 3; ++q) {
-                DecisionRequest alone = ticket();
-                alone.questions = {ticket().questions[q]};
-                CHECK(max_diff({p[q]}, xs::test::decide(*model, *session, alone, whole, nullptr, nullptr, &tools)) <
-                      1e-12);
+            CHECK(tools.text(model->start(text, tools, whole)->sequences()[0]) ==
+                  "<|startoftext|><|im_start|>user\nplain text\n\n\nQUESTION:\n" + team);
+
+            // The state is group 0, each question a group of its own up to its answer slot, the empty thought's end.
+            xs::d1::Config config;
+            config.bos = "<|startoftext|>";
+            const xs::d1::Plan plan = xs::d1::plan(ticket(), tools, config, 16, 4096);
+            REQUIRE(plan.sequences.size() == 1);
+            const xs::d1::Sequence& s = plan.sequences[0];
+            const std::vector<int32_t> groups = s.groups();
+            REQUIRE(groups.size() == s.ids.size());
+            CHECK(tools.text({s.ids.begin(), s.ids.begin() + s.state}) == head);
+            REQUIRE(s.answers.size() == 3);
+            int64_t begin = s.state;
+            for (size_t k = 0; k < 3; ++k) {
+                CHECK(s.ids[static_cast<size_t>(s.answers[k])] == *tools.token_id("</think>"));
+                for (int64_t i = begin; i <= s.answers[k]; ++i)
+                    CHECK(groups[static_cast<size_t>(i)] == static_cast<int32_t>(k + 1));
+                begin = s.answers[k] + 1;
             }
+            CHECK(std::count(groups.begin(), groups.end(), 0) == s.state);
+        }
+        SUBCASE("each answer at a set size of 1 is its question's alone; packed, a question hears the others") {
+            const auto one = xs::test::decide(*alone, *alone_session, ticket(), whole, nullptr, nullptr, &tools);
+            for (size_t q = 0; q < 3; ++q) {
+                DecisionRequest single = ticket();
+                single.questions = {ticket().questions[q]};
+                CHECK(max_diff({one[q]}, xs::test::decide(*alone, *alone_session, single, whole, nullptr, nullptr,
+                                                          &tools)) < 1e-12);
+                // A lone question reads the same at any set size.
+                CHECK(max_diff({one[q]}, xs::test::decide(*model, *session, single, whole, nullptr, nullptr,
+                                                          &tools)) < 1e-12);
+            }
+            CHECK(max_diff(p, one) > 1e-4);
+            // The state sees the questions after the first, so the first question's answer depends on them.
+            DecisionRequest other = ticket();
+            other.questions[2].instructions = "Something else entirely?";
+            CHECK(max_diff({p[0]}, {xs::test::decide(*model, *session, other, whole, nullptr, nullptr, &tools)[0]}) >
+                  1e-4);
+        }
+        SUBCASE("a set size of 2 packs the first two questions and leaves the third alone") {
+            const auto two = xs::load_decision_model(dir.path, {.set_size = 2});
+            const auto two_session = compile(*two);
+            int pairs = 0;
+            const auto q = xs::test::decide(*two, *two_session, ticket(), whole, &pairs, nullptr, &tools);
+            CHECK(pairs == 2);
+            DecisionRequest first_two = ticket(), last = ticket();
+            first_two.questions.resize(2);
+            last.questions = {ticket().questions[2]};
+            CHECK(max_diff({q[0], q[1]}, xs::test::decide(*model, *session, first_two, whole, nullptr, nullptr,
+                                                          &tools)) < 1e-12);
+            CHECK(max_diff({q[2]}, xs::test::decide(*alone, *alone_session, last, whole, nullptr, nullptr, &tools)) <
+                  1e-12);
+        }
+        SUBCASE("a set size is a d1 setting, of at least 1") {
+            CHECK_THROWS_WITH_AS(xs::load_decision_model(dir.path, {.set_size = 0}), doctest::Contains("set size"),
+                                 xs::Error);
+            const xs::test::TempDir pplx("xs_tiny_pplx_set");
+            xs::test::write_tiny_pplx(pplx.path, 9);
+            CHECK_THROWS_WITH_AS(xs::load_decision_model(pplx.path, {.set_size = 4}), doctest::Contains("set size"),
+                                 xs::Error);
         }
         SUBCASE("a noul's outcomes, and the codes of a choice's options") {
             DecisionRequest r = ticket();
@@ -527,7 +586,7 @@ TEST_SUITE("decision models") {
             r.questions[0].options[0].description = Json("Equipment failed.");
             for (int i = 0; i < 54; ++i)
                 r.questions[2].options.push_back({"opt_" + std::to_string(i), Json(nullptr)});
-            const auto run = model->start(r, tools, whole);
+            const auto run = alone->start(r, tools, whole);
             CHECK(tools.text(run->sequences()[0]).find("Hardware?\nYes: Equipment failed.\nNo: None\n\nReply") !=
                   std::string::npos);
             CHECK(tools.text(run->sequences()[1]).find("Options:\nx first\nY Y\n\nReply") != std::string::npos);
@@ -540,7 +599,7 @@ TEST_SUITE("decision models") {
             CHECK(std::accumulate(q[2].begin(), q[2].end(), 0.0) == doctest::Approx(1.0));
             // The pool's two-letter codes come last: the one left that is a token of its own, then none.
             r.questions[2].options.push_back({"opt_54", Json(nullptr)});
-            CHECK(tools.text(model->start(r, tools, whole)->sequences()[2]).find("\nz opt 53\nNO opt 54\n\nReply") !=
+            CHECK(tools.text(alone->start(r, tools, whole)->sequences()[2]).find("\nz opt 53\nNO opt 54\n\nReply") !=
                   std::string::npos);
             r.questions[2].options.push_back({"opt_55", Json(nullptr)});
             CHECK_THROWS_WITH_AS(model->start(r, tools, whole), doctest::Contains("no single-token code is left"),
@@ -584,19 +643,27 @@ TEST_SUITE("decision models") {
                     CHECK(e.code() == "unsupported_question");
                 }
             }
+            // A pack over the limit is refused whole, naming its questions and its tokens.
+            const size_t packed = model->start(ticket(), tools, whole)->sequences()[0].size();
             try {
-                model->start(ticket(), tools, DecisionLimits{60, 60});
+                model->start(ticket(), tools, DecisionLimits{static_cast<int64_t>(packed) - 1, 4096});
                 FAIL("expected a refusal");
             } catch (const xs::DecisionRefused& e) {
                 CHECK(e.code() == "max_tokens_exceeded");
+                CHECK(std::string(e.what()).find("questions 'team' to 'effort'") != std::string::npos);
+                CHECK(std::string(e.what()).find(std::to_string(packed) + " tokens") != std::string::npos);
             }
         }
-        SUBCASE("the GPU agrees with the reference backend") {
+        SUBCASE("the GPU agrees with the reference backend, packed and alone") {
             namespace dev = xs::test::device;
             if (!dev::enabled()) return;
+            const double tolerance = dev::is_f16() ? 2e-2 : 1e-4;
             const auto gpu = dev::backend().compile(model->programs(), model->weights(), dev::options());
-            CHECK(max_diff(p, xs::test::decide(*model, *gpu, ticket(), whole, nullptr, nullptr, &tools)) <
-                  (dev::is_f16() ? 2e-2 : 1e-4));
+            CHECK(max_diff(p, xs::test::decide(*model, *gpu, ticket(), whole, nullptr, nullptr, &tools)) < tolerance);
+            const auto one = xs::test::decide(*alone, *alone_session, ticket(), whole, nullptr, nullptr, &tools);
+            const auto gpu_alone = dev::backend().compile(alone->programs(), alone->weights(), dev::options());
+            CHECK(max_diff(one, xs::test::decide(*alone, *gpu_alone, ticket(), whole, nullptr, nullptr, &tools)) <
+                  tolerance);
         }
     }
 

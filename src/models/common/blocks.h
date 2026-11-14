@@ -105,6 +105,7 @@ struct AttentionSpec {
     bool kv_cache = true;         // decoder: k / v go through a new KV slot; encoder: attend over this step's k / v
     int64_t kv_window = 0;        // the slot's sliding-window hint
     std::string kv_label;
+    graph::Value groups;          // [T] i32: attention in groups (attrs.grouped, no KV cache); invalid: none
 };
 
 struct AttentionParts {
