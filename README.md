@@ -14,7 +14,7 @@ Intel GPUs. **[model_recipes.md](model_recipes.md) has the commands for every mo
 optimized one) and what was measured**; this page says what is supported and how the APIs look.
 [CLAUDE.md](CLAUDE.md) maps the code.
 
-> **A 27B model's full context on one 24 GB card.** Qwen3.8-27B (its Q4_0 GGUF file, with its MTP drafter) reads all
+> 🚀 **A 27B model's full context on one 24 GB card.** Qwen3.8-27B (its Q4_0 GGUF file, with its MTP drafter) reads all
 > 262,144 tokens it can take on a single Intel Arc Pro B60, with the KV cache in TurboQuant's `turbo4`. With an f16
 > cache the same card stops at 64k tokens, with int8 at 128k.
 >
