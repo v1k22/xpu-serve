@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/logo.png" alt="xpu-serve: one repo, one binary, Intel GPUs" width="380">
+  <img src="docs/images/logo.png" alt="xpu-serve: one repo, one binary, Intel GPUs" width="900">
 </p>
 
 # xpu-serve
