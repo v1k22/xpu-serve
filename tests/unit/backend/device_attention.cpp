@@ -21,8 +21,18 @@ namespace dev = xs::test::device;
 namespace {
 
 const dev::Tolerance kAttention = dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3});
-// int8 KV against the int8-rounded reference: a code the device rounds the other way at a .5 tie moves one key.
-const dev::Tolerance kAttentionI8 = dev::tolerance({1e-4, 1e-4}, {4e-3, 4e-3});
+// A quantized KV cache against the reference over the values its formats store. int8: a code the device rounds the
+// other way at a .5 tie moves one key. TurboQuant: the device stores the host's bits, and attends in the rotated
+// domain, which rounds differently.
+const dev::Tolerance kAttentionQuantized = dev::tolerance({1e-4, 1e-4}, {4e-3, 4e-3});
+using quant::KvFormat;
+const quant::KvFormats kI8{KvFormat::I8, KvFormat::I8};
+const quant::KvFormats kTurboFormats[] = {{KvFormat::Turbo4, KvFormat::Turbo4},
+                                          {KvFormat::Turbo3, KvFormat::Turbo3},
+                                          {KvFormat::Turbo2, KvFormat::Turbo2},
+                                          {KvFormat::I8, KvFormat::Turbo4},
+                                          {KvFormat::I8, KvFormat::Turbo3},
+                                          {KvFormat::I8, KvFormat::Turbo2}};
 
 struct AttentionCase {
     int64_t heads = 4;
@@ -33,13 +43,14 @@ struct AttentionCase {
     float scale = 0.0f;  // 0 = 1/sqrt(head_dim)
     std::string impl = "auto";
     std::vector<int64_t> steps{5, 1, 3};
-    bool kv_i8 = false;  // --kv-dtype i8
+    quant::KvFormats kv;  // --kv-dtype
     bool causal = true;
+    bool quantized() const { return kv.k != KvFormat::Float; }
 };
 
 std::string describe(const AttentionCase& c) {
     return str_cat("D", c.head_dim, " H", c.heads, "/", c.kv_heads, " w", c.window, " cap", c.softcap, " ", c.impl,
-                   c.kv_i8 ? " kv-i8" : "", c.causal ? "" : " not causal");
+                   c.quantized() ? " kv " + quant::kv_formats_name(c.kv) : "", c.causal ? "" : " not causal");
 }
 
 float scale_of(const AttentionCase& c) {
@@ -63,21 +74,21 @@ void append_rows(Tensor64& all, const HostTensor& rows) {
     all.shape[0] += r.shape[0];
 }
 
-HostTensor kv_i8_values(const HostTensor& x) {
+HostTensor stored_values(const HostTensor& x, KvFormat format) {
     HostTensor r = x.clone();
-    quant::round_trip_kv_i8(r.data<float>(), r.numel() / r.shape().back(), r.shape().back());
+    quant::round_trip_kv(format, r.data<float>(), r.numel() / r.shape().back(), r.shape().back());
     return r;
 }
 
 // Runs every step of `c` through one session. Returns false at the first step whose output is not within `tol` of
-// the reference computed with `reference_spec`, over int8 KV values when `c.kv_i8` and `rounded_reference`.
+// the reference computed with `reference_spec`, over the values the cache's formats store when `rounded_reference`.
 bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& reference_spec, dev::Tolerance tol,
                        uint32_t seed, bool rounded_reference = true) {
     test::TensorRng rng(seed);
     SessionOptions options = dev::options();
     options.extra["attention"] = c.impl;
-    if (c.kv_i8) options.kv_dtype = DType::I8;
-    const bool rounded = c.kv_i8 && rounded_reference;
+    options.kv = c.kv;
+    const quant::KvFormats stored = rounded_reference ? c.kv : quant::KvFormats{};
     const auto session = dev::backend().compile(attention_graph(c), test::MemoryWeights{}, options);
     Tensor64 k_all, v_all;
     bool ok = true;
@@ -85,8 +96,8 @@ bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& r
         const HostTensor q = rng.uniform(DType::F32, {t, c.heads, c.head_dim});
         const HostTensor k = rng.uniform(DType::F32, {t, c.kv_heads, c.head_dim});
         const HostTensor v = rng.uniform(DType::F32, {t, c.kv_heads, c.head_dim});
-        append_rows(k_all, rounded ? kv_i8_values(k) : k);
-        append_rows(v_all, rounded ? kv_i8_values(v) : v);
+        append_rows(k_all, stored_values(k, stored.k));
+        append_rows(v_all, stored_values(v, stored.v));
         TensorMap out;
         session->run({{"q", q}, {"k", k}, {"v", v}}, out);
         const Tensor64 expected = test::ref::attention(to_f64(q), k_all, v_all, reference_spec);
@@ -96,8 +107,8 @@ bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& r
 }
 
 bool attention_matches(const AttentionCase& c, uint32_t seed) {
-    return attention_matches(c, {scale_of(c), c.window, c.softcap, 0, c.causal}, c.kv_i8 ? kAttentionI8 : kAttention,
-                             seed);
+    return attention_matches(c, {scale_of(c), c.window, c.softcap, 0, c.causal},
+                             c.quantized() ? kAttentionQuantized : kAttention, seed);
 }
 
 }  // namespace
@@ -135,10 +146,12 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
         }
     }
 
-    TEST_CASE("not causal with a window (a drafter's block): steps of up to the window, every lowering, int8 KV") {
+    TEST_CASE("not causal with a window (a drafter's block): steps of up to the window, every lowering and KV format") {
         for (const int64_t head_dim : {64, 128}) {
             for (const std::string& impl : dev::attention_impls()) {
-                for (const bool kv_i8 : {false, true}) {
+                std::vector<quant::KvFormats> formats{{}, kI8};
+                if (head_dim == 128) formats.insert(formats.end(), std::begin(kTurboFormats), std::end(kTurboFormats));
+                for (const quant::KvFormats& kv : formats) {
                     AttentionCase c;
                     c.head_dim = head_dim;
                     c.heads = 8;
@@ -146,7 +159,7 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
                     c.window = 16;
                     c.causal = false;
                     c.impl = impl;
-                    c.kv_i8 = kv_i8;
+                    c.kv = kv;
                     c.steps = {16, 9, 16, 1, 8, 16};
                     CAPTURE(describe(c));
                     CHECK(attention_matches(c, static_cast<uint32_t>(900 + head_dim)));
@@ -164,20 +177,21 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
 
     TEST_CASE("not causal with a window, steps longer than it: as far after a query as before, every lowering") {
         for (const std::string& impl : dev::attention_impls()) {
-            for (const bool kv_i8 : {false, true}) {
+            for (const quant::KvFormats& kv : {quant::KvFormats{}, kI8, kTurboFormats[1]}) {
                 AttentionCase c;
+                c.head_dim = kv == kTurboFormats[1] ? 128 : 64;
                 c.heads = 8;
                 c.kv_heads = 2;
                 c.window = 16;
                 c.causal = false;
                 c.impl = impl;
-                c.kv_i8 = kv_i8;
+                c.kv = kv;
                 c.steps = {70, 1, 37};
                 CAPTURE(describe(c));
                 CHECK(attention_matches(c, 960));
                 test::ref::AttentionSpec one_sided{scale_of(c), c.window, 0.0, 0, false};
                 one_sided.one_sided = true;
-                CHECK_FALSE(attention_matches(c, one_sided, c.kv_i8 ? kAttentionI8 : kAttention, 960));
+                CHECK_FALSE(attention_matches(c, one_sided, c.quantized() ? kAttentionQuantized : kAttention, 960));
             }
         }
     }
@@ -237,7 +251,7 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
                 c.heads = 8;
                 c.kv_heads = 2;
                 c.impl = impl;
-                c.kv_i8 = true;
+                c.kv = kI8;
                 CAPTURE(describe(c));
                 CHECK(attention_matches(c, static_cast<uint32_t>(500 + head_dim)));
                 c.window = 16;
@@ -253,7 +267,7 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
                 c.window = window;
                 c.softcap = 30.0f;
                 c.impl = impl;
-                c.kv_i8 = true;
+                c.kv = kI8;
                 c.steps = {2100, 1, 2};
                 CAPTURE(describe(c));
                 CHECK(attention_matches(c, static_cast<uint32_t>(700 + window)));
@@ -266,10 +280,78 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
         for (const std::string& impl : dev::attention_impls()) {
             AttentionCase c;
             c.impl = impl;
-            c.kv_i8 = true;
+            c.kv = kI8;
             CAPTURE(impl);
-            CHECK(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, kAttentionI8, 800));
-            CHECK_FALSE(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, kAttentionI8, 800, false));
+            CHECK(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, kAttentionQuantized, 800));
+            CHECK_FALSE(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, kAttentionQuantized, 800, false));
+        }
+    }
+
+    TEST_CASE("TurboQuant KV cache: head dims 128, 256 and 512, GQA, windows, long decode, every lowering") {
+        for (const std::string& impl : dev::attention_impls()) {
+            for (const quant::KvFormats& kv : kTurboFormats) {
+                for (const int64_t head_dim : {128, 256, 512}) {
+                    AttentionCase c;
+                    c.head_dim = head_dim;
+                    c.heads = 8;
+                    c.kv_heads = 2;
+                    c.impl = impl;
+                    c.kv = kv;
+                    CAPTURE(describe(c));
+                    CHECK(attention_matches(c, static_cast<uint32_t>(1500 + head_dim)));
+                    c.window = 16;
+                    c.steps = {37, 1, 1, 4};
+                    CAPTURE(describe(c));
+                    CHECK(attention_matches(c, static_cast<uint32_t>(1600 + head_dim)));
+                }
+            }
+            for (const int64_t window : {0, 1100}) {
+                AttentionCase c;
+                c.head_dim = 256;
+                c.heads = 8;
+                c.kv_heads = 1;
+                c.window = window;
+                c.softcap = 30.0f;
+                c.impl = impl;
+                c.kv = kTurboFormats[0];
+                c.steps = {2100, 1, 2};
+                CAPTURE(describe(c));
+                CHECK(attention_matches(c, static_cast<uint32_t>(1700 + window)));
+            }
+        }
+    }
+
+    TEST_CASE("TurboQuant KV cache: a query that sees one key reads the value the host stores for it") {
+        // A window of one: each output row is its own value row as the cache stores it, so a code or a norm the
+        // device rounds otherwise than quant::turbo::quantize_group shows up whole.
+        const dev::Tolerance exact = dev::tolerance({2e-5, 2e-5}, {4e-3, 4e-3});
+        for (const std::string& impl : dev::attention_impls()) {
+            for (const quant::KvFormats& kv : kTurboFormats) {
+                AttentionCase c;
+                c.head_dim = 256;
+                c.heads = 4;
+                c.kv_heads = 4;
+                c.window = 1;
+                c.impl = impl;
+                c.kv = kv;
+                c.steps = {700, 3, 1};
+                CAPTURE(describe(c));
+                CHECK(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, exact, 1800));
+            }
+        }
+    }
+
+    TEST_CASE("planted bug: TurboQuant KV output must not match the reference over the unrounded keys and values") {
+        for (const std::string& impl : dev::attention_impls()) {
+            for (const quant::KvFormats& kv : kTurboFormats) {
+                AttentionCase c;
+                c.head_dim = 128;
+                c.impl = impl;
+                c.kv = kv;
+                CAPTURE(describe(c));
+                CHECK(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, kAttentionQuantized, 1900));
+                CHECK_FALSE(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, kAttentionQuantized, 1900, false));
+            }
         }
     }
 }

@@ -110,10 +110,11 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
 // True when attention() runs on the matrix engines (flash or GEMMs) for this shape: f16 operands welcome.
 bool attention_matrix_path(const AttentionShape& s, AttentionPath path);
 
-// attention() over an int8 KV cache. The rows path reads the codes; the GEMM path first dequantizes the keys the
-// queries can see to CT in `kv_scratch` (a second scratch: the GEMM path uses `scratch` for its own buffers).
+// attention() over a quantized KV cache. The rows path reads the codes; the matrix paths first decode the keys and
+// values the queries can see to CT in `kv_scratch` (a second scratch: they use `scratch` for their own buffers). A
+// TurboQuant format's rows decode rotated: the queries are rotated to meet the keys, the output rotated back.
 template <typename CT>
-void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvI8& kv, float* out,
-                  const AttentionShape& s, const AttentionPlan& plan);
+void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvQuantized& kv,
+                         float* out, const AttentionShape& s, const AttentionPlan& plan);
 
 }  // namespace xs::sycl_be

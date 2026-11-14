@@ -61,11 +61,11 @@ TEST_CASE("a block drafter matches the reference" * doctest::skip(!enabled())) {
                                           &spec->draft_graph()};
     auto session = xs::make_backend(env_or("XS_PARITY_BACKEND", "cpu-ref"))->compile(programs, model->weights(), options);
 
-    // Scores may differ by this much of a row's largest (an int8 KV cache rounds the context's keys and values), and
-    // so many of the candidates must be the reference's.
-    const bool kv_i8 = env_or("XS_PARITY_KV_DTYPE", "auto") == "i8";
-    const double score_tolerance = kv_i8 ? 8e-2 : f32 ? 2e-3 : 3e-2;
-    const double shared_candidates = kv_i8 ? 0.85 : f32 ? 1.0 : 0.9;
+    // Scores may differ by this much of a row's largest (a quantized KV cache rounds the context's keys and values),
+    // and so many of the candidates must be the reference's.
+    const bool kv_quantized = options.kv != xs::quant::KvFormats{};
+    const double score_tolerance = kv_quantized ? 8e-2 : f32 ? 2e-3 : 3e-2;
+    const double shared_candidates = kv_quantized ? 0.85 : f32 ? 1.0 : 0.9;
     for (const auto& c : manifest["cases"]) {
         const auto ids = c["input_ids"].get<std::vector<int32_t>>();
         session->reset();
@@ -139,14 +139,14 @@ TEST_CASE("a block drafter matches the reference" * doctest::skip(!enabled())) {
                     const float* row = scores.data<float>() + (i * k + from) * k;
                     from = std::max_element(row, row + k) - row;
                 }
-            } else if (!f32 || kv_i8) {
+            } else if (!f32 || kv_quantized) {
                 // a clear winner must be ours too
                 const auto margins = round["margins"].get<std::vector<double>>();
                 for (size_t i = 0; i < drafts.size(); ++i) {
                     if (margins[i] > score_tolerance) CHECK(drafts[i] == want[i]);
                 }
             }
-            if (f32 && !kv_i8) CHECK(drafts == want);
+            if (f32 && !kv_quantized) CHECK(drafts == want);
 
             std::vector<int32_t> step{anchor};
             step.insert(step.end(), want.begin(), want.end());

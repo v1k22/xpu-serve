@@ -14,6 +14,7 @@
 
 #include "graph/graph.h"
 #include "io/safetensors.h"
+#include "quant/kv_format.h"
 #include "tensor/tensor.h"
 
 namespace xs {
@@ -29,9 +30,9 @@ struct SessionOptions {
     std::string device;                // empty = backend default
     DType precision = DType::F16;      // compute precision for activations and weights (F16 or F32)
     int64_t max_context = 8192;        // upper bound on tokens per sequence (sizes caches)
-    // KV cache storage: empty = the backend's choice for `precision`; I8 = int8 codes with one f32 scale per (token,
-    // KV head), rounded as quant::quantize_kv_row_i8.
-    std::optional<DType> kv_dtype;
+    // How the KV cache stores its keys and its values (quant/kv_format.h). A backend stores exactly what
+    // quant::round_trip_kv gives each appended row.
+    quant::KvFormats kv;
     // Steps of up to this many tokens can be cut back to any point inside them (truncate), conv and recurrent state
     // included: the verify step of speculative decoding (k + 1 tokens). 0: a step is kept or dropped whole.
     int64_t rewind_tokens = 0;

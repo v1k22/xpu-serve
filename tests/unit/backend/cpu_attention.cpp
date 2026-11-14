@@ -49,26 +49,27 @@ test::ref::AttentionSpec spec_of(const AttentionAttrs& a) {
     return {a.scale, a.sliding_window, a.softcap, 0, a.causal};
 }
 
-// Each row (token, head) of x [T, H, D] as its int8 KV value.
-HostTensor kv_i8_values(const HostTensor& x) {
+// Each row (token, head) of x [T, H, D] as the value a KV format stores for it.
+HostTensor stored_values(const HostTensor& x, quant::KvFormat format) {
     HostTensor r = x.clone();
-    quant::round_trip_kv_i8(r.data<float>(), r.numel() / r.shape().back(), r.shape().back());
+    quant::round_trip_kv(format, r.data<float>(), r.numel() / r.shape().back(), r.shape().back());
     return r;
 }
 
 // Runs `steps` token counts through one session; checks every step against the reference over the full history
-// (with an int8 KV cache, the history of int8 KV values). Returns the last step's output and reference inputs for
-// planted-bug checks, plus the unrounded history.
+// (with a quantized KV cache, the history of the values it stores). Returns the last step's output and reference
+// inputs for planted-bug checks, plus the unrounded history.
 struct LastStep {
     HostTensor out;
     Tensor64 q, k_all, v_all;
     Tensor64 k_exact, v_exact;
 };
 
-LastStep check_steps(const AttentionCase& c, const std::vector<int64_t>& steps, uint32_t seed, bool kv_i8 = false) {
+LastStep check_steps(const AttentionCase& c, const std::vector<int64_t>& steps, uint32_t seed,
+                     quant::KvFormats kv = {}) {
     const auto backend = make_cpu_ref_backend();
     SessionOptions options;
-    if (kv_i8) options.kv_dtype = DType::I8;
+    options.kv = kv;
     const auto session = backend->compile(attention_graph(c), test::MemoryWeights{}, options);
     test::TensorRng rng(seed);
     Tensor64 k_hist, v_hist;
@@ -78,8 +79,8 @@ LastStep check_steps(const AttentionCase& c, const std::vector<int64_t>& steps, 
         const HostTensor q = rng.uniform(DType::F32, {t, c.q_heads, c.head_dim}, 2.0f);
         const HostTensor k = rng.uniform(DType::F32, {t, c.kv_heads, c.head_dim}, 2.0f);
         const HostTensor v = rng.uniform(DType::F32, {t, c.kv_heads, c.head_dim});
-        append_rows(k_hist, to_f64(kv_i8 ? kv_i8_values(k) : k));
-        append_rows(v_hist, to_f64(kv_i8 ? kv_i8_values(v) : v));
+        append_rows(k_hist, to_f64(stored_values(k, kv.k)));
+        append_rows(v_hist, to_f64(stored_values(v, kv.v)));
         append_rows(last.k_exact, to_f64(k));
         append_rows(last.v_exact, to_f64(v));
         TensorMap out;
@@ -155,18 +156,29 @@ TEST_SUITE("cpu-ref attention") {
             test::all_close(last.out, test::ref::attention(last.q, last.k_all, last.v_all, unscaled), kAtol, kRtol));
     }
 
-    TEST_CASE("int8 KV cache: the cache holds int8 KV values; attention over them, not over the inputs") {
-        for (const AttentionCase& c : {AttentionCase{8, 2, 64, {0.125f, 0, 0.0f}}, AttentionCase{4, 1, 256, {0.0625f, 3, 0.0f}}}) {
-            CAPTURE(c.head_dim);
-            const LastStep last = check_steps(c, {6, 1, 2}, 18, true);
-            CHECK_FALSE(test::all_close(last.out, test::ref::attention(last.q, last.k_exact, last.v_exact,
-                                                                       spec_of(c.attrs)),
-                                        kAtol, kRtol));
+    TEST_CASE("quantized KV cache: the cache holds the values its formats store; attention over them, not the inputs") {
+        using quant::KvFormat;
+        const quant::KvFormats formats[] = {{KvFormat::I8, KvFormat::I8},
+                                            {KvFormat::Turbo4, KvFormat::Turbo4},
+                                            {KvFormat::Turbo3, KvFormat::Turbo3},
+                                            {KvFormat::Turbo2, KvFormat::Turbo2},
+                                            {KvFormat::I8, KvFormat::Turbo3}};
+        for (const quant::KvFormats& kv : formats) {
+            CAPTURE(quant::kv_formats_name(kv));
+            for (const AttentionCase& c :
+                 {AttentionCase{8, 2, 128, {0.09f, 0, 0.0f}}, AttentionCase{4, 1, 256, {0.0625f, 3, 0.0f}}}) {
+                CAPTURE(c.head_dim);
+                const LastStep last = check_steps(c, {6, 1, 2}, 18, kv);
+                CHECK_FALSE(test::all_close(last.out, test::ref::attention(last.q, last.k_exact, last.v_exact,
+                                                                           spec_of(c.attrs)),
+                                            kAtol, kRtol));
+            }
         }
-        SessionOptions f16_kv;
-        f16_kv.kv_dtype = DType::F16;
-        CHECK_THROWS_WITH_AS(make_cpu_ref_backend()->compile(attention_graph({2, 2, 16, {0.25f, 0, 0.0f}}),
-                                                             test::MemoryWeights{}, f16_kv),
-                             doctest::Contains("KV cache dtype"), Error);
+        check_steps(AttentionCase{8, 2, 64, {0.125f, 0, 0.0f}}, {6, 1, 2}, 19, {KvFormat::I8, KvFormat::I8});
+        SessionOptions turbo;
+        turbo.kv = {KvFormat::Turbo4, KvFormat::Turbo4};
+        CHECK_THROWS_WITH_AS(make_cpu_ref_backend()->compile(attention_graph({2, 2, 64, {0.125f, 0, 0.0f}}),
+                                                             test::MemoryWeights{}, turbo),
+                             doctest::Contains("kv slot 'layer' has 64"), Error);
     }
 }

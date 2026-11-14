@@ -129,13 +129,17 @@ struct Plan {
     size_t arena_bytes = 0;
 };
 
+// The dtype a plan gives the k and v of a KV slot stored in the session's quantized formats (SessionOptions::kv):
+// bytes only the attention kernels read.
+constexpr DType kKvCodes = DType::U8;
+
 struct KvBuffers {
-    DeviceBuffer k, v;
-    DeviceBuffer k_scale, v_scale;  // I8: one f32 per (token, KV head)
+    DeviceBuffer k, v;              // the values, or a quantized format's codes
+    DeviceBuffer k_scale, v_scale;  // a quantized format's scales (quant::kv_row_bytes)
     int64_t capacity = 0;  // tokens
     int64_t heads = 0;
     int64_t row = 0;       // elements per token: heads * head_dim
-    DType dtype = DType::F16;
+    DType dtype = DType::F16;  // F16, F32 or kKvCodes
 };
 
 // A scratch buffer that grows on demand (sycl_be::Scratch).
@@ -145,13 +149,15 @@ public:
     void* get(size_t bytes) override {
         if (bytes > buf_.bytes()) {
             q_.wait();
-            buf_ = DeviceBuffer(q_, bytes + bytes / 4);
+            buf_ = DeviceBuffer();  // freed first: the old and the new never stand together
+            buf_ = DeviceBuffer(q_, bytes + std::min(bytes / 4, kHeadroom));
         }
         return buf_.get();
     }
     void* get_host(size_t) override { fail("sycl: this scratch has no host memory"); }
 
 private:
+    static constexpr size_t kHeadroom = size_t{64} << 20;  // a cache that grows a step at a time regrows it seldom
     sycl::queue& q_;
     DeviceBuffer buf_;
 };
@@ -315,7 +321,7 @@ public:
     std::vector<std::unique_ptr<sycl_be::BlockWeight>> block_weights;  // what a QuantWeight::block points at
     std::map<BlockFormat, const uint32_t*> block_grids;                // codebook tables, uploaded once each
     DeviceBuffer arena;
-    GrowingScratch kv_scratch{q};  // the int8 KV cache dequantized for prefill attention
+    GrowingScratch kv_scratch{q};  // a quantized KV cache decoded for the matrix attention paths
 
 private:
     DeviceBuffer scratch_;
@@ -334,7 +340,7 @@ public:
           attention_(attention),
           quant_(quant),
           precision_(options.precision),
-          kv_i8_(options.kv_dtype == DType::I8),
+          kv_format_(options.kv),
           max_context_(options.max_context),
           profiling_(env_flag("XS_SYCL_PROFILE")),
           sync_(profiling_ || env_flag("XS_SYCL_SYNC")),
@@ -368,18 +374,26 @@ public:
         plan_half_values();
         upload_leaves(weights);
         finish_mm_parts();
-        size_t int8_slots = 0;
+        size_t fresh = 0, quantized = 0;  // slots this program is the first to write
+        int64_t token_bytes = 0;
         for (size_t i = 0; i < graph_.nodes().size(); ++i) {
             const Node& n = graph_.nodes()[i];
             if (n.kind != OpKind::KvCache) continue;
             SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(std::get<graph::KvCacheAttrs>(n.attrs).slot)]];
             XS_CHECK(!slot.typed || slot.buf.dtype == dtype_[i][0], "sycl: kv slot '", slot.spec.label,
                      "' is written in two dtypes by two programs");
+            if (slot.typed) continue;
             slot.buf.dtype = dtype_[i][0];
             slot.typed = true;
-            int8_slots += dtype_[i][0] == DType::I8 ? 1 : 0;
+            ++fresh;
+            quantized += slot.buf.dtype == kKvCodes ? 1 : 0;
+            const KvTokenBytes bytes = kv_token_bytes(slot.buf);
+            token_bytes += bytes.k + bytes.k_scale + bytes.v + bytes.v_scale;
         }
-        if (kv_i8_ && !reads_kv_) log::info("sycl: int8 KV cache for ", int8_slots, " of ", kv_slot_.size(), " slots");
+        if (fresh > 0) {
+            log::info("sycl: KV cache of ", token_bytes, " bytes a token in ", fresh, " slots",
+                      quantized > 0 ? str_cat(", ", quantized, " of them in ", quant::kv_formats_name(kv_format_)) : "");
+        }
     }
 
     ~SyclProgram() override {
@@ -636,6 +650,30 @@ private:
     }
 
     KvBuffers& kv_buffers(int64_t slot) const { return shared_.kv[kv_slot_[static_cast<size_t>(slot)]].buf; }
+
+    // Bytes a token takes in each buffer of a slot.
+    struct KvTokenBytes {
+        int64_t k = 0, v = 0, k_scale = 0, v_scale = 0;
+    };
+    KvTokenBytes kv_token_bytes(const KvBuffers& b) const {
+        if (b.dtype != kKvCodes) {
+            const int64_t values = b.row * static_cast<int64_t>(dtype_size(b.dtype));
+            return {values, values, 0, 0};
+        }
+        const quant::KvRowBytes k = quant::kv_row_bytes(kv_format_.k, b.row / b.heads);
+        const quant::KvRowBytes v = quant::kv_row_bytes(kv_format_.v, b.row / b.heads);
+        return {b.heads * k.codes, b.heads * v.codes, b.heads * k.scales, b.heads * v.scales};
+    }
+    // A quantized slot's keys and values from row `first` (a token's head) on.
+    sycl_be::KvQuantized kv_streams(const KvBuffers& b, int64_t first) const {
+        const quant::KvRowBytes k = quant::kv_row_bytes(kv_format_.k, b.row / b.heads);
+        const quant::KvRowBytes v = quant::kv_row_bytes(kv_format_.v, b.row / b.heads);
+        const auto at = [first](const DeviceBuffer& buf, int64_t row_bytes) {
+            return reinterpret_cast<const uint8_t*>(buf.get()) + first * row_bytes;
+        };
+        return {{kv_format_.k, at(b.k, k.codes), at(b.k_scale, k.scales)},
+                {kv_format_.v, at(b.v, v.codes), at(b.v_scale, v.scales)}};
+    }
     StateBuffers& fixed_state(size_t index) { return shared_.fixed[fixed_slot_[index]].state; }
 
     // sycl_be::Scratch: the session's
@@ -679,7 +717,7 @@ private:
         return any;
     }
 
-    // An int8 KV slot needs every reader of its k / v to be an Attention reading them directly (it applies the scales).
+    // A quantized KV slot needs every reader of its k / v to be an Attention reading them directly (it decodes them).
     bool attention_reads_only(size_t node, const std::vector<std::vector<std::pair<size_t, size_t>>>& consumers) const {
         for (const auto& out : graph_.outputs()) {
             if (static_cast<size_t>(out.value.node) == node) return false;
@@ -737,8 +775,13 @@ private:
                         std::get<graph::KvCacheAttrs>(n.attrs).slot)]];
                     if (unread && slot.typed) {
                         dtype_[i][0] = dtype_[i][1] = slot.buf.dtype;
-                    } else if (kv_i8_ && (unread || attention_reads_only(i, consumers))) {
-                        dtype_[i][0] = dtype_[i][1] = DType::I8;
+                    } else if (kv_format_.k != quant::KvFormat::Float && (unread || attention_reads_only(i, consumers))) {
+                        for (const quant::KvFormat f : {kv_format_.k, kv_format_.v}) {
+                            XS_CHECK(quant::kv_format_fits(f, slot.spec.head_dim), "sycl: KV format ",
+                                     quant::kv_format_name(f), " needs a head_dim that is a multiple of 128; kv slot '",
+                                     slot.spec.label, "' has ", slot.spec.head_dim);
+                        }
+                        dtype_[i][0] = dtype_[i][1] = kKvCodes;
                     } else {
                         dtype_[i][0] = dtype_[i][1] = precision_ == DType::F16 && (unread || f16_readers_only(i, consumers))
                                                           ? DType::F16
@@ -838,7 +881,7 @@ private:
                     break;
                 case OpKind::Attention: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1) || dt(n.inputs[1]) == DType::I8, "f16, f32 or i8");
+                    need(1, is_fp(1) || dt(n.inputs[1]) == kKvCodes, "f16, f32 or a quantized KV slot");
                     need(2, dt(n.inputs[2]) == dt(n.inputs[1]), "the dtype of k");
                     const int64_t d = graph_.type(n.inputs[0]).shape.back();
                     XS_CHECK(d % 8 == 0 && d <= 512, where(i), ": head_dim ", d,
@@ -1195,7 +1238,7 @@ private:
             if (n.kind != OpKind::Attention || attention_.path == sycl_be::AttentionPath::Rows) return false;
             const Dims& q = graph_.type(n.inputs[0]).shape;
             const Dims& k = graph_.type(n.inputs[1]).shape;
-            if (!static_shape(q) || !static_shape(k) || dt(n.inputs[1]) == DType::I8) return false;
+            if (!static_shape(q) || !static_shape(k) || dt(n.inputs[1]) == kKvCodes) return false;
             sycl_be::AttentionShape sh;
             sh.tokens = q[0];
             sh.head_dim = q[2];
@@ -1468,20 +1511,17 @@ private:
             KvBuffers& b = shared_.kv[slot].buf;
             const int64_t len = shared_.kv[slot].len;
             if (tokens <= b.capacity) continue;
-            const size_t esize = dtype_size(b.dtype);
+            const KvTokenBytes bytes = kv_token_bytes(b);
             const int64_t cap = std::min(max_context_, std::max({tokens, 2 * b.capacity, int64_t{1024}}));
-            const auto grow = [&](DeviceBuffer& buf, size_t per_token) {
-                DeviceBuffer bigger(q_, static_cast<size_t>(cap) * per_token);
-                if (len > 0) q_.memcpy(bigger.get(), buf.get(), static_cast<size_t>(len) * per_token);
+            const auto grow = [&](DeviceBuffer& buf, int64_t per_token) {
+                DeviceBuffer bigger(q_, static_cast<size_t>(cap * per_token));
+                if (len > 0 && per_token > 0) q_.memcpy(bigger.get(), buf.get(), static_cast<size_t>(len * per_token));
                 return bigger;
             };
-            DeviceBuffer k = grow(b.k, static_cast<size_t>(b.row) * esize);
-            DeviceBuffer v = grow(b.v, static_cast<size_t>(b.row) * esize);
-            DeviceBuffer ks, vs;
-            if (b.dtype == DType::I8) {
-                ks = grow(b.k_scale, static_cast<size_t>(b.heads) * sizeof(float));
-                vs = grow(b.v_scale, static_cast<size_t>(b.heads) * sizeof(float));
-            }
+            DeviceBuffer k = grow(b.k, bytes.k);
+            DeviceBuffer v = grow(b.v, bytes.v);
+            DeviceBuffer ks = grow(b.k_scale, bytes.k_scale);
+            DeviceBuffer vs = grow(b.v_scale, bytes.v_scale);
             q_.wait();
             b.k = std::move(k);
             b.v = std::move(v);
@@ -2096,14 +2136,17 @@ private:
                 KvBuffers& b = kv_buffers(slot);
                 const int64_t count = step.tokens * b.row;
                 const size_t offset = static_cast<size_t>((step.kv_len - step.tokens) * b.row);
-                if (b.dtype == DType::I8) {
+                if (b.dtype == kKvCodes) {
                     const int64_t rows = step.tokens * b.heads;
-                    const int64_t first = (step.kv_len - step.tokens) * b.heads;
                     const int64_t width = b.row / b.heads;
-                    sycl_be::quantize_kv_i8(q_, in_f32(0), reinterpret_cast<int8_t*>(b.k.get()) + offset,
-                                            reinterpret_cast<float*>(b.k_scale.get()) + first, rows, width);
-                    sycl_be::quantize_kv_i8(q_, in_f32(1), reinterpret_cast<int8_t*>(b.v.get()) + offset,
-                                            reinterpret_cast<float*>(b.v_scale.get()) + first, rows, width);
+                    const int64_t first = (step.kv_len - step.tokens) * b.heads;
+                    const auto append = [&](quant::KvFormat f, const float* x, DeviceBuffer& codes, DeviceBuffer& scales) {
+                        const quant::KvRowBytes bytes = quant::kv_row_bytes(f, width);
+                        sycl_be::quantize_kv(q_, f, x, reinterpret_cast<uint8_t*>(codes.get()) + first * bytes.codes,
+                                             reinterpret_cast<uint8_t*>(scales.get()) + first * bytes.scales, rows, width);
+                    };
+                    append(kv_format_.k, in_f32(0), b.k, b.k_scale);
+                    append(kv_format_.v, in_f32(1), b.v, b.v_scale);
                 } else if (b.dtype == DType::F16) {
                     auto* k = reinterpret_cast<half*>(b.k.get()) + offset;
                     auto* v = reinterpret_cast<half*>(b.v.get()) + offset;
@@ -2135,18 +2178,15 @@ private:
                 } else if (n.inputs.size() == 4) {
                     s.key_bias = in_f32(3);
                 }
-                if (in_dt(1) == DType::I8) {
+                if (in_dt(1) == kKvCodes) {
                     const int slot = std::get<graph::KvCacheAttrs>(graph_.node(n.inputs[1]).attrs).slot;
-                    const KvBuffers& b = kv_buffers(slot);
-                    sycl_be::KvI8 kv;
-                    kv.k = reinterpret_cast<const int8_t*>(b.k.get());
-                    kv.v = reinterpret_cast<const int8_t*>(b.v.get());
-                    kv.k_scale = reinterpret_cast<const float*>(b.k_scale.get());
-                    kv.v_scale = reinterpret_cast<const float*>(b.v_scale.get());
+                    const sycl_be::KvQuantized kv = kv_streams(kv_buffers(slot), 0);
                     if (precision_ == DType::F16) {
-                        sycl_be::attention_i8<half>(q_, *this, shared_.kv_scratch, in_f32(0), kv, out, s, attention_);
+                        sycl_be::attention_quantized<half>(q_, *this, shared_.kv_scratch, in_f32(0), kv, out, s,
+                                                           attention_);
                     } else {
-                        sycl_be::attention_i8<float>(q_, *this, shared_.kv_scratch, in_f32(0), kv, out, s, attention_);
+                        sycl_be::attention_quantized<float>(q_, *this, shared_.kv_scratch, in_f32(0), kv, out, s,
+                                                            attention_);
                     }
                 } else {
                     // Keys and values in place, in two parts when the concats were fused away (attn_split_).
@@ -2385,7 +2425,7 @@ private:
     const sycl_be::AttentionPlan attention_;
     const sycl_be::QuantMatmulPlan quant_;  // how quantized matmuls run on this device (sycl_be::quant_path)
     const DType precision_;
-    const bool kv_i8_;  // KV slots that only attention reads are int8 (SessionOptions::kv_dtype)
+    const quant::KvFormats kv_format_;  // of the KV slots that only attention reads (SessionOptions::kv)
     const int64_t max_context_;
     const bool profiling_;
     const bool sync_;  // XS_SYCL_SYNC=1: wait after every op and name the op a device error comes from
@@ -2480,8 +2520,9 @@ public:
         XS_CHECK(options.precision == DType::F16 || options.precision == DType::F32,
                  "sycl session precision must be f16 or f32, got ", dtype_name(options.precision));
         XS_CHECK(options.max_context > 0, "sycl max_context must be positive, got ", options.max_context);
-        XS_CHECK(!options.kv_dtype || *options.kv_dtype == DType::I8, "sycl KV cache dtype must be i8 when set, got ",
-                 dtype_name(*options.kv_dtype));
+        XS_CHECK(sycl_be::kv_formats_supported(options.kv), "sycl: a KV cache with keys in ",
+                 quant::kv_format_name(options.kv.k), " and values in ", quant::kv_format_name(options.kv.v),
+                 " is not supported: both take one format, or the keys i8 and the values a turbo format");
         sycl_be::AttentionPlan attention;
         std::string gemv = "auto";
         int64_t few_rows = -1;

@@ -10,6 +10,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include "quant/kv_format.h"
+
 namespace xs::sycl_be {
 
 using half = sycl::half;
@@ -168,28 +170,48 @@ inline bool attention_rows_head_dim(int64_t d) {
     return d == 16 || d == 32 || d == 64 || d == 128 || d == 192 || d == 256 || d == 512;
 }
 
-// An int8 KV cache: codes [N, Hkv, D] and one f32 scale per (key, head); the value is code * scale.
-struct KvI8 {
-    const int8_t* k = nullptr;
-    const int8_t* v = nullptr;
-    const float* k_scale = nullptr;
-    const float* v_scale = nullptr;
+// The keys or the values of a KV cache in a quantized format (quant/kv_format.h): rows [N * Hkv], each
+// quant::kv_row_bytes of codes and of scales (I8: int8 codes and an f32 scale; TurboQuant: its codes and an f16 norm
+// per 128 values).
+struct KvStream {
+    quant::KvFormat format = quant::KvFormat::I8;
+    const uint8_t* codes = nullptr;
+    const uint8_t* scales = nullptr;
 };
-// codes [rows, width] and scales [rows] of x, one sub-group per row, rounded as quant::quantize_kv_row_i8.
-void quantize_kv_i8(sycl::queue& q, const float* x, int8_t* codes, float* scales, int64_t rows, int64_t width);
-// out [rows, width] = codes * scale of the row.
+struct KvQuantized {
+    KvStream k, v;
+};
+// The pairs of formats the kernels read: both float, both the same quantized format, or int8 keys with TurboQuant
+// values (the keys decide which keys a query attends to, so they are the side worth more bits).
+bool kv_formats_supported(const quant::KvFormats& f);
+// The codes and scales of x [rows, width] in `format`: the bits quant::round_trip_kv decodes its values from.
+void quantize_kv(sycl::queue& q, quant::KvFormat format, const float* x, uint8_t* codes, uint8_t* scales, int64_t rows,
+                 int64_t width);
+// out [rows, width] = the values the rows store. A TurboQuant format's stay rotated (kv_rotate): a query rotated the
+// same way has the dot products of the originals, and a weighted sum of such rows is rotated back.
 template <typename CT>
-void dequantize_kv_i8(sycl::queue& q, const int8_t* codes, const float* scales, CT* out, int64_t rows, int64_t width);
+void dequantize_kv(sycl::queue& q, const KvStream& s, CT* out, int64_t rows, int64_t width);
+// y [rows, width] = x with each group of 128 values rotated as the TurboQuant formats rotate a row, or rotated back
+// (`inverse`); y may be x.
+void kv_rotate(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width, bool inverse);
 
-// One work-group per (query, head, split), online softmax over its share of the visible keys. For few queries.
-// split == 1 writes `out`; otherwise each work-group writes [D partial sums, max, denominator] to `part`
-// ([T * Hq * split, D + 2]) and attention_combine merges them into `out` (flash-decoding for long contexts).
+// How attention_rows lays a shape out: `heads` query heads a work-group (heads of one token that share a KV head, so
+// each key and value is read once for all of them), and its sub-groups.
+struct RowsLayout {
+    int heads = 1;
+    int sub_groups = 16;
+};
+RowsLayout attention_rows_layout(const AttentionShape& s);
+// One work-group per (query, RowsLayout::heads query heads, split), an online softmax per head over its share of the
+// visible keys. For few queries. split == 1 writes `out`; otherwise each work-group writes [D partial sums, max,
+// denominator] per head to `part` ([T * Hq * split, D + 2]) and attention_combine merges them into `out`
+// (flash-decoding for long contexts).
 template <typename KV>
 void attention_rows(sycl::queue& q, const float* qp, const KV* k, const KV* v, float* out, const AttentionShape& s,
                     int64_t split, float* part);
-// attention_rows reading an int8 cache (scales applied per key: to the score for k, to the probability for v).
-void attention_rows_i8(sycl::queue& q, const float* qp, const KvI8& kv, float* out, const AttentionShape& s,
-                       int64_t split, float* part);
+// attention_rows reading a quantized cache: the codes of each key and value, decoded in registers.
+void attention_rows_quantized(sycl::queue& q, const float* qp, const KvQuantized& kv, float* out,
+                              const AttentionShape& s, int64_t split, float* part);
 void attention_combine(sycl::queue& q, const float* part, float* out, int64_t rows, int64_t split, int64_t head_dim);
 
 // Fused attention on the matrix engines (sycl_flash_attention.cpp): an online softmax over blocks of keys, the

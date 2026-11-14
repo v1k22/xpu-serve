@@ -5,7 +5,7 @@
 //   XS_PARITY_BACKEND   cpu-ref (default) | sycl
 //   XS_PARITY_DEVICE    backend device, e.g. GPU
 //   XS_PARITY_PRECISION f32 (default) | f16
-//   XS_PARITY_KV_DTYPE  auto (default) | i8 (the int8 KV cache)
+//   XS_PARITY_KV_DTYPE  auto (default) | i8 | turbo4 | turbo3 | turbo2 | <keys>:<values> (a quantized KV cache)
 //   XS_PARITY_FIXTURES  default: <source>/tests/fixtures/generated/<model_type of the model>
 //   XS_TEST_DRAFTER_DIR the drafter checkpoint the fixtures were made with (hf_reference.py --assistant)
 

@@ -56,7 +56,7 @@ inline SessionOptions parity_options() {
     options.device = env_or("XS_PARITY_DEVICE", "");
     options.precision = env_or("XS_PARITY_PRECISION", "f32") == "f32" ? DType::F32 : DType::F16;
     options.max_context = 4096;
-    if (env_or("XS_PARITY_KV_DTYPE", "auto") == "i8") options.kv_dtype = DType::I8;
+    options.kv = quant::parse_kv_formats(env_or("XS_PARITY_KV_DTYPE", "auto"));
     return options;
 }
 

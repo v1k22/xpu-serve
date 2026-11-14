@@ -75,8 +75,6 @@ void check_options(const SessionOptions& options) {
              "cpu-ref precision must be f32 or f16, got ", dtype_name(options.precision));
     XS_CHECK(options.max_context > 0, "cpu-ref max_context must be positive, got ", options.max_context);
     if (!options.extra.empty()) fail("cpu-ref does not know backend option '", options.extra.begin()->first, "'");
-    XS_CHECK(!options.kv_dtype || *options.kv_dtype == DType::I8, "cpu-ref KV cache dtype must be i8 when set, got ",
-             dtype_name(*options.kv_dtype));
 }
 
 // Sizes of the symbolic dims in one run.
@@ -115,16 +113,22 @@ struct SharedState {
 class CpuProgram {
   public:
     CpuProgram(graph::Graph graph, std::vector<HostTensor> leaves, std::shared_ptr<cpu_ref::ThreadPool> pool,
-               SharedState& shared, int64_t max_context, bool kv_i8, int64_t rewind_tokens)
+               SharedState& shared, int64_t max_context, quant::KvFormats kv, int64_t rewind_tokens)
         : graph_(std::move(graph)),
           leaves_(std::move(leaves)),
           last_use_(graph_.nodes().size(), 0),
           pool_(std::move(pool)),
           shared_(shared),
           max_context_(max_context),
-          kv_i8_(kv_i8),
+          kv_format_(kv),
           rewind_tokens_(rewind_tokens) {
-        for (const graph::KvSlot& k : graph_.kv_slots()) kv_.push_back(kv_slot(k));
+        for (const graph::KvSlot& k : graph_.kv_slots()) {
+            for (const quant::KvFormat f : {kv_format_.k, kv_format_.v}) {
+                XS_CHECK(quant::kv_format_fits(f, k.head_dim), "cpu-ref: KV format ", quant::kv_format_name(f),
+                         " needs a head_dim that is a multiple of 128; kv slot '", k.label, "' has ", k.head_dim);
+            }
+            kv_.push_back(kv_slot(k));
+        }
         for (const graph::ConvSlot& c : graph_.conv_slots())
             conv_.push_back(fixed_slot(true, c.label, static_cast<size_t>((c.kernel - 1) * c.channels)));
         for (const graph::RecurrentSlot& r : graph_.recurrent_slots())
@@ -474,11 +478,9 @@ class CpuProgram {
         const size_t past = static_cast<size_t>(step.kv_len - step.tokens) * row;
         std::copy(k.data<float>(), k.data<float>() + k.numel(), state.k.begin() + static_cast<std::ptrdiff_t>(past));
         std::copy(v.data<float>(), v.data<float>() + v.numel(), state.v.begin() + static_cast<std::ptrdiff_t>(past));
-        if (kv_i8_) {
-            const int64_t rows = k.numel() / s.head_dim;
-            quant::round_trip_kv_i8(state.k.data() + past, rows, s.head_dim);
-            quant::round_trip_kv_i8(state.v.data() + past, rows, s.head_dim);
-        }
+        const int64_t rows = k.numel() / s.head_dim;
+        quant::round_trip_kv(kv_format_.k, state.k.data() + past, rows, s.head_dim);
+        quant::round_trip_kv(kv_format_.v, state.v.data() + past, rows, s.head_dim);
         const Dims shape{step.kv_len, s.num_kv_heads, s.head_dim};
         return {HostTensor::from_vector(DType::F32, shape, state.k),
                 HostTensor::from_vector(DType::F32, shape, state.v)};
@@ -496,7 +498,7 @@ class CpuProgram {
     const std::shared_ptr<cpu_ref::ThreadPool> pool_;
     SharedState& shared_;
     const int64_t max_context_;
-    const bool kv_i8_;  // the cache holds each appended row as its int8 KV value
+    const quant::KvFormats kv_format_;  // the cache holds each appended row as the value its format stores
     const int64_t rewind_tokens_;
     bool reads_kv_ = false;               // the program reads its KV slots (KvRead) instead of appending
     std::vector<size_t> kv_, conv_, recurrent_;  // the shared slot of each of the graph's slots
@@ -573,7 +575,7 @@ class CpuBackend final : public Backend {
                 }
             }
             session->add(std::make_unique<CpuProgram>(*graph, std::move(leaves), pool_, session->shared(),
-                                                      options.max_context, options.kv_dtype == DType::I8,
+                                                      options.max_context, options.kv,
                                                       options.rewind_tokens));
         }
         return session;

@@ -15,14 +15,14 @@ const dev::Tolerance kCross = dev::tolerance({1e-4, 1e-4}, {3e-2, 2e-2});
 
 // Runs `steps` (token counts) through both backends and compares every output of every step.
 void compare_backends(const dev::TinyModelSpec& spec, const std::vector<int32_t>& steps, uint32_t seed,
-                      bool kv_i8 = false) {
+                      quant::KvFormats kv = {}) {
     test::TensorRng rng(seed);
     test::MemoryWeights weights;
     dev::add_tiny_weights(spec, weights, rng);
     const graph::Graph g = dev::tiny_model(spec, weights);
     SessionOptions oracle_options;
     SessionOptions gpu_options = dev::options();
-    if (kv_i8) oracle_options.kv_dtype = gpu_options.kv_dtype = DType::I8;
+    oracle_options.kv = gpu_options.kv = kv;
     const auto oracle = make_cpu_ref_backend()->compile(g, weights, oracle_options);
     const auto gpu = dev::backend().compile(g, weights, gpu_options);
     int32_t begin = 0;
@@ -69,12 +69,35 @@ TEST_SUITE("device vs cpu-ref" * doctest::skip(!dev::enabled())) {
     }
 
     TEST_CASE("tiny decoder with an int8 KV cache on both backends: sliding and global layers, GQA") {
-        compare_backends({}, {7, 1, 1, 3}, 4, true);
+        const quant::KvFormats i8{quant::KvFormat::I8, quant::KvFormat::I8};
+        compare_backends({}, {7, 1, 1, 3}, 4, i8);
         dev::TinyModelSpec spec;
         spec.head_dim = 256;
         spec.heads = 4;
         spec.kv_heads = 1;
         spec.sliding_window = 4;
-        compare_backends(spec, {9, 1, 2}, 5, true);
+        compare_backends(spec, {9, 1, 2}, 5, i8);
+    }
+
+    TEST_CASE("tiny decoder with a TurboQuant KV cache on both backends: each format, int8 keys beside, GQA") {
+        // At f16 the two backends' keys and values differ in their last digits, enough to round a coordinate on an
+        // edge to the other code: a whole centroid apart, which moves the logits ten times as far as a float cache
+        // lets them move. The attention suite compares the formats at f16 over the same keys and values.
+        if (dev::is_f16()) return;
+        using quant::KvFormat;
+        for (const KvFormat v : {KvFormat::Turbo4, KvFormat::Turbo3, KvFormat::Turbo2}) {
+            for (const KvFormat k : {v, KvFormat::I8}) {
+                CAPTURE(quant::kv_formats_name({k, v}));
+                dev::TinyModelSpec spec;
+                spec.head_dim = 128;
+                spec.heads = 4;
+                spec.kv_heads = 2;
+                compare_backends(spec, {7, 1, 1, 3}, 6, {k, v});
+                spec.head_dim = 256;
+                spec.kv_heads = 1;
+                spec.sliding_window = 4;
+                compare_backends(spec, {9, 1, 2}, 7, {k, v});
+            }
+        }
     }
 }

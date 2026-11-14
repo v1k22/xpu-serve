@@ -78,7 +78,10 @@ void add_engine_options(Args& a) {
          default_backend())
         .value("device", "device, e.g. GPU, GPU.1, CPU (default: the backend's choice)")
         .value("precision", "compute precision: f16 | f32", "f16")
-        .value("kv-dtype", "KV cache: auto (the precision's float) | i8 (int8 with a scale per token and head)", "auto")
+        .value("kv-dtype",
+               "KV cache: auto (the precision's float) | i8 (int8, a scale per token and head) | turbo4 | turbo3 | "
+               "turbo2 (TurboQuant: 4, 3 or 2 bits a value), or <keys>:<values>, e.g. i8:turbo4",
+               "auto")
         .value("ctx", "context length in tokens (prompt + output)", "8192")
         .value("prefill-chunk", "tokens per prefill step", "1024")
         .value("backend-opt", "backend options as key=value[,key=value]")
@@ -120,12 +123,7 @@ ServiceOptions service_options(const Args& a) {
     } else {
         fail("--precision must be f16 or f32, got '", p, "'");
     }
-    const std::string& kv_dtype = a.get("kv-dtype");
-    if (kv_dtype == "i8") {
-        o.session.kv_dtype = DType::I8;
-    } else if (kv_dtype != "auto") {
-        fail("--kv-dtype must be auto or i8, got '", kv_dtype, "'");
-    }
+    o.session.kv = quant::parse_kv_formats(a.get("kv-dtype"));
     o.vision = !a.has("no-vision");
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");

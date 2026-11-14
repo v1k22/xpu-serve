@@ -128,6 +128,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Paged KV: block allocator, pools per attention kind (sliding / global), sliding-window block release,
       KV-shared layers read their source pool
 - [x] int8 KV option (`--kv-dtype i8`): int8 codes + an f32 scale per (token, KV head), opt-in (docs/decisions/0010)
+- [x] TurboQuant KV formats (`--kv-dtype turbo4 | turbo3 | turbo2`, or `i8:<turbo>`): rotated groups of 128 values,
+      a 4 / 3 / 2 bit code a value and an f16 norm per group, opt-in (docs/decisions/0020)
+- [ ] TurboQuant KV: head dims that are not multiples of 128 (a rotation of 64); a format per layer (the first and
+      last layers' values kept at int8, as TurboQuant+ finds helps turbo2); values whose attention weight is negligible
+      skipped in decode; prefill without the f16 copy of one layer's keys and values
 - [ ] Refuse a `--ctx` whose KV cache and largest step cannot fit the device, at load and by name: Qwen3.8-27B Q4_0
       on an Arc Pro B60 runs 64k tokens with an f16 cache and 128k with int8, but a 96k f16 prompt ran out of device
       memory in the middle of its prefill and the uncaught error ended the process

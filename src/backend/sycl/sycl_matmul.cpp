@@ -18,7 +18,7 @@ using oneapi::mkl::transpose;
 
 constexpr int64_t kScoreBudget = int64_t{512} << 20;  // bytes of scores + probabilities per attention chunk
 constexpr int64_t kCacheChunkQueries = 64;            // fewest queries worth a chunk that fits the cache
-constexpr int64_t kTargetWorkGroups = 160;            // decode attention: work-groups to keep the GPU busy
+constexpr int64_t kTargetSubGroups = 2560;            // decode attention: sub-groups to keep the GPU busy
 constexpr int64_t kMinSplitKeys = 512;                // fewest keys worth a split of their own
 
 size_t align_up(size_t n) {
@@ -282,7 +282,9 @@ template <typename Run>
 void attention_by_rows(sycl::queue& q, Scratch& scratch, float* out, const AttentionShape& s, const Run& run) {
     const int64_t rows = s.tokens * s.q_heads;
     const int64_t keys = attention_visible_keys(s);
-    const int64_t split = std::clamp<int64_t>(std::min(kTargetWorkGroups / rows, keys / kMinSplitKeys), 1, 64);
+    const RowsLayout layout = attention_rows_layout(s);
+    const int64_t sub_groups = rows / layout.heads * layout.sub_groups;
+    const int64_t split = std::clamp<int64_t>(std::min(kTargetSubGroups / sub_groups, keys / kMinSplitKeys), 1, 64);
     if (split == 1) {
         run(int64_t{1}, static_cast<float*>(nullptr));
         return;
@@ -409,26 +411,41 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
 }
 
 template <typename CT>
-void attention_i8(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvI8& kv, float* out,
-                  const AttentionShape& s, const AttentionPlan& plan) {
+void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvQuantized& kv,
+                         float* out, const AttentionShape& s, const AttentionPlan& plan) {
     if (rows_path(s, plan.path)) {
-        attention_by_rows(q, scratch, out, s,
-                          [&](int64_t split, float* part) { attention_rows_i8(q, qp, kv, out, s, split, part); });
+        attention_by_rows(q, scratch, out, s, [&](int64_t split, float* part) {
+            attention_rows_quantized(q, qp, kv, out, s, split, part);
+        });
         return;
     }
     // Keys before `first` are outside every query's window: drop them, which shifts all positions alike.
     const int64_t past = s.kv_len - s.tokens;
     const int64_t first = s.window > 0 ? std::max<int64_t>(0, past - s.window + 1) : 0;
     const int64_t rows = (s.kv_len - first) * s.kv_heads;
-    const size_t half_bytes = align_up(static_cast<size_t>(rows * s.head_dim) * sizeof(CT));
-    auto* k = static_cast<CT*>(kv_scratch.get(2 * half_bytes));
-    auto* v = reinterpret_cast<CT*>(reinterpret_cast<char*>(k) + half_bytes);
-    const int64_t skip = first * s.kv_heads;
-    dequantize_kv_i8(q, kv.k + skip * s.head_dim, kv.k_scale + skip, k, rows, s.head_dim);
-    dequantize_kv_i8(q, kv.v + skip * s.head_dim, kv.v_scale + skip, v, rows, s.head_dim);
+    const int64_t queries = s.tokens * s.q_heads;
+    const bool rotated_keys = quant::turbo_bits(kv.k.format) != 0;
+    const size_t kv_bytes = align_up(static_cast<size_t>(rows * s.head_dim) * sizeof(CT));
+    const size_t q_bytes = rotated_keys ? static_cast<size_t>(queries * s.head_dim) * sizeof(float) : 0;
+    auto* base = static_cast<char*>(kv_scratch.get(2 * kv_bytes + q_bytes));
+    auto* k = reinterpret_cast<CT*>(base);
+    auto* v = reinterpret_cast<CT*>(base + kv_bytes);
+    const auto from = [&](const KvStream& stream) {  // the stream from row `first` of every head on
+        const quant::KvRowBytes bytes = quant::kv_row_bytes(stream.format, s.head_dim);
+        const int64_t skip = first * s.kv_heads;
+        return KvStream{stream.format, stream.codes + skip * bytes.codes, stream.scales + skip * bytes.scales};
+    };
+    dequantize_kv(q, from(kv.k), k, rows, s.head_dim);
+    dequantize_kv(q, from(kv.v), v, rows, s.head_dim);
+    if (rotated_keys) {
+        auto* rotated = reinterpret_cast<float*>(base + 2 * kv_bytes);
+        kv_rotate(q, qp, rotated, queries, s.head_dim, false);
+        qp = rotated;
+    }
     AttentionShape visible = s;
     visible.kv_len = s.kv_len - first;
     attention(q, scratch, qp, k, v, out, visible, plan);
+    if (quant::turbo_bits(kv.v.format) != 0) kv_rotate(q, out, out, queries, s.head_dim, true);
 }
 
 namespace {
@@ -549,9 +566,9 @@ template void attention<half, half>(sycl::queue&, Scratch&, const half*, const h
                                     const AttentionShape&, const AttentionPlan&, const KvSecond&);
 template void attention<float, half>(sycl::queue&, Scratch&, const half*, const float*, const float*, float*,
                                      const AttentionShape&, const AttentionPlan&, const KvSecond&);
-template void attention_i8<half>(sycl::queue&, Scratch&, Scratch&, const float*, const KvI8&, float*,
-                                 const AttentionShape&, const AttentionPlan&);
-template void attention_i8<float>(sycl::queue&, Scratch&, Scratch&, const float*, const KvI8&, float*,
-                                  const AttentionShape&, const AttentionPlan&);
+template void attention_quantized<half>(sycl::queue&, Scratch&, Scratch&, const float*, const KvQuantized&, float*,
+                                        const AttentionShape&, const AttentionPlan&);
+template void attention_quantized<float>(sycl::queue&, Scratch&, Scratch&, const float*, const KvQuantized&, float*,
+                                         const AttentionShape&, const AttentionPlan&);
 
 }  // namespace xs::sycl_be
