@@ -44,17 +44,17 @@ void fp8_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
     const int64_t cols = v.shape.back();
     XS_CHECK(first >= 0 && count >= 0 && first + count <= matrix_rows(v.shape), "fp8: rows ", first, " to ",
              first + count, " of a ", dims_to_string(v.shape), " weight");
-    const int64_t grid_cols = (cols + kFp8Block - 1) / kFp8Block;
     int64_t begin = 0;  // the first row of `run`
     for (const Fp8Run& run : v.fp8) {
+        const int64_t grid_cols = (cols + run.block_cols - 1) / run.block_cols;
         const int64_t end = std::min(first + count, begin + run.rows);
         for (int64_t r = std::max(first, begin); r < end; ++r) {
             const uint8_t* codes = run.codes + (r - begin) * cols;
-            const float* scales = run.scales + (r - begin) / kFp8Block * grid_cols;
+            const float* scales = run.scales + (r - begin) / run.block_rows * grid_cols;
             float* o = out + (r - first) * cols;
-            for (int64_t c0 = 0; c0 < cols; c0 += kFp8Block) {
-                const float scale = scales[c0 / kFp8Block];
-                const int64_t c1 = std::min(cols, c0 + kFp8Block);
+            for (int64_t c0 = 0; c0 < cols; c0 += run.block_cols) {
+                const float scale = scales[c0 / run.block_cols];
+                const int64_t c1 = std::min(cols, c0 + run.block_cols);
                 for (int64_t c = c0; c < c1; ++c) o[c] = kE4m3[codes[c]] * scale;
             }
         }

@@ -1,5 +1,5 @@
-// FP8 checkpoints (quant/fp8.h): the E4M3 code table, the weight store's F8 views (codes paired with their block
-// scales, tensors joined row-wise), reading and quantizing them, and the refusals.
+// FP8 checkpoints (quant/fp8.h): the E4M3 code table, the weight store's F8 views (codes paired with their scales, one
+// per block or one per row; tensors joined row-wise), reading and quantizing them, and the refusals.
 #include <doctest/doctest.h>
 
 #include <cmath>
@@ -78,6 +78,21 @@ Raw scale_grid(const std::string& name, int64_t rows, int64_t cols, DType dtype 
         }
     }
     return t;
+}
+
+// A scale per row of a [rows, cols] matrix, as compressed-tensors stores them ([rows, 1]): 0.5, 0.75, 1, ...
+Raw row_scales(const std::string& name, int64_t rows, Dims shape = {}) {
+    Raw t = scale_grid(name, rows * kFp8Block, 1);  // one value per row
+    t.shape = shape.empty() ? Dims{rows, 1} : shape;
+    return t;
+}
+
+// The magnitude and sign of a code, from its fields through ldexp.
+float code_value(uint8_t code) {
+    const int e = (code >> 3) & 0xF, m = code & 7;
+    const float magnitude =
+        e == 0 ? std::ldexp(static_cast<float>(m), -9) : std::ldexp(static_cast<float>(8 + m), e - 10);
+    return (code & 0x80) != 0 ? -magnitude : magnitude;
 }
 
 // The values the pair stands for, written without the code under test: the code's fields through ldexp, the block's
@@ -167,6 +182,35 @@ TEST_SUITE("fp8") {
         }
     }
 
+    TEST_CASE("codes beside a scale per row are one f8 weight too; rows read whole and in part") {
+        for (const bool flat : {false, true}) {  // the scales as [rows, 1], or as [rows]
+            CAPTURE(flat);
+            const Dir dir("xs_fp8_rows_test");
+            const Raw codes = random_codes("layer.q_proj.weight", 200, 300, 9);
+            write_file(dir.path / "model.safetensors",
+                       {codes, row_scales("layer.q_proj.weight_scale", 200, flat ? Dims{200} : Dims{})});
+            const auto store = SafetensorsWeights::open_dir(dir.path);
+            CHECK(store->names() == std::vector<std::string>{"layer.q_proj.weight"});
+            const TensorView& w = store->get("layer.q_proj.weight");
+            CHECK(w.dtype == DType::F8);
+            CHECK(w.shape == Dims{200, 300});
+            std::vector<float> expected(200 * 300), by_block(200 * 300);
+            for (int64_t r = 0; r < 200; ++r) {
+                for (int64_t c = 0; c < 300; ++c) {
+                    const auto i = static_cast<size_t>(r * 300 + c);
+                    expected[i] = code_value(codes.bytes[i]) * (0.5f + 0.25f * static_cast<float>(r));
+                    // Planted bug: the scales read as a grid of blocks.
+                    const auto block = static_cast<float>((r / 128) * 3 + c / 128);
+                    by_block[i] = code_value(codes.bytes[i]) * (0.5f + 0.25f * block);
+                }
+            }
+            CHECK(rows_of(w, 0, 200) == expected);
+            CHECK(rows_of(w, 120, 20) == slice_rows(expected, 300, 120, 20));
+            CHECK(rows_of(w, 199, 1) == slice_rows(expected, 300, 199, 1));
+            CHECK(rows_of(w, 0, 200) != by_block);
+        }
+    }
+
     TEST_CASE("join_rows: f8 matrices read as one weight, run after run, without their own names") {
         const Dir dir("xs_fp8_join_test");
         const Raw a = random_codes("experts.0.gate_proj.weight", 64, 320, 1);
@@ -200,6 +244,44 @@ TEST_SUITE("fp8") {
         CHECK_THROWS_AS(rows_of(bank, 270, 3), Error);
     }
 
+    TEST_CASE("join_rows: runs of either scale layout in one weight; float matrices copied into one") {
+        const Dir dir("xs_fp8_join_dense_test");
+        const Raw a = random_codes("experts.0.gate_proj.weight", 6, 320, 1);  // a scale per block
+        const Raw b = random_codes("experts.0.up_proj.weight", 5, 320, 2);    // a scale per row
+        std::vector<Raw> tensors = {a, scale_grid(a.name + "_scale_inv", 6, 320, DType::BF16, 2.0f), b,
+                                    row_scales(b.name + "_scale", 5)};
+        std::vector<float> dense;  // two float matrices [3, 8] and [2, 8]
+        for (int i = 0; i < 40; ++i)
+            dense.push_back(0.25f * static_cast<float>(i) - 3.0f);
+        const auto f32 = [&](const std::string& name, int64_t first, int64_t rows) {
+            const auto* p = reinterpret_cast<const uint8_t*>(dense.data() + first * 8);
+            return Raw{name, DType::F32, {rows, 8}, {p, p + rows * 8 * 4}};
+        };
+        tensors.push_back(f32("mtp.experts.0.down_proj.weight", 0, 3));
+        tensors.push_back(f32("mtp.experts.1.down_proj.weight", 3, 2));
+        write_file(dir.path / "model.safetensors", tensors);
+        const auto store = SafetensorsWeights::open_dir(dir.path);
+
+        store->join_rows("experts.bank", {a.name, b.name}, {11, 320});
+        std::vector<float> expected = expected_values(a, 2.0f);
+        for (int64_t r = 0; r < 5; ++r)
+            for (int64_t c = 0; c < 320; ++c)
+                expected.push_back(code_value(b.bytes[static_cast<size_t>(r * 320 + c)]) *
+                                   (0.5f + 0.25f * static_cast<float>(r)));
+        CHECK(rows_of(store->get("experts.bank"), 0, 11) == expected);
+        CHECK(rows_of(store->get("experts.bank"), 4, 5) == slice_rows(expected, 320, 4, 5));
+
+        store->join_rows("mtp.experts.down_proj", {"mtp.experts.0.down_proj.weight", "mtp.experts.1.down_proj.weight"},
+                         {5, 8});
+        CHECK(store->names() == std::vector<std::string>{"experts.bank", "mtp.experts.down_proj"});
+        const TensorView& bank = store->get("mtp.experts.down_proj");
+        CHECK(bank.dtype == DType::F32);
+        CHECK(bank.shape == Dims{5, 8});
+        REQUIRE(bank.data != nullptr);
+        CHECK(rows_of(bank, 0, 5) == dense);
+        CHECK(rows_of(bank, 2, 2) == slice_rows(dense, 8, 2, 2));  // across the two parts
+    }
+
     TEST_CASE("refusals by name: codes without scales, a wrong grid, other ranks, dense or mismatched parts") {
         // Whether running `fn` is refused with a message that names `part`.
         const auto refuses = [](const auto& fn, const std::string& part) {
@@ -216,6 +298,19 @@ TEST_SUITE("fp8") {
             const Dir dir("xs_fp8_refuse_a");
             write_file(dir.path / "model.safetensors", {codes});
             CHECK(refuses([&] { open(dir); }, "w.weight_scale_inv"));
+            CHECK(refuses([&] { open(dir); }, "'w.weight_scale'"));
+        }
+        {
+            const Dir dir("xs_fp8_refuse_e");  // both layouts' scales beside one tensor
+            write_file(dir.path / "model.safetensors",
+                       {codes, scale_grid("w.weight_scale_inv", 130, 64), row_scales("w.weight_scale", 130)});
+            CHECK(refuses([&] { open(dir); }, "only a matrix beside its scales"));
+        }
+        {
+            const Dir dir("xs_fp8_refuse_f");  // a scale per row, for another number of rows
+            write_file(dir.path / "model.safetensors", {codes, row_scales("w.weight_scale", 64)});
+            CHECK(refuses([&] { open(dir); }, "[64, 1]"));
+            CHECK(refuses([&] { open(dir); }, "[130, 1]"));
         }
         {
             const Dir dir("xs_fp8_refuse_b");  // one scale per 64 rows: not this layout
@@ -236,12 +331,17 @@ TEST_SUITE("fp8") {
             write_file(dir.path / "model.safetensors",
                        {codes, scale_grid("w.weight_scale_inv", 130, 64), other,
                         scale_grid("v.weight_scale_inv", 16, 32),
-                        Raw{"dense.weight", DType::F32, {1, 64}, std::vector<uint8_t>(256)}});
+                        Raw{"dense.weight", DType::F32, {1, 64}, std::vector<uint8_t>(256)},
+                        Raw{"half.weight", DType::BF16, {1, 64}, std::vector<uint8_t>(128)},
+                        Raw{"ids", DType::I32, {1, 64}, std::vector<uint8_t>(256)}});
             const auto store = SafetensorsWeights::open_dir(dir.path);
             const auto join = [&](const std::string& name, const std::vector<std::string>& parts, const Dims& shape) {
                 return [&store, name, parts, shape] { store->join_rows(name, parts, shape); };
             };
-            CHECK(refuses(join("bank", {"w.weight", "dense.weight"}, {131, 64}), "only fp8"));
+            CHECK(refuses(join("bank", {"w.weight", "dense.weight"}, {131, 64}),
+                          "'dense.weight', a part of 'bank', is f32"));
+            CHECK(refuses(join("bank", {"dense.weight", "half.weight"}, {2, 64}), "is bf16"));
+            CHECK(refuses(join("bank", {"ids", "ids"}, {2, 64}), "is i32"));
             CHECK(refuses(join("bank", {"w.weight", "v.weight"}, {146, 64}), "64 columns"));
             CHECK(refuses(join("bank", {"w.weight", "absent"}, {131, 64}), "is missing"));
             CHECK(refuses(join("bank", {"w.weight"}, {2, 64, 64}), "130 rows"));

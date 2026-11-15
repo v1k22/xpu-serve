@@ -20,8 +20,9 @@ using graph::Graph;
 using graph::kT;
 using graph::Value;
 
-// A mixture-of-experts checkpoint that stores each expert's projections on their own (the FP8 releases): the banks the
-// model reads are their rows in expert order, an expert's gate rows before its up rows.
+// A mixture-of-experts checkpoint that stores each expert's projections on their own (the FP8 releases; an MTP head's
+// experts in some original ones): the banks the model reads are their rows in expert order, an expert's gate rows
+// before its up rows.
 void join_expert_banks(SafetensorsWeights& weights, const Config& cfg) {
     if (cfg.num_experts == 0) return;
     std::vector<std::string> layers;

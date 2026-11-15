@@ -1,6 +1,7 @@
 // An FP8 checkpoint (quant/fp8.h) is the model it decodes to: a tiny Qwen3.5, dense and mixture of experts, written
-// the way the FP8 releases store one and again with the decoded values in the usual layout. Same weights, same
-// logits on cpu-ref (and with XS_DEVICE_TEST_DEVICE on the GPU), same packs out of `convert`.
+// the way the FP8 releases store one (a scale per block, or per channel) and again with the decoded values in the
+// usual layout. Same weights, same logits on cpu-ref (and with XS_DEVICE_TEST_DEVICE on the GPU), same packs out of
+// `convert`.
 #include <doctest/doctest.h>
 
 #include <filesystem>
@@ -21,6 +22,7 @@
 using namespace xs;
 namespace fs = std::filesystem;
 namespace dev = xs::test::device;
+using xs::test::Fp8Layout;
 using xs::test::TempDir;
 using xs::test::TinyQwen;
 
@@ -47,9 +49,9 @@ std::vector<float> values(const TensorView& v) {
 struct Twins {
     TempDir work;
     std::unique_ptr<Model> original, fp8, decoded;
-    Twins(const std::string& name, const TinyQwen& tiny) : work(name) {
+    Twins(const std::string& name, const TinyQwen& tiny, Fp8Layout layout = Fp8Layout::Blocks) : work(name) {
         xs::test::write_tiny_qwen(work.path / "tiny", tiny, 11);
-        xs::test::write_fp8_twins(work.path / "tiny", work.path / "tiny-fp8", work.path / "tiny-decoded");
+        xs::test::write_fp8_twins(work.path / "tiny", work.path / "tiny-fp8", work.path / "tiny-decoded", layout);
         original = load_model(work.path / "tiny");
         fp8 = load_model(work.path / "tiny-fp8");
         decoded = load_model(work.path / "tiny-decoded");
@@ -159,6 +161,49 @@ TEST_SUITE("fp8 checkpoint") {
         check_same_packs(t, DType::Q4);
     }
 
+    TEST_CASE("compressed-tensors' FP8, a scale per channel: dense and expert by expert, the same model") {
+        {
+            const Twins t("xs_fp8_channel_dense_test", TinyQwen{}, Fp8Layout::Channels);
+            const TensorView& up = t.fp8->weights().get("model.layers.0.mlp.up_proj.weight");
+            CHECK(up.dtype == DType::F8);
+            REQUIRE(up.fp8.size() == 1);
+            CHECK(up.fp8[0].block_rows == 1);
+            CHECK(up.fp8[0].block_cols == 128);
+            CHECK_FALSE(t.fp8->weights().contains("model.layers.0.mlp.up_proj.weight_scale"));
+            check_same_weights(*t.fp8, *t.decoded);
+            check_same_logits(t);
+            check_same_packs(t, DType::Q4);
+        }
+        TinyQwen tiny;
+        tiny.experts = 8;
+        const Twins t("xs_fp8_channel_moe_test", tiny, Fp8Layout::Channels);
+        const TensorView& bank = t.fp8->weights().get("model.layers.0.mlp.experts.gate_up_proj");
+        CHECK(bank.dtype == DType::F8);
+        CHECK(bank.shape == Dims{8, 128, 128});
+        CHECK(bank.fp8.size() == 16);
+        check_same_weights(*t.fp8, *t.decoded);
+        check_same_logits(t);
+        check_same_packs(t, DType::Q4);
+    }
+
+    TEST_CASE("expert banks stored expert by expert as floats are joined into the fused banks") {
+        TinyQwen tiny;
+        tiny.experts = 8;
+        const Twins t("xs_per_expert_floats_test", tiny, Fp8Layout::Floats);
+        const TensorView& bank = t.fp8->weights().get("model.layers.0.mlp.experts.gate_up_proj");
+        const TensorView& fused = t.original->weights().get("model.layers.0.mlp.experts.gate_up_proj");
+        CHECK(bank.dtype == fused.dtype);
+        CHECK(bank.shape == fused.shape);
+        CHECK(bank.data != fused.data);
+        CHECK(std::memcmp(bank.data, fused.data, fused.nbytes()) == 0);
+        CHECK_FALSE(t.fp8->weights().contains("model.layers.0.mlp.experts.0.gate_proj.weight"));
+        CHECK(t.fp8->weights().names() == t.original->weights().names());
+        const auto oracle = make_cpu_ref_backend();
+        SessionOptions so;
+        so.precision = DType::F32;
+        CHECK(last_logits(*oracle, *t.fp8, so) == last_logits(*oracle, *t.original, so));
+    }
+
     TEST_CASE("quantization_config: FP8 with 128 x 128 blocks is read, anything else is refused by name") {
         const TempDir work("xs_fp8_config_test");
         xs::test::write_tiny_qwen(work.path / "tiny", TinyQwen{}, 11);
@@ -191,5 +236,58 @@ TEST_SUITE("fp8 checkpoint") {
         other = fp8;
         other.erase("weight_block_size");
         CHECK(refusal(other).find("weight_block_size") != std::string::npos);
+    }
+
+    TEST_CASE("quantization_config: compressed-tensors' FP8 with a scale per channel is read, the rest refused") {
+        const TempDir work("xs_fp8_ct_config_test");
+        xs::test::write_tiny_qwen(work.path / "tiny", TinyQwen{}, 11);
+        const auto refusal = [&](const nlohmann::json& quantization) -> std::string {
+            nlohmann::json config = nlohmann::json::parse(std::ifstream(work.path / "tiny" / "config.json"));
+            config["quantization_config"] = quantization;
+            std::ofstream(work.path / "tiny" / "config.json") << config.dump(1);
+            try {
+                load_model(work.path / "tiny");
+            } catch (const Error& e) {
+                return e.what();
+            }
+            return "";
+        };
+        const auto refuses = [&](const nlohmann::json& q, const std::string& part) {
+            const std::string message = refusal(q);
+            CAPTURE(message);
+            return message.find(part) != std::string::npos;
+        };
+        const nlohmann::json fp8 = xs::test::compressed_tensors_fp8();
+        CHECK(refusal(fp8).empty());
+        nlohmann::json other = fp8;
+        other["format"] = "pack-quantized";
+        CHECK(refuses(other, "format 'pack-quantized'"));
+        other = fp8;
+        other["config_groups"]["config_group_0"]["weights"]["num_bits"] = 4;
+        CHECK(refuses(other, "config_group_0.weights: 4-bit float"));
+        other = fp8;
+        other["config_groups"]["config_group_0"]["weights"]["type"] = "int";
+        CHECK(refuses(other, "8-bit int weights"));
+        other = fp8;
+        other["config_groups"]["config_group_0"]["weights"]["strategy"] = "block";
+        CHECK(refuses(other, "strategy 'block'"));
+        other = fp8;
+        other["config_groups"]["config_group_0"]["input_activations"]["dynamic"] = false;
+        CHECK(refuses(other, "input_activations: only dynamic"));
+        other = fp8;
+        other["config_groups"]["config_group_0"]["input_activations"] = nullptr;
+        CHECK(refusal(other).empty());
+        other = fp8;
+        other["config_groups"]["config_group_0"]["output_activations"] = {{"num_bits", 8}};
+        CHECK(refuses(other, "output_activations is not supported"));
+        other = fp8;
+        other["kv_cache_scheme"] = {{"num_bits", 8}};
+        CHECK(refuses(other, "kv_cache_scheme is not supported"));
+        other = fp8;
+        other["quantization_status"] = "frozen";
+        CHECK(refuses(other, "quantization_status 'frozen'"));
+        other = fp8;
+        other.erase("config_groups");
+        CHECK(refuses(other, "config_groups"));
     }
 }

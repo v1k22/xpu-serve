@@ -44,9 +44,18 @@ mixture-of-experts one lacked the banks the model code reads.
 - **Activations are not rounded to FP8.** With `activation_scheme: dynamic` the reference runtime rounds each
   projection's input to E4M3 as it goes. Here the weights are the decoded ones and activations are f16 or f32, which
   is the float model the codes stand for and closer to the bf16 release than the reference FP8 runtime is.
+- **compressed-tensors' float-quantized format is read too** (2026-11-15; `ornith-ai/Ornith-1.5-35B-A3B-FP8`, made
+  with llm-compressor's FP8_DYNAMIC scheme): the same E4M3 codes with a scale per output channel, `<name>_scale`
+  [rows, 1], beside them. An `Fp8Run` carries the block its scales cover (128 x 128, or one row by all columns), so
+  the reader, the upload and `convert` take both layouts. `quantization_config` must say `float-quantized` and
+  `compressed`, and every config group static symmetric 8-bit float weights with a scale per channel and dynamic (or
+  no) input activations; a KV cache scheme, sparsity, transforms or output activations are refused by name.
+- **A bank stored expert by expert in a float dtype is joined too** (2026-11-15): Ornith's FP8 release keeps its MTP
+  head's experts bf16, one tensor per expert. `join_rows` copies float parts into one buffer the store keeps (for
+  that head 1.6 GB, once per load), and joins F8 parts without a copy as before; parts of mixed dtypes are refused.
 - **Everything else is refused by name** (`cfg::check_quantization`, the weight store): another `quant_method`
   (bitsandbytes, AWQ, GPTQ), another block size or code format, a static activation scheme, codes without scales or
-  with a grid of another shape.
+  with scales of another shape, codes beside both kinds of scales.
 
 ## What was measured
 
@@ -100,6 +109,17 @@ Face fp32 on the decoded twin: last-token logits cosine 0.999997 or better on si
 Tests: `tests/unit/test_fp8.cpp` (the code table, pairing, joining, refusals), `tests/unit/model/fp8_checkpoint.cpp`
 (a tiny checkpoint written both ways: equal weights, equal logits on cpu-ref and bit for bit on the GPU at f16 and
 f32, equal packs). The GPU suites pass at f16 and f32 (339 cases).
+
+**compressed-tensors' FP8 (2026-11-15).** Tiny Qwen3.5 checkpoints, dense and mixture of experts, written with a scale
+per channel (`tiny_checkpoints.h`, `Fp8Layout::Channels`) are the model their codes decode to: the same weights and
+logits on cpu-ref and the same packs; a planted bug (row scales read as blocks) fails. Ornith-1.5-35B-A3B-FP8 against
+its bf16 original, tensor by tensor with numpy alone (each code times its row's scale; an expert's projection against
+its rows of the fused bank): 30,880 FP8 tensors at cosine 0.999643 or better, 2.65 % relative error (2.67 % at most),
+and the 1,571 other tensors identical. The q4 packs (g32, round to nearest) from the FP8 release and from the bf16
+original hold the same 1,045 tensors in the same formats, the 703 unquantized ones byte for byte and the 342 quantized
+ones at cosine 0.99448 or better; against the original's float32 answers on 300 MMLU-Pro questions (the letter read-out)
+they keep 163 and 168, and get 113 and 114 right (the original 125). Converting the FP8 release took 36 s on the B60
+machine, the bf16 one 109 s (39.3 and 71.9 GB in, 23.34 GB out each).
 
 ## Consequences
 

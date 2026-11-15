@@ -440,30 +440,47 @@ inline void write_tiny_drafter(const fs::path& dir, const TinyDrafter& d, const 
     write_random(dir / "model.safetensors", specs, seed);
 }
 
-// A matrix as an FP8 release stores it: for each block of kFp8Block rows and columns a bf16 scale (the block's largest
-// magnitude over the largest code value) and, per element, the E4M3 code nearest to w / scale. `decoded` gets the
-// values the codes and scales stand for.
+// The quantization_config llm-compressor's FP8_DYNAMIC scheme writes: Linear weights as E4M3 codes with a scale per
+// output channel, activations rounded per token as the runtime goes.
+inline nlohmann::json compressed_tensors_fp8() {
+    const nlohmann::json weights = {{"num_bits", 8}, {"type", "float"}, {"strategy", "channel"}, {"symmetric", true},
+                                    {"dynamic", false}, {"observer", "memoryless_minmax"}, {"group_size", nullptr}};
+    const nlohmann::json activations = {{"num_bits", 8}, {"type", "float"}, {"strategy", "token"}, {"symmetric", true},
+                                        {"dynamic", true}, {"observer", nullptr}};
+    return {{"quant_method", "compressed-tensors"}, {"format", "float-quantized"},
+            {"quantization_status", "compressed"}, {"kv_cache_scheme", nullptr},
+            {"transform_config", nlohmann::json::object()}, {"ignore", {"lm_head", "re:.*mtp\\..*"}},
+            {"config_groups",
+             {{"config_group_0",
+               {{"format", "float-quantized"}, {"targets", {"Linear"}}, {"weights", weights},
+                {"input_activations", activations}, {"output_activations", nullptr}}}}}};
+}
+
+// A matrix as an FP8 release stores it: a bf16 scale for each block of `block_rows` rows and `block_cols` columns
+// (the block's largest magnitude over the largest code value) and, per element, the E4M3 code nearest to w / scale.
+// `decoded` gets the values the codes and scales stand for.
 struct Fp8Matrix {
     std::vector<char> codes;
-    std::vector<char> scales;  // bf16 [ceil(rows / kFp8Block), ceil(cols / kFp8Block)]
+    std::vector<char> scales;  // bf16 [ceil(rows / block_rows), ceil(cols / block_cols)]
 };
-inline Fp8Matrix to_fp8(const float* w, int64_t rows, int64_t cols, float* decoded) {
-    const int64_t grid_rows = (rows + kFp8Block - 1) / kFp8Block, grid_cols = (cols + kFp8Block - 1) / kFp8Block;
+inline Fp8Matrix to_fp8(const float* w, int64_t rows, int64_t cols, float* decoded, int64_t block_rows = kFp8Block,
+                        int64_t block_cols = kFp8Block) {
+    const int64_t grid_rows = (rows + block_rows - 1) / block_rows, grid_cols = (cols + block_cols - 1) / block_cols;
     Fp8Matrix out;
     out.codes.resize(static_cast<size_t>(rows * cols));
     out.scales.resize(static_cast<size_t>(grid_rows * grid_cols) * 2);
     for (int64_t br = 0; br < grid_rows; ++br) {
         for (int64_t bc = 0; bc < grid_cols; ++bc) {
-            const int64_t r1 = std::min(rows, (br + 1) * kFp8Block), c1 = std::min(cols, (bc + 1) * kFp8Block);
+            const int64_t r1 = std::min(rows, (br + 1) * block_rows), c1 = std::min(cols, (bc + 1) * block_cols);
             float peak = 0.0f;
-            for (int64_t r = br * kFp8Block; r < r1; ++r)
-                for (int64_t c = bc * kFp8Block; c < c1; ++c)
+            for (int64_t r = br * block_rows; r < r1; ++r)
+                for (int64_t c = bc * block_cols; c < c1; ++c)
                     peak = std::max(peak, std::fabs(w[r * cols + c]));
             const uint16_t stored = f32_to_bf16(peak > 0.0f ? peak / 448.0f : 1.0f);
             std::memcpy(out.scales.data() + (br * grid_cols + bc) * 2, &stored, 2);
             const float scale = bf16_to_f32(stored);
-            for (int64_t r = br * kFp8Block; r < r1; ++r) {
-                for (int64_t c = bc * kFp8Block; c < c1; ++c) {
+            for (int64_t r = br * block_rows; r < r1; ++r) {
+                for (int64_t c = bc * block_cols; c < c1; ++c) {
                     const float target = std::fabs(w[r * cols + c]) / scale;
                     int best = 0;
                     for (int code = 1; code < 0x7F; ++code) {  // the finite magnitudes, ascending
@@ -482,11 +499,19 @@ inline Fp8Matrix to_fp8(const float* w, int64_t rows, int64_t cols, float* decod
     return out;
 }
 
+// How a checkpoint rewritten by write_fp8_twins stores what it changes.
+enum class Fp8Layout {
+    Blocks,    // transformers' fine-grained FP8: `<name>_scale_inv`, a scale per block of kFp8Block rows and columns
+    Channels,  // compressed-tensors' float-quantized format: `<name>_scale` [rows, 1], a scale per row
+    Floats,    // nothing quantized: only the expert banks cut expert by expert, in their own dtype
+};
+
 // Writes the Qwen3.5 checkpoint in `from` twice. To `fp8` the way an FP8 release stores it: every projection as E4M3
-// codes beside `<name>_scale_inv`, an expert bank expert by expert (experts.<e>.gate_proj.weight, up_proj, down_proj),
+// codes beside its scales, an expert bank expert by expert (experts.<e>.gate_proj.weight, up_proj, down_proj),
 // quantization_config in config.json. To `decoded` in the layout of `from`, with exactly the f32 values those codes
 // and scales stand for. The two are the same model.
-inline void write_fp8_twins(const fs::path& from, const fs::path& fp8, const fs::path& decoded) {
+inline void write_fp8_twins(const fs::path& from, const fs::path& fp8, const fs::path& decoded,
+                            Fp8Layout layout = Fp8Layout::Blocks) {
     const auto source = SafetensorsWeights::open_dir(from);
     const auto ends_with = [](const std::string& s, const std::string& tail) {
         return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0;
@@ -504,9 +529,9 @@ inline void write_fp8_twins(const fs::path& from, const fs::path& fp8, const fs:
     for (const std::string& name : source->names()) {
         const TensorView& v = source->get(name);
         const bool gate_up = ends_with(name, "experts.gate_up_proj"), down = ends_with(name, "experts.down_proj");
-        const bool projection = v.shape.size() == 2 && (ends_with(name, "_proj.weight") ||
-                                                        ends_with(name, "in_proj_qkv.weight") ||
-                                                        ends_with(name, "in_proj_z.weight"));
+        const bool projection = layout != Fp8Layout::Floats && v.shape.size() == 2 &&
+                                (ends_with(name, "_proj.weight") || ends_with(name, "in_proj_qkv.weight") ||
+                                 ends_with(name, "in_proj_z.weight"));
         if (!gate_up && !down && !projection) {
             const auto* bytes = static_cast<const char*>(v.data);
             unit(fp8_units, name, v.dtype, v.shape, {bytes, bytes + v.nbytes()});
@@ -538,13 +563,31 @@ inline void write_fp8_twins(const fs::path& from, const fs::path& fp8, const fs:
             }
         }
         for (const Piece& piece : pieces) {
-            Fp8Matrix m = to_fp8(w.data() + piece.first * cols, piece.count, cols, values.data() + piece.first * cols);
+            if (layout == Fp8Layout::Floats) {
+                const auto element = static_cast<int64_t>(dtype_size(v.dtype));
+                const auto* bytes = static_cast<const char*>(v.data) + piece.first * cols * element;
+                unit(fp8_units, piece.name, v.dtype, {piece.count, cols}, {bytes, bytes + piece.count * cols * element});
+                continue;
+            }
+            const bool channels = layout == Fp8Layout::Channels;
+            Fp8Matrix m = to_fp8(w.data() + piece.first * cols, piece.count, cols, values.data() + piece.first * cols,
+                                 channels ? 1 : kFp8Block, channels ? cols : kFp8Block);
             unit(fp8_units, piece.name, DType::F8, {piece.count, cols}, std::move(m.codes));
-            unit(fp8_units, piece.name + "_scale_inv", DType::BF16,
-                 {(piece.count + kFp8Block - 1) / kFp8Block, (cols + kFp8Block - 1) / kFp8Block}, std::move(m.scales));
+            if (channels) {
+                unit(fp8_units, piece.name + "_scale", DType::BF16, {piece.count, 1}, std::move(m.scales));
+            } else {
+                unit(fp8_units, piece.name + "_scale_inv", DType::BF16,
+                     {(piece.count + kFp8Block - 1) / kFp8Block, (cols + kFp8Block - 1) / kFp8Block},
+                     std::move(m.scales));
+            }
         }
-        const auto* bytes = reinterpret_cast<const char*>(values.data());
-        unit(decoded_units, name, DType::F32, v.shape, {bytes, bytes + values.size() * sizeof(float)});
+        if (layout == Fp8Layout::Floats) {
+            const auto* bytes = static_cast<const char*>(v.data);
+            unit(decoded_units, name, v.dtype, v.shape, {bytes, bytes + v.nbytes()});
+        } else {
+            const auto* bytes = reinterpret_cast<const char*>(values.data());
+            unit(decoded_units, name, DType::F32, v.shape, {bytes, bytes + values.size() * sizeof(float)});
+        }
     }
     for (const fs::path& to : {fp8, decoded}) {
         fs::create_directories(to);
@@ -554,8 +597,12 @@ inline void write_fp8_twins(const fs::path& from, const fs::path& fp8, const fs:
     write_safetensors(decoded / "model.safetensors", decoded_units);
     fs::copy_file(from / "config.json", decoded / "config.json");
     nlohmann::json config = nlohmann::json::parse(std::ifstream(from / "config.json"));
-    config["quantization_config"] = {{"quant_method", "fp8"}, {"fmt", "e4m3"}, {"activation_scheme", "dynamic"},
-                                     {"weight_block_size", {kFp8Block, kFp8Block}}};
+    if (layout == Fp8Layout::Blocks) {
+        config["quantization_config"] = {{"quant_method", "fp8"}, {"fmt", "e4m3"}, {"activation_scheme", "dynamic"},
+                                         {"weight_block_size", {kFp8Block, kFp8Block}}};
+    } else if (layout == Fp8Layout::Channels) {
+        config["quantization_config"] = compressed_tensors_fp8();
+    }
     std::ofstream(fp8 / "config.json") << config.dump(1);
 }
 

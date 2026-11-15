@@ -65,15 +65,11 @@ std::vector<int32_t> get_int_list(const nlohmann::json& obj, const char* key, co
     return out;
 }
 
-void check_quantization(const nlohmann::json& config) {
-    if (!config.contains("quantization_config") || config.at("quantization_config").is_null()) return;
-    const nlohmann::json& q = config.at("quantization_config");
-    const std::string where = "config.json quantization_config";
-    const std::string method = get_string(q, "quant_method", where);
-    if (method != "fp8") {
-        fail(where, ": quant_method '", method, "' is not supported (supported: fp8 with one scale per block of ",
-             kFp8Block, " rows and columns; or the checkpoint this one was quantized from)");
-    }
+namespace {
+
+// transformers' fine-grained FP8 (the -FP8 releases of Qwen): E4M3 codes, a scale per block of kFp8Block rows and
+// columns.
+void check_fp8_blocks(const nlohmann::json& q, const std::string& where) {
     if (q.contains("fmt") && get_string(q, "fmt", where) != "e4m3") {
         fail(where, ": fmt '", get_string(q, "fmt", where), "' is not supported (supported: e4m3)");
     }
@@ -87,6 +83,67 @@ void check_quantization(const nlohmann::json& config) {
         fail(where, ": activation_scheme '", get_string(q, "activation_scheme", where),
              "' is not supported (supported: dynamic)");
     }
+}
+
+bool absent(const nlohmann::json& obj, const char* key) {
+    return !obj.contains(key) || obj.at(key).is_null();
+}
+
+// compressed-tensors' float-quantized format (llm-compressor's FP8_DYNAMIC): the weights of Linear layers as E4M3
+// codes with a scale per output channel; activations rounded as the reference runtime goes, which stay unquantized
+// here.
+void check_compressed_tensors(const nlohmann::json& q, const std::string& where) {
+    if (const std::string format = get_string(q, "format", where); format != "float-quantized") {
+        fail(where, ": format '", format, "' is not supported (supported: float-quantized)");
+    }
+    if (q.contains("quantization_status") && get_string(q, "quantization_status", where) != "compressed") {
+        fail(where, ": quantization_status '", get_string(q, "quantization_status", where),
+             "' is not supported (supported: compressed)");
+    }
+    for (const char* key : {"kv_cache_scheme", "sparsity_config"}) {
+        if (!absent(q, key)) fail(where, ": ", key, " is not supported");
+    }
+    if (q.contains("transform_config") && !q.at("transform_config").empty()) {
+        fail(where, ": transform_config is not supported");
+    }
+    if (!q.contains("config_groups") || !q.at("config_groups").is_object() || q.at("config_groups").empty()) {
+        fail(where, ": config_groups must name the quantized layers' scheme");
+    }
+    for (const auto& [name, group] : q.at("config_groups").items()) {
+        const std::string in = where + " config_groups." + name;
+        if (absent(group, "weights")) fail(in, ": no weights scheme");
+        const nlohmann::json& w = group.at("weights");
+        const std::string type = get_string(w, "type", in + ".weights");
+        const int64_t bits = get_int(w, "num_bits", in + ".weights");
+        const std::string strategy = get_string(w, "strategy", in + ".weights");
+        if (type != "float" || bits != 8 || strategy != "channel" || !get_bool_or(w, "symmetric", true, in) ||
+            get_bool_or(w, "dynamic", false, in)) {
+            fail(in, ".weights: ", bits, "-bit ", type, " weights with strategy '", strategy,
+                 "' are not supported (supported: symmetric static 8-bit float weights, a scale per channel)");
+        }
+        if (!absent(group, "input_activations")) {
+            const nlohmann::json& a = group.at("input_activations");
+            if (!a.contains("dynamic") || !a.at("dynamic").is_boolean() || !a.at("dynamic").get<bool>()) {
+                fail(in, ".input_activations: only dynamic activation quantization is supported (calibrated ",
+                     "activation scales are not read)");
+            }
+        }
+        if (!absent(group, "output_activations")) fail(in, ".output_activations is not supported");
+    }
+}
+
+}  // namespace
+
+void check_quantization(const nlohmann::json& config) {
+    if (!config.contains("quantization_config") || config.at("quantization_config").is_null()) return;
+    const nlohmann::json& q = config.at("quantization_config");
+    const std::string where = "config.json quantization_config";
+    const std::string method = get_string(q, "quant_method", where);
+    if (method == "fp8") return check_fp8_blocks(q, where);
+    if (method == "compressed-tensors") return check_compressed_tensors(q, where);
+    fail(where, ": quant_method '", method, "' is not supported (supported: fp8 with one scale per block of ",
+         kFp8Block, " rows and columns; compressed-tensors' float-quantized format with a scale per channel; or the ",
+         "checkpoint this one was quantized from)");
 }
 
 std::string model_id(const std::filesystem::path& model_dir) {

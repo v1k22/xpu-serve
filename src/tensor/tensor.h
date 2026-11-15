@@ -31,13 +31,16 @@ struct QuantParams {
     const float* input_scales = nullptr;  // f32 [cols], or null
 };
 
-// A run of rows of an FP8 weight (dtype F8): E4M3 codes [rows, cols], a byte each, and one f32 scale per block of
-// kFp8Block rows and columns, [ceil(rows / kFp8Block), ceil(cols / kFp8Block)] row-major: w = e4m3(code) * scale.
+// A run of rows of an FP8 weight (dtype F8): E4M3 codes [rows, cols], a byte each, and f32 scales, one per block of
+// `block_rows` rows and `block_cols` columns, [ceil(rows / block_rows), ceil(cols / block_cols)] row-major:
+// w = e4m3(code) * scale. A scale per row is a block of one row and all its columns.
 inline constexpr int64_t kFp8Block = 128;
 struct Fp8Run {
     const uint8_t* codes = nullptr;
     const float* scales = nullptr;
     int64_t rows = 0;
+    int64_t block_rows = kFp8Block;
+    int64_t block_cols = kFp8Block;
 };
 
 struct TensorView {

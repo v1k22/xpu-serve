@@ -146,8 +146,7 @@ Value Decoder::moe(Graph& g, const std::string& L, Value y) const {
         parts.up = bank("up_proj", {e, inter, h});
     } else {
         fail("qwen3_5: ", L, "experts has no gate and up banks: they come fused (experts.gate_up_proj), apart ",
-             "(experts.gate_proj and experts.up_proj), or expert by expert as fp8 tensors ",
-             "(experts.<e>.gate_proj.weight)");
+             "(experts.gate_proj and experts.up_proj), or expert by expert (experts.<e>.gate_proj.weight)");
     }
     parts.down = bank("down_proj", {e, h, inter});
     if (cfg_.shared_expert_intermediate_size > 0) {

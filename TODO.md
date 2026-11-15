@@ -281,9 +281,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] FP8 checkpoints (`Qwen/Qwen3.8-27B-FP8`, `Qwen/Qwen3.6-35B-A3B-FP8`): E4M3 codes with a scale per 128 x 128
       block read as one more stored format of a float weight (`DType::F8`, `quant::read_rows`), expert banks stored
       expert by expert joined without a copy; `run`, `serve`, `bench` and `convert` take the directory
-      (`docs/decisions/0014`)
-- [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; vision tower; a bf16 checkpoint with
-      per-expert tensors (`experts.<e>.gate_proj`; only FP8 ones are joined)
+      (`docs/decisions/0014`); also compressed-tensors' float-quantized format with a scale per channel
+      (`ornith-ai/Ornith-1.5-35B-A3B-FP8`)
+- [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; vision tower
 - [x] LFM3 (`lfm3`, text): gated short convolutions and gated attention from the shared blocks (a per-head gate added
       to `blocks::attention`; no new op), its tokenizer and chat template byte-exact, the `qwen3_5` output parser;
       HF parity on cpu-ref and the B60, q8 / q4 packs (`docs/decisions/0013`)

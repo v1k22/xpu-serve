@@ -48,8 +48,8 @@ inline constexpr int kPackVersion = 1;
 // quantized weight appears under its own name as one Q8 / Q4 view over its codes, `.scales` and `.biases` tensors,
 // and each weight in a GGUF block format (a manifest entry {"format": "Q4_K", "shape": [..., cols]}, the format named
 // as block_format_name does) as one Block view of that shape over its U8 tensor [rows, block_row_bytes(cols)].
-// In an FP8 checkpoint (quant/fp8.h) each F8_E4M3 matrix appears as one F8 view over its codes and its
-// `<name>_scale_inv` tensor.
+// In an FP8 checkpoint (quant/fp8.h) each F8_E4M3 matrix appears as one F8 view over its codes and its scales
+// (`<name>_scale_inv`, one per block, or `<name>_scale`, one per row).
 class SafetensorsWeights final : public WeightStore {
 public:
     static std::unique_ptr<SafetensorsWeights> open_dir(const std::filesystem::path& dir);
@@ -61,9 +61,10 @@ public:
     size_t file_count() const { return files_.size(); }
     bool is_pack() const { return is_pack_; }
 
-    // Shows the F8 matrices `parts` (the same number of columns each) as one weight `name` of `shape`, whose matrix
-    // is their rows one after another, and drops their own names: for a checkpoint that stores in pieces what the
-    // model reads as one tensor (an expert bank, expert by expert). Nothing is copied. Dense tensors are refused.
+    // Shows the matrices `parts` (the same number of columns each) as one weight `name` of `shape`, whose matrix is
+    // their rows one after another, and drops their own names: for a checkpoint that stores in pieces what the model
+    // reads as one tensor (an expert bank, expert by expert). F8 parts are shown where they are; float parts of one
+    // dtype are copied into a buffer the store keeps.
     void join_rows(const std::string& name, const std::vector<std::string>& parts, Dims shape);
 
 private:
@@ -78,6 +79,9 @@ private:
     std::map<std::string, TensorView> fp8_views_;
     std::map<std::string, std::vector<Fp8Run>> fp8_runs_;
     std::vector<std::unique_ptr<float[]>> fp8_scales_;
+    // Float weights join_rows copied together.
+    std::map<std::string, TensorView> joined_views_;
+    std::vector<std::unique_ptr<char[]>> joined_data_;
     bool is_pack_ = false;
 };
 

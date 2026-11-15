@@ -1,9 +1,13 @@
 #pragma once
 
-// FP8 checkpoints (DeepSeek-V3's layout, which the -FP8 releases of Qwen use): a projection's weight is stored as
-// E4M3 codes, a byte each, beside `<name>_scale_inv`, one scale per block of kFp8Block rows and columns:
-// w = e4m3(code) * scale. The weight store shows such a pair as one F8 view (io/safetensors.h); a backend reads it
-// into its own float format and `convert` quantizes it like any float weight (quant::read_rows).
+// FP8 checkpoints: a projection's weight is stored as E4M3 codes, a byte each, beside its scales, w = e4m3(code) *
+// scale. Two layouts are read:
+// - DeepSeek-V3's, which the -FP8 releases of Qwen use: `<name>_scale_inv`, one scale per block of kFp8Block rows and
+//   columns;
+// - compressed-tensors' float-quantized scheme with a scale per output channel (llm-compressor's FP8_DYNAMIC):
+//   `<name>_scale` [rows, 1], one scale per row.
+// The weight store shows such a pair as one F8 view (io/safetensors.h); a backend reads it into its own float format
+// and `convert` quantizes it like any float weight (quant::read_rows).
 
 #include <cstdint>
 
