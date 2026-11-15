@@ -7,8 +7,9 @@
 // gated delta rule with a fixed-size state per sequence), every `full_attention_interval`-th layer is gated full
 // attention (sigmoid output gate, q/k norms, partial rotary). Norms are zero-centered (x * (1 + w)). Served: the text
 // decoder, dense ("qwen3_5") or mixture of experts in every layer ("qwen3_5_moe": softmax router, top-k renormalized,
-// fused gate_up expert banks, a sigmoid-gated shared expert), and its MTP head (mtp.*) as the drafter for speculative
-// decoding. The vision tower is not loaded.
+// expert banks whose gate and up projections come fused, as Hugging Face stores them, or apart, as a GGUF import keeps
+// them, a sigmoid-gated shared expert), and its MTP head (mtp.*) as the drafter for speculative decoding. The vision
+// tower is not loaded.
 
 #include <filesystem>
 #include <memory>

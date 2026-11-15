@@ -106,7 +106,7 @@ public:
     std::string_view name() const override { return kArch; }
 
     ImportPlan plan(const gguf::File& f) const override {
-        const Qwen35Decoder decoder = read_qwen35_decoder(f, kArch, kHeadKeys);
+        const Qwen35Decoder decoder = read_qwen35_decoder(f, kArch, Qwen35Mlp::Dense, kHeadKeys);
         if (const std::string_view type = f.get_string("clef.decision.type"); type != "clef") {
             fail("clef: decision.type '", type, "' is not supported (supported: clef)");
         }

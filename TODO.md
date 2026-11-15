@@ -312,7 +312,14 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       the GPU; results in docs/gguf_models.md)
 - [x] GGUF: `modern-bert` decision files (ggml-org's Laya and Julia-1) into the original checkpoint's layout; the
       tokenizers `modern-bert` and `mmbert`, equal to the originals over their whole vocabularies (docs/decisions/0018)
-- [ ] GGUF: more architectures (`qwen35moe`, Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
+- [x] GGUF: architecture `qwen35moe` (the Qwen3.5 family's mixture of experts): read as a `qwen35` file whose layers
+      hold a router, expert banks and a shared expert; the gate and up banks kept apart as the file stores them, which
+      the model reads in the fused bank's place; the MTP block with experts of its own, also from its own file
+      (`convert --mtp`); a tiny file gives the logits and drafts of the checkpoint its blocks decode to (cpu-ref)
+- [ ] GGUF: a real `qwen35moe` file checked (`gguf_real_file.cpp` with `XS_QWEN35MOE_DIR`) and measured on the GPU
+- [ ] GGUF: a `qwen35moe` file whose gate and up banks the converter fused (`--fuse-gate-up-exps`); `-hf` fetching
+      the MTP head published apart from a `qwen35moe` file
+- [ ] GGUF: more architectures (Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
 - [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
 - [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)
 - [x] GGUF: a matrix-engine GEMV over block formats (`gemv_block_xmx`, from 2 rows: a speculative verify)

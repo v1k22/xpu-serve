@@ -208,14 +208,12 @@ ImportPlan Architecture::plan_with_mtp(const gguf::File&, const gguf::File&) con
 }
 
 const Architecture& find_architecture(std::string_view name) {
-    const std::vector<const Architecture*> all{&qwen35(), &gemma4(), &gemma4_assistant(), &clef(), &modern_bert()};
+    const std::vector<const Architecture*> all{&qwen35(),           &qwen35moe(), &gemma4(),
+                                               &gemma4_assistant(), &clef(),      &modern_bert()};
     std::string list;
     for (const Architecture* a : all) {
         if (a->name() == name) return *a;
         list += str_cat(list.empty() ? "" : ", ", a->name());
-    }
-    if (name == "qwen35moe") {
-        fail("GGUF architecture 'qwen35moe' (Qwen3.5 mixture of experts) is not supported yet (supported: ", list, ")");
     }
     fail("GGUF architecture '", name, "' is not supported (supported: ", list, ")");
 }

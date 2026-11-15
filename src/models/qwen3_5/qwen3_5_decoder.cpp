@@ -115,7 +115,8 @@ blocks::Linear Decoder::proj(Graph& g, const std::string& name) const {
     return [this, &g, name](Value x) { return g.matmul(x, weight(g, name)); };
 }
 
-// Qwen3_5MoeSparseMoeBlock.
+// Qwen3_5MoeSparseMoeBlock. The gate and up banks come fused (experts.gate_up_proj: an expert's gate rows, then its up
+// rows), or apart (experts.gate_proj and experts.up_proj: a GGUF import's, each in the format its file stores).
 Value Decoder::moe(Graph& g, const std::string& L, Value y) const {
     blocks::MoeSpec spec;
     spec.experts = cfg_.num_experts;
@@ -124,17 +125,31 @@ Value Decoder::moe(Graph& g, const std::string& L, Value y) const {
     spec.normalize = cfg_.norm_topk_prob;
     blocks::MoeParts parts;
     parts.router = weight(g, L + "gate.weight");
-    if (!weights_.contains(L + "experts.gate_up_proj")) {
-        fail("qwen3_5: ", L, "experts.gate_up_proj is missing: the expert banks come fused, or expert by expert ",
-             "as fp8 tensors (experts.<e>.gate_proj.weight)");
-    }
-    parts.gate_up = weight(g, L + "experts.gate_up_proj");
-    parts.down = weight(g, L + "experts.down_proj");
     const int64_t e = cfg_.num_experts, h = cfg_.hidden_size, inter = cfg_.moe_intermediate_size;
-    XS_CHECK(g.type(parts.gate_up).shape == (Dims{e, 2 * inter, h}) && g.type(parts.down).shape == (Dims{e, h, inter}),
-             "qwen3_5: ", L, " expert banks have shapes ", dims_to_string(g.type(parts.gate_up).shape), " and ",
-             dims_to_string(g.type(parts.down).shape), ", expected [", e, ", ", 2 * inter, ", ", h, "] and [", e, ", ",
-             h, ", ", inter, "]");
+    const std::string E = L + "experts.";
+    const auto bank = [&](const char* name, const Dims& shape) {
+        const Value w = weight(g, E + name);
+        XS_CHECK(g.type(w).shape == shape, "qwen3_5: ", E, name, " has shape ", dims_to_string(g.type(w).shape),
+                 ", expected ", dims_to_string(shape));
+        return w;
+    };
+    const bool fused = weights_.contains(E + "gate_up_proj");
+    const bool apart = weights_.contains(E + "gate_proj") || weights_.contains(E + "up_proj");
+    if (fused && apart) {
+        fail("qwen3_5: ", L, "experts holds the fused bank (gate_up_proj) and the banks apart (gate_proj, up_proj): ",
+             "a checkpoint has one layout or the other");
+    }
+    if (fused) {
+        parts.gate_up = bank("gate_up_proj", {e, 2 * inter, h});
+    } else if (apart) {
+        parts.gate = bank("gate_proj", {e, inter, h});
+        parts.up = bank("up_proj", {e, inter, h});
+    } else {
+        fail("qwen3_5: ", L, "experts has no gate and up banks: they come fused (experts.gate_up_proj), apart ",
+             "(experts.gate_proj and experts.up_proj), or expert by expert as fp8 tensors ",
+             "(experts.<e>.gate_proj.weight)");
+    }
+    parts.down = bank("down_proj", {e, h, inter});
     if (cfg_.shared_expert_intermediate_size > 0) {
         parts.shared_gate = proj(g, L + "shared_expert.gate_proj.weight");
         parts.shared_up = proj(g, L + "shared_expert.up_proj.weight");

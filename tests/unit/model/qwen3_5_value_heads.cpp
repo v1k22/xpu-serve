@@ -18,12 +18,14 @@
 #include "io/safetensors_writer.h"
 #include "models/model.h"
 #include "models/qwen3_5/qwen3_5.h"
+#include "step_logits.h"
 #include "tiny_checkpoints.h"
 #include "util/error.h"
 
 using namespace xs;
 namespace fs = std::filesystem;
 namespace dev = xs::test::device;
+using xs::test::relative_gap;
 using xs::test::TempDir;
 using xs::test::TinyQwen;
 
@@ -94,31 +96,7 @@ void write_tiled(const fs::path& from, const fs::path& to, const TinyQwen& m, bo
 
 // The logits of a prefill and of three decode steps after it (the conv and recurrent state carried).
 std::vector<std::vector<float>> step_logits(Backend& backend, const Model& model, const SessionOptions& options) {
-    const auto session = backend.compile(model.graph(), model.weights(), options);
-    std::vector<std::vector<float>> out;
-    const std::vector<std::vector<int32_t>> steps{{3, 17, 42, 99, 5, 250, 7, 8, 64, 128}, {11}, {200}, {1}};
-    int64_t pos = 0;
-    for (const auto& ids : steps) {
-        TensorMap inputs, outputs;
-        model.prepare_inputs(ids, pos, {}, inputs);
-        session->run(inputs, outputs);
-        const HostTensor& l = outputs.at("logits");
-        out.emplace_back(l.data<float>(), l.data<float>() + l.numel());
-        pos += static_cast<int64_t>(ids.size());
-    }
-    return out;
-}
-
-// The largest difference between the two runs' logits, over the largest logit.
-double relative_gap(const std::vector<std::vector<float>>& a, const std::vector<std::vector<float>>& b) {
-    double gap = 0.0, scale = 0.0;
-    for (size_t s = 0; s < a.size(); ++s) {
-        for (size_t i = 0; i < a[s].size(); ++i) {
-            gap = std::max(gap, static_cast<double>(std::fabs(a[s][i] - b[s][i])));
-            scale = std::max(scale, static_cast<double>(std::fabs(b[s][i])));
-        }
-    }
-    return gap / scale;
+    return xs::test::step_logits(backend, model, options, {3, 17, 42, 99, 5, 250, 7, 8, 64, 128}, {11, 200, 1});
 }
 
 }  // namespace

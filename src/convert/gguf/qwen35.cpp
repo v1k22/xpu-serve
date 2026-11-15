@@ -1,15 +1,21 @@
-// GGUF architecture "qwen35": the Qwen3.5 family's dense text models (Qwen3.5, Qwen3.6, Qwen3.8) as llama.cpp's
-// converter writes them (convert_hf_to_gguf.py, Qwen3_5TextModel), imported for models/qwen3_5/.
+// GGUF architectures "qwen35" and "qwen35moe": the Qwen3.5 family's text models (Qwen3.5, Qwen3.6, Qwen3.8), dense
+// and mixture of experts, as llama.cpp's converter writes them (conversion/qwen.py: Qwen3_5TextModel,
+// Qwen3_5MoeTextModel), imported for models/qwen3_5/. The two differ in their layers' MLP alone (Qwen35Mlp).
 //
 // What the converter changed, and what the import does about it:
 // - names: blk.<i>.* for layer i, token_embd / output / output_norm; mapped back to the Hugging Face names.
+// - a mixture of experts' fused bank, experts.gate_up_proj [E, 2 I, hidden] (an expert's gate rows, then its up rows),
+//   is stored as two, ffn_gate_exps and ffn_up_exps [E, I, hidden], which can differ in format: kept apart, as
+//   experts.gate_proj and experts.up_proj, which models/qwen3_5/ reads in the fused bank's place (a quantized weight is
+//   never re-encoded, and the two halves of an expert are not runs of rows of one tensor).
+// - the shared expert's gate, [1, hidden], can be stored 1-D: reshaped.
 // - every norm weight but linear attention's (ssm_norm) is stored as 1 + w: written back as w.
 // - A_log is stored as ssm_a = -exp(A_log): written back as log(-ssm_a).
 // - the conv1d weight [C, 1, K] is stored squeezed, [C, K]: reshaped.
 // - linear attention's value heads are stored tiled instead of grouped: kept, and config.json says
 //   linear_value_head_order "tiled" (models/qwen3_5/qwen3_5.h), since a quantized weight is never reordered.
-// - the converter can store in_proj_qkv and in_proj_z as one tensor (attn_qkv_gate), and in_proj_b and in_proj_a
-//   (ssm_beta_alpha): cut back into their runs of rows.
+// - the converter can store a dense model's in_proj_qkv and in_proj_z as one tensor (attn_qkv_gate), and its in_proj_b
+//   and in_proj_a (ssm_beta_alpha): cut back into their runs of rows.
 // - the MTP head is one more block per MTP layer (blk.<n> past the decoder's layers, with nextn.* beside the first):
 //   mapped to mtp.*.
 // - a file can come without the head (nextn_predict_layers 0), its head published apart as llama.cpp's draft model
@@ -31,8 +37,8 @@
 namespace xs::gguf_import {
 namespace {
 
-constexpr std::string_view kArch = "qwen35";
-const std::string kPrefix = "model.";  // a text-only checkpoint's decoder, as Qwen3_5ForCausalLM names it
+// A text-only checkpoint's decoder, as Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM name it.
+const std::string kPrefix = "model.";
 
 float minus_one(float x) {
     return x - 1.0f;
@@ -43,13 +49,12 @@ float log_of_negative(float x) {
 const FloatMap kNorm{"w = (1 + w) - 1 of a norm weight", minus_one};
 const FloatMap kALog{"A_log = log(-ssm_a)", log_of_negative};
 
-// The decoder's keys the import reads, or knows to change nothing it writes. An MTP head's (nextn_predict_layers) is
-// the architecture's to allow.
+// The decoder's keys the import reads, or knows to change nothing it writes, whatever its layers' MLP. An MTP head's
+// (nextn_predict_layers) is the architecture's to allow.
 const std::set<std::string_view> kDecoderKeys = {
     "block_count",
     "context_length",
     "embedding_length",
-    "feed_forward_length",
     "vocab_size",
     "attention.head_count",
     "attention.head_count_kv",
@@ -69,21 +74,49 @@ const std::set<std::string_view> kDecoderKeys = {
     "ssm.inner_size",
 };
 
+// The keys of each kind of MLP, all of them required.
+const std::set<std::string_view> kDenseKeys = {"feed_forward_length"};
+const std::set<std::string_view> kExpertKeys = {
+    "expert_count",
+    "expert_used_count",
+    "expert_feed_forward_length",
+    "expert_shared_feed_forward_length",
+};
+
 struct Dimensions {
-    int64_t vocab, hidden, ffn, heads, kv_heads, head_dim;
+    int64_t vocab, hidden, heads, kv_heads, head_dim;
     int64_t key_heads, value_heads, key_dim, value_dim, conv_kernel;
+    int64_t ffn;  // the dense MLP's width; 0 with experts
+    // A mixture of experts (experts > 0): how many, how many a token uses, an expert's width and the shared expert's.
+    int64_t experts, experts_used, expert_ffn, shared_ffn;
     int64_t key_width() const { return key_heads * key_dim; }
     int64_t value_width() const { return value_heads * value_dim; }
     int64_t conv_width() const { return 2 * key_width() + value_width(); }
 };
 
+// A layer's MLP under `M` (".../mlp."): the dense one, or the router, the expert banks and the gated shared expert.
+void add_mlp(Entries& e, const Dimensions& d, const std::string& M) {
+    if (d.experts == 0) {
+        e["ffn_gate.weight"] = one({d.ffn, d.hidden}, M + "gate_proj.weight");
+        e["ffn_up.weight"] = one({d.ffn, d.hidden}, M + "up_proj.weight");
+        e["ffn_down.weight"] = one({d.hidden, d.ffn}, M + "down_proj.weight");
+        return;
+    }
+    e["ffn_gate_inp.weight"] = one({d.experts, d.hidden}, M + "gate.weight");
+    e["ffn_gate_exps.weight"] = one({d.experts, d.expert_ffn, d.hidden}, M + "experts.gate_proj");
+    e["ffn_up_exps.weight"] = one({d.experts, d.expert_ffn, d.hidden}, M + "experts.up_proj");
+    e["ffn_down_exps.weight"] = one({d.experts, d.hidden, d.expert_ffn}, M + "experts.down_proj");
+    e["ffn_gate_shexp.weight"] = one({d.shared_ffn, d.hidden}, M + "shared_expert.gate_proj.weight");
+    e["ffn_up_shexp.weight"] = one({d.shared_ffn, d.hidden}, M + "shared_expert.up_proj.weight");
+    e["ffn_down_shexp.weight"] = one({d.hidden, d.shared_ffn}, M + "shared_expert.down_proj.weight");
+    e["ffn_gate_inp_shexp.weight"] = one({1, d.hidden}, M + "shared_expert_gate.weight");
+}
+
 // A decoder layer of either kind: the norms and the MLP.
 void add_layer_common(Entries& e, const Dimensions& d, const std::string& L) {
     e["attn_norm.weight"] = one({d.hidden}, L + "input_layernorm.weight", &kNorm);
     e["post_attention_norm.weight"] = one({d.hidden}, L + "post_attention_layernorm.weight", &kNorm);
-    e["ffn_gate.weight"] = one({d.ffn, d.hidden}, L + "mlp.gate_proj.weight");
-    e["ffn_up.weight"] = one({d.ffn, d.hidden}, L + "mlp.up_proj.weight");
-    e["ffn_down.weight"] = one({d.hidden, d.ffn}, L + "mlp.down_proj.weight");
+    add_mlp(e, d, L + "mlp.");
 }
 
 // Gated full attention: q_proj holds each head's query and output gate.
@@ -100,7 +133,9 @@ Entries full_attention_layer(const Dimensions& d, const std::string& L) {
     return e;
 }
 
-// Gated DeltaNet; in_proj_qkv / in_proj_z and in_proj_b / in_proj_a stored apart or as one tensor each.
+// Gated DeltaNet; in_proj_qkv / in_proj_z and in_proj_b / in_proj_a stored apart, or in a dense model's file as one
+// tensor each (the converter merges them for Qwen3_5TextModel alone, and llama.cpp reads the merged tensors in no
+// qwen35moe file).
 Entries linear_attention_layer(const Dimensions& d, const std::string& L) {
     Entries e;
     add_layer_common(e, d, L);
@@ -111,10 +146,12 @@ Entries linear_attention_layer(const Dimensions& d, const std::string& L) {
     const Piece a{A + "in_proj_a.weight", {d.value_heads, d.hidden}};
     e["attn_qkv.weight"] = Entry{qkv.shape, {qkv}};
     e["attn_gate.weight"] = Entry{z.shape, {z}};
-    e["attn_qkv_gate.weight"] = Entry{{d.conv_width() + d.value_width(), d.hidden}, {qkv, z}};
     e["ssm_beta.weight"] = Entry{b.shape, {b}};
     e["ssm_alpha.weight"] = Entry{a.shape, {a}};
-    e["ssm_beta_alpha.weight"] = Entry{{2 * d.value_heads, d.hidden}, {b, a}};
+    if (d.experts == 0) {
+        e["attn_qkv_gate.weight"] = Entry{{d.conv_width() + d.value_width(), d.hidden}, {qkv, z}};
+        e["ssm_beta_alpha.weight"] = Entry{{2 * d.value_heads, d.hidden}, {b, a}};
+    }
     e["ssm_a"] = one({d.value_heads}, A + "A_log", &kALog);
     e["ssm_dt.bias"] = one({d.value_heads}, A + "dt_bias");
     e["ssm_conv1d.weight"] =
@@ -233,12 +270,20 @@ void add_head_tensors(const gguf::File& f, const gguf::File& head, std::string_v
 nlohmann::ordered_json config(const gguf::File& f, std::string_view arch, const Dimensions& d, int64_t layers,
                               int64_t mtp, const std::vector<bool>& linear) {
     const auto key = [&](std::string_view rest) { return str_cat(arch, ".", rest); };
+    const bool experts = d.experts > 0;
     nlohmann::ordered_json c;
-    c["architectures"] = {"Qwen3_5ForCausalLM"};
-    c["model_type"] = "qwen3_5_text";
+    c["architectures"] = {experts ? "Qwen3_5MoeForCausalLM" : "Qwen3_5ForCausalLM"};
+    c["model_type"] = experts ? "qwen3_5_moe_text" : "qwen3_5_text";
     c["vocab_size"] = d.vocab;
     c["hidden_size"] = d.hidden;
-    c["intermediate_size"] = d.ffn;
+    if (experts) {
+        c["num_experts"] = d.experts;
+        c["num_experts_per_tok"] = d.experts_used;
+        c["moe_intermediate_size"] = d.expert_ffn;
+        c["shared_expert_intermediate_size"] = d.shared_ffn;
+    } else {
+        c["intermediate_size"] = d.ffn;
+    }
     c["num_hidden_layers"] = layers;
     nlohmann::ordered_json types = nlohmann::ordered_json::array();
     for (const bool l : linear)
@@ -302,31 +347,40 @@ Layout layout(const Dimensions& d, int64_t layers, int64_t blocks, const std::ve
     return l;
 }
 
+// The language model of a file: its decoder, and its MTP head when the file, or a file of its own, holds one.
 class Qwen35 final : public Architecture {
 public:
-    std::string_view name() const override { return kArch; }
+    Qwen35(std::string_view name, Qwen35Mlp mlp) : name_(name), mlp_(mlp) {}
+
+    std::string_view name() const override { return name_; }
 
     ImportPlan plan(const gguf::File& f) const override { return plan_from(f, nullptr); }
     ImportPlan plan_with_mtp(const gguf::File& f, const gguf::File& mtp) const override { return plan_from(f, &mtp); }
 
 private:
     // The plan of the model file `f`, with its MTP head from the file `head` when one is given.
-    static ImportPlan plan_from(const gguf::File& f, const gguf::File* head) {
-        const Qwen35Decoder d = read_qwen35_decoder(f, kArch, {"nextn_predict_layers"}, head);
+    ImportPlan plan_from(const gguf::File& f, const gguf::File* head) const {
+        const Qwen35Decoder d = read_qwen35_decoder(f, name_, mlp_, {"nextn_predict_layers"}, head);
         ImportPlan plan;
         plan.config = d.config;
         plan.copies = d.copies;
-        map_tensors(d.tensors, kArch, d.layout, plan);
+        map_tensors(d.tensors, name_, d.layout, plan);
         return plan;
     }
+
+    std::string_view name_;
+    Qwen35Mlp mlp_;
 };
 
 }  // namespace
 
-Qwen35Decoder read_qwen35_decoder(const gguf::File& f, std::string_view arch, const std::set<std::string_view>& keys,
-                                  const gguf::File* head) {
+Qwen35Decoder read_qwen35_decoder(const gguf::File& f, std::string_view arch, Qwen35Mlp mlp,
+                                  const std::set<std::string_view>& keys, const gguf::File* head) {
     const auto key = [&](std::string_view rest) { return str_cat(arch, ".", rest); };
+    const bool experts = mlp == Qwen35Mlp::Experts;
+    const std::set<std::string_view>& mlp_keys = experts ? kExpertKeys : kDenseKeys;
     std::set<std::string_view> known = kDecoderKeys;
+    known.insert(mlp_keys.begin(), mlp_keys.end());
     known.insert(keys.begin(), keys.end());
     refuse_unknown_keys(f, arch, known);
     if (const gguf::Value* s = f.find(key("rope.scaling.type")); s != nullptr && s->as_string() != "none") {
@@ -338,7 +392,17 @@ Qwen35Decoder read_qwen35_decoder(const gguf::File& f, std::string_view arch, co
     Dimensions d{};
     d.vocab = embed->rows();
     d.hidden = positive(f, arch, key("embedding_length"));
-    d.ffn = positive(f, arch, key("feed_forward_length"));
+    if (experts) {
+        d.experts = positive(f, arch, key("expert_count"));
+        d.experts_used = positive(f, arch, key("expert_used_count"));
+        d.expert_ffn = positive(f, arch, key("expert_feed_forward_length"));
+        d.shared_ffn = positive(f, arch, key("expert_shared_feed_forward_length"));
+        if (d.experts_used > d.experts) {
+            fail(arch, ": expert_used_count ", d.experts_used, " of expert_count ", d.experts);
+        }
+    } else {
+        d.ffn = positive(f, arch, key("feed_forward_length"));
+    }
     d.heads = positive(f, arch, key("attention.head_count"));
     d.kv_heads = positive(f, arch, key("attention.head_count_kv"));
     d.head_dim =
@@ -409,7 +473,12 @@ Qwen35Decoder read_qwen35_decoder(const gguf::File& f, std::string_view arch, co
 }
 
 const Architecture& qwen35() {
-    static const Qwen35 arch;
+    static const Qwen35 arch("qwen35", Qwen35Mlp::Dense);
+    return arch;
+}
+
+const Architecture& qwen35moe() {
+    static const Qwen35 arch("qwen35moe", Qwen35Mlp::Experts);
     return arch;
 }
 

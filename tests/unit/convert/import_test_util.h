@@ -16,6 +16,7 @@
 #include "convert/gguf/gguf_import.h"
 #include "engine/spec/chain_drafter.h"
 #include "io/gguf_test_util.h"
+#include "model/step_logits.h"
 #include "models/model.h"
 #include "quant/quant.h"
 #include "util/error.h"
@@ -38,37 +39,10 @@ inline SessionOptions f32_session() {
     return so;
 }
 
-// The logits of a prefill of `prompt` and of one decode step per token of `steps` after it.
+// The logits of a prefill of `prompt` and of one decode step per token of `steps` after it, on cpu-ref.
 inline std::vector<std::vector<float>> step_logits(const Model& model, const std::vector<int32_t>& prompt,
                                                    const std::vector<int32_t>& steps) {
-    const auto backend = make_cpu_ref_backend();
-    const auto session = backend->compile(model.graph(), model.weights(), f32_session());
-    std::vector<std::vector<int32_t>> feeds{prompt};
-    for (const int32_t t : steps)
-        feeds.push_back({t});
-    std::vector<std::vector<float>> out;
-    int64_t pos = 0;
-    for (const std::vector<int32_t>& ids : feeds) {
-        TensorMap inputs, outputs;
-        model.prepare_inputs(ids, pos, {}, inputs);
-        session->run(inputs, outputs);
-        const HostTensor& l = outputs.at("logits");
-        out.emplace_back(l.data<float>(), l.data<float>() + l.numel());
-        pos += static_cast<int64_t>(ids.size());
-    }
-    return out;
-}
-
-// The largest difference between two runs' logits, over the largest logit of `b`.
-inline double relative_gap(const std::vector<std::vector<float>>& a, const std::vector<std::vector<float>>& b) {
-    double gap = 0.0, scale = 0.0;
-    for (size_t s = 0; s < a.size(); ++s) {
-        for (size_t i = 0; i < a[s].size(); ++i) {
-            gap = std::max(gap, static_cast<double>(std::fabs(a[s][i] - b[s][i])));
-            scale = std::max(scale, static_cast<double>(std::fabs(b[s][i])));
-        }
-    }
-    return gap / scale;
+    return step_logits(*make_cpu_ref_backend(), model, f32_session(), prompt, steps);
 }
 
 // `tokens` greedy tokens after `prompt`.
@@ -89,6 +63,24 @@ inline std::vector<int32_t> greedy(const Model& model, const std::vector<int32_t
         feed = {best};
     }
     return out;
+}
+
+// The MTP head's logits for three pairs (hidden row, next token), from its own program.
+inline std::vector<float> draft_logits(const Model& model) {
+    const Speculation* spec = model.speculation();
+    REQUIRE(spec != nullptr);
+    REQUIRE(spec->chain() != nullptr);
+    const auto backend = make_cpu_ref_backend();
+    const auto session = backend->compile(spec->draft_graph(), model.weights(), f32_session());
+    const int64_t hidden = model.info().hidden_size;
+    std::vector<float> rows(static_cast<size_t>(3 * hidden));
+    for (size_t i = 0; i < rows.size(); ++i)
+        rows[i] = std::sin(0.37f * static_cast<float>(i));
+    TensorMap inputs, outputs;
+    spec->chain()->prepare_draft(std::vector<int32_t>{5, 77, 266}, rows, 4, 0, inputs);
+    session->run(inputs, outputs);
+    const HostTensor& l = outputs.at("logits");
+    return {l.data<float>(), l.data<float>() + l.numel()};
 }
 
 // A model's drafter after a prefill of `prompt`: its logits for (the first greedy token, the prompt's last hidden row),

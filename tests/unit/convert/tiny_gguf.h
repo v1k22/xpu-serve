@@ -10,7 +10,11 @@
 // And its twin: the Hugging Face checkpoint those bytes stand for, every weight as the f32 values the file's blocks
 // decode to, in the grouped order, with the norms and A_log computed back the way the import computes them.
 //
-// The decoder's part (put_tiny_decoder) also writes the decoder of a clef file (tiny_clef_gguf.h).
+// The decoder's part (put_tiny_decoder) also writes the decoder of a clef file (tiny_clef_gguf.h), and that of a tiny
+// qwen35moe GGUF (Qwen3_5MoeTextModel; build_tiny_moe_gguf), whose layers and MTP block hold a mixture of experts: the
+// router F32, the gate and up banks as two 3-D tensors where the checkpoint has one (in different formats in some
+// blocks, block formats and floats), the shared expert, and its gate stored 1-D as llama-quantize leaves it. Its twin
+// holds the fused banks.
 
 #include <cmath>
 #include <filesystem>
@@ -37,6 +41,13 @@ namespace xs::test {
 inline TinyQwen tiny_gguf_model() {
     TinyQwen m;
     m.vocab = 288;
+    return m;
+}
+
+// The same with a mixture of experts in every layer.
+inline TinyQwen tiny_moe_gguf_model() {
+    TinyQwen m = tiny_gguf_model();
+    m.experts = 8;
     return m;
 }
 
@@ -259,29 +270,49 @@ inline int32_t tiny_eos() {
     return tiny_tokenizer_json()["added_tokens"][2]["id"];
 }
 
-// Writes `hf`: the tiny checkpoint (tiny_gguf_model()), its tokenizer and chat template.
-inline void write_tiny_hf(const std::filesystem::path& hf, uint32_t seed) {
-    write_tiny_qwen(hf, tiny_gguf_model(), seed);
+// Writes `hf`: the tiny checkpoint `m`, its tokenizer and chat template.
+inline void write_tiny_hf(const std::filesystem::path& hf, uint32_t seed, const TinyQwen& m = tiny_gguf_model()) {
+    write_tiny_qwen(hf, m, seed);
     std::ofstream(hf / "tokenizer.json") << tiny_tokenizer_json().dump();
     std::ofstream(hf / "tokenizer_config.json") << R"({"eos_token": "<|im_end|>", "bos_token": null})";
     std::ofstream(hf / "chat_template.jinja") << kTinyChatTemplate;
 }
 
-// The tiny checkpoint in `checkpoint` as the converter writes a Qwen3.5 decoder into a GGUF of architecture `arch`:
+// The formats of block `block`'s expert banks in the tiny qwen35moe GGUF: gate and up in different ones in blocks 0, 2
+// and 4 (the MTP block), a float bank beside a block format one in 2 and 4.
+struct TinyBankStorage {
+    Storage gate, up, down;
+};
+inline TinyBankStorage tiny_bank_storage(int64_t block) {
+    static const TinyBankStorage table[] = {{Storage::Q4_0, Storage::Q8_0, Storage::Q8_0},
+                                            {Storage::Q8_0, Storage::Q8_0, Storage::BF16},
+                                            {Storage::F16, Storage::Q4_0, Storage::Q4_0},
+                                            {Storage::Q4_0, Storage::Q4_0, Storage::Q8_0},
+                                            {Storage::Q8_0, Storage::BF16, Storage::Q4_0}};
+    return table[block % 5];
+}
+
+// The tiny checkpoint `m` in `checkpoint` as the converter writes a Qwen3.5 decoder into a GGUF of architecture `arch`:
 // its keys under "<arch>.", the tokenizer's, and its tensors into `w`, with an MTP head when `mtp`; their twin's into
 // `b`.
 inline void put_tiny_decoder(GgufWriter& w, TinyGgufBuilder& b, const std::filesystem::path& checkpoint,
-                             const std::string& arch, bool mtp, uint32_t seed) {
-    const TinyQwen m = tiny_gguf_model();
+                             const std::string& arch, bool mtp, uint32_t seed, const TinyQwen& m = tiny_gguf_model()) {
     const int64_t h = m.hidden, hk = m.lin_k_heads, hv = m.lin_v_heads, dv = m.lin_dim;
     const int64_t key_width = hk * m.lin_dim, value_width = hv * dv, conv_width = 2 * key_width + value_width;
     const auto layers = static_cast<int64_t>(m.layers.size());
     const auto key = [&](const char* rest) { return arch + "." + rest; };
     w.u32(key("block_count"), static_cast<uint32_t>(layers + (mtp ? 1 : 0)))
         .u32(key("context_length"), 4096)
-        .u32(key("embedding_length"), static_cast<uint32_t>(h))
-        .u32(key("feed_forward_length"), static_cast<uint32_t>(m.ffn))
-        .u32(key("attention.head_count"), static_cast<uint32_t>(m.heads))
+        .u32(key("embedding_length"), static_cast<uint32_t>(h));
+    if (m.experts > 0) {
+        w.u32(key("expert_count"), static_cast<uint32_t>(m.experts))
+            .u32(key("expert_used_count"), static_cast<uint32_t>(m.top_k))
+            .u32(key("expert_feed_forward_length"), static_cast<uint32_t>(m.moe_ffn))
+            .u32(key("expert_shared_feed_forward_length"), static_cast<uint32_t>(m.shared_ffn));
+    } else {
+        w.u32(key("feed_forward_length"), static_cast<uint32_t>(m.ffn));
+    }
+    w.u32(key("attention.head_count"), static_cast<uint32_t>(m.heads))
         .u32(key("attention.head_count_kv"), static_cast<uint32_t>(m.kv_heads))
         .i32s(key("rope.dimension_sections"), {11, 11, 10, 0})
         .f32(key("rope.freq_base"), 1e7f)
@@ -334,6 +365,47 @@ inline void put_tiny_decoder(GgufWriter& w, TinyGgufBuilder& b, const std::files
         b.put(gguf, shape, plus_one(v), Storage::F32, unnorm, {{hf, shape}});
     };
 
+    // The MLP of block `block`, the twin's under `M` (".../mlp."), its weights from `get` (a name after M, its shape).
+    const auto mlp = [&](int64_t block, const std::string& M, const auto& get) {
+        const std::string B = "blk." + std::to_string(block) + ".";
+        if (m.experts == 0) {
+            const Dims in{m.ffn, h}, out{h, m.ffn};
+            matrix(B + "ffn_gate.weight", M + "gate_proj.weight", in, get("gate_proj.weight", in), next_block());
+            matrix(B + "ffn_up.weight", M + "up_proj.weight", in, get("up_proj.weight", in), next_block());
+            matrix(B + "ffn_down.weight", M + "down_proj.weight", out, get("down_proj.weight", out),
+                   block == 1 ? Storage::BF16 : next_block());
+            return;
+        }
+        const int64_t half = m.moe_ffn * h;  // the values of an expert's gate rows, or of its up rows
+        const Dims router{m.experts, h}, bank{m.experts, m.moe_ffn, h}, fused{m.experts, 2 * m.moe_ffn, h};
+        const Dims down{m.experts, h, m.moe_ffn}, in{m.shared_ffn, h}, out{h, m.shared_ffn};
+        const TinyBankStorage storage = tiny_bank_storage(block);
+        matrix(B + "ffn_gate_inp.weight", M + "gate.weight", router, get("gate.weight", router), Storage::F32);
+        const std::vector<float> gate_up = get("experts.gate_up_proj", fused);
+        std::vector<float> gate, up, held;
+        for (int64_t e = 0; e < m.experts; ++e) {
+            const auto at = gate_up.begin() + e * 2 * half;
+            gate.insert(gate.end(), at, at + half);
+            up.insert(up.end(), at + half, at + 2 * half);
+        }
+        gate = b.store(B + "ffn_gate_exps.weight", bank, gate, storage.gate);
+        up = b.store(B + "ffn_up_exps.weight", bank, up, storage.up);
+        for (int64_t e = 0; e < m.experts; ++e) {
+            held.insert(held.end(), gate.begin() + e * half, gate.begin() + (e + 1) * half);
+            held.insert(held.end(), up.begin() + e * half, up.begin() + (e + 1) * half);
+        }
+        b.twin(M + "experts.gate_up_proj", fused, std::move(held));
+        matrix(B + "ffn_down_exps.weight", M + "experts.down_proj", down, get("experts.down_proj", down), storage.down);
+        matrix(B + "ffn_gate_shexp.weight", M + "shared_expert.gate_proj.weight", in,
+               get("shared_expert.gate_proj.weight", in), next_block());
+        matrix(B + "ffn_up_shexp.weight", M + "shared_expert.up_proj.weight", in,
+               get("shared_expert.up_proj.weight", in), next_block());
+        matrix(B + "ffn_down_shexp.weight", M + "shared_expert.down_proj.weight", out,
+               get("shared_expert.down_proj.weight", out), next_block());
+        b.put(B + "ffn_gate_inp_shexp.weight", {h}, get("shared_expert_gate.weight", {1, h}), Storage::F32, same,
+              {{M + "shared_expert_gate.weight", {1, h}}});
+    };
+
     matrix("token_embd.weight", "model.embed_tokens.weight", {m.vocab, h}, values("model.embed_tokens.weight"),
            Storage::Q8_0);
     norm("output_norm.weight", "model.norm.weight", values("model.norm.weight"));
@@ -350,12 +422,7 @@ inline void put_tiny_decoder(GgufWriter& w, TinyGgufBuilder& b, const std::files
         norm(B + "attn_norm.weight", L + "input_layernorm.weight", values(L + "input_layernorm.weight"));
         norm(B + "post_attention_norm.weight", L + "post_attention_layernorm.weight",
              values(L + "post_attention_layernorm.weight"));
-        matrix(B + "ffn_gate.weight", L + "mlp.gate_proj.weight", {m.ffn, h}, values(L + "mlp.gate_proj.weight"),
-               next_block());
-        matrix(B + "ffn_up.weight", L + "mlp.up_proj.weight", {m.ffn, h}, values(L + "mlp.up_proj.weight"),
-               next_block());
-        matrix(B + "ffn_down.weight", L + "mlp.down_proj.weight", {h, m.ffn}, values(L + "mlp.down_proj.weight"),
-               i == 1 ? Storage::BF16 : next_block());
+        mlp(i, L + "mlp.", [&](const std::string& name, const Dims&) { return values(L + "mlp." + name); });
         if (m.layers[static_cast<size_t>(i)] == "full_attention") {
             const std::string A = L + "self_attn.";
             matrix(B + "attn_q.weight", A + "q_proj.weight", {2 * m.heads * m.head_dim, h}, values(A + "q_proj.weight"),
@@ -376,7 +443,7 @@ inline void put_tiny_decoder(GgufWriter& w, TinyGgufBuilder& b, const std::files
         const std::vector<float> z_t = tiled(values(A + "in_proj_z.weight"), z, 0, 0, dv);
         const std::vector<float> b_t = tiled(values(A + "in_proj_b.weight"), ab, 0, 0, 1);
         const std::vector<float> a_t = tiled(values(A + "in_proj_a.weight"), ab, 0, 0, 1);
-        if (i == 0) {  // one tensor each for [qkv; z] and [b; a]
+        if (i == 0 && m.experts == 0) {  // one tensor each for [qkv; z] and [b; a], which only a dense model's file has
             std::vector<float> qkvz = qkv_t;
             qkvz.insert(qkvz.end(), z_t.begin(), z_t.end());
             b.put(B + "attn_qkv_gate.weight", {conv_width + value_width, h}, qkvz, next_block(),
@@ -437,10 +504,10 @@ inline void put_tiny_decoder(GgufWriter& w, TinyGgufBuilder& b, const std::files
            random({h, m.heads * m.head_dim}, 1.0f / std::sqrt(static_cast<float>(m.heads * m.head_dim))), next_block());
     norm(B + "attn_q_norm.weight", M + "self_attn.q_norm.weight", random({m.head_dim}, 0.1f));
     norm(B + "attn_k_norm.weight", M + "self_attn.k_norm.weight", random({m.head_dim}, 0.1f));
-    matrix(B + "ffn_gate.weight", M + "mlp.gate_proj.weight", {m.ffn, h}, random({m.ffn, h}, in), next_block());
-    matrix(B + "ffn_up.weight", M + "mlp.up_proj.weight", {m.ffn, h}, random({m.ffn, h}, in), next_block());
-    matrix(B + "ffn_down.weight", M + "mlp.down_proj.weight", {h, m.ffn},
-           random({h, m.ffn}, 1.0f / std::sqrt(static_cast<float>(m.ffn))), next_block());
+    // Matrices at 1/sqrt(fan-in); a router larger, so that each token's experts win clearly.
+    mlp(layers, M + "mlp.", [&](const std::string& name, const Dims& shape) {
+        return random(shape, (name == "gate.weight" ? 8.0f : 1.0f) / std::sqrt(static_cast<float>(shape.back())));
+    });
     matrix(B + "nextn.eh_proj.weight", "mtp.fc.weight", {h, 2 * h},
            random({h, 2 * h}, 1.0f / std::sqrt(static_cast<float>(2 * h))), next_block());
     norm(B + "nextn.enorm.weight", "mtp.pre_fc_norm_embedding.weight", random({h}, 0.1f));
@@ -463,20 +530,32 @@ inline void write_tiny_twin(const std::filesystem::path& dir, const TinyGgufBuil
     }
 }
 
-// Writes, under `dir`: hf/ (the tiny checkpoint, its tokenizer and chat template), twin/ (the checkpoint the GGUF
-// stands for). Returns the GGUF's writer: the test writes the file, as it is or changed.
-inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t seed) {
-    write_tiny_hf(dir / "hf", seed);
+// Writes, under `dir`: hf/ (the tiny checkpoint `m`, its tokenizer and chat template), twin/ (the checkpoint the GGUF
+// stands for). Returns the writer of the GGUF, of architecture `arch` and named `name`, with an MTP head: the test
+// writes the file, as it is or changed.
+inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t seed, const TinyQwen& m,
+                                  const std::string& arch, const std::string& name) {
+    write_tiny_hf(dir / "hf", seed, m);
     GgufWriter w;
-    w.string("general.architecture", "qwen35")
+    w.string("general.architecture", arch)
         .string("general.type", "model")
-        .string("general.name", "Tiny Qwen3.5")
+        .string("general.name", name)
         .u32("general.file_type", 7)
         .u32("general.quantization_version", 2);
     TinyGgufBuilder b(w);
-    put_tiny_decoder(w, b, dir / "hf", "qwen35", true, seed);
+    put_tiny_decoder(w, b, dir / "hf", arch, true, seed, m);
     write_tiny_twin(dir, b, 1);
     return w;
+}
+
+// The tiny qwen35 GGUF.
+inline GgufWriter build_tiny_gguf(const std::filesystem::path& dir, uint32_t seed) {
+    return build_tiny_gguf(dir, seed, tiny_gguf_model(), "qwen35", "Tiny Qwen3.5");
+}
+
+// The tiny qwen35moe GGUF.
+inline GgufWriter build_tiny_moe_gguf(const std::filesystem::path& dir, uint32_t seed) {
+    return build_tiny_gguf(dir, seed, tiny_moe_gguf_model(), "qwen35moe", "Tiny Qwen3.5 MoE");
 }
 
 // A pack tensor's values in the twin's order: the import keeps linear attention's value heads tiled.
@@ -498,26 +577,26 @@ inline std::vector<float> grouped_values(const std::string& name, const TensorVi
     return values;
 }
 
-// The tiny GGUF of build_tiny_gguf as unsloth publishes the small files of a model: the model without its MTP head
-// (block_count and nextn_predict_layers say so), and the head in a file of its own, llama.cpp's draft model of it.
-// That file has the qwen35.* metadata of a file that holds the head and no tokenizer; its tensors are the head's block,
-// with the same bytes, and a token_embd, output and output_norm of its own (Q4_0, Q4_0 and F16, where the model's are
-// Q8_0, tied to the embedding and F32).
+// A tiny GGUF of architecture `arch` (build_tiny_gguf, build_tiny_moe_gguf) as unsloth publishes the small files of a
+// model: the model without its MTP head (block_count and nextn_predict_layers say so), and the head in a file of its
+// own, llama.cpp's draft model of it. That file has the <arch>.* metadata of a file that holds the head and no
+// tokenizer; its tensors are the head's block, with the same bytes, and a token_embd, output and output_norm of its own
+// (Q4_0, Q4_0 and F16, where the model's are Q8_0, tied to the embedding and F32).
 struct TinyMtpFiles {
     GgufWriter model, mtp;
 };
 
-inline TinyMtpFiles split_tiny_gguf(const GgufWriter& with_head) {
+inline TinyMtpFiles split_tiny_gguf(const GgufWriter& with_head, const std::string& arch = "qwen35") {
     const TinyQwen m = tiny_gguf_model();
     const auto layers = static_cast<uint32_t>(m.layers.size());
     const std::string head = "blk." + std::to_string(layers) + ".";
     const auto in_head = [&](const std::string& name) { return name.rfind(head, 0) == 0; };
     TinyMtpFiles out{with_head, with_head};
     out.model.drop_tensors_if(in_head)
-        .drop_value("qwen35.block_count")
-        .u32("qwen35.block_count", layers)
-        .drop_value("qwen35.nextn_predict_layers")
-        .u32("qwen35.nextn_predict_layers", 0);
+        .drop_value(arch + ".block_count")
+        .u32(arch + ".block_count", layers)
+        .drop_value(arch + ".nextn_predict_layers")
+        .u32(arch + ".nextn_predict_layers", 0);
     out.mtp.drop_tensors_if([&](const std::string& name) { return !in_head(name); })
         .drop_values_if([](const std::string& key) { return key.rfind("tokenizer.", 0) == 0 || key == "general.name"; })
         .string("general.name", "Tiny Qwen3.5 MTP");

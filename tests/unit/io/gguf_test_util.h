@@ -121,6 +121,17 @@ public:
         std::erase_if(tensors_, [&](const Tensor& t) { return drop(t.name); });
         return *this;
     }
+    // Exchanges the names of two tensors: each then holds what the other held (a test's planted mix-up).
+    GgufWriter& swap_tensors(std::string_view a, std::string_view b) {
+        for (Tensor& t : tensors_) {
+            if (t.name == a) {
+                t.name = b;
+            } else if (t.name == b) {
+                t.name = a;
+            }
+        }
+        return *this;
+    }
     // A string value's text (the first of that key), for a test that rewrites it.
     std::string string_value(std::string_view key) const {
         for (const Kv& kv : kvs_) {

@@ -27,6 +27,7 @@
 
 using namespace xs;
 namespace fs = std::filesystem;
+using xs::test::draft_logits;
 using xs::test::GgufWriter;
 using xs::test::has;
 using xs::test::import_into;
@@ -41,24 +42,6 @@ const std::vector<int32_t> kSteps{11, 200, 1};
 
 std::vector<std::vector<float>> step_logits(const Model& model) {
     return xs::test::step_logits(model, kPrompt, kSteps);
-}
-
-// The MTP head's logits for three pairs (hidden row, next token), from its own program.
-std::vector<float> draft_logits(const Model& model) {
-    const Speculation* spec = model.speculation();
-    REQUIRE(spec != nullptr);
-    REQUIRE(spec->chain() != nullptr);
-    const auto backend = make_cpu_ref_backend();
-    const auto session = backend->compile(spec->draft_graph(), model.weights(), xs::test::f32_session());
-    const int64_t hidden = model.info().hidden_size;
-    std::vector<float> rows(static_cast<size_t>(3 * hidden));
-    for (size_t i = 0; i < rows.size(); ++i)
-        rows[i] = std::sin(0.37f * static_cast<float>(i));
-    TensorMap inputs, outputs;
-    spec->chain()->prepare_draft(std::vector<int32_t>{5, 77, 266}, rows, 4, 0, inputs);
-    session->run(inputs, outputs);
-    const HostTensor& l = outputs.at("logits");
-    return {l.data<float>(), l.data<float>() + l.numel()};
 }
 
 // The tiny GGUF with `change` applied, imported into a fresh directory: the error it gives, or "" when it imports.
@@ -376,10 +359,8 @@ TEST_SUITE("gguf import") {
                 w.drop_value("general.architecture").string("general.architecture", name);
             });
         };
-        CHECK(architecture("llama").find("GGUF architecture 'llama' is not supported (supported: qwen35, gemma4, "
-                                         "gemma4-assistant, clef, modern-bert)") != std::string::npos);
-        CHECK(architecture("qwen35moe").find("'qwen35moe' (Qwen3.5 mixture of experts) is not supported yet") !=
-              std::string::npos);
+        CHECK(architecture("llama").find("GGUF architecture 'llama' is not supported (supported: qwen35, qwen35moe, "
+                                         "gemma4, gemma4-assistant, clef, modern-bert)") != std::string::npos);
         CHECK(
             refusal(work.path,
                     [](GgufWriter& w) { w.f32_tensor("blk.0.ssm_extra.weight", {128}, std::vector<float>(128, 0.0f)); })

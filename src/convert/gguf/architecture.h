@@ -1,11 +1,11 @@
 #pragma once
 
-// What a GGUF architecture's importer provides (one file per architecture: qwen35.cpp, gemma4.cpp, clef.cpp,
-// modern_bert.cpp): from the file's metadata the config.json the model code reads (and any other JSON file of the
-// pack), and for every tensor of the file the pack tensors it becomes, under the names the model code reads. The
-// import driver (gguf_import.cpp) writes them: a tensor in a block format byte for byte, a float tensor as stored or
-// through a value-by-value transform. A quantized tensor is never decoded, re-encoded or reordered; it can only be
-// cut into runs of whole rows.
+// What a GGUF architecture's importer provides (one file per architecture, or per pair that shares a reader:
+// qwen35.cpp, gemma4.cpp, clef.cpp, modern_bert.cpp): from the file's metadata the config.json the model code reads
+// (and any other JSON file of the pack), and for every tensor of the file the pack tensors it becomes, under the names
+// the model code reads. The import driver (gguf_import.cpp) writes them: a tensor in a block format byte for byte, a
+// float tensor as stored or through a value-by-value transform. A quantized tensor is never decoded, re-encoded or
+// reordered; it can only be cut into runs of whole rows.
 //
 // A model's MTP head can come in a file of its own (`convert --mtp`): the plan then draws its tensors from two files,
 // and is the plan of a model file that held the head.
@@ -80,6 +80,7 @@ public:
 };
 
 const Architecture& qwen35();
+const Architecture& qwen35moe();
 const Architecture& gemma4();
 const Architecture& gemma4_assistant();
 const Architecture& clef();
