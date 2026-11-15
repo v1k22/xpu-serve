@@ -631,8 +631,81 @@ constexpr bool by_quarters(BlockFormat f, int m) {
     }
 }
 
-// A sub-group takes kRows rows; a lane takes units lane, lane + 16, ... of each, so a unit's x loads once for the
-// rows and its codes decode once for the M inputs. Over a half unit dot(w, x) = a dot(wv, x) + b sum(x).
+// acc[r][mm] += row rp[r] of w . xs[mm] over this lane's units: a lane takes units lane, lane + 16, ... of each row, so
+// a unit's x loads once for the rows and its codes decode once for the M inputs. Over a half unit
+// dot(w, x) = a dot(wv, x) + b sum(x).
+template <BlockFormat F, int M>
+inline void block_rows_dot(const Streams& w, const RowPtr (&rp)[kRows], const float* const (&xs)[M], int lane,
+                           int32_t units, float (&acc)[kRows][M]) {
+    for (int32_t u = lane; u < units; u += kSubGroup) {
+        float a[kRows][2];
+        float b[kRows][2];
+        if constexpr (by_quarters(F, M)) {
+            float dot[kRows][M][2] = {};
+            float xsum[M][2] = {};
+            const typename Fmt<F>::Fields f[kRows] = {Fmt<F>::fields(rp[0], u), Fmt<F>::fields(rp[1], u)};
+            for (int r = 0; r < kRows; ++r)
+                fast_affine<F>(f[r], a[r], b[r]);
+            for (int t = 0; t < 4; ++t) {
+                float wv[kRows][8];
+                for (int r = 0; r < kRows; ++r)
+                    fast_quarter<F>(f[r], w.grid, t, wv[r]);
+                for (int mm = 0; mm < M; ++mm) {
+                    const auto* xp =
+                        reinterpret_cast<const sycl::vec<float, 4>*>(xs[mm] + static_cast<int64_t>(u) * kUnit + 8 * t);
+                    const sycl::vec<float, 4> x0 = xp[0];
+                    const sycl::vec<float, 4> x1 = xp[1];
+                    if constexpr (Fmt<F>::kTrick) {
+                        xsum[mm][t >> 1] += ((x0[0] + x0[1]) + (x0[2] + x0[3])) + ((x1[0] + x1[1]) + (x1[2] + x1[3]));
+                    }
+                    for (int r = 0; r < kRows; ++r) {
+                        float d = 0.0f;
+                        for (int i = 0; i < 4; ++i)
+                            d += wv[r][i] * x0[i] + wv[r][4 + i] * x1[i];
+                        dot[r][mm][t >> 1] += d;
+                    }
+                }
+            }
+            for (int r = 0; r < kRows; ++r) {
+                for (int mm = 0; mm < M; ++mm) {
+                    acc[r][mm] += a[r][0] * dot[r][mm][0] + a[r][1] * dot[r][mm][1];
+                    if constexpr (Fmt<F>::kTrick) acc[r][mm] += b[r][0] * xsum[mm][0] + b[r][1] * xsum[mm][1];
+                }
+            }
+        } else {
+            float wv[kRows][kUnit];
+            for (int r = 0; r < kRows; ++r) {
+                const auto f = Fmt<F>::fields(rp[r], u);
+                for (int t = 0; t < 4; ++t)
+                    fast_quarter<F>(f, w.grid, t, &wv[r][8 * t]);
+                fast_affine<F>(f, a[r], b[r]);
+            }
+            for (int mm = 0; mm < M; ++mm) {
+                float xv[kUnit];
+                const auto* xp = reinterpret_cast<const sycl::vec<float, 4>*>(xs[mm] + static_cast<int64_t>(u) * kUnit);
+                for (int i = 0; i < kUnit / 4; ++i) {
+                    const sycl::vec<float, 4> v = xp[i];
+                    for (int j = 0; j < 4; ++j)
+                        xv[4 * i + j] = v[j];
+                }
+                float sum[2] = {0.0f, 0.0f};
+                if constexpr (Fmt<F>::kTrick) {
+                    for (int i = 0; i < kUnit; ++i)
+                        sum[i >> 4] += xv[i];
+                }
+                for (int r = 0; r < kRows; ++r) {
+                    float d[2] = {0.0f, 0.0f};
+                    for (int i = 0; i < kUnit; ++i)
+                        d[i >> 4] += wv[r][i] * xv[i];
+                    acc[r][mm] += a[r][0] * d[0] + a[r][1] * d[1];
+                    if constexpr (Fmt<F>::kTrick) acc[r][mm] += b[r][0] * sum[0] + b[r][1] * sum[1];
+                }
+            }
+        }
+    }
+}
+
+// A sub-group takes kRows rows of the weight (block_rows_dot).
 template <BlockFormat F, int M>
 void gemv_block_t(sycl::queue& q, const float* x, const Streams& w, float* y, int64_t m, int64_t n, int64_t k) {
     const int64_t wgs = ceil_div(n, kSgPerWg * kRows);
@@ -653,78 +726,86 @@ void gemv_block_t(sycl::queue& q, const float* x, const Streams& w, float* y, in
             for (int mm = 0; mm < M; ++mm)
                 xs[mm] = x + std::min(mm, inputs - 1) * k;  // unused inputs repeat the last
             float acc[kRows][M] = {};
-            for (int32_t u = lane; u < units; u += kSubGroup) {
-                float a[kRows][2];
-                float b[kRows][2];
-                if constexpr (by_quarters(F, M)) {
-                    float dot[kRows][M][2] = {};
-                    float xsum[M][2] = {};
-                    const typename Fmt<F>::Fields f[kRows] = {Fmt<F>::fields(rp[0], u), Fmt<F>::fields(rp[1], u)};
-                    for (int r = 0; r < kRows; ++r)
-                        fast_affine<F>(f[r], a[r], b[r]);
-                    for (int t = 0; t < 4; ++t) {
-                        float wv[kRows][8];
-                        for (int r = 0; r < kRows; ++r)
-                            fast_quarter<F>(f[r], w.grid, t, wv[r]);
-                        for (int mm = 0; mm < M; ++mm) {
-                            const auto* xp = reinterpret_cast<const sycl::vec<float, 4>*>(
-                                xs[mm] + static_cast<int64_t>(u) * kUnit + 8 * t);
-                            const sycl::vec<float, 4> x0 = xp[0];
-                            const sycl::vec<float, 4> x1 = xp[1];
-                            if constexpr (Fmt<F>::kTrick) {
-                                xsum[mm][t >> 1] +=
-                                    ((x0[0] + x0[1]) + (x0[2] + x0[3])) + ((x1[0] + x1[1]) + (x1[2] + x1[3]));
-                            }
-                            for (int r = 0; r < kRows; ++r) {
-                                float d = 0.0f;
-                                for (int i = 0; i < 4; ++i)
-                                    d += wv[r][i] * x0[i] + wv[r][4 + i] * x1[i];
-                                dot[r][mm][t >> 1] += d;
-                            }
-                        }
-                    }
-                    for (int r = 0; r < kRows; ++r) {
-                        for (int mm = 0; mm < M; ++mm) {
-                            acc[r][mm] += a[r][0] * dot[r][mm][0] + a[r][1] * dot[r][mm][1];
-                            if constexpr (Fmt<F>::kTrick) acc[r][mm] += b[r][0] * xsum[mm][0] + b[r][1] * xsum[mm][1];
-                        }
-                    }
-                } else {
-                    float wv[kRows][kUnit];
-                    for (int r = 0; r < kRows; ++r) {
-                        const auto f = Fmt<F>::fields(rp[r], u);
-                        for (int t = 0; t < 4; ++t)
-                            fast_quarter<F>(f, w.grid, t, &wv[r][8 * t]);
-                        fast_affine<F>(f, a[r], b[r]);
-                    }
-                    for (int mm = 0; mm < M; ++mm) {
-                        float xv[kUnit];
-                        const auto* xp =
-                            reinterpret_cast<const sycl::vec<float, 4>*>(xs[mm] + static_cast<int64_t>(u) * kUnit);
-                        for (int i = 0; i < kUnit / 4; ++i) {
-                            const sycl::vec<float, 4> v = xp[i];
-                            for (int j = 0; j < 4; ++j)
-                                xv[4 * i + j] = v[j];
-                        }
-                        float sum[2] = {0.0f, 0.0f};
-                        if constexpr (Fmt<F>::kTrick) {
-                            for (int i = 0; i < kUnit; ++i)
-                                sum[i >> 4] += xv[i];
-                        }
-                        for (int r = 0; r < kRows; ++r) {
-                            float d[2] = {0.0f, 0.0f};
-                            for (int i = 0; i < kUnit; ++i)
-                                d[i >> 4] += wv[r][i] * xv[i];
-                            acc[r][mm] += a[r][0] * d[0] + a[r][1] * d[1];
-                            if constexpr (Fmt<F>::kTrick) acc[r][mm] += b[r][0] * sum[0] + b[r][1] * sum[1];
-                        }
-                    }
-                }
-            }
+            block_rows_dot<F, M>(w, rp, xs, lane, units, acc);
             for (int r = 0; r < kRows; ++r) {
                 for (int mm = 0; mm < M; ++mm) {
                     const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
                     if (lane == 0 && row0 + r < n && mm < inputs) y[mm * n + row0 + r] = sum;
+                }
+            }
+        });
+}
+
+// ExpertMatMul over a bank (rows = E * N), a GEMV per (token, slot) pair on the pair's expert: one work-group per pair
+// and kSgPerWg * kRows of the expert's rows.
+template <BlockFormat F, typename I>
+void expert_block_pairs_t(sycl::queue& q, const float* x, bool per_slot, const Streams& w, const I* idx, float* out,
+                          int64_t pairs, int64_t slots, int64_t experts, int64_t n, int64_t k) {
+    const int64_t blocks = ceil_div(n, kSgPerWg * kRows);
+    const auto units = static_cast<int32_t>(k / kUnit);
+    syclex::nd_launch(
+        q, sycl::nd_range<1>(static_cast<size_t>(pairs * blocks * kSgPerWg * kSubGroup), kSgPerWg * kSubGroup),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = static_cast<int>(sg.get_local_linear_id());
+            const int64_t p = static_cast<int64_t>(it.get_group(0)) / blocks;
+            const int64_t block = static_cast<int64_t>(it.get_group(0)) % blocks;
+            const int64_t row0 = (block * kSgPerWg + static_cast<int64_t>(sg.get_group_linear_id())) * kRows;
+            const int64_t base = expert_of(idx, p, experts) * n;
+            RowPtr rp[kRows];
+            for (int r = 0; r < kRows; ++r)
+                rp[r] = row_ptr(w, base + std::min<int64_t>(row0 + r, n - 1));
+            const float* const xs[1] = {x + (per_slot ? p : p / slots) * k};
+            float acc[kRows][1] = {};
+            block_rows_dot<F, 1>(w, rp, xs, lane, units, acc);
+            for (int r = 0; r < kRows; ++r) {
+                const float sum = sycl::reduce_over_group(sg, acc[r][0], sycl::plus<float>());
+                if (lane == 0 && row0 + r < n) out[p * n + row0 + r] = sum;
+            }
+        });
+}
+
+// The same with the pairs grouped by expert (expert_group): one work-group per (expert with pairs, block of rows); it
+// walks the expert's pairs kGemvMaxRows at a time, so an expert's rows are read once per that many pairs.
+template <BlockFormat F>
+void expert_block_grouped_t(sycl::queue& q, const float* x, bool per_slot, const Streams& w, float* out, int64_t slots,
+                            int64_t experts, int64_t n, int64_t k, const int32_t* grouping, int64_t max_active) {
+    constexpr int M = static_cast<int>(kGemvMaxRows);
+    const int64_t blocks = ceil_div(n, kSgPerWg * kRows);
+    const auto units = static_cast<int32_t>(k / kUnit);
+    const int32_t* offsets = expert_offsets(grouping, experts);
+    const int32_t* order = expert_order(grouping, experts);
+    const int32_t* active = expert_active(grouping, experts);
+    const int32_t* n_active = expert_active_count(grouping, experts);
+    syclex::nd_launch(
+        q, sycl::nd_range<1>(static_cast<size_t>(max_active * blocks * kSgPerWg * kSubGroup), kSgPerWg * kSubGroup),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+            const int64_t a = static_cast<int64_t>(it.get_group(0)) / blocks;
+            if (a >= *n_active) return;  // uniform across the work-group
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = static_cast<int>(sg.get_local_linear_id());
+            const int64_t block = static_cast<int64_t>(it.get_group(0)) % blocks;
+            const int64_t row0 = (block * kSgPerWg + static_cast<int64_t>(sg.get_group_linear_id())) * kRows;
+            const int64_t e = active[a];
+            const int64_t begin = offsets[e];
+            const int64_t end = offsets[e + 1];
+            RowPtr rp[kRows];
+            for (int r = 0; r < kRows; ++r)
+                rp[r] = row_ptr(w, e * n + std::min<int64_t>(row0 + r, n - 1));
+            for (int64_t c = begin; c < end; c += M) {
+                int64_t ps[M];
+                const float* xs[M];
+                for (int mm = 0; mm < M; ++mm) {
+                    ps[mm] = order[std::min<int64_t>(c + mm, end - 1)];
+                    xs[mm] = x + (per_slot ? ps[mm] : ps[mm] / slots) * k;
+                }
+                float acc[kRows][M] = {};
+                block_rows_dot<F, M>(w, rp, xs, lane, units, acc);
+                for (int r = 0; r < kRows; ++r) {
+                    for (int mm = 0; mm < M; ++mm) {
+                        const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
+                        if (lane == 0 && c + mm < end && row0 + r < n) out[ps[mm] * n + row0 + r] = sum;
+                    }
                 }
             }
         });
@@ -1102,6 +1183,33 @@ void gemv_block_xmx(sycl::queue& q, const float* x, const BlockWeight& w, float*
     dispatch(w.format, [&]<BlockFormat F>() { gemv_block_xmx_t<F>(q, s, xh, xs, y, m, n, k, compute_units); });
 }
 
+template <typename I>
+void expert_matmul_block(sycl::queue& q, const float* x, bool per_slot, const BlockWeight& w, const I* idx, float* out,
+                         int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping) {
+    const Streams s = streams_of(w, k);
+    const int64_t pairs = tokens * slots;
+    if (pairs <= kExpertPairsDirect || grouping == nullptr) {
+        dispatch(w.format, [&]<BlockFormat F>() {
+            expert_block_pairs_t<F, I>(q, x, per_slot, s, idx, out, pairs, slots, experts, n, k);
+        });
+        return;
+    }
+    expert_group(q, idx, pairs, experts, grouping);
+    dispatch(w.format, [&]<BlockFormat F>() {
+        expert_block_grouped_t<F>(q, x, per_slot, s, out, slots, experts, n, k, grouping, std::min(pairs, experts));
+    });
+}
+
+BlockWeight block_rows(const BlockWeight& w, int64_t first, int64_t k) {
+    int64_t stride[kBlockStreams];
+    block_stream_rows(w.format, k, stride);
+    BlockWeight rows = w;
+    for (int i = 0; i < kBlockStreams; ++i) {
+        if (rows.s[i] != nullptr) rows.s[i] += first * stride[i];
+    }
+    return rows;
+}
+
 template <typename T>
 void dequantize_block(sycl::queue& q, const BlockWeight& w, T* out, int64_t n, int64_t k) {
     const Streams s = streams_of(w, k);
@@ -1114,6 +1222,10 @@ void gather_block(sycl::queue& q, const BlockWeight& table, const I* ids, float*
     dispatch(table.format, [&]<BlockFormat F>() { gather_block_t<F, I>(q, s, ids, out, count, width); });
 }
 
+template void expert_matmul_block<int32_t>(sycl::queue&, const float*, bool, const BlockWeight&, const int32_t*, float*,
+                                           int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*);
+template void expert_matmul_block<int64_t>(sycl::queue&, const float*, bool, const BlockWeight&, const int64_t*, float*,
+                                           int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*);
 template void dequantize_block<half>(sycl::queue&, const BlockWeight&, half*, int64_t, int64_t);
 template void dequantize_block<float>(sycl::queue&, const BlockWeight&, float*, int64_t, int64_t);
 template void gather_block<int32_t>(sycl::queue&, const BlockWeight&, const int32_t*, float*, int64_t, int64_t);

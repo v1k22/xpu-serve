@@ -318,19 +318,29 @@ bool quant_gemm_tiled_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w
 template <typename Y>
 void quant_gemm_tiled(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
                       bool add = false);
-// ExpertMatMul over a quantized expert bank (rows = E * N of K columns): out [T, S, N], x [T, K] or (per_slot)
-// [T, S, K], expert ids outside [0, E) read expert 0. Up to kExpertPairsDirect (token, slot) pairs run one GEMV each;
+// ExpertMatMul over a quantized expert bank (rows = E * N of K columns; a pack's q8 / q4, or a GGUF block format
+// through expert_matmul_block): out [T, S, N], x [T, K] or (per_slot) [T, S, K], expert ids outside [0, E) read
+// expert 0. Up to kExpertPairsDirect (token, slot) pairs run one GEMV each;
 // more are grouped by expert on the device in `grouping` (expert_grouping_bytes) so an expert's rows are read once
 // per kGemvMaxRows of its pairs. The direct path covers a speculative verify (up to kGemvMaxRows tokens with eight
 // experts each): its tokens share few experts, and the grouped path's 8-row GEMV streams a weight at well under half
 // the one-row GEMV's rate.
 inline constexpr int64_t kExpertPairsDirect = 64;
 size_t expert_grouping_bytes(int64_t pairs, int64_t experts);
+// The expert pair `pair` reads: its id, or 0 when that is outside [0, E).
+template <typename I>
+inline int64_t expert_of(const I* idx, int64_t pair, int64_t experts) {
+    const int64_t e = static_cast<int64_t>(idx[pair]);
+    return e < 0 || e >= experts ? 0 : e;
+}
 // Groups the (token, slot) pairs by expert in `grouping` (expert_grouping_bytes): offsets [E + 1] at grouping + E,
-// the pairs in expert order at grouping + 4 E + 2 (the order inside an expert is not deterministic).
+// the experts that have pairs at grouping + 3 E + 1 and their number after them, the pairs in expert order at
+// grouping + 4 E + 2 (the order inside an expert is not deterministic).
 template <typename I>
 void expert_group(sycl::queue& q, const I* idx, int64_t pairs, int64_t experts, int32_t* grouping);
 inline const int32_t* expert_offsets(const int32_t* grouping, int64_t experts) { return grouping + experts; }
+inline const int32_t* expert_active(const int32_t* grouping, int64_t experts) { return grouping + 3 * experts + 1; }
+inline const int32_t* expert_active_count(const int32_t* grouping, int64_t experts) { return grouping + 4 * experts + 1; }
 inline const int32_t* expert_order(const int32_t* grouping, int64_t experts) { return grouping + 4 * experts + 2; }
 // rows [pairs, K] in CT: row i is x's row for pair order[i] (x [T, K], or per_slot [T, S, K]).
 template <typename CT>

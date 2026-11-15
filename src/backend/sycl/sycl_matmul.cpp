@@ -450,15 +450,17 @@ void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, 
 
 namespace {
 
-// Rows [first, first + count) of a quantized weight, as a weight of its own.
-QuantWeight quant_rows(const QuantWeight& w, int64_t first, int64_t k) {
+// out [count, K] = rows [first, first + count) of a quantized weight, dequantized.
+template <typename CT>
+void dequantize_rows(sycl::queue& q, const QuantWeight& w, int64_t first, int64_t count, int64_t k, CT* out) {
+    if (w.block != nullptr) return dequantize_block(q, block_rows(*w.block, first, k), out, count, k);
     QuantWeight r = w;
     const int64_t row_bytes = w.q4 ? k / 2 : k;
     const int64_t groups = k / w.group;
     r.codes = w.codes + first * row_bytes;
     r.scales = w.scales + first * groups;
     if (w.biases != nullptr) r.biases = w.biases + first * groups;
-    return r;
+    dequantize(q, r, out, count, k);
 }
 
 template <typename CT, typename I>
@@ -510,7 +512,7 @@ void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_sl
             int64_t run_end = e;
             while (run_end < e1 && offsets[static_cast<size_t>(run_end + 1)] > offsets[static_cast<size_t>(run_end)])
                 ++run_end;
-            dequantize(q, quant_rows(w, e * n, k), wd + (e - e0) * n * k, (run_end - e) * n, k);
+            dequantize_rows(q, w, e * n, (run_end - e) * n, k, wd + (e - e0) * n * k);
             for (; e < run_end; ++e) {
                 const int64_t first = offsets[static_cast<size_t>(e)];
                 pm[groups] = offsets[static_cast<size_t>(e + 1)] - first;

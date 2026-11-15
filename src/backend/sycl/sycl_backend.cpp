@@ -857,9 +857,7 @@ private:
                     break;
                 case OpKind::ExpertMatMul: {
                     need(0, is_f32(0), "f32");
-                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8 or q4");
-                    XS_CHECK(dt(n.inputs[1]) != DType::Block, where(i), ": an expert bank in a GGUF block format is "
-                             "not supported yet (--backend-opt block=f16 decodes block formats to f16)");
+                    need(1, is_fp(1) || is_packed(1), "f16, f32, q8, q4 or a GGUF block format");
                     need(2, is_int(2), "i32 or i64");
                     const int64_t k = graph_.type(n.inputs[1]).shape[2];
                     XS_CHECK(!is_packed(1) || k % 32 == 0, where(i), ": a quantized expert bank needs a multiple of 32 "

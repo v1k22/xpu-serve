@@ -845,12 +845,6 @@ void gemv_quant_q(sycl::queue& q, const float* x, const QuantParts& parts, int64
     }
 }
 
-template <typename I>
-inline int64_t expert_of(const I* idx, int64_t pair, int64_t experts) {
-    const int64_t e = static_cast<int64_t>(idx[pair]);
-    return e < 0 || e >= experts ? 0 : e;
-}
-
 // One work-group per (pair, block of kQSgPerWg * R rows).
 template <bool Q4, bool AWQ, typename I>
 void expert_quant_pairs_t(sycl::queue& q, const float* x, bool per_slot, QuantWeight w, const I* idx, float* out,
@@ -1791,7 +1785,9 @@ size_t expert_grouping_bytes(int64_t pairs, int64_t experts) {
 template <typename I>
 void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const QuantWeight& w, const I* idx, float* out,
                          int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping) {
-    XS_CHECK(w.block == nullptr, "sycl expert_matmul_quant: an expert bank in a GGUF block format");
+    if (w.block != nullptr) {
+        return expert_matmul_block(q, x, per_slot, *w.block, idx, out, tokens, slots, experts, n, k, grouping);
+    }
     const int64_t pairs = tokens * slots;
     if (pairs <= kExpertPairsDirect || grouping == nullptr) {
         quant_dispatch(w, [&]<bool Q4, bool AWQ>() {

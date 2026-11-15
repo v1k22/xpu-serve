@@ -2,7 +2,7 @@
 
 // Kernels over GGUF block-format weights in their device layout (sycl_block_layout.h). They mirror the pack kernels of
 // sycl_kernels.h: a GEMV that reads each weight once for up to kGemvMaxRows inputs, and its matrix-engine version; the
-// weight written out as f16 or f32 for a GEMM; rows gathered by id.
+// same GEMV on each token's experts of a bank; the weight written out as f16 or f32 for a GEMM; rows gathered by id.
 
 #include <cstdint>
 #include <span>
@@ -32,6 +32,13 @@ bool gemv_block_xmx_fits(const BlockWeight& w, int64_t k);
 size_t gemv_block_xmx_scratch(int64_t m, int64_t k);
 void gemv_block_xmx(sycl::queue& q, const float* x, const BlockWeight& w, float* y, int64_t m, int64_t n, int64_t k,
                     int64_t compute_units, void* scratch);
+// ExpertMatMul over a bank (rows = E * N of K columns): expert_matmul_quant's contract (sycl_kernels.h), x 16-byte
+// aligned.
+template <typename I>
+void expert_matmul_block(sycl::queue& q, const float* x, bool per_slot, const BlockWeight& w, const I* idx, float* out,
+                         int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping);
+// Rows [first, ...) of a weight of K columns, as a weight of its own (an expert of a bank).
+BlockWeight block_rows(const BlockWeight& w, int64_t first, int64_t k);
 // out [N, K] = w as f16 or f32: the values ggml's dequantization gives, rounded to T.
 template <typename T>
 void dequantize_block(sycl::queue& q, const BlockWeight& w, T* out, int64_t n, int64_t k);
