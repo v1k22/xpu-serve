@@ -23,12 +23,13 @@ std::string env(const char* name) {
     return v != nullptr ? std::string(v) : std::string();
 }
 
-// A qwen35 file whose MTP head is not in it (nextn_predict_layers 0): unsloth's smallest Qwen3.8-27B files.
+// A file of the Qwen3.5 family (qwen35, qwen35moe) whose MTP head is not in it (nextn_predict_layers 0): unsloth's
+// smallest Qwen3.8-27B files.
 bool lacks_mtp_head(const fs::path& file) {
     const gguf::File f(file);
     const gguf::Value* arch = f.find("general.architecture");
-    if (arch == nullptr || arch->as_string() != "qwen35") return false;
-    const gguf::Value* n = f.find("qwen35.nextn_predict_layers");
+    if (arch == nullptr || (arch->as_string() != "qwen35" && arch->as_string() != "qwen35moe")) return false;
+    const gguf::Value* n = f.find(std::string(arch->as_string()) + ".nextn_predict_layers");
     return n == nullptr || n->as_int() == 0;
 }
 

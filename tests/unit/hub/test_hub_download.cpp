@@ -158,44 +158,49 @@ TEST_SUITE("hub download") {
     }
 
     TEST_CASE("--hf of a GGUF file: imported into a pack once, with the MTP head its repository publishes apart") {
-        FakeHub hub;
-        HubTempDir dir("xs_hub_gguf");
-        const test::TinyMtpFiles files = test::split_tiny_gguf(test::build_tiny_gguf(dir.path / "tiny", 3));
-        files.model.write(dir.path / "model.gguf");
-        files.mtp.write(dir.path / "mtp.gguf");
-        hub.add("org/Tiny-GGUF", "Tiny-Q8_0.gguf", read_file(dir.path / "model.gguf"));
-        hub.add("org/Tiny-GGUF", "MTP/mtp-Tiny-Q8_0.gguf", read_file(dir.path / "mtp.gguf"));
-        hub.add("org/Tiny-GGUF", "mmproj-F16.gguf", "not a model");
-        hub.add("org/Tiny-GGUF", "README.md", "# Tiny", false);
-        SourceOptions o;
-        o.hub = hub.options(dir.path / "hf");
-        o.cache = dir.path / "xs";
-        const ModelSource m = resolve_model("org/Tiny-GGUF:Q8_0", FileRole::Model, o);
-        CHECK(m.name == "org/Tiny-GGUF:Q8_0");
-        REQUIRE(fs::exists(m.dir / "xpu_pack.json"));
-        CHECK(m.dir.parent_path().parent_path().filename() == "models--org--Tiny-GGUF");
-        CHECK(m.dir.filename() == "Tiny-Q8_0+mtp-Tiny-Q8_0");
-        // The same pack convert writes from the two files.
-        gguf_import::ImportOptions io;
-        io.source = dir.path / "model.gguf";
-        io.mtp = dir.path / "mtp.gguf";
-        io.output = dir.path / "local";
-        gguf_import::import_gguf(io);
-        CHECK(read_file(m.dir / "model.safetensors") == read_file(dir.path / "local" / "model.safetensors"));
-        CHECK(read_file(m.dir / "config.json") == read_file(dir.path / "local" / "config.json"));
-        // Neither the projector nor the README was downloaded; the second time nothing is imported again.
-        CHECK_FALSE(fs::exists(fs::path(o.hub.cache) / "models--org--Tiny-GGUF" / "snapshots" / FakeHub::kCommit /
-                               "mmproj-F16.gguf"));
-        const auto written = fs::last_write_time(m.dir / "model.safetensors");
-        const int requests = hub.file_requests;
-        CHECK(resolve_model("org/Tiny-GGUF:Q8_0", FileRole::Model, o).dir == m.dir);
-        CHECK(fs::last_write_time(m.dir / "model.safetensors") == written);
-        CHECK(hub.file_requests == requests);
-        CHECK_FALSE(fs::exists(m.dir.string() + ".partial"));
-        // fetch_source hands convert the files themselves.
-        const SourceFiles s = fetch_source("org/Tiny-GGUF:Q8_0", FileRole::Model, o);
-        CHECK(s.gguf.filename() == "Tiny-Q8_0.gguf");
-        CHECK(s.mtp.filename() == "mtp-Tiny-Q8_0.gguf");
+        for (const std::string arch : {"qwen35", "qwen35moe"}) {
+            CAPTURE(arch);
+            FakeHub hub;
+            HubTempDir dir("xs_hub_gguf_" + arch);
+            const test::TinyMtpFiles files =
+                arch == "qwen35" ? test::split_tiny_gguf(test::build_tiny_gguf(dir.path / "tiny", 3))
+                                 : test::split_tiny_gguf(test::build_tiny_moe_gguf(dir.path / "tiny", 3), arch);
+            files.model.write(dir.path / "model.gguf");
+            files.mtp.write(dir.path / "mtp.gguf");
+            hub.add("org/Tiny-GGUF", "Tiny-Q8_0.gguf", read_file(dir.path / "model.gguf"));
+            hub.add("org/Tiny-GGUF", "MTP/mtp-Tiny-Q8_0.gguf", read_file(dir.path / "mtp.gguf"));
+            hub.add("org/Tiny-GGUF", "mmproj-F16.gguf", "not a model");
+            hub.add("org/Tiny-GGUF", "README.md", "# Tiny", false);
+            SourceOptions o;
+            o.hub = hub.options(dir.path / "hf");
+            o.cache = dir.path / "xs";
+            const ModelSource m = resolve_model("org/Tiny-GGUF:Q8_0", FileRole::Model, o);
+            CHECK(m.name == "org/Tiny-GGUF:Q8_0");
+            REQUIRE(fs::exists(m.dir / "xpu_pack.json"));
+            CHECK(m.dir.parent_path().parent_path().filename() == "models--org--Tiny-GGUF");
+            CHECK(m.dir.filename() == "Tiny-Q8_0+mtp-Tiny-Q8_0");
+            // The same pack convert writes from the two files.
+            gguf_import::ImportOptions io;
+            io.source = dir.path / "model.gguf";
+            io.mtp = dir.path / "mtp.gguf";
+            io.output = dir.path / "local";
+            gguf_import::import_gguf(io);
+            CHECK(read_file(m.dir / "model.safetensors") == read_file(dir.path / "local" / "model.safetensors"));
+            CHECK(read_file(m.dir / "config.json") == read_file(dir.path / "local" / "config.json"));
+            // Neither the projector nor the README was downloaded; the second time nothing is imported again.
+            CHECK_FALSE(fs::exists(fs::path(o.hub.cache) / "models--org--Tiny-GGUF" / "snapshots" / FakeHub::kCommit /
+                                   "mmproj-F16.gguf"));
+            const auto written = fs::last_write_time(m.dir / "model.safetensors");
+            const int requests = hub.file_requests;
+            CHECK(resolve_model("org/Tiny-GGUF:Q8_0", FileRole::Model, o).dir == m.dir);
+            CHECK(fs::last_write_time(m.dir / "model.safetensors") == written);
+            CHECK(hub.file_requests == requests);
+            CHECK_FALSE(fs::exists(m.dir.string() + ".partial"));
+            // fetch_source hands convert the files themselves.
+            const SourceFiles s = fetch_source("org/Tiny-GGUF:Q8_0", FileRole::Model, o);
+            CHECK(s.gguf.filename() == "Tiny-Q8_0.gguf");
+            CHECK(s.mtp.filename() == "mtp-Tiny-Q8_0.gguf");
+        }
     }
 
     TEST_CASE("a checkpoint that reads a file its repository does not publish gets it beside its files") {
