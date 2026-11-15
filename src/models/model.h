@@ -131,8 +131,8 @@ struct LoadOptions {
     // A drafter that reads the target's head (an MTP head) picks among this many of its rows, chosen by a one-bit
     // sketch of the head and re-scored exactly (blocks::shortlist_head); 0: it reads the whole head.
     int64_t draft_shortlist = 64;
-    // The drafts a round will ask for, when known (0: the drafter's own count): a block drafter whose rows do not see
-    // the rows after them runs no more than these.
+    // The drafts a round will ask for, when known (0: the drafter's own count): a block drafter runs no more rows than
+    // these and the pending token.
     int64_t drafts = 0;
 };
 

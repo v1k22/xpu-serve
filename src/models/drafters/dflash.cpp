@@ -125,28 +125,34 @@ Config parse_config(const nlohmann::json& j) {
     XS_CHECK(c.num_layers >= 1 && c.num_heads % c.num_kv_heads == 0 && c.head_dim % 2 == 0,
              "drafter: ", c.num_layers, " layers, ", c.num_heads, " heads over ", c.num_kv_heads, " of ", c.head_dim);
 
-    // Every layer is of one kind: sliding attention (a window, causal unless is_causal says otherwise) or full.
-    bool sliding = false;
+    // A layer is sliding attention (a window, causal unless is_causal says otherwise) or full attention, as z-lab's
+    // Qwen3DFlashAttention reads layer_types.
+    std::vector<std::string> types(static_cast<size_t>(c.num_layers), "full_attention");
     if (j.contains("layer_types") && j.at("layer_types").is_array()) {
         XS_CHECK(static_cast<int64_t>(j.at("layer_types").size()) == c.num_layers, "drafter: layer_types names ",
                  j.at("layer_types").size(), " layers of ", c.num_layers);
-        const std::string first = j.at("layer_types").at(0).get<std::string>();
-        for (const auto& t : j.at("layer_types")) {
-            XS_CHECK(t.get<std::string>() == first, "drafter: mixed layer_types are not supported");
-        }
-        XS_CHECK(first == "sliding_attention" || first == "full_attention", "drafter: layer type '", first,
-                 "' is not supported");
-        sliding = first == "sliding_attention";
+        types = j.at("layer_types").get<std::vector<std::string>>();
     }
-    c.causal = j.contains("is_causal") && !j.at("is_causal").is_null() ? j.at("is_causal").get<bool>() : sliding;
-    c.sliding_window = sliding ? cfg::get_int(j, "sliding_window", kWhere) : 0;
+    const bool is_causal_set = j.contains("is_causal") && !j.at("is_causal").is_null();
+    for (const std::string& type : types) {
+        XS_CHECK(type == "sliding_attention" || type == "full_attention", "drafter: layer type '", type,
+                 "' is not supported");
+        const bool sliding = type == "sliding_attention";
+        LayerAttention layer;
+        layer.causal = is_causal_set ? j.at("is_causal").get<bool>() : sliding;
+        layer.sliding_window = sliding ? cfg::get_int(j, "sliding_window", kWhere) : 0;
+        XS_CHECK(!sliding || layer.sliding_window >= 1, "drafter: a sliding window of ", layer.sliding_window);
+        c.layers.push_back(layer);
+    }
 
     c.mask_token_id = cfg::get_int(d, "mask_token_id", "drafter dflash_config");
     c.block_size = d.contains("block_size") ? cfg::get_int(d, "block_size", "drafter dflash_config")
                                              : cfg::get_int_or(j, "block_size", 16, kWhere);
     XS_CHECK(c.block_size >= 2 && c.block_size <= 64, "drafter: block_size ", c.block_size, " is not supported");
-    XS_CHECK(c.sliding_window == 0 || c.block_size <= c.sliding_window, "drafter: a block of ", c.block_size,
-             " in a window of ", c.sliding_window);
+    for (const LayerAttention& layer : c.layers) {
+        XS_CHECK(layer.sliding_window == 0 || c.block_size <= layer.sliding_window, "drafter: a block of ",
+                 c.block_size, " in a window of ", layer.sliding_window);
+    }
     if (d.contains("target_layer_ids")) {
         for (const int32_t id : cfg::get_int_list(d, "target_layer_ids", "drafter dflash_config")) c.target_layer_ids.push_back(id);
     } else {
@@ -186,7 +192,7 @@ Config parse_config(const nlohmann::json& j) {
                                "selected_prefix_terminal"},
                            "dflash_config");
             const auto is = [&](const char* key, const nlohmann::json& want) { return d.contains(key) && d.at(key) == want; };
-            XS_CHECK(is("draft_block_causal", true) && c.causal, "drafter: DSpine without a causal block is not supported");
+            XS_CHECK(is("draft_block_causal", true) && c.causal(), "drafter: DSpine without a causal block is not supported");
             XS_CHECK(is("selected_prefix_decode_mode", "serial") && is("selected_prefix_feature_writes", true) &&
                          is("selected_prefix_feature_write_mode", "independent") && is("selected_prefix_terminal", false),
                      "drafter: this DSpine bridge is not supported (serial decode, independent feature writes and no ",
@@ -219,13 +225,17 @@ Config parse_config(const nlohmann::json& j) {
     return c;
 }
 
+bool Config::causal() const {
+    return std::all_of(layers.begin(), layers.end(), [](const LayerAttention& l) { return l.causal; });
+}
+
 std::unique_ptr<WeightStore> open_weights(const std::filesystem::path& dir) {
     return std::make_unique<StackedViews>(SafetensorsWeights::open_dir(dir));
 }
 
 Drafter::Drafter(Config config, const WeightStore& weights, std::string prefix, int64_t drafts)
     : cfg_(std::move(config)), weights_(weights), prefix_(std::move(prefix)) {
-    rows_ = cfg_.causal && drafts > 0 ? std::min(cfg_.block_size, drafts + 1) : cfg_.block_size;
+    rows_ = drafts > 0 ? std::min(cfg_.block_size, drafts + 1) : cfg_.block_size;
     const TensorView& fc = weights_.get(prefix_ + "fc.weight");
     const Dims want{cfg_.hidden_size, static_cast<int64_t>(cfg_.target_layer_ids.size()) * cfg_.hidden_size};
     XS_CHECK(fc.shape == want, "drafter: fc.weight is ", dims_to_string(fc.shape), ", expected ", dims_to_string(want));
@@ -273,7 +283,8 @@ void Drafter::append_context(Graph& g, std::span<const Value> layers, Value posi
         const Value k = g.rope(norm(g, g.reshape(g.matmul(context, weight(g, a + "k_proj.weight")), heads), a + "k_norm.weight"),
                                positions, freq);
         const Value v = g.reshape(g.matmul(context, weight(g, a + "v_proj.weight")), heads);
-        g.kv_cache(g.add_kv_slot(cfg_.num_kv_heads, cfg_.head_dim, cfg_.sliding_window, slot_label(l)), k, v);
+        const int64_t window = cfg_.layers[static_cast<size_t>(l)].sliding_window;
+        g.kv_cache(g.add_kv_slot(cfg_.num_kv_heads, cfg_.head_dim, window, slot_label(l)), k, v);
     }
 }
 
@@ -284,9 +295,10 @@ Value Drafter::attention(Graph& g, int64_t layer, Value x, Value pos, Value freq
     s.kv_heads = cfg_.num_kv_heads;
     s.head_dim = cfg_.head_dim;
     s.attrs.scale = 1.0f / std::sqrt(static_cast<float>(cfg_.head_dim));
-    s.attrs.causal = cfg_.causal;
-    s.attrs.sliding_window = cfg_.sliding_window;
-    s.kv_window = cfg_.sliding_window;
+    const LayerAttention& kind = cfg_.layers[static_cast<size_t>(layer)];
+    s.attrs.causal = kind.causal;
+    s.attrs.sliding_window = kind.sliding_window;
+    s.kv_window = kind.sliding_window;
     s.kv_label = slot_label(layer);
     blocks::AttentionParts p;
     p.q = blocks::matmul_by(g, weight(g, a + "q_proj.weight"));

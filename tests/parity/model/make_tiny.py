@@ -256,8 +256,8 @@ def mtp_head(model):
     return {"mtp." + k: v.contiguous() for k, v in head.state_dict().items()}
 
 
-def drafter(kind, target_dir, dflash_repo, out):
-    """A random block drafter for the target in `target_dir`."""
+def drafter(kind, target_dir, dflash_repo, out, layer_types=None):
+    """A random block drafter for the target in `target_dir`; `layer_types`: its layers' kinds, else the variant's."""
     spec = importlib.util.spec_from_file_location("dflash_model", os.path.join(dflash_repo, "dflash", "model.py"))
     dflash = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(dflash)
@@ -265,12 +265,15 @@ def drafter(kind, target_dir, dflash_repo, out):
         target = json.load(f)
     target = target.get("text_config", target)
     hidden, vocab, layers = target["hidden_size"], target["vocab_size"], 3
-    window = kind != "dflash"
+    if layer_types is None:
+        layer_types = ["sliding_attention" if kind != "dflash" else "full_attention"] * layers
+    layers = len(layer_types)
+    window = "sliding_attention" in layer_types
     config = dflash.Qwen3Config(
         vocab_size=vocab, hidden_size=hidden, intermediate_size=2 * hidden, num_hidden_layers=layers,
         num_attention_heads=4, num_key_value_heads=2, head_dim=32, max_position_embeddings=4096, rms_norm_eps=1e-6,
         initializer_range=0.05, tie_word_embeddings=False, use_sliding_window=window, sliding_window=24,
-        max_window_layers=layers, layer_types=["sliding_attention" if window else "full_attention"] * layers,
+        max_window_layers=layers, layer_types=layer_types,
         rope_parameters={"rope_theta": 10000000, "rope_type": "default"},
     )
     config.num_target_layers = target["num_hidden_layers"]
@@ -355,6 +358,8 @@ def main():
     ap.add_argument("--drafter", choices=["dflash", "dflash2", "dspine"])
     ap.add_argument("--target", help="--drafter: the tiny target it drafts for")
     ap.add_argument("--dflash-repo", help="--drafter: a clone of github.com/z-lab/dflash")
+    ap.add_argument("--layer-types", help="--drafter: its layers' kinds, separated by commas (sliding_attention, "
+                    "full_attention), instead of the variant's three of one kind")
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--pooling", choices=["mean", "cls"], default="mean", help="bert, nomic_bert: the Pooling mode")
@@ -365,7 +370,8 @@ def main():
     if args.drafter:
         if not args.target or not args.dflash_repo:
             ap.error("--drafter needs --target and --dflash-repo")
-        drafter(args.drafter, args.target, args.dflash_repo, args.out)
+        drafter(args.drafter, args.target, args.dflash_repo, args.out,
+                args.layer_types.split(",") if args.layer_types else None)
         return
     if not args.arch or not args.tokenizer_from:
         ap.error("--arch and --tokenizer-from are required")

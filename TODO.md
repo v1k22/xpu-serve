@@ -186,7 +186,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       --drafter <dir>`; `convert <drafter> --target <model>` for a q4 / q8 drafter pack), a block of drafts from one
       drafter pass over state the target's programs write; parity with the drafters' PyTorch code on tiny checkpoints
       (docs/decisions/0012). Qwen3.8-27B q4 with DFlash 2 at q4, 7 drafts: 60.7 tok/s on the B60 (MTP 49.9), 20.1 on
-      the B390 (MTP 18.3; 22.8 and 19.8 with the q4 g128 target); DSpine 50.6 and 17.5
+      the B390 (MTP 18.3; 22.8 and 19.8 with the q4 g128 target); DSpine 50.6 and 17.5. A drafter's layers each of
+      their own kind (sliding causal ones under a full one, Ornith's); every block cut to the drafts a round asks for
 - [ ] The matrix-engine GEMV past 8 rows (a verify of a whole 16-token block); a block drafter's head over a
       shortlist; sampled chains from a block drafter's candidates
 - [ ] Spec stats in logs and `/metrics`

@@ -337,11 +337,16 @@ struct TinyDrafter {
     int64_t block = 6, window = 12, top_k = 4;
     int64_t code = 32, rank = 16;                       // dspine: the code bridge
     int64_t conv_group = 16, taps = 2, selector = 32;   // dflash2
+    std::vector<std::string> layer_types;               // each layer's kind; empty: the kind's, all alike
 };
 
 inline void write_tiny_drafter(const fs::path& dir, const TinyDrafter& d, const TinyQwen& target, uint32_t seed) {
     fs::create_directories(dir);
-    const bool sliding = d.kind != "dflash";
+    std::vector<std::string> types = d.layer_types;
+    if (types.empty()) {
+        types.assign(static_cast<size_t>(d.layers), d.kind != "dflash" ? "sliding_attention" : "full_attention");
+    }
+    const bool sliding = std::find(types.begin(), types.end(), "sliding_attention") != types.end();
     const auto layers = static_cast<int64_t>(target.layers.size());
     const std::vector<int64_t> ids{0, layers / 2, layers - 1};
     nlohmann::json config = {
@@ -350,8 +355,7 @@ inline void write_tiny_drafter(const fs::path& dir, const TinyDrafter& d, const 
         {"intermediate_size", d.ffn}, {"num_hidden_layers", d.layers}, {"num_attention_heads", d.heads},
         {"num_key_value_heads", d.kv_heads}, {"head_dim", d.head_dim}, {"hidden_act", "silu"},
         {"attention_bias", false}, {"rms_norm_eps", 1e-6}, {"num_target_layers", layers},
-        {"layer_types", std::vector<std::string>(static_cast<size_t>(d.layers),
-                                                 sliding ? "sliding_attention" : "full_attention")},
+        {"layer_types", types},
         {"sliding_window", sliding ? nlohmann::json(d.window) : nlohmann::json(nullptr)},
         {"rope_parameters", {{"rope_type", "default"}, {"rope_theta", 1e7}}}};
     nlohmann::json dflash = {{"mask_token_id", target.vocab - 1}, {"target_layer_ids", ids}};

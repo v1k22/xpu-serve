@@ -34,9 +34,17 @@ checkpoint was trained for.
   the program gives `candidates` [n, K] and `scores` [n, K, K] (the score of candidate k of a draft for each
   candidate j the draft before could have been), and the host follows the best of each row in turn. That keeps the
   serial choice (a handful of comparisons) off the device while every tensor is computed in one run.
-- **A causal block runs only the rows asked for.** DSpine's rows do not see the rows after them, so a round of k
-  drafts runs k + 1 rows. A block that sees itself whole (DFlash, DFlash 2) always runs the rows it was trained
-  with, and the first k drafts are used.
+- **A block runs only the rows asked for** (changed 2026-11-15; first, only a causal block did). A round of k drafts
+  runs the pending token and k mask rows. DSpine's rows do not see the rows after them, so they are the first rows of
+  its whole block. A block that sees itself whole (DFlash, DFlash 2) then sees fewer rows: z-lab's own generation loop
+  does the same when it is given a block below the checkpoint's (`dflash_generate(block_size=...)`), so the
+  references still apply (`block_drafter_reference.py --block-size`). Rows past the drafts cost the drafter's layers
+  and its head, and past 8 rows the head leaves the GEMV: with a GGUF target whose head is Q6_K that is the whole head
+  dequantized for a GEMM every round.
+- **Each layer's attention is its own** (2026-11-15), as z-lab's `Qwen3DFlashAttention` reads `layer_types`: a
+  sliding layer sees a window of keys and is causal unless `is_causal` says otherwise, a full layer sees every key,
+  the rest of its block included. Ornith-1.5-35B-A3B's DFlash drafter has five sliding causal layers under a full one;
+  the released Qwen3.8-27B drafters have layers of one kind.
 - **The drafts default to 7** for a block drafter: a verify of up to 8 tokens runs on the matrix-engine GEMV, whose
   cost hardly grows with the rows; a verify of 9 or more does not (a 16-row verify of Qwen3.8-27B on the Arc Pro
   B60: 117 ms, against 57 ms at 8 rows).
@@ -62,6 +70,18 @@ drafts) and 3.53 (15 drafts). DSpine's published lead over DFlash 2 is on reason
 thinking on; on these prompts (thinking off) its longer block does not pay for itself.
 
 Speeds are in docs/design-spec-decode.md, section 6.2.
+
+**Layers of both kinds, and blocks cut short (2026-11-15).** A tiny DFlash drafter with two sliding causal layers
+under a full one, beside a tiny Qwen3.5 mixture of experts: every draft equal to z-lab's over five rounds of five
+prompts at its whole block of 6 and at a block of 4; a tiny DFlash 2 at a block of 4: every draft and candidate equal,
+scores within 1.3e-5. A planted bug (the full layer made causal) changes 16 of 125 drafts. On an Arc Pro B60, the
+block cut to the drafts asked against the whole block, at the same acceptance (six chat prompts, 256 greedy tokens):
+
+| Target, drafter | k = 3 | k = 5 | k = 7 |
+|---|---|---|---|
+| Ornith-1.5-35B-A3B q4 pack, its DFlash drafter's q4 pack (block 16) | 86.0 → 89.1 tok/s | 82.9 → 85.9 | 77.0 → 79.3 |
+| Ornith-1.5-35B-A3B Q4_K_M GGUF pack, the same | 60.2 → 70.9 | 59.7 → 69.1 | 55.7 → 63.6 |
+| Qwen3.8-27B Q4_0 GGUF pack, `z-lab/Qwen3.8-27B-DFlash2` (block 8) | 42.7 → 44.2 | 48.4 → 49.4 | 50.2 → 50.3 |
 
 ## Consequences
 

@@ -1,6 +1,6 @@
 // Block drafters (DFlash, DFlash 2, DSpine) on a tiny random Qwen3.5 written to disk: what the engine and `convert`
 // rely on, checked without a reference (their math against the references is block_drafter_parity.cpp): a context
-// fed in chunks or cut back after a verify is the same context, a causal block stops after the drafts asked for, a
+// fed in chunks or cut back after a verify is the same context, a block has the rows a round asks for, a
 // drafter converts to a pack of its own, and configs that are not implemented are refused by name.
 #include <doctest/doctest.h>
 
@@ -150,7 +150,7 @@ TEST_SUITE("block drafters") {
         }
     }
 
-    TEST_CASE("a causal block stops after the drafts asked for; a block that sees itself whole runs all its rows") {
+    TEST_CASE("a block has the rows a round asks for; a causal block's are the first of its whole block's") {
         const Checkpoints files("xs_block_drafters_rows");
         Loaded whole(files.target, files.drafter("dspine"));
         Loaded few(files.target, files.drafter("dspine"), 2);
@@ -168,7 +168,35 @@ TEST_SUITE("block drafters") {
         const std::vector<int32_t> a = spec::block_drafts(all);
         CHECK(spec::block_drafts(two) == std::vector<int32_t>(a.begin(), a.begin() + 2));
         CHECK(Loaded(files.target, files.drafter("dspine"), 40).block->block_drafts() == 5);  // no more than its block
-        for (const char* kind : {"dflash", "dflash2"}) CHECK(Loaded(files.target, files.drafter(kind), 2).block->block_drafts() == 5);
+        // A block that sees itself whole is cut too; its rows then see fewer rows, so they are another block's.
+        for (const char* kind : {"dflash", "dflash2"}) {
+            CAPTURE(kind);
+            Loaded cut(files.target, files.drafter(kind), 2);
+            CHECK(cut.block->block_drafts() == 2);
+            cut.feed(spec::kPrefill, kPrompt);
+            CHECK(spec::block_drafts(cut.draft(9)).size() == 2);
+            CHECK(Loaded(files.target, files.drafter(kind), 40).block->block_drafts() == 5);
+        }
+        // Layers of both kinds in one drafter: sliding causal ones under a last one that sees the whole block.
+        TinyDrafter mixed;
+        mixed.kind = "dflash";
+        mixed.layer_types = {"sliding_attention", "full_attention"};
+        xs::test::write_tiny_drafter(files.work.path / "mixed", mixed, TinyQwen{}, 11);
+        Loaded both(files.target, files.work.path / "mixed");
+        CHECK(both.block->block_drafts() == 5);
+        both.feed(spec::kPrefill, kPrompt);
+        const std::vector<int32_t> drafts = spec::block_drafts(both.draft(9));
+        CHECK(drafts.size() == 5);
+        // The same weights with every layer full, or every layer sliding, draft another block.
+        for (const char* kind : {"full_attention", "sliding_attention"}) {
+            CAPTURE(kind);
+            mixed.layer_types = {kind, kind};
+            const fs::path dir = files.work.path / (std::string("mixed-") + kind);
+            xs::test::write_tiny_drafter(dir, mixed, TinyQwen{}, 11);
+            Loaded other(files.target, dir);
+            other.feed(spec::kPrefill, kPrompt);
+            CHECK(spec::block_drafts(other.draft(9)) != drafts);
+        }
     }
 
     TEST_CASE("convert writes a drafter's pack: its matmul weights and tables quantized, close to the original") {
@@ -268,19 +296,25 @@ TEST_SUITE("block drafters") {
         };
         const dflash::Config plain = dflash::parse_config(read("dflash"));
         CHECK(plain.variant == dflash::Variant::DFlash);
-        CHECK_FALSE(plain.causal);
-        CHECK(plain.sliding_window == 0);
+        const auto kinds = [](const dflash::Config& c) {
+            std::vector<std::pair<bool, int64_t>> out;
+            for (const dflash::LayerAttention& l : c.layers) out.emplace_back(l.causal, l.sliding_window);
+            return out;
+        };
+        using Kinds = std::vector<std::pair<bool, int64_t>>;
+        CHECK(kinds(plain) == Kinds{{false, 0}, {false, 0}});
+        CHECK_FALSE(plain.causal());
         CHECK(plain.block_size == 6);
         CHECK(plain.target_layer_ids == std::vector<int64_t>{0, 2, 3});
         const dflash::Config two = dflash::parse_config(read("dflash2"));
         CHECK(two.variant == dflash::Variant::DFlash2);
-        CHECK_FALSE(two.causal);
-        CHECK(two.sliding_window == 12);
+        CHECK(kinds(two) == Kinds{{false, 12}, {false, 12}});
         CHECK(two.conv_taps == 2);
         CHECK(two.top_k == 4);
         const dflash::Config spine = dflash::parse_config(read("dspine"));
         CHECK(spine.variant == dflash::Variant::DSpine);
-        CHECK(spine.causal);
+        CHECK(kinds(spine) == Kinds{{true, 12}, {true, 12}});
+        CHECK(spine.causal());
         CHECK(spine.code_size == 32);
         CHECK(spine.bridge_rank == 16);
 
@@ -291,9 +325,25 @@ TEST_SUITE("block drafters") {
         j["layer_types"] = std::vector<std::string>(5, "full_attention");
         CHECK(dflash::parse_config(j).target_layer_ids == std::vector<int64_t>{1, 16, 31, 46, 61});
 
+        // Each layer's own kind: sliding layers are causal and windowed, a full one sees every key.
+        j = read("dflash");
+        j["layer_types"] = {"sliding_attention", "full_attention"};
+        j["sliding_window"] = 9;
+        CHECK(kinds(dflash::parse_config(j)) == Kinds{{true, 9}, {false, 0}});
+        CHECK_FALSE(dflash::parse_config(j).causal());
+        j["is_causal"] = true;
+        CHECK(kinds(dflash::parse_config(j)) == Kinds{{true, 9}, {true, 0}});
+        CHECK(dflash::parse_config(j).causal());
+
         const auto refused = [](nlohmann::json config, const char* what) {
             CHECK_THROWS_WITH_AS(dflash::parse_config(config), doctest::Contains(what), xs::Error);
         };
+        j = read("dflash");
+        j["layer_types"] = {"full_attention", "linear_attention"};
+        refused(j, "'linear_attention'");
+        j = read("dflash");
+        j["layer_types"] = {"sliding_attention", "full_attention"};  // a sliding layer with no window given
+        refused(j, "sliding_window");
         j = read("dflash2");
         j["dflash_config"]["projector_type"] = "mlp";
         refused(j, "projector_type");

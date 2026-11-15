@@ -5,7 +5,8 @@
 // through its hidden states: the outputs of a few of its layers, concatenated and projected (fc, hidden_norm), are the
 // context every drafter layer attends to beside its own block. The context's keys and values depend on the target
 // alone, so the target's own programs append them (append_context) to KV slots the block program shares.
-//   DFlash    the block's argmax, position by position
+//   DFlash    the block's argmax, position by position; layers of either kind in one drafter (sliding causal layers
+//             under a last one that sees the whole block)
 //   DFlash 2  two-tap dynamic convolutions around attention and MLP, a block that sees all of itself, and a selector
 //             that scores each position's candidates against the one chosen before
 //   DSpine    after every layer each position passes a code of what it predicts to the next one (a causal block),
@@ -30,6 +31,12 @@ namespace xs::dflash {
 
 enum class Variant : uint8_t { DFlash, DFlash2, DSpine };
 
+// What a layer's block rows see of the keys (the context, then the block).
+struct LayerAttention {
+    bool causal = true;          // the keys up to a row; else every key, the rest of its block included
+    int64_t sliding_window = 0;  // keys this far from a row are not seen (0: all are)
+};
+
 struct Config {
     Variant variant = Variant::DFlash;
     int64_t hidden_size = 0;
@@ -43,8 +50,7 @@ struct Config {
     std::vector<int64_t> target_layer_ids;  // whose outputs make the context, 0-based
     int64_t block_size = 0;                 // the pending token and block_size - 1 drafts
     int64_t mask_token_id = 0;
-    bool causal = true;          // a block row sees the rows before it; else all of its block
-    int64_t sliding_window = 0;  // keys this far behind a row are not seen (0: all are)
+    std::vector<LayerAttention> layers;  // one per layer
     double rms_norm_eps = 1e-6;
     double rope_theta = 0;
     // DFlash 2
@@ -57,6 +63,9 @@ struct Config {
     double bridge_eps = 0;
     // DFlash 2 and DSpine: candidates per position
     int64_t top_k = 0;
+
+    // Whether a block's rows are the same whatever follows them: every layer causal.
+    bool causal() const;
 };
 
 // Parses a drafter checkpoint's config.json; refuses by name what is not implemented.
@@ -69,8 +78,9 @@ std::unique_ptr<WeightStore> open_weights(const std::filesystem::path& dir);
 class Drafter final : public BlockDrafting {
 public:
     // `weights` holds the drafter's tensors under `prefix` and outlives the drafter. `drafts` > 0: a round asks for
-    // that many, and a causal block (whose rows are the same whatever follows them) stops there; a block that sees
-    // itself whole always runs the rows it was trained with.
+    // that many, and the block is the pending token and that many rows, up to the block the drafter was trained
+    // with (the reference's generation loop cuts a block the same way; a block that sees itself whole then sees
+    // fewer rows).
     Drafter(Config config, const WeightStore& weights, std::string prefix, int64_t drafts = 0);
 
     const Config& config() const { return cfg_; }

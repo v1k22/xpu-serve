@@ -4,6 +4,7 @@
     python -I tests/parity/model/block_drafter_reference.py --model-dir <target> --drafter <drafter checkpoint>
         --dflash-repo <clone of github.com/z-lab/dflash> [--dspine-repo <clone of github.com/Tencent/DSpine>]
         [--out tests/fixtures/generated/<model_type>] [--rounds 4] [--accept 2,0,5,1] [--prompts chat_short,...]
+        [--block-size N]
         [--prompts-file <one user message a line> [--max-tokens 128]]
 
 Target and drafter run in float32 on the CPU, without caches: every round is one forward over the whole sequence.
@@ -23,6 +24,9 @@ after the tokens committed so far:
               before (the anchor for the first). DSpine's scores are logits of the normalized state, so they equal
               unnormalized ones up to a positive factor per sender.
   margins     DFlash only: per draft, the gap between its two best logits over the logit range.
+
+--block-size cuts the block to N rows (the pending token and N - 1 drafts), as the block_size argument of z-lab's
+dflash_generate does; the checkpoint's own by default.
 
 With --prompts-file the prompts are that file's lines as user messages (thinking off), and a prompt's rounds also end
 at a stop token or after --max-tokens tokens: the reference's tokens per round on a real checkpoint, printed at the end.
@@ -123,6 +127,7 @@ def main():
     ap.add_argument("--prompts", help="comma-separated prompt names; default: all but the long one")
     ap.add_argument("--prompts-file", help="one user message a line, instead of the built-in prompts")
     ap.add_argument("--max-tokens", type=int, default=0, help="end a prompt's rounds after this many tokens (0: never)")
+    ap.add_argument("--block-size", type=int, default=0, help="rows of a block (default: the checkpoint's)")
     ap.add_argument("--threads", type=int, default=min(32, os.cpu_count() or 1))
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
@@ -145,7 +150,9 @@ def main():
     model = cls.from_pretrained(args.drafter, dtype=torch.float32).eval()
     head = target.get_output_embeddings()
     embed = target.get_input_embeddings().weight
-    block_size, mask = int(model.block_size), int(model.mask_token_id)
+    block_size, mask = args.block_size or int(model.block_size), int(model.mask_token_id)
+    if not 2 <= block_size <= int(model.block_size):
+        raise SystemExit(f"--block-size {block_size} is not within the checkpoint's block of {int(model.block_size)}")
     bridge = ref = top_k = None
     if variant == "dspine":
         if not args.dspine_repo:

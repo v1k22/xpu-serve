@@ -1,7 +1,7 @@
 // A block drafter (DFlash, DFlash 2, DSpine) against its reference rounds
 // (tests/parity/model/block_drafter_reference.py), for the target in XS_TEST_MODEL_DIR and the drafter checkpoint in
 // XS_TEST_DRAFTER_DIR. Opt-in, with the XS_PARITY_* variables of model_parity.cpp; the references are
-// <fixtures>/<drafter name>.json.
+// <fixtures>/<drafter name>.json, and the block has the rows they were written with.
 
 #include <doctest/doctest.h>
 
@@ -12,6 +12,7 @@
 
 #include "backend/backend.h"
 #include "engine/spec/block_drafter.h"
+#include "models/drafters/dflash.h"
 #include "models/model.h"
 #include "parity_util.h"
 #include "test_support.h"
@@ -40,20 +41,24 @@ int64_t index_of(const std::vector<int32_t>& row, int32_t token) {
 // factor (DSpine's reference ranks normalized states, the graph unnormalized ones).
 TEST_CASE("a block drafter matches the reference" * doctest::skip(!enabled())) {
     const bool f32 = env_or("XS_PARITY_PRECISION", "f32") == "f32";
-    auto model = xs::load_model(*xs::test::model_dir(), {.vision = false,
-                                                         .speculation = true,
-                                                         .drafter = env_or("XS_TEST_DRAFTER_DIR", ""),
-                                                         .draft_shortlist = 0});
-    const xs::Speculation* spec = model->speculation();
-    REQUIRE(spec != nullptr);
-    REQUIRE(spec->block() != nullptr);
-    const std::string name(spec->drafter_name());
+    const std::filesystem::path drafter_dir = env_or("XS_TEST_DRAFTER_DIR", "");
+    std::ifstream cf(drafter_dir / "config.json");
+    const std::string name(xs::dflash::variant_name(xs::dflash::parse_config(nlohmann::json::parse(cf)).variant));
     const std::filesystem::path fixtures = xs::test::model_fixtures();
     std::ifstream mf(fixtures / (name + ".json"));
     REQUIRE_MESSAGE(mf.good(), "no reference rounds: ", (fixtures / (name + ".json")).string());
     const auto manifest = nlohmann::json::parse(mf);
-    const int64_t n = spec->block()->block_drafts();
-    REQUIRE(manifest["block_size"].get<int64_t>() == n + 1);
+    const int64_t n = manifest["block_size"].get<int64_t>() - 1;
+    auto model = xs::load_model(*xs::test::model_dir(), {.vision = false,
+                                                         .speculation = true,
+                                                         .drafter = drafter_dir,
+                                                         .draft_shortlist = 0,
+                                                         .drafts = n});
+    const xs::Speculation* spec = model->speculation();
+    REQUIRE(spec != nullptr);
+    REQUIRE(spec->block() != nullptr);
+    REQUIRE(spec->drafter_name() == name);
+    REQUIRE(spec->block()->block_drafts() == n);
 
     xs::SessionOptions options = xs::test::parity_options();
     options.rewind_tokens = static_cast<int>(n) + 1;
