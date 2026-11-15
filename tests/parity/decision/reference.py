@@ -79,7 +79,7 @@ def pplx(model_dir, requests):
 
 
 def letters(model_dir, requests):
-    from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
 
     # The helper reads its settings from the environment when imported: serve/SERVE.md's.
     os.environ.update(READOUT_T="0.85", READOUT_NOUL_T="1.829074", READOUT_NOUL_BIAS="0", READOUT_TARGETED="1",
@@ -92,7 +92,9 @@ def letters(model_dir, requests):
     shim.round = lambda value, digits=None: value
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(model_dir, dtype=torch.float32).eval()
+    with open(os.path.join(model_dir, "config.json")) as f:
+        auto = AutoModelForImageTextToText if "vision_config" in json.load(f) else AutoModelForCausalLM
+    model = auto.from_pretrained(model_dir, dtype=torch.float32).eval()
     prompts = []
 
     def create(messages=None, extra_body=None, **kwargs):

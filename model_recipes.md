@@ -17,6 +17,7 @@ APIs look; the numbers live here.
   - [Qwen3.5-4B](#qwen35-4b)
   - [Qwen3.5-9B](#qwen35-9b)
   - [Qwen3.6-35B-A3B](#qwen36-35b-a3b)
+  - [Ornith-1.5-35B-A3B](#ornith-15-35b-a3b)
   - [Qwen3.8-27B](#qwen38-27b)
   - [LFM3-1.7B](#lfm3-17b)
 - [GGUF imports](#gguf-imports)
@@ -24,10 +25,12 @@ APIs look; the numbers live here.
   - [Qwen3.5-4B GGUF](#qwen35-4b-gguf)
   - [Gemma 4 E2B GGUF](#gemma-4-e2b-gguf)
   - [Qwen3.8-27B GGUF](#qwen38-27b-gguf)
+  - [Ornith-1.5-35B-A3B GGUF](#ornith-15-35b-a3b-gguf)
 - [Drafters](#drafters)
   - [Speculative decoding](#speculative-decoding)
   - [Gemma 4 assistants](#gemma-4-assistants)
   - [DFlash 2 and DSpine drafters for Qwen3.8-27B](#dflash-2-and-dspine-drafters-for-qwen38-27b)
+  - [The DFlash drafter for Ornith-1.5-35B-A3B](#the-dflash-drafter-for-ornith-15-35b-a3b)
 - [Decision models](#decision-models)
   - [The System One request](#the-system-one-request)
   - [Clef-Flash](#clef-flash)
@@ -434,12 +437,80 @@ xpu-serve serve ~/models/Qwen3.6-35B-A3B-q4 --device GPU --spec mtp --spec-k 3 -
 - Less VRAM: `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2` store the KV cache in fewer bits, each at a
   growing cost in accuracy; they need a head_dim that is a multiple of 128
   ([KV cache formats](#kv-cache-formats)).
-- A GGUF file of it (`qwen35moe`) is refused by name.
+- Its GGUF files (`qwen35moe`) import like Ornith-1.5-35B-A3B's ([Ornith-1.5-35B-A3B GGUF](#ornith-15-35b-a3b-gguf)).
 
 Measured: at q4, decode 62 tok/s, and 94 tok/s with MTP (k = 3); prefill 1,550 tok/s.
 
 Checked against Hugging Face on a tiny checkpoint; its q4 pack against Hugging Face fp32 logits of the checkpoint
 (cosine 0.92 to 0.98); MMLU-Pro (25 questions): 80 to 84 %.
+
+### Ornith-1.5-35B-A3B
+
+`ornith-ai/Ornith-1.5-35B-A3B`, or its FP8 release `ornith-ai/Ornith-1.5-35B-A3B-FP8` (39 GB to download instead of
+72) (`qwen3_5_moe`: Qwen3.6-35B-A3B's shape, 3B of its 35B parameters active a token, trained further by Ornith; MIT
+license). Text. A reasoning model: thinking is on unless a request turns it off. Drafters: its MTP head (inside the
+checkpoint and its packs) and the DFlash drafter `ornith-ai/Ornith-1.5-35B-A3B-DFlash`
+([its section](#the-dflash-drafter-for-ornith-15-35b-a3b)).
+
+Reference (its f16 weights do not fit a 24 GB card; the FP8 release also runs as f16 on the device):
+
+```bash
+xpu-serve serve -hf ornith-ai/Ornith-1.5-35B-A3B --device GPU
+```
+
+Optimized (a q4 pack fits one 24 GB card, with the drafter's pack beside it):
+
+```bash
+xpu-serve convert -hf ornith-ai/Ornith-1.5-35B-A3B-FP8 --out ~/models/Ornith-1.5-35B-A3B-q4 --quant q4
+xpu-serve convert -hf ornith-ai/Ornith-1.5-35B-A3B-DFlash --target ~/models/Ornith-1.5-35B-A3B-q4 \
+    --out ~/models/Ornith-1.5-35B-A3B-DFlash-q4
+xpu-serve serve ~/models/Ornith-1.5-35B-A3B-q4 --device GPU --spec dflash \
+    --drafter ~/models/Ornith-1.5-35B-A3B-DFlash-q4 --spec-k 3 --kv-dtype i8
+```
+
+- Less VRAM: `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2` store the KV cache in fewer bits, each at a
+  growing cost in accuracy ([KV cache formats](#kv-cache-formats)). Long contexts are measured on the GGUF file:
+  [Ornith-1.5-35B-A3B GGUF](#ornith-15-35b-a3b-gguf).
+- On the Arc B390 the MTP head is the faster drafter: `--spec mtp --spec-k 2`.
+- Closer to the original: round-to-nearest q4 moves this model's answers more than it moves Qwen3.6's when it answers
+  without thinking (below). A pack that keeps everything but the expert banks at q8
+  (`--q8 linear_attn,self_attn,shared_expert,lm_head` on `convert`, 24.2 GB), or the GGUF Q4_K_M file keeps more of the
+  original's answers there, at about a tenth less speed without a drafter (with the MTP head the q8 one decodes as fast,
+  83 tok/s); with thinking on, the three scored alike on 50 questions (34 to 39, within what 50 questions can tell).
+- Its GGUF files: [Ornith-1.5-35B-A3B GGUF](#ornith-15-35b-a3b-gguf).
+
+Measured over six chat prompts (thinking off, 256 greedy tokens each; drafters at the best `--spec-k`):
+
+| | GPU memory | Decode | With MTP | With the DFlash drafter | Prefill (1k / 4k tokens) |
+|---|---|---|---|---|---|
+| Arc Pro B60, q4 pack | 20.4 GiB | 61 tok/s | 83 tok/s (k = 2) | 89 tok/s (k = 3) | 1,465 / 1,608 tok/s |
+| Arc Pro B60, q4 with the rest at q8 | 21.2 GiB | 54 tok/s | 83 tok/s (k = 2) | 81 tok/s (k = 3) | 1,474 tok/s (1k) |
+| Arc B390, q4 pack | 20.4 GiB | 36 tok/s | 55 tok/s (k = 2) | 48 tok/s (k = 3) | 639 / 728 tok/s |
+
+The optimized command as written (the drafter at k = 3, an `i8` cache) decodes the six prompts at 89 tok/s. With
+thinking on, the drafter does better: answering MMLU-Pro questions with the DFlash drafter at k = 3, the q4 pack
+decoded at 102 tok/s on the B60 (the median over 50 answers of 2,700 tokens on average; the pack with the rest at q8,
+95 tok/s; the GGUF Q4_K_M, 73 tok/s).
+
+Accuracy, against the original checkpoint's own answers in float32 on the CPU:
+
+| | MMLU-Pro, thinking on (50 questions) | MMLU-Pro read at the option letters, right (300) | The original's answer kept (300) | Shift |
+|---|---|---|---|---|
+| *original, f32 on the CPU* | | 125 | 300 | 0 |
+| GGUF Q4_K_M | 39 (5 ran past 8,192 tokens) | 114 | 213 | 0.280 |
+| q4 with the rest at q8 | 34 (8 ran past 8,192 tokens) | 111 | 198 | 0.308 |
+| q4 pack | 36 (9 ran past 8,192 tokens) | 113 | 163 | 0.388 |
+
+"Read at the option letters" is the letter read-out with thinking off (`--readout openjev`, the same 300 questions
+as [docs/gguf_models.md](docs/gguf_models.md)): a reasoning model answers worse without thinking, and its answer
+distributions there are wide, so they move more with rounding than Qwen3.8-27B's (shift 0.07 to 0.13 for its 4-bit
+files). The q4 packs from the FP8 release and from the bf16 original hold the same tensors to cosine 0.9945 and keep
+163 and 168 of the 300 ([docs/decisions/0014](docs/decisions/0014-fp8-checkpoints.md)).
+
+Checked: the engine's prompts are the reference's token for token, and on one pack the GPU's answers differ from the
+reference as much as the CPU backend's at f32 do (the difference is the rounding of the weights). The model code is
+Qwen3.6-35B-A3B's (tiny-checkpoint parity with Hugging Face); the FP8 release's 30,880 FP8 tensors against the bf16
+original at cosine 0.99964 or better.
 
 ### Qwen3.8-27B
 
@@ -710,6 +781,58 @@ Over all its files: 15 to 21 tok/s decode, 25 to 47 with MTP.
 On an Arc B390 the Q4_0 file decodes at 6.4 tok/s and at 17.4 with MTP (k = 6, 2.7 times; 17.2 at k = 5): a verify
 of up to 8 rows costs about one decode step there.
 
+### Ornith-1.5-35B-A3B GGUF
+
+[ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) (`qwen35moe`): five
+files, each with the MTP head inside. Only Q4_K_M (21.7 GB) fits a 24 GB card; Q5_K_M (25.3 GB), Q6_K, Q8_0 and BF16
+hold more weights than the card has memory. The mmproj file (the vision tower) is not read.
+
+Closest to the reference on one card, and with its whole context (`turbo4` cache):
+
+```bash
+xpu-serve serve -hf ornith-ai/Ornith-1.5-35B-A3B-GGUF:Q4_K_M --device GPU --spec mtp --spec-k 2 \
+    --ctx 262144 --kv-dtype turbo4
+```
+
+- Its MTP head drafts as well as the DFlash drafter over this file (71 tok/s either way on the B60; the command above,
+  with its `turbo4` cache, 75 tok/s in a later run), so no second download is needed. The DFlash drafter:
+  `--spec dflash -hfd ornith-ai/Ornith-1.5-35B-A3B-DFlash --spec-k 3`.
+- With a drafter the greedy text can part from plain decoding where two tokens are close: a verify of several tokens
+  reads the activations in f16 (the matrix-engine GEMV over block formats), a single-token step in f32. With
+  `--backend-opt gemv=vector` the two agree token for token (checked on both GPUs).
+- Q4_K_M here is Q4_K for 82 % of the weights and Q6_K for 18 % (half the layers' down-projection expert banks, the
+  output head, part of the attention), imported byte for byte: GPU memory is the file's size.
+
+Measured, thinking off, six chat prompts of 256 greedy tokens (drafters at their best `--spec-k`):
+
+| | GPU memory | Decode | With MTP | With the DFlash drafter | Prefill (1k / 4k tokens) |
+|---|---|---|---|---|---|
+| Arc Pro B60 | 19.7 GiB | 55 tok/s | 71 tok/s (k = 2) | 71 tok/s (k = 3) | 1,211 / 1,321 tok/s |
+| Arc B390 | 19.7 GiB | 34 tok/s | 51 tok/s (k = 3) | 47 tok/s (k = 3) | 603 / 675 tok/s |
+
+Accuracy: in [Ornith-1.5-35B-A3B](#ornith-15-35b-a3b), beside the packs (this file keeps 213 of the original's 300
+answers, the q4 pack 163).
+
+**Long contexts.** The KV cache of the model's ten full-attention layers takes 20,480 bytes a token at f16, 10,400 in
+`i8` and 5,280 in `turbo4` (the other thirty layers keep a fixed-size state). On one Arc Pro B60, each context filled
+with a prompt of that length and then 64 tokens decoded (no drafter):
+
+| `--kv-dtype` | 32k | 64k | 128k | 256k (262,144, the model's whole context) |
+|---|---|---|---|---|
+| f16 | 21.6 GiB, 1,063 / 40.9 | 22.2 GiB, 871 / 34.7 | 23.5 GiB, 589 / 26.1 | out of device memory |
+| `i8` | 21.4 GiB, 1,078 / 43.2 | 21.8 GiB, 873 / 35.7 | 22.5 GiB, 584 / 27.0 | 23.9 GiB, 321 / 2.3 (the card is full) |
+| `turbo4` | 21.2 GiB, 898 / 40.3 | 21.5 GiB, 744 / 32.0 | 21.9 GiB, 532 / 24.3 | **22.8 GiB, 342 / 16.7** |
+
+Each cell: peak GPU memory, then prefill and decode in tok/s. With `turbo4` the whole 262,144-token context fits a
+24 GB card with about 1.2 GiB to spare (its prefill takes 12.8 minutes); an `i8` cache of that length fills the card,
+and decode slows to a crawl. With the MTP head (`--spec mtp --spec-k 2`, the command above) in `turbo4`:
+22.6 GiB and decode 29.4 tok/s at 128k, 23.5 GiB and 17.5 tok/s at 256k (2.86 tokens a round; at that length each
+round's attention over the whole cache is most of its cost).
+
+On the Arc B390 (its memory is the system's: 30 GB in the machine measured), `turbo4` also takes the whole context:
+prefill 526, 271 and 150 tok/s and decode 26.4, 16.7 and 11.4 tok/s at 32k, 128k and 256k (that prefill takes 29
+minutes).
+
 ## Drafters
 
 ### Speculative decoding
@@ -736,19 +859,24 @@ without → with that technique, and the `--spec-k` (drafts per round) that gave
 | Qwen3.5 4B | q4, Arc Pro B60 | 104 → 149, k = 2 | – | – |
 | Qwen3.5 9B | q4, Arc Pro B60 | 62 → 108, k = 4 | – | – |
 | Qwen3.6-35B-A3B | q4, Arc Pro B60 | 62 → 94, k = 3 | – | – |
+| Ornith-1.5-35B-A3B | q4, Arc Pro B60 | 61 → 83, k = 2 | 61 → 89, k = 3 | – |
+| Ornith-1.5-35B-A3B | q4, Arc B390 | 36 → 55, k = 2 | 36 → 48, k = 3 | – |
+| Ornith-1.5-35B-A3B | GGUF Q4_K_M, Arc Pro B60 | 55 → 71, k = 2 | 55 → 71, k = 3 | – |
 | Qwen3.8-27B | q4, Arc Pro B60 | 22 → 50, k = 4 | 22 → 61, k = 7 | 22 → 51, k = 7 |
 | Qwen3.8-27B | q4, Arc B390 | 6.6 → 18, k = 5 | 6.6 → 20, k = 7 | 6.6 → 17.5, k = 7 |
 | LFM3-1.7B | | – | – | – |
 
 Greedy decode over six chat prompts of up to 256 new tokens (`bench --prompts`); the drafters as q4 packs, the Gemma 4
-assistants as their checkpoints. DFlash 2 and DSpine checkpoints are released for Qwen3.8-27B only. The original
-DFlash format loads through the same code (`--spec dflash`), but no DFlash checkpoint exists for a model in this
-table.
+assistants as their checkpoints. DFlash 2 and DSpine checkpoints are released for Qwen3.8-27B; a DFlash one
+(the original format) for Ornith-1.5-35B-A3B. With thinking on a drafter does better than in this table (reasoning
+text is easier to predict): Ornith-1.5-35B-A3B's q4 pack with its DFlash drafter decodes on the B60 while it
+reasons (102 tok/s, the median over 50 answers).
 
 - A drafter checkpoint is served as it is (`-hfd <org/name>`), or from a pack of its own, which is smaller and drafts
   faster: `convert -hf <drafter> --target <model> --out <dir>`, then `--drafter <dir>`.
-- `--spec-k` is 3 by default and 7 for a block drafter, which proposes its whole block in one pass
-  ([docs/design-spec-decode.md](docs/design-spec-decode.md)); the table has the value to pass per model.
+- `--spec-k` is 3 by default and 7 for a block drafter, which proposes up to its whole block in one pass and runs only
+  the rows a round asks for ([docs/design-spec-decode.md](docs/design-spec-decode.md)); the table has the value to
+  pass per model.
 - An MTP head picks each draft among 64 tokens that a one-bit sketch of the output layer shortlists
   (`--draft-shortlist`, 0 to read the whole layer).
 - `bench --prompts file` measures over real prompts, since acceptance depends on the text, and prints where a round's
@@ -789,6 +917,23 @@ xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec dspine --drafter ~/m
 
 Measured in [Qwen3.8-27B](#qwen38-27b): 22 → 61 tok/s with DFlash 2 and 22 → 51 with DSpine on the Arc Pro B60, at the
 default of 7 drafts a round.
+
+### The DFlash drafter for Ornith-1.5-35B-A3B
+
+`ornith-ai/Ornith-1.5-35B-A3B-DFlash` (blocks of 16; five sliding-window layers under a full-attention one), for
+[Ornith-1.5-35B-A3B](#ornith-15-35b-a3b) and its GGUF file. As it is, or as a pack of its own (231 MB at q4):
+
+```bash
+xpu-serve serve ~/models/Ornith-1.5-35B-A3B-q4 --device GPU --spec dflash --spec-k 3 \
+    -hfd ornith-ai/Ornith-1.5-35B-A3B-DFlash
+xpu-serve convert -hf ornith-ai/Ornith-1.5-35B-A3B-DFlash --target ~/models/Ornith-1.5-35B-A3B-q4 \
+    --out ~/models/Ornith-1.5-35B-A3B-DFlash-q4
+```
+
+Over the six chat prompts with the q4 target on the B60: 89, 86 and 79 tok/s at k = 3, 5 and 7 (2.46, 2.75 and 2.85
+tokens a round); the checkpoint as it is drafts a little slower (86, 83, 77). Its acceptance matches its reference:
+z-lab's own code over the float32 target accepts 2.79 tokens a round on the same prompts at its whole block, this
+engine 2.87 over the q4 target, and the drafter proposes 74 to 80 % of the reference's drafts round by round.
 
 ## Decision models
 

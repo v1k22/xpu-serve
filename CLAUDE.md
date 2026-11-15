@@ -35,8 +35,8 @@ Laya and Julia-1, ModernBERT encoders read at a mask token per option, a sequenc
 docs/decisions/0018),
 served end to end on the SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs
 from `convert`; speculative decoding with the model's drafter (`--spec mtp`: Qwen's MTP head, a Gemma 4 assistant
-with `--drafter`; `--spec dflash|dspine`: a block drafter checkpoint for Qwen3.8-27B with `--drafter`;
-docs/design-spec-decode.md). One sequence at a time. Embedding models behind `POST /v1/embeddings` (all-MiniLM-L6-v2
+with `--drafter`; `--spec dflash|dspine`: a block drafter checkpoint for Qwen3.8-27B or Ornith-1.5-35B-A3B with
+`--drafter`; docs/design-spec-decode.md). One sequence at a time. Embedding models behind `POST /v1/embeddings` (all-MiniLM-L6-v2
 and bge-small-en-v1.5: BERT; nomic-embed-text-v1.5: NomicBERT; docs/decisions/0017), checked against
 sentence-transformers on cpu-ref.
 
@@ -531,10 +531,10 @@ Hugging Face safetensors (8.1 first, if it does not).
   under d1). No audio or video.
   Images only as base64 data: URLs.
 - Speculative decoding drafts greedily (rejection sampling keeps sampled output exact). Drafters: the MTP heads, the
-  Gemma 4 assistants, and block drafters for Qwen3.5-family targets (checkpoints exist for Qwen3.8-27B). An MTP head
-  picks each draft among 64 tokens (`--draft-shortlist`; a one-bit sketch of the output layer chooses them, the exact
-  layer ranks them): a pick the shortlist misses costs a draft. A verify of more than 8 tokens leaves the fast path
-  (a block drafter drafts 7 by default).
+  Gemma 4 assistants, and block drafters for Qwen3.5-family targets (checkpoints exist for Qwen3.8-27B and
+  Ornith-1.5-35B-A3B). An MTP head picks each draft among 64 tokens (`--draft-shortlist`; a one-bit sketch of the output
+  layer chooses them, the exact layer ranks them): a pick the shortlist misses costs a draft. A verify of more than 8
+  tokens leaves the fast path (a block drafter drafts 7 by default).
 - Models with conv or recurrent state (Qwen3.5's linear attention, LFM3's convolutions) re-prefill when a new prompt
   does not extend the cached sequence (no state snapshots): with thinking on, a template that drops earlier turns'
   reasoning makes every new user turn such a prompt.

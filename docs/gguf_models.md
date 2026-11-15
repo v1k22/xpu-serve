@@ -1,6 +1,6 @@
 # GGUF files: what was measured
 
-Every result behind xpu-serve's GGUF support, in one place: three language models and the decision models
+Every result behind xpu-serve's GGUF support, in one place: four language models and the decision models
 Clef-Flash, Clef, Laya and Julia-1, every file their publisher offers that fits one Intel Arc Pro B60 (24 GB).
 [Decision 0016](decisions/0016-gguf.md) has the design; [model_recipes.md](../model_recipes.md#gguf-imports) has the
 commands and the short version.
@@ -322,6 +322,27 @@ What each file holds:
 | UD-Q6_K_L (does not fit) | 24.17 GB | 3 | in the file | Q6_K 60 %, Q8_0 31 %, Q5_K 9 % |
 | MTP/mtp-Qwen3.8-27B-Q4_0 | 1.36 GB | 3 | the head alone | Q3_K 86 % (its own embedding and output head), Q4_K 11 %, Q6_K 4 % |
 
+## Ornith-1.5-35B-A3B
+
+Files: [ornith-ai/Ornith-1.5-35B-A3B-GGUF](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF), `qwen35moe`, a
+mixture of experts (Qwen3.6-35B-A3B's shape). Of its five files only Q4_K_M fits the card; Q5_K_M (25.3 GB), Q6_K
+(29.2 GB), Q8_0 (37.8 GB) and BF16 (71.1 GB) do not. Every file holds the MTP head. The reference is the original
+checkpoint in float32 on the CPU, read as for Qwen3.8-27B (`--readout openjev`); the 300 questions are the same.
+
+| Variant | File | GPU memory | Decode | Prefill | MMLU-Pro right (300) | Same answer as the reference (300) | Shift | Decode with MTP (best k) |
+|---|---|---|---|---|---|---|---|---|
+| Q4_K_M | 21.71 GB | 19.66 GiB | 54.9 tok/s | 1,211 tok/s | 114 | 213 | 0.280 | 70.9 tok/s (k = 2), 1.29x |
+| our q4 pack (from the FP8 release) | n/a | 20.42 GiB | 60.7 tok/s | 1,465 tok/s | 113 | 163 | 0.388 | 82.9 tok/s (k = 2), 1.37x |
+| our q4 pack, the rest at q8 | n/a | 21.20 GiB | 53.0 tok/s | | 111 | 198 | 0.308 | |
+| *original, f32 on the CPU* | | | | | 125 | 300 | 0 | |
+
+Q4_K_M is Q4_K (82 % of the weights) and Q6_K (18 %); 753 tensors, the expert banks 3-D in the file's formats.
+The import takes 11 s. The read-out answers of this reasoning model, read with thinking off, are spread out (the
+reference holds 88 of its 300 answers at 0.9 or more), so rounding moves them more than Qwen3.8-27B's; of those 88
+the file changes 5 and the q4 pack 14. With thinking on: in [model_recipes.md](../model_recipes.md#ornith-15-35b-a3b).
+Long contexts (an f16, `i8` and `turbo4` KV cache up to the model's 262,144 tokens):
+[model_recipes.md](../model_recipes.md#ornith-15-35b-a3b-gguf).
+
 ## Clef-Flash and Clef (decision models)
 
 Files: [ggml-org/Clef-Flash-GGUF](https://huggingface.co/ggml-org/Clef-Flash-GGUF), all three (BF16, Q8_0, Q4_K_M), and
@@ -496,3 +517,13 @@ verify over block formats was slow; both are general:
 | An MTP head from a file of its own (`convert --mtp`) | 240 added, 45 removed | `convert/gguf/qwen35.cpp` (121), `gguf_import.cpp`, `cli/main.cpp` |
 | Qwen3.8-27B itself | 0 | |
 | Tests | 340 added, 55 removed | 8 files |
+
+The fourth model (Ornith-1.5-35B-A3B) brought the mixture of experts: `qwen35moe` read by the `qwen35` reader, and
+expert banks in block formats on the GPU:
+
+| Area | Lines | Main files |
+|---|---|---|
+| The `qwen35moe` import | 125 added, 47 removed | `convert/gguf/qwen35.cpp` (one class and one reader for both architectures) |
+| Model code | 29 added, 13 removed | `models/qwen3_5/qwen3_5_decoder.cpp`: the gate and up banks apart, or fused |
+| Expert banks in block formats | 213 added, 88 removed | `backend/sycl/sycl_block_kernels.cpp`: the GEMV's row loop shared with two expert kernels; the grouped GEMM's dequantization in `sycl_matmul.cpp` |
+| Tests | 842 added, 145 removed | `gguf_import_moe.cpp`, `qwen3_5_expert_banks.cpp`, `device_block_ops.cpp`, the real-file checks |
