@@ -67,3 +67,75 @@ TEST_CASE("qwen3_5 config: linear_value_head_order, grouped unless the config sa
     CHECK_THROWS_WITH_AS(xs::qwen3_5::parse_config(config),
                          doctest::Contains("linear_value_head_order 'interleaved' is not supported"), xs::Error);
 }
+
+namespace {
+
+// SenseNova-Loop-9B's loop_settings and mhc on a 32-layer text_config.
+json sensenova_loop_config() {
+    json config = qwen38_config();
+    config["model_type"] = "sensenova_loop";
+    json types = json::array();
+    for (int i = 0; i < 32; ++i)
+        types.push_back((i + 1) % 4 == 0 ? "full_attention" : "linear_attention");
+    config["text_config"]["num_hidden_layers"] = 32;
+    config["text_config"]["layer_types"] = types;
+    config["loop_settings"] = {{"counts", {2}}, {"end", 28}, {"eval_count", 2}, {"start", 4}};
+    config["mhc"] = {{"end", 28}, {"fixed_identity", false}, {"iterations", 20}, {"pre_scale", 1.0}, {"start", 4},
+                     {"streams", 2}};
+    return config;
+}
+
+}  // namespace
+
+TEST_CASE("qwen3_5 config: SenseNova Loop's plan (layers 4 to 27 twice) and hyper-connections") {
+    const xs::qwen3_5::Config c = xs::qwen3_5::parse_config(sensenova_loop_config());
+    REQUIRE(c.plan.size() == 56);
+    CHECK(c.plan[3] == 3);
+    CHECK(c.plan[4] == 4);
+    CHECK(c.plan[27] == 27);
+    CHECK(c.plan[28] == 4);  // the second pass
+    CHECK(c.plan[51] == 27);
+    CHECK(c.plan[52] == 28);
+    CHECK(c.plan[55] == 31);
+    CHECK(c.looped());
+    CHECK(c.mhc.start == 4);
+    CHECK(c.mhc.end == 28);
+    CHECK(c.mhc.streams == 2);
+    CHECK(c.mhc.iterations == 20);
+    CHECK(c.mhc.pre_scale == 1.0f);
+    // a plain Qwen3.5 checkpoint has neither
+    const xs::qwen3_5::Config q = xs::qwen3_5::parse_config(qwen38_config());
+    CHECK(q.plan.empty());
+    CHECK(q.mhc.streams == 0);
+    CHECK_FALSE(q.looped());
+}
+
+TEST_CASE("qwen3_5 config: SenseNova Loop settings it does not implement, refused by name") {
+    struct Case {
+        const char* object;
+        const char* key;
+        json value;
+        const char* message;
+    };
+    for (const Case& k : {Case{"loop_settings", "counts", json::array({1, 2}), "counts"},
+                          Case{"loop_settings", "end", 40, "loop_settings"},
+                          Case{"loop_settings", "eval_count", 0, "loop_settings"},
+                          Case{"mhc", "streams", 3, "streams"},
+                          Case{"mhc", "iterations", 0, "iterations"},
+                          Case{"mhc", "fixed_identity", true, "fixed_identity"},
+                          Case{"mhc", "pre_scale", -1.0, "pre_scale"},
+                          Case{"mhc", "end", 29, "cross"},
+                          Case{"mhc", "alpha", 1.0, "alpha"}}) {
+        CAPTURE(k.object);
+        CAPTURE(k.key);
+        json config = sensenova_loop_config();
+        config[k.object][k.key] = k.value;
+        CHECK_THROWS_WITH_AS(xs::qwen3_5::parse_config(config), doctest::Contains(k.message), xs::Error);
+    }
+    json missing = sensenova_loop_config();
+    missing.erase("loop_settings");
+    CHECK_THROWS_WITH_AS(xs::qwen3_5::parse_config(missing), doctest::Contains("loop_settings"), xs::Error);
+    json other = qwen38_config();
+    other["mhc"] = sensenova_loop_config()["mhc"];
+    CHECK_THROWS_WITH_AS(xs::qwen3_5::parse_config(other), doctest::Contains("sensenova_loop"), xs::Error);
+}

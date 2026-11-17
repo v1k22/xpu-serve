@@ -75,10 +75,22 @@ void Decoder::token_inputs(std::span<const int32_t> tokens, int64_t start_pos, T
 std::vector<Value> Decoder::layers(Graph& g, const Inputs& in, Attention attention) const {
     Value h = g.gather(embedding(g), in.ids);
     const Value freq = inv_freq(g);
+    std::vector<int64_t> plan = cfg_.plan;
+    if (plan.empty()) {
+        for (int64_t i = 0; i < cfg_.num_layers; ++i) plan.push_back(i);
+    }
+    std::vector<int64_t> runs(static_cast<size_t>(cfg_.num_layers), 0);
     std::vector<Value> after;
-    for (int64_t i = 0; i < cfg_.num_layers; ++i) {
+    for (const int64_t i : plan) {
         const std::string name = "layers." + std::to_string(i);
-        h = layer(g, prefix_ + name + ".", name, cfg_.layer_kinds[static_cast<size_t>(i)], h, in.pos, freq, attention);
+        const int64_t pass = runs[static_cast<size_t>(i)]++;
+        const std::string label = pass == 0 ? name : name + ".pass" + std::to_string(pass);
+        const std::string L = prefix_ + name + ".";
+        if (cfg_.mhc.streams > 0 && i >= cfg_.mhc.start && i < cfg_.mhc.end) {
+            h = mhc_layer(g, L, label, i, h, in.pos, freq, attention);
+        } else {
+            h = layer(g, L, label, cfg_.layer_kinds[static_cast<size_t>(i)], h, in.pos, freq, attention);
+        }
         after.push_back(h);
     }
     return after;
@@ -87,14 +99,57 @@ std::vector<Value> Decoder::layers(Graph& g, const Inputs& in, Attention attenti
 Value Decoder::layer(Graph& g, const std::string& L, const std::string& label, LayerKind kind, Value h, Value pos,
                      Value freq, Attention attention) const {
     Graph::Scope s(g, label);
-    const Value x = norm(g, h, L + "input_layernorm.weight");
-    const Value mixed = kind == LayerKind::Linear ? linear_attention(g, L, label, x)
-                                                  : full_attention(g, L, label, x, pos, freq, attention);
-    h = g.add(h, mixed);
-    const Value y = norm(g, h, L + "post_attention_layernorm.weight");
-    if (cfg_.num_experts > 0) return g.add(h, moe(g, L + "mlp.", y));
-    return g.add(h, blocks::gated_mlp(g, y, proj(g, L + "mlp.gate_proj.weight"), proj(g, L + "mlp.up_proj.weight"),
-                                      proj(g, L + "mlp.down_proj.weight"), blocks::Act::Silu));
+    h = g.add(h, mixer(g, L, label, kind, norm(g, h, L + "input_layernorm.weight"), pos, freq, attention));
+    return g.add(h, mlp(g, L, norm(g, h, L + "post_attention_layernorm.weight")));
+}
+
+Value Decoder::mixer(Graph& g, const std::string& L, const std::string& label, LayerKind kind, Value x, Value pos,
+                     Value freq, Attention attention) const {
+    return kind == LayerKind::Linear ? linear_attention(g, L, label, x)
+                                     : full_attention(g, L, label, x, pos, freq, attention);
+}
+
+Value Decoder::mlp(Graph& g, const std::string& L, Value y) const {
+    if (cfg_.num_experts > 0) return moe(g, L + "mlp.", y);
+    return blocks::gated_mlp(g, y, proj(g, L + "mlp.gate_proj.weight"), proj(g, L + "mlp.up_proj.weight"),
+                             proj(g, L + "mlp.down_proj.weight"), blocks::Act::Silu);
+}
+
+// MHCDecoderLayer: enter (copy into the streams), each branch through its router, leave (mean of the streams).
+Value Decoder::mhc_layer(Graph& g, const std::string& L, const std::string& label, int64_t physical, Value h, Value pos,
+                         Value freq, Attention attention) const {
+    Graph::Scope s(g, label);
+    const int64_t streams = cfg_.mhc.streams, hidden = cfg_.hidden_size;
+    Value r = h;
+    if (physical == cfg_.mhc.start) {
+        r = g.concat(std::vector<Value>(static_cast<size_t>(streams), g.reshape(h, {kT, 1, hidden})), 1);
+    }
+    const LayerKind kind = cfg_.layer_kinds[static_cast<size_t>(physical)];
+    r = mhc_branch(g, L + "mhc_attn.", r, [&](Value x) {
+        return mixer(g, L, label, kind, norm(g, x, L + "input_layernorm.weight"), pos, freq, attention);
+    });
+    r = mhc_branch(g, L + "mhc_ffn.", r,
+                   [&](Value x) { return mlp(g, L, norm(g, x, L + "post_attention_layernorm.weight")); });
+    if (physical == cfg_.mhc.end - 1) return g.scale(g.reduce_sum(r, 1), 1.0f / static_cast<float>(streams));
+    return r;
+}
+
+// MHCRouter around one branch of streams r [T, S, hidden]: from W rms(flatten(r)) + b the read weights (pre), the
+// write weights (post) and the stream mix (graph.h, MhcRoute); the new streams are mix @ r + post (outer)
+// branch(pre @ r).
+template <typename Branch>
+Value Decoder::mhc_branch(Graph& g, const std::string& router, Value r, Branch branch) const {
+    const int64_t s = cfg_.mhc.streams, hidden = cfg_.hidden_size, width = 2 * s + s * s;
+    const Value w = weight(g, router + "weight");
+    const Value b = weight(g, router + "bias");
+    XS_CHECK(g.type(w).shape == (Dims{width, s * hidden}) && g.type(b).shape == Dims{width}, "qwen3_5: ", router,
+             "weight and bias have shapes ", dims_to_string(g.type(w).shape), " and ", dims_to_string(g.type(b).shape),
+             ", expected [", width, ", ", s * hidden, "] and [", width, "]");
+    const graph::MhcMaps maps =
+        g.mhc_route(g.matmul(g.rms_norm(g.reshape(r, {kT, s * hidden}), 1e-6f), w), b, s, cfg_.mhc.iterations);
+    Value x = g.reshape(g.stream_mix(g.reshape(maps.pre, {kT, 1, s}), r), {kT, hidden});
+    if (cfg_.mhc.pre_scale != 1.0f) x = g.scale(x, cfg_.mhc.pre_scale);
+    return g.stream_mix(maps.mix, r, maps.post, branch(x));
 }
 
 Value Decoder::norm(Graph& g, Value x, const std::string& name) const {

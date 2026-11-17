@@ -1,7 +1,9 @@
 #pragma once
 
 // Qwen3.5 (Hugging Face model_type "qwen3_5" / "qwen3_5_text"). Reference: transformers models/qwen3_5/
-// modeling_qwen3_5.py (Qwen3_5TextModel, Qwen3_5DecoderLayer, Qwen3_5GatedDeltaNet, Qwen3_5Attention).
+// modeling_qwen3_5.py (Qwen3_5TextModel, Qwen3_5DecoderLayer, Qwen3_5GatedDeltaNet, Qwen3_5Attention). Also SenseNova
+// Loop ("sensenova_loop", the checkpoint's modeling_sensenova_loop.py): the same decoder with a block of layers run
+// several times (loop_settings) and manifold-constrained hyper-connections inside it (mhc).
 //
 // A hybrid decoder: most layers are Gated DeltaNet linear attention (a causal depthwise conv over q, k, v, then the
 // gated delta rule with a fixed-size state per sequence), every `full_attention_interval`-th layer is gated full
@@ -29,6 +31,19 @@ enum class LayerKind { Linear, Full };
 // files, which llama.cpp's converter writes so): head s * key heads + k is. config.json linear_value_head_order names
 // it ("grouped" when absent).
 enum class ValueHeadOrder : uint8_t { Grouped, Tiled };
+
+// Manifold-constrained hyper-connections (SenseNova Loop's MHCRouter): layers [start, end) carry `streams` residual
+// streams of hidden_size each. Each of a layer's two branches (attention, MLP) reads a weighted sum of the streams and
+// writes its output back into every stream, through a router of its own (mhc_attn, mhc_ffn): from the RMS-normed
+// streams, read weights sigmoid(.), write weights 2 sigmoid(.) and a stream mix made doubly stochastic by `iterations`
+// of Sinkhorn. The first layer copies the hidden state into every stream, the last averages them.
+struct Mhc {
+    int64_t start = 0;
+    int64_t end = 0;
+    int64_t streams = 0;  // 0: no hyper-connections
+    int iterations = 0;
+    float pre_scale = 1.0f;  // multiplies what a branch reads
+};
 
 struct Config {
     int64_t vocab_size = 0;
@@ -59,6 +74,11 @@ struct Config {
     int64_t conv_kernel = 0;
     ValueHeadOrder value_head_order = ValueHeadOrder::Grouped;
     int64_t mtp_layers = 0;  // decoder layers of the MTP head (mtp.layers.<i>); 0: no head
+    // The layers in the order they run (loop_settings: [0, start) once, [start, end) eval_count times, the rest
+    // once); every run of a layer has state of its own and the layer's weights. Empty: each layer once, in order.
+    std::vector<int64_t> plan;
+    Mhc mhc;
+    bool looped() const { return !plan.empty() && static_cast<int64_t>(plan.size()) != num_layers; }
 };
 
 // Parses config.json (the text_config object of a multimodal config, or the root of a text-only one).

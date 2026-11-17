@@ -33,7 +33,9 @@ public:
     // Fills those inputs for `tokens` at positions start_pos, start_pos + 1, ...
     void token_inputs(std::span<const int32_t> tokens, int64_t start_pos, TensorMap& inputs) const;
 
-    // The embedded tokens through every decoder layer: the state after each layer (before the final norm).
+    // The embedded tokens through the decoder's layers in the order they run (Config::plan): the state after each
+    // run (before the final norm; inside the hyper-connections, their streams [T, streams, hidden]). A layer's first
+    // run keeps its state slots under "layers.<i>", a later one under "layers.<i>.pass<n>".
     std::vector<graph::Value> layers(graph::Graph& g, const Inputs& in, Attention attention = Attention::Causal) const;
     // One decoder layer from the weights under `L` (".../layers.<i>."); `label` names its state slots.
     graph::Value layer(graph::Graph& g, const std::string& L, const std::string& label, LayerKind kind, graph::Value h,
@@ -53,6 +55,16 @@ public:
 private:
     float eps() const { return static_cast<float>(cfg_.rms_norm_eps); }
     blocks::Linear proj(graph::Graph& g, const std::string& name) const;
+    // A layer's two branches, on their normed inputs: attention of its kind, and the MLP (dense or experts).
+    graph::Value mixer(graph::Graph& g, const std::string& L, const std::string& label, LayerKind kind, graph::Value x,
+                       graph::Value pos, graph::Value freq, Attention attention) const;
+    graph::Value mlp(graph::Graph& g, const std::string& L, graph::Value y) const;
+    // Layer `physical` of the hyper-connections (Config::mhc): h is the hidden state [T, hidden] at their first
+    // layer, else their streams [T, streams, hidden]; the result is the streams, or their mean after the last layer.
+    graph::Value mhc_layer(graph::Graph& g, const std::string& L, const std::string& label, int64_t physical,
+                           graph::Value h, graph::Value pos, graph::Value freq, Attention attention) const;
+    template <typename Branch>
+    graph::Value mhc_branch(graph::Graph& g, const std::string& router, graph::Value r, Branch branch) const;
     graph::Value moe(graph::Graph& g, const std::string& L, graph::Value y) const;
     graph::Value linear_attention(graph::Graph& g, const std::string& layer, const std::string& label,
                                   graph::Value x) const;

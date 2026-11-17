@@ -48,9 +48,11 @@ std::optional<DType> fitting(const std::string& name, const TensorView& v, DType
 }
 
 // Weights of the matmuls whose output decides a TopK (through Softmax / Sigmoid) that picks what the graph reads next
-// (experts, a drafter's centroids): mixture-of-experts routers. They stay unquantized: a rounded router picks
-// different experts for some tokens, a much larger error than rounding a weight. A TopK whose indices only leave the
-// graph (a head's argmax) picks nothing.
+// (experts, a drafter's centroids): mixture-of-experts routers; and of those whose output an MhcRoute reads:
+// hyper-connection routers. They stay unquantized: a rounded router picks
+// different experts for some tokens, a much larger error than rounding a weight, and a hyper-connection router's
+// small matrix sets how every layer's output reaches the residual streams. A TopK whose indices only leave the graph
+// (a head's argmax) picks nothing.
 std::set<std::string> router_weights(const graph::Graph& g) {
     const auto& nodes = g.nodes();
     const auto selects = [&](size_t topk) {  // its indices reach an ExpertMatMul or a Gather, through reshapes
@@ -67,15 +69,21 @@ std::set<std::string> router_weights(const graph::Graph& g) {
         return false;
     };
     std::set<std::string> out;
+    const auto matmul_weight = [&](graph::Value v) {
+        const auto& mm = g.node(v);
+        if (mm.kind == OpKind::MatMul && g.node(mm.inputs[1]).kind == OpKind::Weight) {
+            out.insert(std::get<graph::WeightAttrs>(g.node(mm.inputs[1]).attrs).name);
+        }
+    };
+    for (const auto& n : nodes) {
+        if (n.kind == OpKind::MhcRoute) matmul_weight(n.inputs[0]);
+    }
     for (size_t i = 0; i < nodes.size(); ++i) {
         const auto& n = nodes[i];
         if (n.kind != OpKind::TopK || !selects(i)) continue;
         graph::Value v = n.inputs[0];
         while (g.node(v).kind == OpKind::Softmax || g.node(v).kind == OpKind::Sigmoid) v = g.node(v).inputs[0];
-        const auto& mm = g.node(v);
-        if (mm.kind == OpKind::MatMul && g.node(mm.inputs[1]).kind == OpKind::Weight) {
-            out.insert(std::get<graph::WeightAttrs>(g.node(mm.inputs[1]).attrs).name);
-        }
+        matmul_weight(v);
     }
     return out;
 }

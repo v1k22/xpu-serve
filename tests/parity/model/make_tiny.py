@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3 --tokenizer-from <dir>
-        --out <dir>
+    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3|sensenova_loop
+        --tokenizer-from <dir> --out <dir>
     python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
         [--pooling mean|cls] [--normalize] [--max-seq-length N]
     python -I tests/parity/model/make_tiny.py --drafter dflash|dflash2|dspine --target <tiny dir> --dflash-repo <clone
@@ -11,9 +11,9 @@
 The model keeps the real layer pattern and tensor names (Qwen3.5 MoE: three Gated DeltaNet layers then one full
 attention layer, fused gate_up expert banks, a gated shared expert; an MTP head) at a width a CPU runs in seconds.
 The tokenizer files are copied from a real checkpoint, so the vocabulary is the real one; an architecture
-transformers does not ship (lfm3) is built from the modeling code in that checkpoint, which is copied too. Router
-weights are scaled up so each token's top-k experts win by a clear margin: a near tie could route differently at f16
-and fail parity for a reason that is not a bug. Then run hf_reference.py on the output.
+transformers does not ship (lfm3, sensenova_loop) is built from the modeling code in that checkpoint, which is copied
+too. Router weights are scaled up so each token's top-k experts win by a clear margin: a near tie could route
+differently at f16 and fail parity for a reason that is not a bug. Then run hf_reference.py on the output.
 
 An embedding model (bert, nomic_bert) is the encoder of a sentence-transformers checkpoint, with its modules.json,
 1_Pooling/config.json and sentence_bert_config.json: --pooling and --normalize pick the pipeline, --max-seq-length the
@@ -139,6 +139,43 @@ def lfm3(vocab_size, source):
     return model
 
 
+def sensenova_loop(vocab_size, source):
+    """SenseNova-Loop-9B's layout from its own modeling code (the --tokenizer-from checkpoint's): twelve Qwen3.5 layers
+    in three linear / linear / linear / full cycles, the middle four run twice (loop_settings) inside two-stream
+    hyper-connections (mhc), a tiny vision tower (the class builds one; the engine does not load it). The routers'
+    weights are as large as a trained router's, so read, write and mix weights differ by token and stream and a wrong
+    order of streams or mix shows; norms away from their defaults."""
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    config_cls = get_class_from_dynamic_module("modeling_sensenova_loop.SenseNovaLoopConfig", source)
+    model_cls = get_class_from_dynamic_module("modeling_sensenova_loop.SenseNovaLoopForConditionalGeneration", source)
+    with open(os.path.join(source, "config.json")) as f:
+        config = json.load(f)
+    for key in ("auto_map", "model_name"):
+        config.pop(key, None)
+    config["text_config"].update(
+        vocab_size=vocab_size, hidden_size=64, intermediate_size=128, num_hidden_layers=12, num_attention_heads=4,
+        num_key_value_heads=2, head_dim=32, linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=32,
+        linear_value_head_dim=32, max_position_embeddings=4096, initializer_range=0.05,
+        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 3,
+    )
+    config["text_config"]["rope_parameters"]["mrope_section"] = [1, 1, 2]
+    config["vision_config"].update(hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=64, depth=2)
+    config["hidden_size"] = 64
+    config["loop_settings"] = {"counts": [2], "start": 4, "end": 8, "eval_count": 2}
+    config["mhc"] = {"start": 4, "end": 8, "streams": 2, "iterations": 20, "fixed_identity": False, "pre_scale": 1.0}
+    model = model_cls(config_cls.from_dict(config)).float()
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if ".mhc_" in name and name.endswith("weight"):
+                p.normal_(0.0, 0.1)
+            elif ".mhc_" in name:
+                p.normal_(0.0, 1.0)
+            elif p.dim() == 1 and "norm" in name and "visual" not in name:
+                p.normal_(0.0, 0.2)  # zero-centered norms: (1 + w) away from 1, so a skipped norm shows
+    return model
+
+
 def bert(vocab_size, source):
     """BERT as all-MiniLM-L6-v2 and bge-small-en-v1.5 are: post-norm layers, biases everywhere, the exact GELU,
     absolute positions; head_dim 32 as theirs."""
@@ -181,8 +218,8 @@ def perturbed(model):
     return model.eval()
 
 
-ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3, "bert": bert,
-         "nomic_bert": nomic_bert}
+ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3,
+         "sensenova_loop": sensenova_loop, "bert": bert, "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}
 ENCODER_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]
 
@@ -235,8 +272,9 @@ def mtp_head(model):
     norms, one full-attention decoder layer of the target's kind, the final norm), built from the target's classes."""
     import torch.nn as nn
 
-    cfg = model.config
-    layer_cls, norm_cls = type(model.model.layers[0]), type(model.model.norm)
+    cfg = model.config.get_text_config()
+    lm = model.model.language_model if hasattr(model.model, "language_model") else model.model
+    layer_cls, norm_cls = type(lm.layers[0]), type(lm.norm)
     hidden = cfg.hidden_size
     head = nn.ModuleDict({
         "layers": nn.ModuleList([layer_cls(cfg, cfg.layer_types.index("full_attention"))]),
@@ -384,9 +422,9 @@ def main():
     model = ARCHS[args.arch](len(tok), args.tokenizer_from)
     model.config.eos_token_id = tok.eos_token_id
     model.generation_config.eos_token_id = tok.eos_token_id
-    qwen = args.arch.startswith("qwen")
+    qwen = args.arch.startswith("qwen") or args.arch == "sensenova_loop"
     if qwen:
-        model.config.mtp_num_hidden_layers = 1
+        model.config.get_text_config().mtp_num_hidden_layers = 1
     model.save_pretrained(args.out, safe_serialization=True)
     weights = os.path.join(args.out, "model.safetensors")
     if qwen:

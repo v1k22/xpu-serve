@@ -62,6 +62,11 @@ public:
         build_target(step_, Head::LastLogits);
         if (!options.speculation) return;
         if (drafter) {
+            if (cfg_.looped()) {
+                fail("qwen3_5: a block drafter reads the target's layers by index; this model runs some layers more ",
+                     "than once (loop_settings), which no block drafter was trained for (--spec mtp drafts with its ",
+                     "own head)");
+            }
             XS_CHECK(drafter->hidden_size == cfg_.hidden_size && drafter->vocab_size == cfg_.vocab_size &&
                          drafter->num_target_layers == cfg_.num_layers,
                      "qwen3_5: the drafter was trained for a target of ", drafter->num_target_layers, " layers of ",
@@ -200,7 +205,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     }
 
     ModelInfo info;
-    info.arch = "qwen3_5";
+    info.arch = cfg.looped() || cfg.mhc.streams > 0 ? "sensenova_loop" : "qwen3_5";
     info.id = cfg::model_id(dir);
     info.vocab_size = cfg.vocab_size;
     info.hidden_size = cfg.hidden_size;

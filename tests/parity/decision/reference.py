@@ -93,8 +93,10 @@ def letters(model_dir, requests):
 
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     with open(os.path.join(model_dir, "config.json")) as f:
-        auto = AutoModelForImageTextToText if "vision_config" in json.load(f) else AutoModelForCausalLM
-    model = auto.from_pretrained(model_dir, dtype=torch.float32).eval()
+        config = json.load(f)
+    auto = AutoModelForImageTextToText if "vision_config" in config else AutoModelForCausalLM
+    # a checkpoint that names its own modeling code (auto_map) runs with it
+    model = auto.from_pretrained(model_dir, dtype=torch.float32, trust_remote_code="auto_map" in config).eval()
     prompts = []
 
     def create(messages=None, extra_body=None, **kwargs):

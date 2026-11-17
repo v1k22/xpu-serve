@@ -30,7 +30,8 @@ bool is_embedding_type(const std::string& type) {
 }  // namespace
 
 std::vector<std::string> supported_model_types() {
-    return {"gemma4", "gemma4_text", "lfm3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"};
+    return {"gemma4",       "gemma4_text", "lfm3",             "qwen3_5",
+            "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "sensenova_loop"};
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOptions& options) {
@@ -39,7 +40,8 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
     const std::string type = cfg::get_string(config, "model_type", "config.json");
     cfg::check_quantization(config);
     if (type == "gemma4" || type == "gemma4_text") return gemma4::load(dir, config, options);
-    if (type == "qwen3_5" || type == "qwen3_5_text" || type == "qwen3_5_moe" || type == "qwen3_5_moe_text") {
+    if (type == "qwen3_5" || type == "qwen3_5_text" || type == "qwen3_5_moe" || type == "qwen3_5_moe_text" ||
+        type == "sensenova_loop") {
         return qwen3_5::load(dir, config, options);
     }
     if (type == "lfm3") return lfm3::load(dir, config, options);

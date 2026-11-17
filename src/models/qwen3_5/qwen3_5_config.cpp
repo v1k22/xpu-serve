@@ -1,8 +1,71 @@
+#include <algorithm>
+#include <cmath>
+
 #include "models/config_util.h"
 #include "models/qwen3_5/qwen3_5.h"
 #include "util/error.h"
 
 namespace xs::qwen3_5 {
+namespace {
+
+// SenseNova Loop's loop_settings and mhc (config.json's root), checked as its execution_plan() checks them.
+void parse_loop(const nlohmann::json& root, Config& c) {
+    const std::string type = root.contains("model_type") && root.at("model_type").is_string()
+                                 ? root.at("model_type").get<std::string>()
+                                 : "";
+    const bool loop = root.contains("loop_settings") && !root.at("loop_settings").is_null();
+    const bool mhc = root.contains("mhc") && !root.at("mhc").is_null();
+    if (type != "sensenova_loop") {
+        if (loop || mhc) fail("config.json: loop_settings and mhc are SenseNova Loop's (model_type sensenova_loop)");
+        return;
+    }
+    if (!loop) fail("config.json: a sensenova_loop checkpoint needs loop_settings");
+    const nlohmann::json& l = root.at("loop_settings");
+    const std::string lw = "config.json loop_settings";
+    const int64_t start = cfg::get_int(l, "start", lw), end = cfg::get_int(l, "end", lw);
+    const int64_t count = cfg::get_int(l, "eval_count", lw);
+    XS_CHECK(0 <= start && start < end && end <= c.num_layers && count >= 1, lw, ": start ", start, ", end ", end,
+             " and eval_count ", count, " do not fit ", c.num_layers, " layers");
+    if (!l.contains("counts") || l.at("counts") != nlohmann::json::array({count})) {
+        fail(lw, ": counts must be [eval_count] (a fixed loop count; others are not supported)");
+    }
+    std::vector<int64_t>& plan = c.plan;
+    for (int64_t i = 0; i < start; ++i) plan.push_back(i);
+    for (int64_t pass = 0; pass < count; ++pass)
+        for (int64_t i = start; i < end; ++i) plan.push_back(i);
+    for (int64_t i = end; i < c.num_layers; ++i) plan.push_back(i);
+
+    if (!mhc) return;
+    const nlohmann::json& m = root.at("mhc");
+    const std::string mw = "config.json mhc";
+    for (const auto& [key, value] : m.items()) {
+        static const std::vector<std::string> known = {"start", "end", "streams", "iterations", "fixed_identity",
+                                                       "pre_scale"};
+        if (std::find(known.begin(), known.end(), key) == known.end()) fail(mw, ": unknown key '", key, "'");
+    }
+    c.mhc.start = cfg::get_int(m, "start", mw);
+    c.mhc.end = cfg::get_int(m, "end", mw);
+    c.mhc.streams = cfg::get_int(m, "streams", mw);
+    c.mhc.iterations = static_cast<int>(cfg::get_int(m, "iterations", mw));
+    c.mhc.pre_scale = static_cast<float>(m.contains("pre_scale") ? cfg::get_float(m, "pre_scale", mw) : 1.0);
+    XS_CHECK(0 <= c.mhc.start && c.mhc.start < c.mhc.end && c.mhc.end <= c.num_layers, mw, ": layers [", c.mhc.start,
+             ", ", c.mhc.end, ") do not fit ", c.num_layers);
+    XS_CHECK(c.mhc.streams == 2 || c.mhc.streams == 4, mw, ": streams ", c.mhc.streams, " (2 or 4)");
+    XS_CHECK(c.mhc.iterations >= 1, mw, ": iterations ", c.mhc.iterations);
+    XS_CHECK(std::isfinite(c.mhc.pre_scale) && c.mhc.pre_scale > 0, mw, ": pre_scale ", c.mhc.pre_scale);
+    if (!m.contains("fixed_identity") || !m.at("fixed_identity").is_boolean()) {
+        fail(mw, ": fixed_identity must be a boolean");
+    }
+    if (m.at("fixed_identity").get<bool>()) fail(mw, ": fixed_identity (no stream mix) is not supported yet");
+    // Inside one phase of the plan: before the loop, inside it or after it.
+    const int64_t bounds[] = {0, start, end, c.num_layers};
+    bool inside = false;
+    for (int b = 0; b < 3; ++b) inside = inside || (bounds[b] <= c.mhc.start && c.mhc.end <= bounds[b + 1]);
+    XS_CHECK(inside, mw, ": layers [", c.mhc.start, ", ", c.mhc.end, ") cross a boundary of the loop [", start, ", ",
+             end, ")");
+}
+
+}  // namespace
 
 Config parse_config(const nlohmann::json& config_json) {
     const bool nested = config_json.contains("text_config");
@@ -90,6 +153,7 @@ Config parse_config(const nlohmann::json& config_json) {
     XS_CHECK(c.rotary_dim > 0 && c.rotary_dim % 2 == 0 && c.rotary_dim <= c.head_dim, where, ": rotary dim ",
              c.rotary_dim, " does not fit head_dim ", c.head_dim);
     XS_CHECK(c.conv_kernel > 1, where, ": linear_conv_kernel_dim must be at least 2");
+    parse_loop(config_json, c);
     return c;
 }
 

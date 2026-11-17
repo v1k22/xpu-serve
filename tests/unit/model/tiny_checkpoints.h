@@ -1,9 +1,9 @@
 #pragma once
 
 // Tiny random checkpoints written to disk for tests that need a model directory without downloading one: a Qwen3.5
-// target (dense or mixture of experts), block drafters for it (DFlash, DFlash 2, DSpine), a Gemma 4 of the E-series
-// layout and an assistant for it, in the released checkpoints' layout (config keys and tensor names); and a checkpoint
-// rewritten the way an FP8 release stores it.
+// target (dense or mixture of experts, or SenseNova Loop's looped layers in hyper-connections), block drafters for it
+// (DFlash, DFlash 2, DSpine), a Gemma 4 of the E-series layout and an assistant for it, in the released checkpoints'
+// layout (config keys and tensor names); and a checkpoint rewritten the way an FP8 release stores it.
 
 #include <algorithm>
 #include <cmath>
@@ -81,6 +81,9 @@ struct TinyQwen {
     int64_t lin_k_heads = 2, lin_v_heads = 4, lin_dim = 32, conv = 4;
     std::vector<std::string> layers{"linear_attention", "linear_attention", "linear_attention", "full_attention"};
     int64_t experts = 0, top_k = 2, moe_ffn = 64, shared_ffn = 96;  // experts > 0: Qwen3.5 MoE (fused banks)
+    // loop_count > 0: SenseNova Loop, layers [loop_start, loop_end) run loop_count times inside hyper-connections of
+    // mhc_streams streams.
+    int64_t loop_start = 0, loop_end = 0, loop_count = 0, mhc_streams = 2;
 };
 
 // Writes config.json and model.safetensors (bf16, random) for `m` into `dir`.
@@ -102,16 +105,26 @@ inline void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t see
         config["moe_intermediate_size"] = m.moe_ffn;
         config["shared_expert_intermediate_size"] = m.shared_ffn;
     }
+    if (m.loop_count > 0) {
+        config["model_type"] = "sensenova_loop";
+        config["loop_settings"] = {{"counts", {m.loop_count}}, {"start", m.loop_start}, {"end", m.loop_end},
+                                   {"eval_count", m.loop_count}};
+        config["mhc"] = {{"start", m.loop_start}, {"end", m.loop_end}, {"streams", m.mhc_streams}, {"iterations", 20},
+                         {"fixed_identity", false}, {"pre_scale", 1.0}};
+    }
     std::ofstream(dir / "config.json") << config.dump(1);
     std::ofstream(dir / "tokenizer_config.json") << R"({"eos_token": "<|end|>"})";
 
     // 1/sqrt(fan-in) for matrices keeps activations O(1); small values for norms (zero-centered) and the rest. The
-    // router is larger, so each token's top-k experts win clearly (a near tie may route differently at f16).
+    // router is larger, so each token's top-k experts win clearly (a near tie may route differently at f16); so are a
+    // hyper-connection router's weights and biases, so its read, write and mix weights differ by token and stream.
     std::vector<TinyTensor> specs;
     const auto add = [&](const std::string& name, Dims shape) {
         const bool router = name.size() > 15 && name.compare(name.size() - 15, 15, "mlp.gate.weight") == 0;
-        const float range = shape.size() >= 2 ? (router ? 8.0f : 1.0f) / std::sqrt(static_cast<float>(shape.back()))
-                                              : 0.1f;
+        const bool mhc = name.find(".mhc_") != std::string::npos;
+        const float range = shape.size() >= 2
+                                 ? (router || mhc ? 8.0f : 1.0f) / std::sqrt(static_cast<float>(shape.back()))
+                                 : (mhc ? 1.5f : 0.1f);
         specs.push_back(TinyTensor{"model." + name, std::move(shape), -range, range});
     };
     add("embed_tokens.weight", {m.vocab, m.hidden});
@@ -121,6 +134,13 @@ inline void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t see
         const std::string L = "layers." + std::to_string(i) + ".";
         add(L + "input_layernorm.weight", {m.hidden});
         add(L + "post_attention_layernorm.weight", {m.hidden});
+        if (m.loop_count > 0 && static_cast<int64_t>(i) >= m.loop_start && static_cast<int64_t>(i) < m.loop_end) {
+            const int64_t s = m.mhc_streams, width = 2 * s + s * s;
+            for (const char* router : {"mhc_attn.", "mhc_ffn."}) {
+                add(L + router + "weight", {width, s * m.hidden});
+                add(L + router + "bias", {width});
+            }
+        }
         if (m.experts > 0) {
             add(L + "mlp.gate.weight", {m.experts, m.hidden});
             add(L + "mlp.experts.gate_up_proj", {m.experts, 2 * m.moe_ffn, m.hidden});
