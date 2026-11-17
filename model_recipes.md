@@ -440,6 +440,19 @@ xpu-serve convert -hf sensenova/SenseNova-Loop-9B --out ~/models/SenseNova-Loop-
 xpu-serve serve ~/models/SenseNova-Loop-9B-q4 --device GPU --spec mtp --spec-k 2 --kv-dtype i8 --ctx 65536
 ```
 
+Full context (the release's 512K tokens by its model card), the q4 pack with an int8 KV cache and no drafter:
+
+```bash
+xpu-serve convert -hf sensenova/SenseNova-Loop-9B --out ~/models/SenseNova-Loop-9B-q4 --quant q4
+xpu-serve serve ~/models/SenseNova-Loop-9B-q4 --device GPU --kv-dtype i8 --ctx 524288
+```
+
+- Estimated, not measured: the cache is 14.2 GiB at 524,288 tokens, about 23 GiB in all with the weights and the
+  prefill's scratch, at the edge of a 24 GB card. If it runs out of memory, `--kv-dtype i8:turbo4` (10.7 GiB of
+  cache, about 20 GiB in all) or `turbo4` (7.2 GiB, about 17 GiB).
+- `--ctx` is capped at the checkpoint's `max_position_embeddings`: 262,144 in the Preview's config. The release's
+  config was not read here (gated).
+
 - Closer to the original: `--quant q8` keeps 290 of the original's 300 answers below (q4: 229), at two thirds of
   q4's speed. `--method awq` on the q4 pack keeps 252 at 11 % less decode speed, and its MTP rounds are slower still
   (42 tok/s instead of 56).
