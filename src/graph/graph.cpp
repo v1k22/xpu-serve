@@ -63,6 +63,8 @@ std::string_view op_name(OpKind kind) {
         case OpKind::PrevRow: return "PrevRow";
         case OpKind::LayerNorm: return "LayerNorm";
         case OpKind::Concat: return "Concat";
+        case OpKind::MhcRoute: return "MhcRoute";
+        case OpKind::StreamMix: return "StreamMix";
     }
     return "?";
 }
@@ -346,6 +348,66 @@ Value Graph::concat(const std::vector<Value>& parts, int axis) {
     return add_node(OpKind::Concat, parts, AxisAttrs{axis}, {TensorType{first.dtype, out}}, "concat");
 }
 
+MhcMaps Graph::mhc_route(Value z, Value bias, int64_t streams, int iterations) {
+    const TensorType& zt = type(z);
+    const int64_t width = 2 * streams + streams * streams;
+    XS_CHECK(streams >= 1 && streams <= 8 && iterations >= 1, "mhc_route of ", streams, " streams (1 to 8) and ",
+             iterations, " iterations (at least 1)");
+    XS_CHECK(is_float(zt.dtype) && !zt.shape.empty() && zt.shape.back() == width, "mhc_route of ", streams,
+             " streams needs floats [..., ", width, "], got ", dtype_name(zt.dtype), shape_to_string(zt.shape), " at ",
+             where(z));
+    std::vector<Value> inputs{z};
+    if (bias.valid()) {
+        XS_CHECK(is_float(type(bias).dtype) && type(bias).shape == Dims{width}, "mhc_route bias must be [", width,
+                 "] floats, got ", shape_to_string(type(bias).shape), " at ", where(bias));
+        inputs.push_back(bias);
+    }
+    Dims lead(zt.shape.begin(), zt.shape.end() - 1);
+    Dims maps = lead, mix = lead;
+    maps.push_back(streams);
+    mix.push_back(streams);
+    mix.push_back(streams);
+    std::vector<TensorType> outputs{TensorType{DType::F32, maps}, TensorType{DType::F32, maps},
+                                    TensorType{DType::F32, mix}};
+    const Value pre = add_node(OpKind::MhcRoute, std::move(inputs), MhcRouteAttrs{streams, iterations},
+                               std::move(outputs), "mhc_route");
+    return {pre, Value{pre.node, 1}, Value{pre.node, 2}};
+}
+
+namespace {
+
+// StreamMix operands: m [..., P, S], x [..., S, D] with the same leading dims; the output [..., P, D].
+Dims stream_mix_shape(const Graph& g, Value m, Value x) {
+    const Dims& ms = g.type(m).shape;
+    const Dims& xs = g.type(x).shape;
+    XS_CHECK(is_float(g.type(m).dtype) && is_float(g.type(x).dtype) && ms.size() >= 2 && ms.size() == xs.size() &&
+                 std::equal(ms.begin(), ms.end() - 2, xs.begin()) && ms.back() == xs[xs.size() - 2] &&
+                 !is_symbol(ms.back()) && !is_symbol(ms[ms.size() - 2]) && !is_symbol(xs.back()),
+             "stream_mix needs m [..., P, S] and x [..., S, D] floats with the same leading dims, got ",
+             shape_to_string(ms), " and ", shape_to_string(xs));
+    Dims out = ms;
+    out.back() = xs.back();
+    return out;
+}
+
+}  // namespace
+
+Value Graph::stream_mix(Value m, Value x) {
+    Dims out = stream_mix_shape(*this, m, x);
+    return add_node(OpKind::StreamMix, {m, x}, {}, {TensorType{DType::F32, std::move(out)}}, "stream_mix");
+}
+
+Value Graph::stream_mix(Value m, Value x, Value a, Value y) {
+    Dims out = stream_mix_shape(*this, m, x);
+    const Dims a_shape(out.begin(), out.end() - 1);
+    Dims y_shape(out.begin(), out.end() - 2);
+    y_shape.push_back(out.back());
+    XS_CHECK(is_float(type(a).dtype) && type(a).shape == a_shape && is_float(type(y).dtype) && type(y).shape == y_shape,
+             "stream_mix a must be ", shape_to_string(a_shape), " and y ", shape_to_string(y_shape), " floats, got ",
+             shape_to_string(type(a).shape), " and ", shape_to_string(type(y).shape), " at ", where(a));
+    return add_node(OpKind::StreamMix, {m, x, a, y}, {}, {TensorType{DType::F32, std::move(out)}}, "stream_mix");
+}
+
 Value Graph::reshape(Value x, Dims shape) {
     const TensorType& xt = type(x);
     for (int64_t d : shape) XS_CHECK(d >= 0 || is_symbol(d), "reshape target has invalid dim ", d);
@@ -625,6 +687,8 @@ std::string attrs_to_string(const Attrs& a) {
                 os << "k=" << v.k;
             } else if constexpr (std::is_same_v<T, AxisAttrs>) {
                 os << "axis=" << v.axis;
+            } else if constexpr (std::is_same_v<T, MhcRouteAttrs>) {
+                os << "streams=" << v.streams << " iterations=" << v.iterations;
             } else if constexpr (std::is_same_v<T, AttentionAttrs>) {
                 os << "scale=" << v.scale << " window=" << v.sliding_window << " softcap=" << v.softcap
                    << " causal=" << v.causal;

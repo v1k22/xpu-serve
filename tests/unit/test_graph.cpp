@@ -151,6 +151,31 @@ TEST_CASE("prev_row keeps the shape; float rows only") {
     CHECK_THROWS_AS(g.prev_row(g.input("ids", DType::I32, {kT})), xs::Error);
 }
 
+TEST_CASE("mhc_route: pre, post [T, S] and mix [T, S, S] from [T, 2S + S^2]; stream_mix mixes [P, S] by [S, D]") {
+    Graph g;
+    const Value z = g.input("z", DType::F32, {kT, 8});
+    const xs::graph::MhcMaps maps = g.mhc_route(z, g.input("b", DType::F32, {8}), 2, 20);
+    CHECK(g.type(maps.pre).shape == (xs::Dims{kT, 2}));
+    CHECK(g.type(maps.post).shape == (xs::Dims{kT, 2}));
+    CHECK(g.type(maps.mix).shape == (xs::Dims{kT, 2, 2}));
+    CHECK(g.type(g.mhc_route(g.input("z4", DType::F32, {kT, 24}), Value{}, 4, 1).mix).shape == (xs::Dims{kT, 4, 4}));
+    CHECK_THROWS_AS(g.mhc_route(z, Value{}, 3, 20), xs::Error);                             // 3 streams take 15
+    CHECK_THROWS_AS(g.mhc_route(z, Value{}, 2, 0), xs::Error);                              // no iteration
+    CHECK_THROWS_AS(g.mhc_route(z, g.input("b6", DType::F32, {6}), 2, 20), xs::Error);      // a bias of another width
+    const Value m = g.input("m", DType::F32, {kT, 2, 2});
+    const Value x = g.input("x", DType::F32, {kT, 2, 16});
+    CHECK(g.type(g.stream_mix(m, x)).shape == (xs::Dims{kT, 2, 16}));
+    const Value pre = g.input("pre", DType::F32, {kT, 1, 2});
+    CHECK(g.type(g.stream_mix(pre, x)).shape == (xs::Dims{kT, 1, 16}));
+    const Value a = g.input("a", DType::F32, {kT, 2});
+    const Value y = g.input("y", DType::F32, {kT, 16});
+    CHECK(g.type(g.stream_mix(m, x, a, y)).shape == (xs::Dims{kT, 2, 16}));
+    CHECK_THROWS_AS(g.stream_mix(g.input("m3", DType::F32, {kT, 2, 3}), x), xs::Error);   // S differs
+    CHECK_THROWS_AS(g.stream_mix(g.input("m4", DType::F32, {4, 2, 2}), x), xs::Error);    // leading dims differ
+    CHECK_THROWS_AS(g.stream_mix(m, x, a, g.input("y8", DType::F32, {kT, 8})), xs::Error);  // y of another width
+    CHECK_THROWS_AS(g.stream_mix(pre, x, a, y), xs::Error);                                  // a of another P
+}
+
 TEST_CASE("sign matmul: one word of signs per 32 columns, a scale per row") {
     Graph g;
     const Value x = g.input("x", DType::F32, {kT, 64});

@@ -665,4 +665,84 @@ HostTensor sign_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& 
     return out;
 }
 
+std::vector<HostTensor> mhc_route(const HostTensor& z, const HostTensor* bias, int64_t streams, int iterations) {
+    check_f32(z, "mhc_route z");
+    if (bias != nullptr) check_f32(*bias, "mhc_route bias");
+    const int64_t s = streams, width = 2 * s + s * s;
+    const int64_t rows = z.numel() / width;
+    Dims lead(z.shape().begin(), z.shape().end() - 1);
+    Dims maps = lead, mixes = lead;
+    maps.push_back(s);
+    mixes.push_back(s);
+    mixes.push_back(s);
+    HostTensor pre(DType::F32, maps), post(DType::F32, maps), mix(DType::F32, mixes);
+    std::vector<double> v(static_cast<size_t>(width));
+    const auto logsumexp = [&](int64_t first, int64_t stride) {
+        double peak = v[static_cast<size_t>(first)];
+        for (int64_t i = 1; i < s; ++i)
+            peak = std::max(peak, v[static_cast<size_t>(first + i * stride)]);
+        double sum = 0;
+        for (int64_t i = 0; i < s; ++i)
+            sum += std::exp(v[static_cast<size_t>(first + i * stride)] - peak);
+        return peak + std::log(sum);
+    };
+    for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t i = 0; i < width; ++i)
+            v[static_cast<size_t>(i)] = static_cast<double>(z.data<float>()[r * width + i]) +
+                                         (bias != nullptr ? bias->data<float>()[i] : 0.0f);
+        for (int64_t i = 0; i < s; ++i) {
+            pre.data<float>()[r * s + i] = static_cast<float>(1.0 / (1.0 + std::exp(-v[static_cast<size_t>(i)])));
+            post.data<float>()[r * s + i] = static_cast<float>(2.0 / (1.0 + std::exp(-v[static_cast<size_t>(s + i)])));
+        }
+        for (int it = 0; it < iterations; ++it) {
+            for (int64_t row = 0; row < s; ++row) {
+                const double l = logsumexp(2 * s + row * s, 1);
+                for (int64_t c = 0; c < s; ++c)
+                    v[static_cast<size_t>(2 * s + row * s + c)] -= l;
+            }
+            for (int64_t c = 0; c < s; ++c) {
+                const double l = logsumexp(2 * s + c, s);
+                for (int64_t row = 0; row < s; ++row)
+                    v[static_cast<size_t>(2 * s + row * s + c)] -= l;
+            }
+        }
+        for (int64_t i = 0; i < s * s; ++i)
+            mix.data<float>()[r * s * s + i] = static_cast<float>(std::exp(v[static_cast<size_t>(2 * s + i)]));
+    }
+    std::vector<HostTensor> out;
+    out.push_back(std::move(pre));
+    out.push_back(std::move(post));
+    out.push_back(std::move(mix));
+    return out;
+}
+
+HostTensor stream_mix(const HostTensor& m, const HostTensor& x, const HostTensor* a, const HostTensor* y) {
+    check_f32(m, "stream_mix m");
+    check_f32(x, "stream_mix x");
+    const bool outer = a != nullptr;
+    if (outer) {
+        check_f32(*a, "stream_mix a");
+        check_f32(*y, "stream_mix y");
+    }
+    const int64_t p = m.shape()[m.rank() - 2];
+    const int64_t s = m.shape().back();
+    const int64_t d = x.shape().back();
+    const int64_t lead = m.numel() / (p * s);
+    Dims shape = m.shape();
+    shape.back() = d;
+    HostTensor out(DType::F32, shape);
+    for (int64_t t = 0; t < lead; ++t) {
+        for (int64_t i = 0; i < p; ++i) {
+            for (int64_t c = 0; c < d; ++c) {
+                const float* mr = m.data<float>() + (t * p + i) * s;
+                double acc = outer ? static_cast<double>(a->data<float>()[t * p + i]) * y->data<float>()[t * d + c] : 0;
+                for (int64_t j = 0; j < s; ++j)
+                    acc += static_cast<double>(mr[j]) * x.data<float>()[(t * s + j) * d + c];
+                out.data<float>()[(t * p + i) * d + c] = static_cast<float>(acc);
+            }
+        }
+    }
+    return out;
+}
+
 }  // namespace xs::cpu_ref

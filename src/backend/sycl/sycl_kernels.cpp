@@ -1351,6 +1351,86 @@ void prev_row(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t wi
     });
 }
 
+namespace {
+
+// A work-item per row; S fixed, so the matrix stays in registers.
+template <int S>
+void mhc_route_rows(sycl::queue& q, const float* z, const float* bias, float* pre, float* post, float* mix,
+                    int64_t rows, int iterations) {
+    constexpr int kWidth = 2 * S + S * S;
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(rows)), [=](sycl::id<1> id) {
+        const auto r = static_cast<int64_t>(id[0]);
+        float v[kWidth];
+#pragma unroll
+        for (int i = 0; i < kWidth; ++i)
+            v[i] = z[r * kWidth + i] + (bias != nullptr ? bias[i] : 0.0f);
+#pragma unroll
+        for (int i = 0; i < S; ++i) {
+            pre[r * S + i] = 1.0f / (1.0f + sycl::exp(-v[i]));
+            post[r * S + i] = 2.0f / (1.0f + sycl::exp(-v[S + i]));
+        }
+        float* m = v + 2 * S;
+        for (int it = 0; it < iterations; ++it) {
+#pragma unroll
+            for (int row = 0; row < S; ++row) {
+                float peak = m[row * S];
+#pragma unroll
+                for (int c = 1; c < S; ++c)
+                    peak = sycl::fmax(peak, m[row * S + c]);
+                float sum = 0.0f;
+#pragma unroll
+                for (int c = 0; c < S; ++c)
+                    sum += sycl::exp(m[row * S + c] - peak);
+                const float l = peak + sycl::log(sum);
+#pragma unroll
+                for (int c = 0; c < S; ++c)
+                    m[row * S + c] -= l;
+            }
+#pragma unroll
+            for (int c = 0; c < S; ++c) {
+                float peak = m[c];
+#pragma unroll
+                for (int row = 1; row < S; ++row)
+                    peak = sycl::fmax(peak, m[row * S + c]);
+                float sum = 0.0f;
+#pragma unroll
+                for (int row = 0; row < S; ++row)
+                    sum += sycl::exp(m[row * S + c] - peak);
+                const float l = peak + sycl::log(sum);
+#pragma unroll
+                for (int row = 0; row < S; ++row)
+                    m[row * S + c] -= l;
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < S * S; ++i)
+            mix[r * S * S + i] = sycl::exp(m[i]);
+    });
+}
+
+}  // namespace
+
+void mhc_route(sycl::queue& q, const float* z, const float* bias, float* pre, float* post, float* mix, int64_t rows,
+               int64_t s, int iterations) {
+    if (s == 2) return mhc_route_rows<2>(q, z, bias, pre, post, mix, rows, iterations);
+    if (s == 4) return mhc_route_rows<4>(q, z, bias, pre, post, mix, rows, iterations);
+    fail("sycl: mhc_route of ", s, " streams (2 or 4)");
+}
+
+void stream_mix(sycl::queue& q, const float* m, const float* x, const float* a, const float* y, float* out,
+                int64_t lead, int64_t p, int64_t s, int64_t d) {
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(lead * p * d)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % d;
+        const int64_t row = i / d;  // t * p + r
+        const int64_t t = row / p;
+        float acc = a != nullptr ? a[row] * y[t * d + c] : 0.0f;
+        for (int64_t j = 0; j < s; ++j)
+            acc += m[row * s + j] * x[(t * s + j) * d + c];
+        out[i] = acc;
+    });
+}
+
 void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner) {
     // A long axis (a row's width): a work-group per output, each lane summing a stride of the axis.
     constexpr int64_t kLongAxis = 256;

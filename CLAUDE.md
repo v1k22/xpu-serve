@@ -262,8 +262,9 @@ sequence. Model code builds it once at load time; a backend compiles it once.
   after their state),
   CausalConv and GatedDelta (stateful, for linear attention),
   ExpertMatMul (each token's chosen experts from a stacked `[E, N, K]` bank, for mixture of experts), SignMatMul (a
-  matmul by a one-bit weight: the cheap score of every row that a shortlist starts from). The exact semantics
-  are the comments in `graph.h`.
+  matmul by a one-bit weight: the cheap score of every row that a shortlist starts from), MhcRoute and StreamMix
+  (manifold-constrained hyper-connections: a router's read and write weights and its Sinkhorn stream mix; residual
+  streams mixed and read). The exact semantics are the comments in `graph.h`.
 - KV: `add_kv_slot(...)` declares per-sequence state; `kv_cache(slot, k, v)` appends this step's K/V and returns the
   whole cache. A slot can be read by later layers (Gemma 4's KV-shared layers reuse an earlier layer's outputs).
 - Graph inputs are filled per step by `Model::prepare_inputs` (token ids, positions, and model-specific host inputs
@@ -299,6 +300,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/backend/device_*.cpp` | each op on the GPU backend (`device_encoder_ops.cpp` likewise), sessions, agreement with cpu-ref (also with an int8 or a TurboQuant KV cache on both; a query that sees one key reads the value the host stores for it), decode timing and quantized matmul timing by rows, format and path (`XS_DEVICE_BENCH=1`, `device_quant_timing.cpp`) | the same references; skip unless `XS_DEVICE_TEST_DEVICE` is set |
 | `tests/unit/backend/*_moe_ops.cpp` | Div, Softmax, TopK (ties to the lower index), ReduceSum, ExpertMatMul and the `moe` block (softmax and sigmoid routers, shared expert), on cpu-ref and the GPU | fp64 references and an fp64 composition of the block (`moe_ops_cases.h`) |
 | `tests/unit/backend/*_shortlist_ops.cpp` | SignMatMul (words loaded whole and one by one, rows that fill no sub-group) and the shortlist head: the best rows by sketch, their exact logits, the head's pick, on cpu-ref and the GPU | fp64 references (`shortlist_cases.h`) |
+| `tests/unit/backend/*_hc_ops.cpp` | MhcRoute (2 and 4 streams, a bias or none, 1, 3 and 20 Sinkhorn iterations, logits large enough to need the peak subtracted) and StreamMix (a read, a mix, a mix with the branch's update; one token and several) on cpu-ref and the GPU | fp64 references (`hc_ops_cases.h`); planted: too few iterations, the bias dropped, the mix transposed |
 | `tests/unit/backend/*_programs.cpp` | sessions of several programs: KV slots shared by label, KvRead, truncate inside a short step (conv, gated delta, KV) equals never running the dropped tokens, the last step undone whole equals never running it; a run asked for some outputs returns those and advances the state all the same | the same session without them (`session_cases.h`) |
 | `tests/unit/engine/` | speculative decoding emits exactly the greedy tokens (a stateful tiny model, a partly wrong drafter that drafts a token a run or a block a run, prefix reuse, stops); the same tokens when greedy decoding reads each row's `argmax` output instead of the logits; rejection sampling draws the target's distribution | plain greedy decoding; exact distributions |
 | `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on cpu-ref and the GPU | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |

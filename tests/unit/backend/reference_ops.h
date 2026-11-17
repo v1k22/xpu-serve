@@ -381,6 +381,82 @@ inline Tensor64 softmax(const Tensor64& x) {
     return out;
 }
 
+// Sinkhorn as SenseNova Loop's MHCRouter writes it: log-space row then column normalization, then exp.
+inline Tensor64 sinkhorn(const Tensor64& x, int iterations) {
+    const int64_t s = x.shape.back();
+    Tensor64 out(x.shape);
+    for (int64_t m = 0; m < x.numel() / (s * s); ++m) {
+        std::vector<std::vector<double>> z(static_cast<size_t>(s), std::vector<double>(static_cast<size_t>(s)));
+        for (int64_t r = 0; r < s; ++r)
+            for (int64_t c = 0; c < s; ++c)
+                z[static_cast<size_t>(r)][static_cast<size_t>(c)] = x[m * s * s + r * s + c];
+        for (int it = 0; it < iterations; ++it) {
+            for (auto& row : z) {
+                double sum = 0;
+                for (const double v : row) sum += std::exp(v);
+                for (double& v : row) v -= std::log(sum);
+            }
+            for (size_t c = 0; c < z.size(); ++c) {
+                double sum = 0;
+                for (const auto& row : z) sum += std::exp(row[c]);
+                for (auto& row : z) row[c] -= std::log(sum);
+            }
+        }
+        for (int64_t r = 0; r < s; ++r)
+            for (int64_t c = 0; c < s; ++c)
+                out[m * s * s + r * s + c] = std::exp(z[static_cast<size_t>(r)][static_cast<size_t>(c)]);
+    }
+    return out;
+}
+
+// MhcRoute: z [..., 2S + S^2] (+ bias) -> pre, post [..., S] and mix [..., S, S].
+struct MhcMaps {
+    Tensor64 pre, post, mix;
+};
+inline MhcMaps mhc_route(const Tensor64& z, const Tensor64* bias, int64_t s, int iterations) {
+    const int64_t width = 2 * s + s * s;
+    const int64_t rows = z.numel() / width;
+    Dims lead(z.shape.begin(), z.shape.end() - 1);
+    Dims maps = lead, mixes = lead;
+    maps.push_back(s);
+    mixes.push_back(s);
+    mixes.push_back(s);
+    MhcMaps out{Tensor64(maps), Tensor64(maps), Tensor64(mixes)};
+    Tensor64 m(Dims{rows, s, s});
+    for (int64_t r = 0; r < rows; ++r) {
+        const auto at = [&](int64_t i) { return z[r * width + i] + (bias != nullptr ? (*bias)[i] : 0.0); };
+        for (int64_t i = 0; i < s; ++i) {
+            out.pre[r * s + i] = 1.0 / (1.0 + std::exp(-at(i)));
+            out.post[r * s + i] = 2.0 / (1.0 + std::exp(-at(s + i)));
+        }
+        for (int64_t i = 0; i < s * s; ++i)
+            m[r * s * s + i] = at(2 * s + i);
+    }
+    out.mix = sinkhorn(m, iterations);
+    out.mix.shape = mixes;
+    return out;
+}
+
+// m [..., P, S] @ x [..., S, D] per leading index (+ a [..., P] outer y [..., D]).
+inline Tensor64 stream_mix(const Tensor64& m, const Tensor64& x, const Tensor64* a = nullptr,
+                           const Tensor64* y = nullptr) {
+    const int64_t p = m.shape[m.shape.size() - 2];
+    const int64_t s = m.shape.back();
+    const int64_t d = x.shape.back();
+    Dims shape = m.shape;
+    shape.back() = d;
+    Tensor64 out(shape);
+    for (int64_t t = 0; t < m.numel() / (p * s); ++t)
+        for (int64_t i = 0; i < p; ++i)
+            for (int64_t c = 0; c < d; ++c) {
+                double acc = a != nullptr ? (*a)[t * p + i] * (*y)[t * d + c] : 0.0;
+                for (int64_t j = 0; j < s; ++j)
+                    acc += m[(t * p + i) * s + j] * x[(t * s + j) * d + c];
+                out[(t * p + i) * d + c] = acc;
+            }
+    return out;
+}
+
 // The k largest per row of the last axis, largest first, ties to the lower index: (values, indices).
 inline std::pair<Tensor64, std::vector<int64_t>> topk(const Tensor64& x, int64_t k) {
     const int64_t width = x.shape.back();

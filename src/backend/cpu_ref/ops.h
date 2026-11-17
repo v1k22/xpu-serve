@@ -59,5 +59,11 @@ HostTensor expert_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor
 HostTensor prev_row(const HostTensor& x);
 // x [..., K], signs [N, K / 32] i32, scales [N] -> [..., N] (graph.h SignMatMul).
 HostTensor sign_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& signs, const HostTensor& scales);
+// The three maps of hyper-connections from a router's output z [..., 2S + S^2] (+ bias): pre, post, mix (graph.h,
+// MhcRoute); in f64.
+std::vector<HostTensor> mhc_route(const HostTensor& z, const HostTensor* bias, int64_t streams, int iterations);
+// m [..., P, S] @ x [..., S, D] per leading index, plus a [..., P] (outer) y [..., D] when given.
+HostTensor stream_mix(const HostTensor& m, const HostTensor& x, const HostTensor* a = nullptr,
+                      const HostTensor* y = nullptr);
 
 }  // namespace xs::cpu_ref

@@ -872,6 +872,17 @@ private:
                 case OpKind::PrevRow:
                     need(0, is_f32(0), "f32");
                     break;
+                case OpKind::MhcRoute: {
+                    const int64_t s = std::get<graph::MhcRouteAttrs>(n.attrs).streams;
+                    XS_CHECK(s == 2 || s == 4, where(i), ": ", s, " streams (the kernel takes 2 or 4)");
+                    for (size_t k = 0; k < n.inputs.size(); ++k)
+                        need(k, is_f32(k), "f32");
+                    break;
+                }
+                case OpKind::StreamMix:
+                    for (size_t k = 0; k < n.inputs.size(); ++k)
+                        need(k, is_f32(k), "f32");
+                    break;
                 case OpKind::Rope:
                     need(0, is_f32(0), "f32");
                     need(1, is_int(1), "i32 or i64");
@@ -2259,6 +2270,25 @@ private:
             case OpKind::PrevRow: {
                 const int64_t rows = out_shape[0];
                 sycl_be::prev_row(q_, in_f32(0), out, rows, rows > 0 ? out_n / rows : 0);
+                return;
+            }
+            case OpKind::MhcRoute: {
+                const auto& a = std::get<graph::MhcRouteAttrs>(n.attrs);
+                const auto at = [&](int32_t k) {
+                    return reinterpret_cast<float*>(ptr(p, Value{static_cast<int32_t>(i), k}));
+                };
+                sycl_be::mhc_route(q_, in_f32(0), n.inputs.size() == 2 ? in_f32(1) : nullptr, out, at(1), at(2),
+                                   out_n / a.streams, a.streams, a.iterations);
+                return;
+            }
+            case OpKind::StreamMix: {
+                const Dims& m = in_shape(0);
+                const int64_t p = m[m.size() - 2];
+                const int64_t s = m.back();
+                const int64_t d = out_shape.back();
+                const bool outer = n.inputs.size() == 4;
+                sycl_be::stream_mix(q_, in_f32(0), in_f32(1), outer ? in_f32(2) : nullptr, outer ? in_f32(3) : nullptr,
+                                    out, out_n / (p * d), p, s, d);
                 return;
             }
             case OpKind::TopK: {

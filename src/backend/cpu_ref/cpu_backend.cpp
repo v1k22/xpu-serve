@@ -464,6 +464,20 @@ class CpuProgram {
                 return {cpu_ref::sign_matmul(*pool_, f32(0), in(1), f32(2))};
             case OpKind::PrevRow:
                 return {cpu_ref::prev_row(f32(0))};
+            case OpKind::MhcRoute: {
+                const auto& a = std::get<graph::MhcRouteAttrs>(n.attrs);
+                if (n.inputs.size() == 2) {
+                    const HostTensor bias = f32(1);
+                    return cpu_ref::mhc_route(f32(0), &bias, a.streams, a.iterations);
+                }
+                return cpu_ref::mhc_route(f32(0), nullptr, a.streams, a.iterations);
+            }
+            case OpKind::StreamMix:
+                if (n.inputs.size() == 4) {
+                    const HostTensor a = f32(2), y = f32(3);
+                    return {cpu_ref::stream_mix(f32(0), f32(1), &a, &y)};
+                }
+                return {cpu_ref::stream_mix(f32(0), f32(1))};
         }
         fail("cpu-ref: unhandled op ", graph::op_name(n.kind));
     }

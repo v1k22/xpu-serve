@@ -79,7 +79,18 @@ enum class OpKind : uint8_t {
     KvRead,     // () -> (k_all [L, Hkv, D], v_all [L, Hkv, D]): a KV slot another program of the session writes, read
                 // without appending; L is that slot's length (a graph either appends to its KV slots or only reads)
     Gelu,       // 0.5 x (1 + erf(x / sqrt(2))): the exact GELU (torch.nn.GELU)
+    MhcRoute,   // (z [..., 2S + S^2] [, b [2S + S^2]]) -> (pre [..., S], post [..., S], mix [..., S, S]): the three
+                // maps of manifold-constrained hyper-connections from a router's output, see below
+    StreamMix,  // (m [..., P, S], x [..., S, D] [, a [..., P], y [..., D]]) -> [..., P, D]: out[..., p, :] =
+                // sum_s m[..., p, s] x[..., s, :] (+ a[..., p] y[..., :]); leading dims equal. Mixes the residual
+                // streams of hyper-connections (S streams of width D), and reads a weighted sum of them (P = 1)
 };
+
+// MhcRoute (S = MhcRouteAttrs::streams): with z + b when b is given, pre = sigmoid(z[:S]) (how much of each stream a
+// layer's branch reads), post = 2 sigmoid(z[S:2S]) (how much of the branch's output each stream takes) and mix the
+// S x S matrix z[2S:] (row-major) made doubly stochastic by Sinkhorn-Knopp in log space: repeat
+// MhcRouteAttrs::iterations times { subtract each row's logsumexp; subtract each column's logsumexp }, then exp.
+// Computed in f32.
 
 // CausalConv: with x' = [the slot's K-1 previous inputs (zeros at the start), x], out[t, c] = sum_j w[c, j] x'[t + j, c];
 // the slot then keeps the last K-1 rows of x'.
@@ -142,6 +153,10 @@ struct TopKAttrs {
 struct AxisAttrs {  // ReduceSum, Concat
     int axis = 0;
 };
+struct MhcRouteAttrs {
+    int64_t streams = 2;
+    int iterations = 1;
+};
 struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op's state across runs
     int slot = -1;
     float qk_l2norm_eps = 0.0f;  // GatedDelta only; 0 = no l2norm of q and k
@@ -174,7 +189,7 @@ struct AttentionAttrs {
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
                            ClampAttrs, NormAttrs, ReshapeAttrs, SliceAttrs, TransposeAttrs, KvCacheAttrs,
-                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, AxisAttrs>;
+                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, AxisAttrs, MhcRouteAttrs>;
 
 struct TensorType {
     DType dtype = DType::F32;
@@ -209,6 +224,12 @@ struct RecurrentSlot {  // a GatedDelta state: [heads, key_dim, value_dim], f32
     int64_t key_dim = 0;
     int64_t value_dim = 0;
     std::string label;
+};
+
+struct MhcMaps {  // MhcRoute's outputs
+    Value pre;
+    Value post;
+    Value mix;
 };
 
 struct GraphOutput {
@@ -264,6 +285,11 @@ public:
     Value sign_matmul(Value x, Value signs, Value scales);
     Value prev_row(Value x);
     Value concat(const std::vector<Value>& parts, int axis);
+    // `bias` may be an invalid Value (none).
+    MhcMaps mhc_route(Value z, Value bias, int64_t streams, int iterations);
+    Value stream_mix(Value m, Value x);
+    // m @ x plus the outer product of a and y: out[..., p, :] += a[..., p] y[..., :].
+    Value stream_mix(Value m, Value x, Value a, Value y);
 
     void output(const std::string& name, Value v);
 

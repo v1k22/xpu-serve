@@ -69,6 +69,14 @@ void sign_matmul(sycl::queue& q, const float* x, const uint32_t* signs, const fl
                  int64_t n, int64_t k, void* scratch);
 // y's row t is x's row t - 1, its row 0 zeros; rows of `width` values.
 void prev_row(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width);
+// MhcRoute (graph.h) of `rows` router outputs z [rows, 2 s + s^2] (+ bias [2 s + s^2] when not null): pre and post
+// [rows, s], mix [rows, s, s]. s is 2 or 4.
+void mhc_route(sycl::queue& q, const float* z, const float* bias, float* pre, float* post, float* mix, int64_t rows,
+               int64_t s, int iterations);
+// out [lead, p, d] = m [lead, p, s] @ x [lead, s, d] per leading index, plus a [lead, p] (outer) y [lead, d] when a is
+// not null.
+void stream_mix(sycl::queue& q, const float* m, const float* x, const float* a, const float* y, float* out,
+                int64_t lead, int64_t p, int64_t s, int64_t d);
 // y [outer, inner] = the sum over the middle axis of x [outer, dim, inner].
 void reduce_sum(sycl::queue& q, const float* x, float* y, int64_t outer, int64_t dim, int64_t inner);
 // out [T, S, N] = x[t] (per_slot: x[t, s]) @ w[idx[t, s]]^T, w [E, N, K]; expert ids outside [0, E) read expert 0.
