@@ -34,7 +34,7 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **OpenAI-compatible server**: `/v1/chat/completions` (streaming, tool calls, thinking), `/v1/completions`,
   `/v1/models`
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
-  Ornith-1.5-35B-A3B, LFM3
+  Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3
 - ✅ **Image input** (Gemma 4 E2B / E4B), as base64 `data:` URLs
 - ✅ **Quantized packs**: q8 and q4 from `xpu-serve convert` (round to nearest; AWQ calibration opt-in)
 - ✅ **FP8 checkpoints** (Qwen3.8-27B-FP8, Qwen3.6-35B-A3B-FP8, Ornith-1.5-35B-A3B-FP8: a scale per 128 x 128 block,
@@ -72,6 +72,7 @@ Each model's recipe has its commands and numbers.
 | Gemma 4 26B-A4B | language, MoE | `google/gemma-4-26B-A4B-it` | q4 pack | [recipe](model_recipes.md#gemma-4-26b-a4b) |
 | Qwen3.5-4B | language | `Qwen/Qwen3.5-4B` | original, q8 / q4 pack, GGUF | [recipe](model_recipes.md#qwen35-4b), [GGUF](model_recipes.md#qwen35-4b-gguf) |
 | Qwen3.5-9B | language | `Qwen/Qwen3.5-9B` | original, q8 / q4 pack | [recipe](model_recipes.md#qwen35-9b) |
+| SenseNova-Loop-9B | language | `sensenova/SenseNova-Loop-9B` (gated), `-Preview` | original, q8 / q4 pack | [recipe](model_recipes.md#sensenova-loop-9b) |
 | Qwen3.6-35B-A3B | language, MoE | `Qwen/Qwen3.6-35B-A3B`, `Qwen/Qwen3.6-35B-A3B-FP8` | q4 pack | [recipe](model_recipes.md#qwen36-35b-a3b) |
 | Qwen3.8-27B | language | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-27B-FP8` | q4 pack, GGUF | [recipe](model_recipes.md#qwen38-27b), [GGUF](model_recipes.md#qwen38-27b-gguf) |
 | Ornith-1.5-35B-A3B | language, MoE | `ornith-ai/Ornith-1.5-35B-A3B`, `-FP8`, `-GGUF` | q4 pack, GGUF Q4_K_M | [recipe](model_recipes.md#ornith-15-35b-a3b), [GGUF](model_recipes.md#ornith-15-35b-a3b-gguf) |
@@ -389,7 +390,7 @@ Every layer is tested against a reference:
 | Chat template | `apply_chat_template`, byte-exact | `tests/unit/chat/` |
 | Image resize | torchvision's antialiased bicubic, bit-exact | `tests/unit/image/` |
 | Every graph op, on cpu-ref and on the GPU | fp64 references, with planted-bug controls | `tests/unit/backend/` |
-| Whole model (Gemma 4, Qwen3.5, LFM3) | Hugging Face fp32 logits and greedy output | `tests/unit/model/model_parity.cpp` |
+| Whole model (Gemma 4, Qwen3.5, LFM3, SenseNova Loop) | Hugging Face fp32 logits and greedy output (SenseNova Loop: its own modeling code) | `tests/unit/model/model_parity.cpp` |
 | Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/gemma4_vision_parity.cpp` |
 | Robot policy (π0.5) | LeRobot fp32 actions and prompt token ids, 3 cameras and 1 | `tests/unit/model/policy_parity.cpp` |
 | Decision models | the checkpoint's own Python code in fp32: prompt token ids and every option's probability | `tests/unit/model/decision_parity.cpp` |

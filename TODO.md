@@ -284,6 +284,14 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       (`docs/decisions/0014`); also compressed-tensors' float-quantized format with a scale per channel
       (`ornith-ai/Ornith-1.5-35B-A3B-FP8`)
 - [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; vision tower
+- [x] SenseNova Loop (`sensenova_loop`): the Qwen3.5 decoder with layers run in a loop (each run with state slots of its
+      own) and manifold-constrained hyper-connections (graph ops MhcRoute and StreamMix; routers kept unquantized by
+      `convert`); parity with the checkpoint's own code on a tiny checkpoint (cpu-ref and SYCL exact) and on
+      SenseNova-Loop-9B-Preview (f16), its MTP head, packs (`docs/decisions/0022`)
+- [ ] SenseNova Loop: measure the gated release `sensenova/SenseNova-Loop-9B` (the Preview's architecture; measured on
+      the Preview); the router's RMS norm and matmul folded into one launch (two of five per branch); why an AWQ pack
+      decodes 11 % slower than a round-to-nearest one and verifies 44 % slower (input scales per weight, sibling
+      launches?); the vision tower
 - [x] LFM3 (`lfm3`, text): gated short convolutions and gated attention from the shared blocks (a per-head gate added
       to `blocks::attention`; no new op), its tokenizer and chat template byte-exact, the `qwen3_5` output parser;
       HF parity on cpu-ref and the B60, q8 / q4 packs (`docs/decisions/0013`)
@@ -360,6 +368,7 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 | 2 | Qwen3.6-35B-A3B (preferred) | `Qwen/Qwen3.6-35B-A3B` | MoE (3B active). **Runs** (text): tiny-model HF parity; q4 g64 pack 18.9 GiB on one Arc Pro B60, decode ~58 tok/s, prefill ~1,250 tok/s, MMLU-Pro 84 % (25 q); with its MTP head: 85.6 tok/s at k = 2 (59.9 without); the q4 g32 pack against HF fp32 on the real checkpoint (2026-11-11): last-token cosine 0.92 to 0.98 on six prompts, MMLU-Pro 80 %. Also from `Qwen/Qwen3.6-35B-A3B-FP8` (per-expert FP8 tensors; `docs/decisions/0014`): the same pack layout and speed, MMLU-Pro 76 %. To do: Panther Lake, AWQ, vision |
 | | Qwen3.5-35B-A3B (older) | `Qwen/Qwen3.5-35B-A3B` | MoE; the Qwen3.5 Gated DeltaNet hybrid |
 | | Ornith-1.5-35B-A3B | `ornith-ai/Ornith-1.5-35B-A3B` | A tuned `qwen3_5_moe` (Qwen3.6-35B-A3B's shape). **Runs** (text) from its FP8 release (compressed-tensors, a scale per channel) as a q4 pack, and from its GGUF files (`qwen35moe`); its MTP head and its DFlash drafter. Numbers in model_recipes.md |
+| | SenseNova-Loop-9B | `sensenova/SenseNova-Loop-9B` | Qwen3.5-9B with layers 4 to 27 run twice inside two-stream hyper-connections (`sensenova_loop`, the checkpoint's own modeling code). **Runs** (text), measured on the open Preview: HF fp32 parity (f16 cosine 0.999997, greedy and MTP drafts equal); Arc Pro B60 decode 12.2 / 21.1 / 32.6 tok/s at 1k (f16 / q8 / q4), 10.4 / 16.1 / 22.1 at 64k, all three fit 64k tokens on 24 GB; q4 with MTP 56 tok/s (k = 2). Numbers in model_recipes.md. To do: the gated release, vision, Panther Lake |
 | | Qwen3.5-9B | `Qwen/Qwen3.5-9B` | Dense `qwen3_5` (32 layers of 4,096, an untied head). **Runs** (text) with no code change: HF fp32 parity of the real checkpoint on six prompts of up to 1,691 tokens (cpu-ref f32: cosine 1, max logit error 5e-5, 32 greedy tokens and the MTP head's drafts equal on all six; Arc Pro B60 f16: cosine 0.999998 or better, greedy equal); 16.7 GiB on the device at f16. Packs: q8 10.4 GB (cosine 0.997 to 0.99996, greedy equal on six of six), q4 g32 7.1 GB (0.90 to 0.99, greedy equal on three of six). Arc Pro B60: decode 21.4 / 38.2 / 61.5 tok/s (f16 / q8 / q4), prefill 3,250 tok/s at 1,024 tokens (f16); with its MTP head at q4 62 to 108 tok/s (k = 4). MMLU-Pro (25 q, thinking off): 72 / 76 / 76 % (f16 / q8 / q4). To do: Panther Lake, AWQ, vision |
 | 3 | Gemma 4 31B | `google/gemma-4-31B-it` | vision tower uses `standardize` |
 | 4 | Gemma 4 26B-A4B | `google/gemma-4-26B-A4B-it` | MoE (4B active). **Runs** (text): tiny-checkpoint HF parity of its layout (experts beside the MLP with per-expert scales, K = V global layers with 2 KV heads; cosine 1 on cpu-ref and SYCL f32); q4 g32 pack 17.3 GB on one Arc Pro B60: decode 65.6 tok/s, 84.2 with its assistant at k = 2. q4 vs HF fp32 last-token cosine 0.95 to 0.9997. To do: images (bidirectional attention over image tokens), AWQ |

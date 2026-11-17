@@ -63,3 +63,9 @@ Against the checkpoint's own code in fp32 on the CPU (`tests/parity/model/hf_ref
 
 The tiny checkpoint comes from the model's own classes (`make_tiny.py --arch sensenova_loop`), its routers as large
 as trained ones so that read, write and mix weights vary by token and stream.
+
+On SenseNova-Loop-9B-Preview, Arc Pro B60 (model_recipes.md has every number): decode 12.2 / 21.1 / 32.6 tok/s at 1k
+tokens (f16 / q8 / q4), about 0.55 times Qwen3.5-9B's (56 layer runs a token instead of 32, the routers' small
+kernels the rest); 64k tokens fit one 24 GB card at f16 (21.5 GiB). Read at the option letters over 300 MMLU-Pro
+questions, f16 keeps all 300 of the reference's answers, q8 290, q4 229 (AWQ 252). Its MTP head takes q4 from 34 to
+56 tok/s at k = 2.

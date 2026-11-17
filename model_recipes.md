@@ -16,6 +16,7 @@ APIs look; the numbers live here.
   - [Gemma 4 26B-A4B](#gemma-4-26b-a4b)
   - [Qwen3.5-4B](#qwen35-4b)
   - [Qwen3.5-9B](#qwen35-9b)
+  - [SenseNova-Loop-9B](#sensenova-loop-9b)
   - [Qwen3.6-35B-A3B](#qwen36-35b-a3b)
   - [Ornith-1.5-35B-A3B](#ornith-15-35b-a3b)
   - [Qwen3.8-27B](#qwen38-27b)
@@ -415,6 +416,79 @@ Measured:
 Prefill 3,200 tok/s. MMLU-Pro (25 questions): 72 %.
 
 Checked against Hugging Face fp32 logits, greedy text and its MTP head's drafts.
+
+### SenseNova-Loop-9B
+
+`sensenova/SenseNova-Loop-9B` (`sensenova_loop`; Apache 2.0; gated on the Hub: accept its terms on the model page,
+then give `-hf` a token in `HF_TOKEN`), or its open preview `sensenova/SenseNova-Loop-9B-Preview`. A Qwen3.5-9B
+decoder whose layers 4 to 27 run twice, with the residual carried as two streams through them (manifold-constrained
+hyper-connections; [docs/decisions/0022](docs/decisions/0022-sensenova-loop.md)): 56 layer runs a token, so it
+decodes at about 0.55 times Qwen3.5-9B's speed from the same bytes of weights. Text (the vision tower is not loaded).
+A reasoning model: thinking is on unless a request turns it off. Its MTP head is the drafter, inside the checkpoint
+and its packs.
+
+Reference (16.7 GiB of weights on the device; 64k tokens of context fit a 24 GB card):
+
+```bash
+xpu-serve serve -hf sensenova/SenseNova-Loop-9B --device GPU
+```
+
+Optimized (56 tok/s over six chat prompts on the Arc Pro B60; 9.4 GiB at 64k tokens):
+
+```bash
+xpu-serve convert -hf sensenova/SenseNova-Loop-9B --out ~/models/SenseNova-Loop-9B-q4 --quant q4
+xpu-serve serve ~/models/SenseNova-Loop-9B-q4 --device GPU --spec mtp --spec-k 2 --kv-dtype i8 --ctx 65536
+```
+
+- Closer to the original: `--quant q8` keeps 290 of the original's 300 answers below (q4: 229), at two thirds of
+  q4's speed. `--method awq` on the q4 pack keeps 252 at 11 % less decode speed, and its MTP rounds are slower still
+  (42 tok/s instead of 56).
+- Less VRAM: `--kv-dtype i8` stores 28 KiB a token instead of 56 (both at 64k below), `turbo4` 14.4 KiB
+  ([KV cache formats](#kv-cache-formats)).
+- The MTP head's second draft is accepted less often than Qwen3.5's, so `--spec-k 2` is the best on q4 and q8 (k = 3
+  equals it at f16).
+
+Measured on `sensenova/SenseNova-Loop-9B-Preview` (the release has its architecture; the gated weights were not
+measured), Arc Pro B60, one GPU. Peak GPU memory of the process, prefill of a prompt of that length, then 64 greedy
+tokens after it:
+
+| Context | f16: memory | prefill | decode | q8: memory | prefill | decode | q4: memory | prefill | decode |
+|---|---|---|---|---|---|---|---|---|---|
+| 1k | 17.5 GiB | 1,597 tok/s | 12.2 tok/s | 9.5 GiB | 1,362 | 21.1 | 6.5 GiB | 1,384 | 32.6 |
+| 2k | 17.7 GiB | 1,584 | 12.2 | 9.6 GiB | 1,355 | 21.1 | 6.7 GiB | 1,376 | 32.6 |
+| 4k | 18.1 GiB | 1,559 | 12.2 | 10.0 GiB | 1,336 | 21.1 | 7.0 GiB | 1,349 | 32.6 |
+| 16k | 18.9 GiB | 1,364 | 11.7 | 10.8 GiB | 1,190 | 19.7 | 7.8 GiB | 1,207 | 29.4 |
+| 32k | 19.7 GiB | 1,134 | 11.2 | 11.8 GiB | 1,013 | 18.2 | 8.7 GiB | 1,026 | 26.3 |
+| 64k | 21.5 GiB | 794 | 10.4 | 13.4 GiB | 732 | 16.1 | 10.5 GiB | 739 | 22.1 |
+
+Weights on the device: 16.7 GiB (f16), 8.6 GiB (q8), 5.6 GiB (q4); packs on disk 10.4 GB and 7.1 GB, from 19.3 GB.
+The KV cache takes 56 KiB a token (14 full-attention runs of 4 KV heads of 256): 3.5 GiB at 64k. The q4 pack at
+64k with `--kv-dtype i8`: 9.0 GiB, decode 22.8 tok/s; with `turbo4`: 8.2 GiB, 21.7 tok/s.
+
+Over six chat prompts (thinking off, 256 greedy tokens each), decode without → with its MTP head:
+
+| | Without | k = 1 | k = 2 | k = 3 | k = 4 |
+|---|---|---|---|---|---|
+| f16 | 12.4 tok/s | 20.6 | 24.2 | 24.4 | 22.9 |
+| q8 | 21.5 tok/s | 34.3 | 37.3 | 36.7 | 35.1 |
+| q4 | 33.6 tok/s | 51.1 | 56.0 | 55.2 | 51.8 |
+
+2.2 tokens a verify at k = 2. The optimized command as written (q4, k = 2, `i8`) decodes them at 56.4 tok/s.
+
+Accuracy, against the checkpoint's own code in float32 on the CPU, 300 MMLU-Pro questions read at the option letters
+with thinking off (`--readout openjev`, as for [Ornith-1.5-35B-A3B](#ornith-15-35b-a3b)):
+
+| | Right (300) | The original's answer kept (300) | Shift |
+|---|---|---|---|
+| *original, f32 on the CPU* | 98 | 300 | 0 |
+| f16 | 98 | 300 | 0.001 |
+| q8 pack | 95 | 290 | 0.019 |
+| q4 pack | 96 | 229 | 0.184 |
+| q4 pack, AWQ | 112 | 252 | 0.140 |
+
+Checked against the checkpoint's own code in fp32 (transformers 5.18): last-token logits cosine 0.999997 or better at
+f16, 32 greedy tokens and the MTP head's drafts equal on six prompts of up to 1,691 tokens (q8: cosine 0.9996, q4:
+0.95 to 0.997); thinking, tool calls, streaming and prefix reuse through the server.
 
 ### Qwen3.6-35B-A3B
 
@@ -858,6 +932,7 @@ without → with that technique, and the `--spec-k` (drafts per round) that gave
 | Gemma 4 26B-A4B | q4, Arc Pro B60 | 67 → 91, k = 2 | – | – |
 | Qwen3.5 4B | q4, Arc Pro B60 | 104 → 149, k = 2 | – | – |
 | Qwen3.5 9B | q4, Arc Pro B60 | 62 → 108, k = 4 | – | – |
+| SenseNova-Loop-9B | q4, Arc Pro B60 | 34 → 56, k = 2 | – | – |
 | Qwen3.6-35B-A3B | q4, Arc Pro B60 | 62 → 94, k = 3 | – | – |
 | Ornith-1.5-35B-A3B | q4, Arc Pro B60 | 61 → 83, k = 2 | 61 → 89, k = 3 | – |
 | Ornith-1.5-35B-A3B | q4, Arc B390 | 36 → 55, k = 2 | 36 → 48, k = 3 | – |
