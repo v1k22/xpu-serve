@@ -520,7 +520,8 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 
 ## Audio models
 
-- [ ] `AudioModel` kind, `audio/` (decode, resample, log-mel), `/v1/audio/transcriptions` and `/v1/audio/speech`
+- [x] `audio/`: decoding (WAV, MP3, FLAC; other containers refused by name), torchaudio's resampling, Qwen3-ASR's log-mel features (Whisper's math), checked against libsndfile, torchaudio and transformers
+- [ ] `AudioModel` kind, `/v1/audio/transcriptions` and `/v1/audio/speech`
 - [ ] Speech recognition (Whisper-style encoder-decoder; streaming encoder state)
 - [ ] Speech synthesis (codec-token TTS: token loop + codec decoder, streaming output)
 - [ ] Audio in chat (an audio encoder in front of an LLM, like images)

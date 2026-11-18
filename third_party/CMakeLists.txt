@@ -25,3 +25,9 @@ add_library(xs_stb_image STATIC stb/stb_image.cpp)
 target_include_directories(xs_stb_image SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/stb)
 target_compile_options(xs_stb_image PRIVATE -w)
 set_target_properties(xs_stb_image PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# MP3 and FLAC decoding (dr_mp3, dr_flac; public domain / MIT-0): one compiled translation unit, its warnings silenced.
+add_library(xs_dr_libs STATIC dr_libs/dr_libs.cpp)
+target_include_directories(xs_dr_libs SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/dr_libs)
+target_compile_options(xs_dr_libs PRIVATE -w)
+set_target_properties(xs_dr_libs PROPERTIES POSITION_INDEPENDENT_CODE ON)
