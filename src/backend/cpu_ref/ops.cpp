@@ -716,6 +716,44 @@ std::vector<HostTensor> mhc_route(const HostTensor& z, const HostTensor* bias, i
     return out;
 }
 
+HostTensor conv2d(ThreadPool& pool, const HostTensor& x, const HostTensor& w, const HostTensor* bias,
+                  const graph::Conv2dAttrs& a) {
+    check_f32(x, "conv2d x");
+    check_f32(w, "conv2d w");
+    if (bias != nullptr) check_f32(*bias, "conv2d bias");
+    const int64_t n = x.dim(0), c = x.dim(1), h = x.dim(2), wd = x.dim(3);
+    const int64_t o = w.dim(0), cg = w.dim(1), kh = w.dim(2), kw = w.dim(3);
+    const int64_t og = o / a.groups;
+    const int64_t ho = (h + a.pad_top + a.pad_bottom - a.dilation_h * (kh - 1) - 1) / a.stride_h + 1;
+    const int64_t wo = (wd + a.pad_left + a.pad_right - a.dilation_w * (kw - 1) - 1) / a.stride_w + 1;
+    HostTensor out(DType::F32, {n, o, ho, wo});
+    const float* xp = x.data<float>();
+    const float* wp = w.data<float>();
+    pool.parallel_for(n * o, [&](int64_t item) {
+        const int64_t b = item / o, oc = item % o, g = oc / og;
+        for (int64_t i = 0; i < ho; ++i) {
+            for (int64_t j = 0; j < wo; ++j) {
+                double acc = bias != nullptr ? bias->data<float>()[oc] : 0.0;
+                for (int64_t ci = 0; ci < cg; ++ci) {
+                    const int64_t ch = g * cg + ci;
+                    for (int64_t u = 0; u < kh; ++u) {
+                        const int64_t y = i * a.stride_h + u * a.dilation_h - a.pad_top;
+                        if (y < 0 || y >= h) continue;
+                        for (int64_t v = 0; v < kw; ++v) {
+                            const int64_t z = j * a.stride_w + v * a.dilation_w - a.pad_left;
+                            if (z < 0 || z >= wd) continue;
+                            acc += static_cast<double>(wp[((oc * cg + ci) * kh + u) * kw + v]) *
+                                   xp[((b * c + ch) * h + y) * wd + z];
+                        }
+                    }
+                }
+                out.data<float>()[((b * o + oc) * ho + i) * wo + j] = static_cast<float>(acc);
+            }
+        }
+    });
+    return out;
+}
+
 HostTensor stream_mix(const HostTensor& m, const HostTensor& x, const HostTensor* a, const HostTensor* y) {
     check_f32(m, "stream_mix m");
     check_f32(x, "stream_mix x");

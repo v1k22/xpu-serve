@@ -18,6 +18,7 @@
 
 #include "backend/sycl/sycl_block_kernels.h"
 #include "backend/sycl/sycl_kernels.h"
+#include "backend/sycl/sycl_conv.h"
 #include "backend/sycl/sycl_matmul.h"
 #include "quant/quant.h"
 #include "util/error.h"
@@ -708,7 +709,8 @@ private:
                     continue;
                 }
                 if (!((kind == OpKind::MatMul && k == 1) || (kind == OpKind::Gather && k == 0) ||
-                      (kind == OpKind::ExpertMatMul && k == 1) || (kind == OpKind::Attention && k > 0))) {
+                      (kind == OpKind::ExpertMatMul && k == 1) || (kind == OpKind::Attention && k > 0) ||
+                      (kind == OpKind::Conv2d && k == 1))) {
                     return false;
                 }
                 any = true;
@@ -871,6 +873,11 @@ private:
                     break;
                 case OpKind::PrevRow:
                     need(0, is_f32(0), "f32");
+                    break;
+                case OpKind::Conv2d:
+                    need(0, is_f32(0), "f32");
+                    need(1, is_fp(1), "f16 or f32");
+                    if (n.inputs.size() == 3) need(2, is_f32(2), "f32");
                     break;
                 case OpKind::MhcRoute: {
                     const int64_t s = std::get<graph::MhcRouteAttrs>(n.attrs).streams;
@@ -2270,6 +2277,19 @@ private:
             case OpKind::PrevRow: {
                 const int64_t rows = out_shape[0];
                 sycl_be::prev_row(q_, in_f32(0), out, rows, rows > 0 ? out_n / rows : 0);
+                return;
+            }
+            case OpKind::Conv2d: {
+                const Dims& xs = in_shape(0);
+                const Dims& ws = in_shape(1);
+                sycl_be::Conv2dShape s{xs[0], xs[1], xs[2], xs[3], ws[0], ws[2], ws[3], out_shape[2], out_shape[3],
+                                       std::get<graph::Conv2dAttrs>(n.attrs)};
+                const float* bias = n.inputs.size() == 3 ? in_f32(2) : nullptr;
+                if (in_dt(1) == DType::F16) {
+                    sycl_be::conv2d(q_, *this, in_f32(0), reinterpret_cast<const half*>(in_ptr(1)), bias, out, s);
+                } else {
+                    sycl_be::conv2d(q_, *this, in_f32(0), in_f32(1), bias, out, s);
+                }
                 return;
             }
             case OpKind::MhcRoute: {

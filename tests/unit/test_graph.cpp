@@ -176,6 +176,26 @@ TEST_CASE("mhc_route: pre, post [T, S] and mix [T, S, S] from [T, 2S + S^2]; str
     CHECK_THROWS_AS(g.stream_mix(pre, x, a, y), xs::Error);                                  // a of another P
 }
 
+TEST_CASE("conv2d output size: stride, padding per side, dilation; groups must divide both channel counts") {
+    Graph g;
+    const Value x = g.input("x", DType::F32, {kT, 1, 128, 100});
+    xs::graph::Conv2dAttrs s2;
+    s2.stride_h = s2.stride_w = 2;
+    s2.pad_top = s2.pad_bottom = s2.pad_left = s2.pad_right = 1;
+    const Value w = g.constant(xs::HostTensor(DType::F32, {480, 1, 3, 3}));
+    CHECK(g.type(g.conv2d(x, w, Value{}, s2)).shape == (xs::Dims{kT, 480, 64, 50}));
+    xs::graph::Conv2dAttrs causal;
+    causal.dilation_w = 3;
+    causal.pad_left = 18;
+    const Value line = g.input("line", DType::F32, {2, 6, 1, 50});
+    CHECK(g.type(g.conv2d(line, g.constant(xs::HostTensor(DType::F32, {4, 6, 1, 7})), Value{}, causal)).shape ==
+          (xs::Dims{2, 4, 1, 50}));
+    xs::graph::Conv2dAttrs grouped;
+    grouped.groups = 4;
+    CHECK_THROWS_AS(g.conv2d(line, g.constant(xs::HostTensor(DType::F32, {4, 6, 1, 7})), Value{}, grouped), xs::Error);
+    CHECK_THROWS_AS(g.conv2d(x, w, g.constant(xs::HostTensor(DType::F32, {3})), s2), xs::Error);  // bias of 3
+}
+
 TEST_CASE("sign matmul: one word of signs per 32 columns, a scale per row") {
     Graph g;
     const Value x = g.input("x", DType::F32, {kT, 64});

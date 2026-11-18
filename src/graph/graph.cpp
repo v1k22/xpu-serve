@@ -64,6 +64,7 @@ std::string_view op_name(OpKind kind) {
         case OpKind::LayerNorm: return "LayerNorm";
         case OpKind::Concat: return "Concat";
         case OpKind::MhcRoute: return "MhcRoute";
+        case OpKind::Conv2d: return "Conv2d";
         case OpKind::StreamMix: return "StreamMix";
     }
     return "?";
@@ -372,6 +373,33 @@ MhcMaps Graph::mhc_route(Value z, Value bias, int64_t streams, int iterations) {
     const Value pre = add_node(OpKind::MhcRoute, std::move(inputs), MhcRouteAttrs{streams, iterations},
                                std::move(outputs), "mhc_route");
     return {pre, Value{pre.node, 1}, Value{pre.node, 2}};
+}
+
+Value Graph::conv2d(Value x, Value w, Value bias, const Conv2dAttrs& a) {
+    const Dims& xs = type(x).shape;
+    const Dims& ws = type(w).shape;
+    XS_CHECK(is_float(type(x).dtype) && xs.size() == 4 && !is_symbol(xs[1]) && !is_symbol(xs[2]) && !is_symbol(xs[3]),
+             "conv2d x must be floats [N, C, H, W] (N may be symbolic), got ", shape_to_string(xs), " at ", where(x));
+    XS_CHECK(is_float(type(w).dtype) && ws.size() == 4, "conv2d w must be floats [O, C / groups, KH, KW], got ",
+             shape_to_string(ws), " at ", where(w));
+    XS_CHECK(a.groups >= 1 && xs[1] % a.groups == 0 && ws[0] % a.groups == 0 && ws[1] == xs[1] / a.groups,
+             "conv2d of ", a.groups, " groups: x has ", xs[1], " channels and w is ", shape_to_string(ws), " at ",
+             where(w));
+    XS_CHECK(a.stride_h >= 1 && a.stride_w >= 1 && a.dilation_h >= 1 && a.dilation_w >= 1 && a.pad_top >= 0 &&
+                 a.pad_bottom >= 0 && a.pad_left >= 0 && a.pad_right >= 0,
+             "conv2d strides and dilations must be positive and paddings not negative");
+    const int64_t ho = (xs[2] + a.pad_top + a.pad_bottom - a.dilation_h * (ws[2] - 1) - 1) / a.stride_h + 1;
+    const int64_t wo = (xs[3] + a.pad_left + a.pad_right - a.dilation_w * (ws[3] - 1) - 1) / a.stride_w + 1;
+    XS_CHECK(ho >= 1 && wo >= 1, "conv2d of a ", ws[2], "x", ws[3], " kernel over ", xs[2], "x", xs[3],
+             " (padded) leaves no output at ", where(x));
+    std::vector<Value> inputs{x, w};
+    if (bias.valid()) {
+        XS_CHECK(is_float(type(bias).dtype) && type(bias).shape == Dims{ws[0]}, "conv2d bias must be [", ws[0],
+                 "] floats, got ", shape_to_string(type(bias).shape), " at ", where(bias));
+        inputs.push_back(bias);
+    }
+    return add_node(OpKind::Conv2d, std::move(inputs), a, {TensorType{DType::F32, Dims{xs[0], ws[0], ho, wo}}},
+                    "conv2d");
 }
 
 namespace {
@@ -689,6 +717,10 @@ std::string attrs_to_string(const Attrs& a) {
                 os << "axis=" << v.axis;
             } else if constexpr (std::is_same_v<T, MhcRouteAttrs>) {
                 os << "streams=" << v.streams << " iterations=" << v.iterations;
+            } else if constexpr (std::is_same_v<T, Conv2dAttrs>) {
+                os << "stride=" << v.stride_h << "," << v.stride_w << " pad=" << v.pad_top << "," << v.pad_bottom << ","
+                   << v.pad_left << "," << v.pad_right << " dilation=" << v.dilation_h << "," << v.dilation_w
+                   << " groups=" << v.groups;
             } else if constexpr (std::is_same_v<T, AttentionAttrs>) {
                 os << "scale=" << v.scale << " window=" << v.sliding_window << " softcap=" << v.softcap
                    << " causal=" << v.causal;

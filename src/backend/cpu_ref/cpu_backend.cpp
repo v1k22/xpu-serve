@@ -472,6 +472,14 @@ class CpuProgram {
                 }
                 return cpu_ref::mhc_route(f32(0), nullptr, a.streams, a.iterations);
             }
+            case OpKind::Conv2d: {
+                const auto& a = std::get<graph::Conv2dAttrs>(n.attrs);
+                if (n.inputs.size() == 3) {
+                    const HostTensor bias = f32(2);
+                    return {cpu_ref::conv2d(*pool_, f32(0), f32(1), &bias, a)};
+                }
+                return {cpu_ref::conv2d(*pool_, f32(0), f32(1), nullptr, a)};
+            }
             case OpKind::StreamMix:
                 if (n.inputs.size() == 4) {
                     const HostTensor a = f32(2), y = f32(3);

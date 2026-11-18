@@ -84,7 +84,14 @@ enum class OpKind : uint8_t {
     StreamMix,  // (m [..., P, S], x [..., S, D] [, a [..., P], y [..., D]]) -> [..., P, D]: out[..., p, :] =
                 // sum_s m[..., p, s] x[..., s, :] (+ a[..., p] y[..., :]); leading dims equal. Mixes the residual
                 // streams of hyper-connections (S streams of width D), and reads a weighted sum of them (P = 1)
+    Conv2d,     // (x [N, C, H, W], w [O, C / groups, KH, KW] [, b [O]]) -> [N, O, HO, WO]; see below
 };
+
+// Conv2d (torch.nn.functional.conv2d: cross-correlation, NCHW): with x zero-padded by Conv2dAttrs::pad,
+// out[n, o, i, j] = b[o] + sum over c in o's group, u < KH, v < KW of
+// w[o, c, u, v] * x[n, c, i * stride_h + u * dilation_h, j * stride_w + v * dilation_w];
+// HO = (H + pad_top + pad_bottom - dilation_h (KH - 1) - 1) / stride_h + 1, WO likewise. A 1-D convolution is H = 1
+// with a kernel of height 1; a causal one pads the left only. N may be symbolic.
 
 // MhcRoute (S = MhcRouteAttrs::streams): with z + b when b is given, pre = sigmoid(z[:S]) (how much of each stream a
 // layer's branch reads), post = 2 sigmoid(z[S:2S]) (how much of the branch's output each stream takes) and mix the
@@ -153,6 +160,12 @@ struct TopKAttrs {
 struct AxisAttrs {  // ReduceSum, Concat
     int axis = 0;
 };
+struct Conv2dAttrs {
+    int64_t stride_h = 1, stride_w = 1;
+    int64_t pad_top = 0, pad_bottom = 0, pad_left = 0, pad_right = 0;
+    int64_t dilation_h = 1, dilation_w = 1;
+    int64_t groups = 1;
+};
 struct MhcRouteAttrs {
     int64_t streams = 2;
     int iterations = 1;
@@ -189,7 +202,7 @@ struct AttentionAttrs {
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
                            ClampAttrs, NormAttrs, ReshapeAttrs, SliceAttrs, TransposeAttrs, KvCacheAttrs,
-                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, AxisAttrs, MhcRouteAttrs>;
+                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, AxisAttrs, MhcRouteAttrs, Conv2dAttrs>;
 
 struct TensorType {
     DType dtype = DType::F32;
@@ -287,6 +300,8 @@ public:
     Value concat(const std::vector<Value>& parts, int axis);
     // `bias` may be an invalid Value (none).
     MhcMaps mhc_route(Value z, Value bias, int64_t streams, int iterations);
+    // `bias` may be an invalid Value (none).
+    Value conv2d(Value x, Value w, Value bias, const Conv2dAttrs& attrs);
     Value stream_mix(Value m, Value x);
     // m @ x plus the outer product of a and y: out[..., p, :] += a[..., p] y[..., :].
     Value stream_mix(Value m, Value x, Value a, Value y);

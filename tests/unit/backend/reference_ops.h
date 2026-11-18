@@ -437,6 +437,45 @@ inline MhcMaps mhc_route(const Tensor64& z, const Tensor64* bias, int64_t s, int
     return out;
 }
 
+// torch.nn.functional.conv2d: x [N, C, H, W], w [O, C / groups, KH, KW], optional bias [O]; padding per side.
+struct Conv2dSpec {
+    int64_t stride_h = 1, stride_w = 1, pad_top = 0, pad_bottom = 0, pad_left = 0, pad_right = 0;
+    int64_t dilation_h = 1, dilation_w = 1, groups = 1;
+};
+inline Tensor64 conv2d(const Tensor64& x, const Tensor64& w, const Tensor64* bias, const Conv2dSpec& s) {
+    const int64_t n = x.shape[0], c = x.shape[1], h = x.shape[2], wd = x.shape[3];
+    const int64_t o = w.shape[0], cg = w.shape[1], kh = w.shape[2], kw = w.shape[3], og = o / s.groups;
+    const int64_t ho = (h + s.pad_top + s.pad_bottom - s.dilation_h * (kh - 1) - 1) / s.stride_h + 1;
+    const int64_t wo = (wd + s.pad_left + s.pad_right - s.dilation_w * (kw - 1) - 1) / s.stride_w + 1;
+    // the zero-padded input
+    const int64_t hp = h + s.pad_top + s.pad_bottom, wp = wd + s.pad_left + s.pad_right;
+    std::vector<double> padded(static_cast<size_t>(n * c * hp * wp), 0.0);
+    for (int64_t b = 0; b < n; ++b)
+        for (int64_t ch = 0; ch < c; ++ch)
+            for (int64_t y = 0; y < h; ++y)
+                for (int64_t z = 0; z < wd; ++z)
+                    padded[static_cast<size_t>(((b * c + ch) * hp + y + s.pad_top) * wp + z + s.pad_left)] =
+                        x[((b * c + ch) * h + y) * wd + z];
+    Tensor64 out(Dims{n, o, ho, wo});
+    for (int64_t b = 0; b < n; ++b)
+        for (int64_t oc = 0; oc < o; ++oc)
+            for (int64_t i = 0; i < ho; ++i)
+                for (int64_t j = 0; j < wo; ++j) {
+                    double acc = bias != nullptr ? (*bias)[oc] : 0.0;
+                    for (int64_t ci = 0; ci < cg; ++ci)
+                        for (int64_t u = 0; u < kh; ++u)
+                            for (int64_t v = 0; v < kw; ++v) {
+                                const int64_t ch = (oc / og) * cg + ci;
+                                const int64_t y = i * s.stride_h + u * s.dilation_h;
+                                const int64_t z = j * s.stride_w + v * s.dilation_w;
+                                acc += w[((oc * cg + ci) * kh + u) * kw + v] *
+                                       padded[static_cast<size_t>(((b * c + ch) * hp + y) * wp + z)];
+                            }
+                    out[((b * o + oc) * ho + i) * wo + j] = acc;
+                }
+    return out;
+}
+
 // m [..., P, S] @ x [..., S, D] per leading index (+ a [..., P] outer y [..., D]).
 inline Tensor64 stream_mix(const Tensor64& m, const Tensor64& x, const Tensor64* a = nullptr,
                            const Tensor64* y = nullptr) {

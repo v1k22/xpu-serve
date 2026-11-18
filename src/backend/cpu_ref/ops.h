@@ -62,6 +62,9 @@ HostTensor sign_matmul(ThreadPool& pool, const HostTensor& x, const HostTensor& 
 // The three maps of hyper-connections from a router's output z [..., 2S + S^2] (+ bias): pre, post, mix (graph.h,
 // MhcRoute); in f64.
 std::vector<HostTensor> mhc_route(const HostTensor& z, const HostTensor* bias, int64_t streams, int iterations);
+// x [N, C, H, W] cross-correlated with w [O, C / groups, KH, KW] (+ bias [O]) as graph.h Conv2d says; f64 sums.
+HostTensor conv2d(ThreadPool& pool, const HostTensor& x, const HostTensor& w, const HostTensor* bias,
+                  const graph::Conv2dAttrs& a);
 // m [..., P, S] @ x [..., S, D] per leading index, plus a [..., P] (outer) y [..., D] when given.
 HostTensor stream_mix(const HostTensor& m, const HostTensor& x, const HostTensor* a = nullptr,
                       const HostTensor* y = nullptr);
