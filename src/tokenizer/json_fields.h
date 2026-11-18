@@ -2,6 +2,7 @@
 
 // Shared readers for tokenizer.json components. `what` names the component kind in errors ("normalizer", ...).
 
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -9,6 +10,9 @@
 #include <nlohmann/json.hpp>
 
 namespace xs::tok {
+
+// A JSON file, parsed from a memory map: several times faster than a stream on vocabulary-sized files.
+nlohmann::json read_json_file(const std::filesystem::path& path);
 
 // The component's "type" field.
 std::string component_type(const nlohmann::json& component, std::string_view what);

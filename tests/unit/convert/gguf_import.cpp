@@ -302,6 +302,15 @@ TEST_SUITE("gguf import") {
         CHECK_FALSE(imported->is_special(*imported->token_id("<think>")));
         CHECK_FALSE(imported->is_special(*imported->token_id("<|fim_prefix|>")));  // typed control in the file
         CHECK(imported->is_special(*imported->token_id("<|im_end|>")));
+        // What the file names only by tokenizer.ggml.pre is the original's, flag for flag.
+        nlohmann::json written = nlohmann::json::parse(std::ifstream(work.path / "pack" / "tokenizer.json"));
+        nlohmann::json hf = nlohmann::json::parse(std::ifstream(work.path / "hf" / "tokenizer.json"));
+        for (nlohmann::json* j : {&written, &hf}) {
+            j->erase("added_tokens");
+            (*j)["model"].erase("vocab");
+            (*j)["model"].erase("merges");
+        }
+        CHECK(written == hf);
         for (const std::string text :
              {"the theater in the evening", "  \n\n  Ünïcödé — 中文 😀 x'll 123",
               "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\nok</think>",

@@ -1,8 +1,19 @@
 #include "tokenizer/json_fields.h"
 
 #include "util/error.h"
+#include "util/mmap_file.h"
 
 namespace xs::tok {
+
+nlohmann::json read_json_file(const std::filesystem::path& path) {
+    const MappedFile file(path);
+    const auto* begin = reinterpret_cast<const char*>(file.data());
+    try {
+        return nlohmann::json::parse(begin, begin + file.size());
+    } catch (const nlohmann::json::exception& e) {
+        fail("'", path.string(), "' is not valid JSON: ", e.what());
+    }
+}
 
 std::string component_type(const nlohmann::json& component, std::string_view what) {
     if (!component.is_object() || !component.contains("type") || !component.at("type").is_string()) {

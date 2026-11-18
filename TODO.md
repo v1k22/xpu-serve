@@ -88,6 +88,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       special tokens (`with_special_tokens`); parity on all-MiniLM-L6-v2, bge-small-en-v1.5, nomic-embed-text-v1.5
 - [x] ByteLevel with the GPT-2 regex (ModernBERT) and Metaspace (mmBERT, Gemma's vocabulary): the tokenizers of Laya
       (three) and Julia-1
+- [x] Slow tokenizer files without tokenizer.json (vocab.json, merges.txt, tokenizer_config.json) read as the
+      tokenizer.json transformers builds from them: Qwen2Tokenizer, parity on Qwen3-ASR
 - [ ] Decide regex engine (PCRE2 vs port) → `docs/decisions/`
 - [x] Parity corpus vs Hugging Face (code, CJK, emoji, whitespace runs, special tokens)
 - [x] Jinja renderer (minja candidate) → `docs/decisions/`; parity vs `apply_chat_template` incl. tools

@@ -1,6 +1,7 @@
 // The Tokenizer behind Tokenizer::load: a Hugging Face tokenizer.json pipeline (added tokens -> normalizer ->
-// pre-tokenizer -> model; the post-processor on request; decoder on the way back). tokenizer.json's truncation and
-// padding are not applied: callers own sequence lengths.
+// pre-tokenizer -> model; the post-processor on request; decoder on the way back), from the directory's tokenizer.json
+// or the one its slow files stand for (slow_files.h). tokenizer.json's truncation and padding are not applied: callers
+// own sequence lengths.
 
 #include <algorithm>
 #include <stdexcept>
@@ -11,13 +12,14 @@
 #include "models/config_util.h"
 #include "tokenizer/added_vocabulary.h"
 #include "tokenizer/decoder.h"
+#include "tokenizer/json_fields.h"
 #include "tokenizer/model.h"
 #include "tokenizer/normalizer.h"
 #include "tokenizer/post_processor.h"
 #include "tokenizer/pre_tokenizer.h"
+#include "tokenizer/slow_files.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
-#include "util/mmap_file.h"
 
 namespace xs::tok {
 namespace {
@@ -186,28 +188,24 @@ private:
     std::optional<int32_t> eos_id_;
 };
 
-// Parses from a memory map: several times faster than nlohmann's stream parser on the 30+ MB Gemma file.
-nlohmann::json read_tokenizer_json(const std::filesystem::path& path) {
-    const MappedFile file(path);
-    const auto* begin = reinterpret_cast<const char*>(file.data());
-    try {
-        return nlohmann::json::parse(begin, begin + file.size());
-    } catch (const nlohmann::json::exception& e) {
-        fail("'", path.string(), "' is not valid JSON: ", e.what());
-    }
-}
-
 }  // namespace
 
 std::unique_ptr<Tokenizer> Tokenizer::load(const std::filesystem::path& model_dir) {
-    const auto tokenizer_path = model_dir / "tokenizer.json";
-    if (!std::filesystem::exists(tokenizer_path)) fail("no tokenizer.json in '", model_dir.string(), "'");
-    const nlohmann::json tokenizer_json = read_tokenizer_json(tokenizer_path);
-    if (!tokenizer_json.is_object()) fail("'", tokenizer_path.string(), "' is not a JSON object");
     const auto config_path = model_dir / "tokenizer_config.json";
     const nlohmann::json tokenizer_config =
         std::filesystem::exists(config_path) ? cfg::read_json(config_path) : nlohmann::json::object();
-    return std::make_unique<HfTokenizer>(tokenizer_json, tokenizer_config);
+    const auto tokenizer_path = model_dir / "tokenizer.json";
+    if (std::filesystem::exists(tokenizer_path)) {
+        const nlohmann::json tokenizer_json = read_json_file(tokenizer_path);
+        if (!tokenizer_json.is_object()) fail("'", tokenizer_path.string(), "' is not a JSON object");
+        return std::make_unique<HfTokenizer>(tokenizer_json, tokenizer_config);
+    }
+    const SlowTokenizerFiles slow = read_slow_files(model_dir, tokenizer_config);
+    try {
+        return std::make_unique<HfTokenizer>(slow.tokenizer, slow.config);
+    } catch (const Error& e) {
+        fail("tokenizer: ", model_dir.string(), " (vocab.json and merges.txt as a tokenizer.json): ", e.what());
+    }
 }
 
 }  // namespace xs::tok

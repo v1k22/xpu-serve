@@ -179,16 +179,9 @@ std::vector<Alternative> qwen_family(uint8_t letters, size_t max_digits) {
 }  // namespace
 
 std::unique_ptr<RegexSplitter> RegexSplitter::for_pattern(std::string_view pattern) {
-    static const std::string kContractions = R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|)";
-    static const std::string kQwen35 = kContractions + R"([^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|)" +
-                                       R"( ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
-    static const std::string kQwen2 =
-        kContractions + R"([^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
-    static const std::string kLlama3 =
-        kContractions + R"([^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
-    if (pattern == kQwen35) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter | kMark, 1));
-    if (pattern == kQwen2) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter, 1));
-    if (pattern == kLlama3) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter, 3));
+    if (pattern == split_regex::kQwen35) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter | kMark, 1));
+    if (pattern == split_regex::kQwen2) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter, 1));
+    if (pattern == split_regex::kLlama3) return std::make_unique<AlternativesSplitter>(qwen_family(kLetter, 3));
     if (pattern == R"('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+)") return gpt2();
     return nullptr;
 }

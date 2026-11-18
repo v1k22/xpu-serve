@@ -13,6 +13,21 @@
 
 namespace xs::tok {
 
+// The Split patterns of the byte-level BPE tokenizers matched here, as tokenizer.json writes them.
+namespace split_regex {
+// Qwen2Tokenizer's (Qwen2, Qwen3, Qwen3-ASR).
+inline constexpr std::string_view kQwen2 =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
+// Qwen3.5's: letter runs take combining marks too.
+inline constexpr std::string_view kQwen35 =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+)"
+    R"(|\s+(?!\S)|\s+)";
+// Llama 3's (LFM3): up to three digits a number.
+inline constexpr std::string_view kLlama3 =
+    R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+)"
+    R"(|\s+(?!\S)|\s+)";
+}  // namespace split_regex
+
 class RegexSplitter {
 public:
     // The matcher for `pattern`, or nullptr when the pattern is not one of the supported ones.

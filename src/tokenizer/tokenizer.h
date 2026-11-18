@@ -6,7 +6,8 @@
 // WordPiece as used by BERT-family encoders (BertNormalizer, BertPreTokenizer, WordPiece decoder), with added/special
 // tokens (normalized ones matched in normalized text) and TemplateProcessing post-processors.
 // Unsupported components are refused by name. tokenizer.json's truncation and padding are not applied: callers own
-// sequence lengths.
+// sequence lengths. A checkpoint without a tokenizer.json is read from transformers' slow files (vocab.json,
+// merges.txt, tokenizer_config.json) as the tokenizer.json transformers builds from them (slow_files.h).
 
 #include <cstdint>
 #include <filesystem>
@@ -21,7 +22,9 @@ namespace xs::tok {
 
 class Tokenizer {
 public:
-    // Loads <dir>/tokenizer.json (and tokenizer_config.json when present, for bos/eos and special-token names).
+    // Loads <dir>/tokenizer.json, or without one the tokenizer its slow files stand for (vocab.json and merges.txt,
+    // by tokenizer_config.json's tokenizer_class); tokenizer_config.json when present, for bos/eos and special-token
+    // names.
     static std::unique_ptr<Tokenizer> load(const std::filesystem::path& model_dir);
     virtual ~Tokenizer() = default;
 

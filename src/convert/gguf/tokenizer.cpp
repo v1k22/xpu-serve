@@ -5,6 +5,8 @@
 #include <optional>
 #include <string_view>
 
+#include "tokenizer/regex_split.h"
+#include "tokenizer/tokenizer_json.h"
 #include "util/error.h"
 #include "util/log.h"
 
@@ -33,17 +35,24 @@ std::string token_type_name(int64_t t) {
     }
 }
 
-constexpr std::string_view kByteLevel =
-    R"json({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false})json";
+nlohmann::json parse(std::string_view text) {
+    return nlohmann::json::parse(text);
+}
+
+// The original tokenizer.json's parts, as JSON text; an empty post-processor is none.
+tok::TokenizerPipeline pipeline(std::string_view normalizer, std::string_view pre_tokenizer,
+                                std::string_view post_processor, std::string_view decoder, std::string_view bpe) {
+    return {parse(normalizer), parse(pre_tokenizer), post_processor.empty() ? nlohmann::json() : parse(post_processor),
+            parse(decoder), parse(bpe)};
+}
 
 // A tokenizer llama.cpp's converter writes: the parts of the original tokenizer.json the file does not hold, and how
 // the file's token types read back as the original's vocabulary and added tokens.
 struct TokenizerKind {
     std::string_view model;  // tokenizer.ggml.model
     std::string_view pre;    // tokenizer.ggml.pre; empty when the model implies it (llama.cpp then ignores the key)
-    std::string_view normalizer, pre_tokenizer, post_processor, decoder;  // JSON
-    std::string_view bpe;  // the BPE model's settings (JSON, without vocab and merges)
-    bool nfc;              // the normalizer is NFC; a file's tokenizer.ggml.normalizer.nfc, when present, must agree
+    tok::TokenizerPipeline pipeline;  // everything of the original tokenizer.json but its vocabulary
+    bool nfc;  // the normalizer is NFC; a file's tokenizer.ggml.normalizer.nfc, when present, must agree
     // Added tokens are also pieces of the BPE vocabulary.
     bool added_in_vocab;
     // Control tokens the original does not mark special.
@@ -66,7 +75,7 @@ struct TokenizerKind {
     bool plain_added_normalized = false;
     // When not empty: the post-processor is a BERT-style template, the file's bos token (its [CLS]) and separator
     // around a sequence, whose special tokens are the ones of these tokenizer.ggml.<name>_token_id keys; the
-    // post_processor above is then unused, and tokenizer_config.json names the bos token cls_token too.
+    // pipeline then has none, and tokenizer_config.json names the bos token cls_token too.
     std::vector<std::string_view> bert_template;
 
     std::string name() const { return std::string(pre.empty() ? model : pre); }
@@ -88,15 +97,11 @@ bool metaspace_run(std::string_view text) {
 
 const std::vector<TokenizerKind>& tokenizer_kinds() {
     static const std::vector<TokenizerKind> table = {
-        // Qwen3.5, Qwen3.6, Qwen3.8: Qwen/Qwen3.5-4B's tokenizer.json. The converter types every added token that
-        // looks like <|...|> control.
+        // Qwen3.5, Qwen3.6, Qwen3.8: Qwen/Qwen3.5-4B's tokenizer.json, Qwen's byte-level BPE over its own regex. The
+        // converter types every added token that looks like <|...|> control.
         {"gpt2",
          "qwen35",
-         R"json({"type": "NFC"})json",
-         R"json({"type": "Sequence", "pretokenizers": [{"type": "Split", "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}, "behavior": "Isolated", "invert": false}, {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}]})json",
-         kByteLevel,
-         kByteLevel,
-         R"json({"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "", "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": false})json",
+         tok::qwen_byte_level_pipeline(tok::split_regex::kQwen35),
          true,
          false,
          {"<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>", "<|repo_name|>", "<|file_sep|>"},
@@ -111,11 +116,12 @@ const std::vector<TokenizerKind>& tokenizer_kinds() {
         // eos_token_id.
         {"gemma4",
          "",
-         R"json({"type": "Replace", "pattern": {"String": " "}, "content": "▁"})json",
-         R"json({"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false})json",
-         R"json({"type": "TemplateProcessing", "single": [{"Sequence": {"id": "A", "type_id": 0}}], "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}], "special_tokens": {}})json",
-         R"json({"type": "Sequence", "decoders": [{"type": "Replace", "pattern": {"String": "▁"}, "content": " "}, {"type": "ByteFallback"}, {"type": "Fuse"}]})json",
-         R"json({"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false})json",
+         pipeline(
+             R"json({"type": "Replace", "pattern": {"String": " "}, "content": "▁"})json",
+             R"json({"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false})json",
+             R"json({"type": "TemplateProcessing", "single": [{"Sequence": {"id": "A", "type_id": 0}}], "pair": [{"Sequence": {"id": "A", "type_id": 0}}, {"Sequence": {"id": "B", "type_id": 1}}], "special_tokens": {}})json",
+             R"json({"type": "Sequence", "decoders": [{"type": "Replace", "pattern": {"String": "▁"}, "content": " "}, {"type": "ByteFallback"}, {"type": "Fuse"}]})json",
+             R"json({"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false})json"),
          false,
          true,
          {},
@@ -127,14 +133,12 @@ const std::vector<TokenizerKind>& tokenizer_kinds() {
         // pieces, those above are not; as added tokens only, they encode alike.
         {.model = "gpt2",
          .pre = "modern-bert",
-         .normalizer = R"json({"type": "NFC"})json",
-         .pre_tokenizer =
+         .pipeline = pipeline(
+             R"json({"type": "NFC"})json",
              R"json({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true})json",
-         .post_processor = "",
-         .decoder =
+             "",
              R"json({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true})json",
-         .bpe =
-             R"json({"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false})json",
+             R"json({"type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false, "byte_fallback": false, "ignore_merges": false})json"),
          .nfc = true,
          .added_in_vocab = false,
          .lstrip = {"[MASK]"},
@@ -146,14 +150,12 @@ const std::vector<TokenizerKind>& tokenizer_kinds() {
         // control like the seven special tokens.
         {.model = "gpt2",
          .pre = "mmbert",
-         .normalizer = R"json({"type": "Replace", "pattern": {"String": " "}, "content": "▁"})json",
-         .pre_tokenizer =
+         .pipeline = pipeline(
+             R"json({"type": "Replace", "pattern": {"String": " "}, "content": "▁"})json",
              R"json({"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always", "split": true})json",
-         .post_processor = "",
-         .decoder =
+             "",
              R"json({"type": "Sequence", "decoders": [{"type": "Replace", "pattern": {"String": "▁"}, "content": " "}, {"type": "ByteFallback"}, {"type": "Fuse"}]})json",
-         .bpe =
-             R"json({"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false})json",
+             R"json({"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false})json"),
          .nfc = false,
          .added_in_vocab = true,
          .special_controls = {"<pad>", "<eos>", "<bos>", "<unk>", "<mask>", "<start_of_turn>", "<end_of_turn>"},
@@ -272,7 +274,7 @@ void check_keys(const gguf::File& file, const TokenizerKind& kind) {
     agree("tokenizer.ggml.normalizer.strip_accents", false);
     agree("tokenizer.ggml.add_space_prefix", false);
     if (const gguf::Value* v = file.find("tokenizer.ggml.metaspace.prepend_scheme")) {
-        const nlohmann::json pre = nlohmann::json::parse(kind.pre_tokenizer);
+        const nlohmann::json& pre = kind.pipeline.pre_tokenizer;
         if (pre.value("type", "") != "Metaspace" || pre.value("prepend_scheme", "") != v->as_string()) {
             fail("GGUF tokenizer.ggml.metaspace.prepend_scheme '", v->as_string(), "' disagrees with the tokenizer '",
                  kind.name(), "' stands for");
@@ -286,16 +288,12 @@ bool is_byte_piece(std::string_view text) {
     return text.size() == 6 && starts_with(text, "<0x") && hex(text[3]) && hex(text[4]) && text[5] == '>';
 }
 
-nlohmann::json parse(std::string_view text) {
-    return nlohmann::json::parse(text);
-}
-
 }  // namespace
 
 TokenizerFiles tokenizer_files(const gguf::File& file) {
     const TokenizerKind& kind = find_kind(file);
     check_keys(file, kind);
-    nlohmann::json bpe = parse(kind.bpe);
+    const nlohmann::json& bpe = kind.pipeline.model;
 
     const std::vector<std::string_view> tokens = file.get("tokenizer.ggml.tokens").strings();
     const std::vector<int64_t> types = file.get("tokenizer.ggml.token_type").ints();
@@ -393,15 +391,14 @@ TokenizerFiles tokenizer_files(const gguf::File& file) {
         return std::nullopt;
     };
     if (const auto unk = token_text("tokenizer.ggml.unknown_token_id", false);
-        unk && bpe["unk_token"].is_string() && bpe["unk_token"] != *unk) {
+        unk && bpe.at("unk_token").is_string() && bpe.at("unk_token") != *unk) {
         fail("GGUF tokenizer.ggml.unknown_token_id is '", *unk, "', which disagrees with the tokenizer '", kind.name(),
-             "' stands for (", bpe["unk_token"].get<std::string>(), ")");
+             "' stands for (", bpe.at("unk_token").get<std::string>(), ")");
     }
 
-    nlohmann::json post_processor;
-    if (kind.bert_template.empty()) {
-        post_processor = parse(kind.post_processor);
-    } else {  // [CLS] A [SEP] and [CLS] A [SEP] B [SEP], every token of type 0, over the file's tokens
+    tok::TokenizerPipeline pipeline = kind.pipeline;
+    if (!kind.bert_template.empty()) {
+        // [CLS] A [SEP] and [CLS] A [SEP] B [SEP], every token of type 0, over the file's tokens
         const auto special = [&](std::string_view name) {
             const std::string key = str_cat("tokenizer.ggml.", name, "_token_id");
             const std::optional<std::string> text = token_text(key, false);
@@ -420,24 +417,16 @@ TokenizerFiles tokenizer_files(const gguf::File& file) {
             const auto [text, id] = special(name);
             tokens_by_text[text] = {{"id", text}, {"ids", {id}}, {"tokens", {text}}};
         }
-        post_processor = {{"type", "TemplateProcessing"},
-                          {"single", {piece("SpecialToken", cls), piece("Sequence", "A"), piece("SpecialToken", sep)}},
-                          {"pair",
-                           {piece("SpecialToken", cls), piece("Sequence", "A"), piece("SpecialToken", sep),
-                            piece("Sequence", "B"), piece("SpecialToken", sep)}},
-                          {"special_tokens", std::move(tokens_by_text)}};
+        pipeline.post_processor = {
+            {"type", "TemplateProcessing"},
+            {"single", {piece("SpecialToken", cls), piece("Sequence", "A"), piece("SpecialToken", sep)}},
+            {"pair",
+             {piece("SpecialToken", cls), piece("Sequence", "A"), piece("SpecialToken", sep), piece("Sequence", "B"),
+              piece("SpecialToken", sep)}},
+            {"special_tokens", std::move(tokens_by_text)}};
     }
-    out.tokenizer = {{"version", "1.0"},
-                     {"truncation", nullptr},
-                     {"padding", nullptr},
-                     {"added_tokens", std::move(added)},
-                     {"normalizer", parse(kind.normalizer)},
-                     {"pre_tokenizer", parse(kind.pre_tokenizer)},
-                     {"post_processor", std::move(post_processor)},
-                     {"decoder", parse(kind.decoder)}};
-    bpe["vocab"] = std::move(vocab);
-    bpe["merges"] = std::move(merges);
-    out.tokenizer["model"] = std::move(bpe);
+    out.tokenizer =
+        tok::make_tokenizer_json(std::move(pipeline), std::move(vocab), std::move(merges), std::move(added));
 
     out.config["added_tokens_decoder"] = std::move(decoder);
     const auto bos = token_text("tokenizer.ggml.bos_token_id", false);
