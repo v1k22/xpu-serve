@@ -1,9 +1,10 @@
 """Renders chat-template parity cases with Hugging Face for the C++ ChatTemplate test.
 
 Usage: python -I tests/parity/chat/gen_cases.py gemma4=<model_dir> qwen3_5=<model_dir> lfm3=<model_dir> ...
-Writes tests/fixtures/chat/<set>_cases.json for each set named. A model dir needs only chat_template.jinja and
-tokenizer_config.json (plus tokenizer.json for AutoTokenizer): the Hugging Face checkpoint named in
-tests/fixtures/chat/<set>/SOURCE, or for lfm3 (whose template is not kept here) LiquidAI/LFM3-1.7B.
+Writes tests/fixtures/chat/<set>_cases.json for each set named. A model dir needs only its chat template
+(chat_template.jinja, or chat_template.json) and tokenizer_config.json (plus tokenizer.json, or vocab.json and
+merges.txt, for AutoTokenizer): the Hugging Face checkpoint named in tests/fixtures/chat/<set>/SOURCE, or for lfm3
+(whose template is not kept here) LiquidAI/LFM3-1.7B.
 """
 
 import copy
@@ -624,19 +625,56 @@ def lfm3_cases():
     ], [WEATHER], True, think_off
 
 
+def qwen3_asr_cases():
+    """Qwen3-ASR's template keeps the system text and writes one audio marker run per audio part of any message: a part
+    of type audio, or one with an audio or audio_url key. Image parts reach templates as {"type": "image"}, audio parts
+    as {"type": "audio"}."""
+    sys_msg = {"role": "system", "content": "Transcribe the audio."}
+    audio = {"type": "audio"}
+    yield "system_and_audio", [sys_msg, {"role": "user", "content": [audio]}], None, True, {}
+    yield "audio_only", [{"role": "user", "content": [audio]}], None, True, {}
+    yield "system_and_audio_no_generation_prompt", [sys_msg, {"role": "user", "content": [audio]}], None, False, {}
+    yield "system_parts_text_and_two_audios", [
+        {"role": "system", "content": [{"type": "text", "text": "Context: "}, {"type": "text", "text": "a meeting."},
+                                       {"type": "image"}]},
+        {"role": "user", "content": [{"type": "text", "text": "This text is not rendered."}, audio, audio]},
+    ], None, True, {}
+    yield "audio_keys_and_urls", [
+        {"role": "user", "content": [
+            {"audio": "clip.wav"}, {"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}},
+            {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}, {"type": "image"}]},
+    ], None, True, {}
+    yield "text_only_user", [sys_msg, {"role": "user", "content": "Hello there"}], None, True, {}
+    yield "audio_across_turns", [
+        sys_msg,
+        {"role": "user", "content": [audio]},
+        {"role": "assistant", "content": "language English<asr_text>Hello."},
+        {"role": "user", "content": [audio]},
+    ], None, True, {}
+
+
 SETS = {
     "gemma4": lambda: itertools.chain(cases(), openai_cases()),
     "qwen3_5": qwen3_5_cases,
     "lfm3": lfm3_cases,
+    "qwen3_asr": qwen3_asr_cases,
 }
+
+
+def processor_template(model):
+    """The template of the model's processor, which transformers reads from chat_template.json (a legacy file that wins
+    over chat_template.jinja, processing_utils); None without one: the tokenizer's own."""
+    path = Path(model) / "chat_template.json"
+    return json.loads(path.read_text(encoding="utf-8"))["chat_template"] if path.exists() else None
 
 
 def write_set(name, model):
     tok = AutoTokenizer.from_pretrained(model, trust_remote_code=False)  # a tokenizer needs no checkpoint code
+    template = processor_template(model)
     out = []
     for case_name, messages, tools, add_gen, extra in SETS[name]():
-        expected = tok.apply_chat_template(
-            openai_to_hf(messages), tools=tools, add_generation_prompt=add_gen, tokenize=False, **extra)
+        expected = tok.apply_chat_template(openai_to_hf(messages), chat_template=template, tools=tools,
+                                           add_generation_prompt=add_gen, tokenize=False, **extra)
         out.append({"name": case_name, "messages": messages, "tools": tools, "add_generation_prompt": add_gen,
                     "extra": extra, "expected": expected})
     names = [c["name"] for c in out]

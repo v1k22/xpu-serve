@@ -11,7 +11,8 @@ namespace xs::chat {
 // A model's own Jinja chat template, rendered natively.
 class ChatTemplate {
 public:
-    // Reads <dir>/chat_template.jinja, else the "chat_template" field of <dir>/tokenizer_config.json. Special-token
+    // Reads <dir>/chat_template.json (a processor's {"chat_template": ...}), else chat_template.jinja, else the
+    // "chat_template" field of tokenizer_config.json: the order in which transformers lets one win. Special-token
     // strings (bos_token, eos_token, ...) come from tokenizer_config.json.
     static std::unique_ptr<ChatTemplate> load(const std::filesystem::path& model_dir);
     virtual ~ChatTemplate() = default;

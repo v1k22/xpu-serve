@@ -90,6 +90,22 @@ TEST_SUITE("chat template") {
         }
     }
 
+    // Qwen3-ASR's template comes as chat_template.json; image and audio parts reach it as {"type": "image"} and
+    // {"type": "audio"}.
+    TEST_CASE("qwen3_asr renders byte-identical to Hugging Face") {
+        const auto tmpl = xs::chat::ChatTemplate::load(kChatFixtures / "qwen3_asr");
+        const ordered_json cases = read_ordered_json(kChatFixtures / "qwen3_asr_cases.json");
+        REQUIRE(cases.size() >= 7);
+        for (const ordered_json& c : cases) {
+            const std::string name = c["name"].get<std::string>();
+            CAPTURE(name);
+            std::string rendered;
+            CHECK_NOTHROW(
+                rendered = tmpl->render(c["messages"], c["tools"], c["add_generation_prompt"].get<bool>(), c["extra"]));
+            CHECK(rendered == c["expected"].get<std::string>());
+        }
+    }
+
     // LFM3's template is not kept here: the test reads it from a checkpoint (XS_LFM3_DIR) and skips without one.
     TEST_CASE("lfm3 renders byte-identical to Hugging Face") {
         const auto dir = xs::test::lfm3_dir();
@@ -120,6 +136,21 @@ TEST_SUITE("chat template") {
         dir.write("tokenizer_config.json", R"({"chat_template": "{{ messages[0]['content'] }}!"})");
         const auto tmpl = xs::chat::ChatTemplate::load(dir.path());
         CHECK(tmpl->render(json::array({{{"role", "user"}, {"content", "hi"}}}), nullptr, false) == "hi!");
+    }
+
+    TEST_CASE("chat_template.json wins over chat_template.jinja, which wins over tokenizer_config") {
+        const json messages = json::array({{{"role", "user"}, {"content", "hi"}}});
+        ScratchModelDir dir("precedence");
+        dir.write("tokenizer_config.json", R"({"chat_template": "config {{ messages[0]['content'] }}"})");
+        CHECK(xs::chat::ChatTemplate::load(dir.path())->render(messages, nullptr, false) == "config hi");
+        dir.write("chat_template.jinja", "jinja {{ messages[0]['content'] }}");
+        CHECK(xs::chat::ChatTemplate::load(dir.path())->render(messages, nullptr, false) == "jinja hi");
+        dir.write("chat_template.json", R"({"chat_template": "json {{ messages[0]['content'] }}"})");
+        CHECK(xs::chat::ChatTemplate::load(dir.path())->render(messages, nullptr, false) == "json hi");
+
+        dir.write("chat_template.json", R"({"chat_template": [{"name": "default", "template": "x"}]})");
+        CHECK_THROWS_WITH_AS(xs::chat::ChatTemplate::load(dir.path()),
+                             doctest::Contains("chat_template.json has no string \"chat_template\""), xs::Error);
     }
 
     TEST_CASE("dictsort is case-insensitive like Jinja2") {

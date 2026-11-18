@@ -25,8 +25,7 @@ std::string read_file(const fs::path& path) {
     return ss.str();
 }
 
-nlohmann::json read_tokenizer_config(const fs::path& path) {
-    if (!fs::exists(path)) return nlohmann::json::object();
+nlohmann::json read_json(const fs::path& path) {
     try {
         return nlohmann::json::parse(read_file(path));
     } catch (const nlohmann::json::exception& e) {
@@ -34,13 +33,26 @@ nlohmann::json read_tokenizer_config(const fs::path& path) {
     }
 }
 
+nlohmann::json read_tokenizer_config(const fs::path& path) {
+    return fs::exists(path) ? read_json(path) : nlohmann::json::object();
+}
+
+// transformers' order: a processor's chat_template.json (a legacy file that wins over chat_template.jinja), then the
+// tokenizer's chat_template.jinja, then its tokenizer_config.json "chat_template".
 std::string read_template_source(const fs::path& model_dir, const nlohmann::json& tokenizer_config) {
+    const fs::path json_path = model_dir / "chat_template.json";
+    if (fs::exists(json_path)) {
+        const nlohmann::json file = read_json(json_path);
+        const auto it = file.is_object() ? file.find("chat_template") : file.end();
+        if (it == file.end() || !it->is_string()) fail(json_path.string(), " has no string \"chat_template\"");
+        return it->get<std::string>();
+    }
     const fs::path jinja_path = model_dir / "chat_template.jinja";
     if (fs::exists(jinja_path)) return read_file(jinja_path);
     const auto it = tokenizer_config.find("chat_template");
     if (it != tokenizer_config.end() && it->is_string()) return it->get<std::string>();
     fail("no chat template in ", model_dir.string(),
-         " (expected chat_template.jinja or a string \"chat_template\" in tokenizer_config.json)");
+         " (expected chat_template.json, chat_template.jinja or a string \"chat_template\" in tokenizer_config.json)");
 }
 
 // Hugging Face passes every named special token (bos_token, eos_token, image_token, ...) to the template. A token is

@@ -1,0 +1,184 @@
+[
+ {
+  "name": "system_and_audio",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Transcribe the audio."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\nTranscribe the audio.<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "audio_only",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "system_and_audio_no_generation_prompt",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Transcribe the audio."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expected": "<|im_start|>system\nTranscribe the audio.<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n"
+ },
+ {
+  "name": "system_parts_text_and_two_audios",
+  "messages": [
+   {
+    "role": "system",
+    "content": [
+     {
+      "type": "text",
+      "text": "Context: "
+     },
+     {
+      "type": "text",
+      "text": "a meeting."
+     },
+     {
+      "type": "image"
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "This text is not rendered."
+     },
+     {
+      "type": "audio"
+     },
+     {
+      "type": "audio"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\nContext: a meeting.<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "audio_keys_and_urls",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "audio": "clip.wav"
+     },
+     {
+      "type": "audio_url",
+      "audio_url": {
+       "url": "https://example.com/a.wav"
+      }
+     },
+     {
+      "type": "input_audio",
+      "input_audio": {
+       "data": "",
+       "format": "wav"
+      }
+     },
+     {
+      "type": "image"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "text_only_user",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Transcribe the audio."
+   },
+   {
+    "role": "user",
+    "content": "Hello there"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\nTranscribe the audio.<|im_end|>\n<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "name": "audio_across_turns",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Transcribe the audio."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     }
+    ]
+   },
+   {
+    "role": "assistant",
+    "content": "language English<asr_text>Hello."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expected": "<|im_start|>system\nTranscribe the audio.<|im_end|>\n<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|><|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n"
+ }
+]
