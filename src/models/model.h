@@ -121,6 +121,30 @@ public:
     virtual std::string_view drafter_weights() const { return {}; }
 };
 
+// What a speech recognition model adds (OpenAI's /v1/audio/transcriptions): its audio is one chat turn the model
+// answers with a transcript in its own format. The service cuts long audio, renders the turn, generates, and reads the
+// reply through this.
+class Transcription {
+public:
+    virtual ~Transcription() = default;
+    // Audio longer than this is cut, at quiet points, into pieces transcribed one after another.
+    virtual double max_piece_seconds() const = 0;
+    // A piece's reply stops after this many tokens: where a model that fell into repeating itself ends.
+    virtual int max_reply_tokens() const = 0;
+    // The text after the chat template's generation prompt that has the model write in `language` (an ISO 639-1
+    // code or a language name, case-insensitive), or "" when `language` is empty (the model detects it). Throws
+    // xs::Error naming a language the model does not know.
+    virtual std::string language_prefix(std::string_view language) const = 0;
+    struct Transcript {
+        std::string language;  // as the model names it; empty when it did not say
+        std::string text;
+    };
+    // The transcript in a reply that followed `prefix` (language_prefix()'s). With `finished` false the reply is still
+    // growing: text the model may yet turn into its header is held back; with `finished` true it is the model's final
+    // text, cleaned as its reference code cleans it.
+    virtual Transcript parse(std::string_view prefix, std::string_view reply, bool finished) const = 0;
+};
+
 class Model {
 public:
     virtual ~Model() = default;
@@ -138,6 +162,8 @@ public:
     virtual const AudioEncoder* audio() const { return nullptr; }
     // The encoder of `m`: vision() or audio().
     const MediaEncoder* encoder(Modality m) const;
+    // Null unless the model transcribes speech (it then has an audio() encoder).
+    virtual const Transcription* transcription() const { return nullptr; }
     // Weights the model reads on the host one row at a time (embedding tables kept out of device memory, like Gemma
     // 4's per-layer embeddings). They never appear in a graph, so convert asks for them here; they may be Q8 / Q4.
     virtual std::vector<std::string> host_tables() const { return {}; }

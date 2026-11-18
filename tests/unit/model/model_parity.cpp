@@ -50,8 +50,9 @@ TEST_CASE("model matches Hugging Face logits and greedy output" * doctest::skip(
     auto model = xs::load_model(*xs::test::model_dir());
     auto session = xs::make_backend(backend_name)->compile(model->graph(), model->weights(), parity_options());
 
-    // Prompt logits straight from the session.
+    // Prompt logits straight from the session. Cases with audio are audio_parity.cpp's.
     for (const auto& c : manifest["cases"]) {
+        if (c.contains("wav")) continue;
         const auto ids = c["input_ids"].get<std::vector<int32_t>>();
         session->reset();
         xs::TensorMap inputs, outputs;
@@ -72,6 +73,7 @@ TEST_CASE("model matches Hugging Face logits and greedy output" * doctest::skip(
     eo.max_context = 4096;
     xs::Engine engine(std::move(model), std::move(session), xs::EncoderSessions{}, eo);
     for (const auto& c : manifest["cases"]) {
+        if (c.contains("wav")) continue;
         const auto ref = c["greedy"].get<std::vector<int32_t>>();
         xs::GenerateRequest req;
         req.prompt = c["input_ids"].get<std::vector<int32_t>>();

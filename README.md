@@ -36,6 +36,8 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3
 - ✅ **Image input** (Gemma 4 E2B / E4B), as base64 `data:` URLs
+- ✅ **Speech recognition** (Qwen3-ASR) behind `/v1/audio/transcriptions` (json, text or streamed) and as
+  `input_audio` in chat: WAV, MP3 or FLAC, long audio cut at quiet points
 - ✅ **Quantized packs**: q8 and q4 from `xpu-serve convert` (round to nearest; AWQ calibration opt-in)
 - ✅ **FP8 checkpoints** (Qwen3.8-27B-FP8, Qwen3.6-35B-A3B-FP8, Ornith-1.5-35B-A3B-FP8: a scale per 128 x 128 block,
   or compressed-tensors' scale per channel), served as they are or converted to a pack
@@ -57,8 +59,8 @@ Not yet:
 
 - Several sequences at once (batching): one request runs at a time.
 - One model across two GPUs.
-- Audio and video input; images for Qwen3.5 (its vision tower is not loaded) and Gemma 4 26B-A4B; images from
-  remote URLs.
+- Timestamps and translation of speech; speech output; video input; images for Qwen3.5 (its vision tower is not
+  loaded) and Gemma 4 26B-A4B; images from remote URLs.
 - Gemma 4 26B-A4B from a GGUF file (a `gemma4` file with experts).
 - `response_format` (JSON mode), `n` above 1, a rerank API.
 
@@ -84,6 +86,7 @@ Each model's recipe has its commands and numbers.
 | d1-2B | decision | `LiquidAI/d1-2B` | original, q8 / q4 pack | [recipe](model_recipes.md#d1-2b) |
 | Laya | decision | `convaiinnovations/laya` | original, GGUF | [recipe](model_recipes.md#laya) |
 | Julia-1 | decision | `SupersonicLabs/Julia-1` | original, GGUF | [recipe](model_recipes.md#julia-1) |
+| Qwen3-ASR-1.7B / 0.6B | speech recognition | `Qwen/Qwen3-ASR-1.7B`, `Qwen/Qwen3-ASR-0.6B` | original, q8 / q4 pack | [1.7B](model_recipes.md#qwen3-asr-17b), [0.6B](model_recipes.md#qwen3-asr-06b) |
 | all-MiniLM-L6-v2 | embedding | `sentence-transformers/all-MiniLM-L6-v2` | original | [recipe](model_recipes.md#all-minilm-l6-v2) |
 | bge-small-en-v1.5 | embedding | `BAAI/bge-small-en-v1.5` | original | [recipe](model_recipes.md#bge-small-en-v15) |
 | nomic-embed-text-v1.5 | embedding | `nomic-ai/nomic-embed-text-v1.5` | original | [recipe](model_recipes.md#nomic-embed-text-v15) |
@@ -252,8 +255,8 @@ bits a value); `<keys>:<values>` sets the two apart, e.g. `i8:turbo4`. All of th
 
 ## APIs
 
-`xpu-serve serve <dir>` serves whatever the directory holds: a language model behind the OpenAI API, an embedding
-model behind `/v1/embeddings`, a decision model behind the System One API, a robot policy behind the policy API.
+`xpu-serve serve <dir>` serves whatever the directory holds: a language model behind the OpenAI API, a speech
+recognition model behind `/v1/audio/transcriptions`, an embedding model behind `/v1/embeddings`, a decision model behind the System One API, a robot policy behind the policy API.
 `--host` and `--port` set the address (127.0.0.1:8080 by default), `--api-key` asks for `Authorization: Bearer <key>`,
 `--model-id` names the model in `/v1/models`. `GET /health` answers once the server is up. A request that names
 something unsupported is refused with the field's name, never served differently.
@@ -279,10 +282,41 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   thinks by default).
 - **Images**: `image_url` parts with a base64 `data:` URL (PNG, JPEG, BMP or GIF); the server does not fetch remote
   URLs.
+- **Audio**: `input_audio` parts (`{"data": <base64>, "format": "wav" | "mp3" | "flac"}`), for a model that takes
+  audio (Qwen3-ASR, whose reply is `language <Name><asr_text><transcript>`).
 - **Sampling**: `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`,
   `repetition_penalty`, `seed`, `stop`, `max_tokens` / `max_completion_tokens`.
 - A response carries `usage` and `timings`. One choice per request (`n` is 1); `response_format` other than text and
   audio or video parts are refused by name.
+
+### Transcriptions
+
+A speech recognition model is served behind OpenAI's transcription API:
+
+```bash
+xpu-serve serve -hf Qwen/Qwen3-ASR-1.7B --device GPU
+curl -s http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en
+```
+
+```json
+{"text": "Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.",
+ "usage": {"type": "tokens", "input_tokens": 94, "output_tokens": 22, "total_tokens": 116}}
+```
+
+(Qwen3-ASR-1.7B's answer on an Arc Pro B60 for LibriSpeech's first clip, 5.9 s.)
+
+- `file`: WAV (integer PCM or float, any channels and sample rate), MP3 or FLAC. Other containers (Ogg, Opus, M4A,
+  WebM) are refused with an ffmpeg command line that converts them.
+- `language`: an ISO 639-1 code or a name (`en`, `English`, `yue`); without it the model finds the language.
+  `prompt` becomes the model's system turn (context such as names and terms); `temperature` 0 to 1.
+- `response_format` `json` or `text`; `stream=true` sends `transcript.text.delta` events as the text is decoded and a
+  `transcript.text.done` event with the whole text and its usage.
+- Audio longer than the model's piece (20 minutes for Qwen3-ASR) is cut at its quietest moments and the pieces'
+  texts joined.
+- Refused by name: timestamps (`verbose_json`, `srt`, `vtt`, `timestamp_granularities[]`), `diarized_json`, and
+  `/v1/audio/translations` (the model transcribes only).
+
+Decision [0023](docs/decisions/0023-speech-recognition.md) has the details.
 
 ### Embeddings
 
@@ -392,6 +426,8 @@ Every layer is tested against a reference:
 | Every graph op, on cpu-ref and on the GPU | fp64 references, with planted-bug controls | `tests/unit/backend/` |
 | Whole model (Gemma 4, Qwen3.5, LFM3, SenseNova Loop) | Hugging Face fp32 logits and greedy output (SenseNova Loop: its own modeling code) | `tests/unit/model/model_parity.cpp` |
 | Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/gemma4_vision_parity.cpp` |
+| Audio decoding, resampling and log-mel features | libsndfile, torchaudio and transformers' feature extractor | `tests/unit/audio/` |
+| Speech recognition (Qwen3-ASR) | transformers fp32 log-mel, encoder rows, prompt, logits and greedy text | `tests/unit/model/audio_parity.cpp` |
 | Robot policy (π0.5) | LeRobot fp32 actions and prompt token ids, 3 cameras and 1 | `tests/unit/model/policy_parity.cpp` |
 | Decision models | the checkpoint's own Python code in fp32: prompt token ids and every option's probability | `tests/unit/model/decision_parity.cpp` |
 | Embedding models | sentence-transformers in fp32: token ids, hidden states and embeddings | `tests/unit/model/embedding_parity.cpp` |

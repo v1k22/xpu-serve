@@ -47,6 +47,12 @@ public:
     virtual MediaInput prepare_media(Modality m, std::span<const uint8_t> /*encoded*/) const {
         fail("model '", model().id, "' does not take ", modality_name(m), " input");
     }
+    // Speech recognition: only a model that transcribes takes it. Blocks until the transcript is complete; `on_text`
+    // (may be empty) receives it as it decodes, on the engine thread. Thread-safe.
+    virtual bool transcribes() const { return false; }
+    virtual TranscriptionResult transcribe(const TranscriptionRequest& /*request*/, const TextCallback& /*on_text*/) {
+        fail("model '", model().id, "' does not transcribe audio");
+    }
     // `prompt` with each media placeholder the chat template rendered replaced by its item's token run. Throws
     // xs::Error when placeholders and items do not pair up.
     virtual std::vector<int32_t> expand_media(std::vector<int32_t> prompt, const std::vector<MediaInput>& media) const {

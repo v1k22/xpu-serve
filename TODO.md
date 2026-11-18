@@ -521,10 +521,23 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 ## Audio models
 
 - [x] `audio/`: decoding (WAV, MP3, FLAC; other containers refused by name), torchaudio's resampling, Qwen3-ASR's log-mel features (Whisper's math), checked against libsndfile, torchaudio and transformers
-- [ ] `AudioModel` kind, `/v1/audio/transcriptions` and `/v1/audio/speech`
-- [ ] Speech recognition (Whisper-style encoder-decoder; streaming encoder state)
-- [ ] Speech synthesis (codec-token TTS: token loop + codec decoder, streaming output)
-- [ ] Audio in chat (an audio encoder in front of an LLM, like images)
+- [x] Graph op Conv2d (strided, padded per side, dilated, grouped), cpu-ref and SYCL (im2col + GEMM)
+- [x] Media by modality: `MediaInput` with encoder runs, `AudioEncoder` beside `VisionEncoder`, an encoder session per
+      modality; chat `input_audio` parts; `run --audio`
+- [x] Qwen3-ASR (released and transformers' layouts; tokenizer from vocab.json + merges.txt): parity with
+      transformers fp32 on cpu-ref and the B60 (f32 and f16); `POST /v1/audio/transcriptions` (json, text, streamed
+      events; timestamps and translations refused by name); long audio cut at quiet points; the reference's limit of
+      4,096 reply tokens and its clean-up of repeated text — docs/decisions/0023
+- [x] Measured on the B60 (1.7B at f16, q8, q4; 0.6B at f16 from `-hf`): word error rate, latency by clip length,
+      first streamed text, memory
+- [ ] A clip's encoder windows in one run (75 runs for 10 minutes today: 0.87 s of a 2.9 s wait for the first text)
+- [ ] Log-mel features on several threads (about 0.5 s of CPU for 10 minutes of audio)
+- [ ] Timestamps: Qwen3-ForcedAligner (`verbose_json`, `srt`, `vtt`, `timestamp_granularities[]`)
+- [ ] Realtime transcription: a WebSocket with OpenAI's realtime events, audio appended as it arrives
+- [ ] Qwen3-Omni: its thinker (audio, images and video in chat), then speech out (talker, code predictor, Code2Wav:
+      `/v1/audio/speech`, chat `modalities`)
+- [ ] Image generation: BAGEL, Qwen-Image-2.1 (`/v1/images/generations`, `/v1/images/edits`)
+- [ ] Whisper-style encoder-decoders (cross-attention)
 
 ---
 

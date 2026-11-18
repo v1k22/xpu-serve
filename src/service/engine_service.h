@@ -49,6 +49,8 @@ public:
     bool accepts(Modality m) const override { return engine_->accepts(m); }
     MediaInput prepare_media(Modality m, std::span<const uint8_t> encoded) const override;
     std::vector<int32_t> expand_media(std::vector<int32_t> prompt, const std::vector<MediaInput>& media) const override;
+    bool transcribes() const override;
+    TranscriptionResult transcribe(const TranscriptionRequest& request, const TextCallback& on_text) override;
 
 private:
     struct Job;

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3|sensenova_loop
+    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3|sensenova_loop|qwen3_asr
         --tokenizer-from <dir> --out <dir>
     python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
         [--pooling mean|cls] [--normalize] [--max-seq-length N]
@@ -38,7 +38,8 @@ import shutil
 import torch
 from safetensors.torch import load_file, save_file
 
-TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "vocab.json", "merges.txt"]
+TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "chat_template.json", "vocab.json",
+                   "merges.txt", "preprocessor_config.json"]
 
 
 def qwen3_5_moe(vocab_size, source):
@@ -176,6 +177,60 @@ def sensenova_loop(vocab_size, source):
     return model
 
 
+def qwen3_asr(vocab_size, source):
+    """Qwen3-ASR's layout from transformers' own classes: a Whisper-style audio encoder (three stride-2 convolutions
+    over chunks of 100 mel frames, attention within windows of 800 frames, a two-layer projector) and a Qwen3
+    decoder; saved in the released checkpoint's layout (weights under thinker.*, a thinker_config) by
+    released_asr_layout(). The audio token is the --tokenizer-from checkpoint's <|audio_pad|>."""
+    from transformers import AutoTokenizer, Qwen3ASRConfig, Qwen3ASRForConditionalGeneration
+
+    audio_token = AutoTokenizer.from_pretrained(source).convert_tokens_to_ids("<|audio_pad|>")
+    config = Qwen3ASRConfig(
+        audio_config=dict(num_mel_bins=128, encoder_layers=2, encoder_attention_heads=4, encoder_ffn_dim=128,
+                          d_model=64, n_window=50, n_window_infer=800, downsample_hidden_size=32, output_dim=96,
+                          max_position_embeddings=13, activation_function="gelu"),
+        text_config=dict(vocab_size=vocab_size, hidden_size=96, intermediate_size=192, num_hidden_layers=2,
+                         num_attention_heads=4, num_key_value_heads=2, head_dim=32, rms_norm_eps=1e-6,
+                         max_position_embeddings=4096, rope_theta=1000000.0, tie_word_embeddings=False,
+                         hidden_act="silu"),
+        audio_token_id=audio_token, tie_word_embeddings=False, initializer_range=0.05)
+    model = Qwen3ASRForConditionalGeneration(config).float()
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dim() == 1 and "norm" in name:
+                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
+            elif p.dim() == 1:
+                p.normal_(0.0, 0.2)
+    return model
+
+
+def released_asr_layout(out):
+    """Rewrites a Qwen3-ASR saved by transformers into the released checkpoint's layout: the configs nested under
+    thinker_config, the weights under thinker.* with the projector inside the audio tower (proj1, proj2)."""
+    path = os.path.join(out, "model.safetensors")
+    renames = [("model.multi_modal_projector.linear_1.", "thinker.audio_tower.proj1."),
+               ("model.multi_modal_projector.linear_2.", "thinker.audio_tower.proj2."),
+               ("model.audio_tower.", "thinker.audio_tower."), ("model.language_model.", "thinker.model."),
+               ("lm_head.", "thinker.lm_head.")]
+    tensors = {}
+    for name, t in load_file(path).items():
+        for old, new in renames:
+            if name.startswith(old):
+                name = new + name[len(old):]
+                break
+        tensors[name] = t
+    save_file(tensors, path, metadata={"format": "pt"})
+    with open(os.path.join(out, "config.json")) as f:
+        flat = json.load(f)
+    audio = dict(flat["audio_config"], max_source_positions=flat["audio_config"].pop("max_position_embeddings"))
+    thinker = {"audio_config": audio, "text_config": flat["text_config"], "audio_token_id": flat["audio_token_id"],
+               "model_type": "qwen3_asr"}
+    released = {"architectures": ["Qwen3ASRForConditionalGeneration"], "model_type": "qwen3_asr",
+                "thinker_config": thinker}
+    with open(os.path.join(out, "config.json"), "w") as f:
+        json.dump(released, f, indent=2)
+
+
 def bert(vocab_size, source):
     """BERT as all-MiniLM-L6-v2 and bge-small-en-v1.5 are: post-norm layers, biases everywhere, the exact GELU,
     absolute positions; head_dim 32 as theirs."""
@@ -219,7 +274,7 @@ def perturbed(model):
 
 
 ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3,
-         "sensenova_loop": sensenova_loop, "bert": bert, "nomic_bert": nomic_bert}
+         "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr, "bert": bert, "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}
 ENCODER_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]
 
@@ -422,7 +477,7 @@ def main():
     model = ARCHS[args.arch](len(tok), args.tokenizer_from)
     model.config.eos_token_id = tok.eos_token_id
     model.generation_config.eos_token_id = tok.eos_token_id
-    qwen = args.arch.startswith("qwen") or args.arch == "sensenova_loop"
+    qwen = args.arch in ("qwen3_5", "qwen3_5_moe", "sensenova_loop")  # with an MTP head
     if qwen:
         model.config.get_text_config().mtp_num_hidden_layers = 1
     model.save_pretrained(args.out, safe_serialization=True)
@@ -430,6 +485,8 @@ def main():
     if qwen:
         save_file({**load_file(weights), **mtp_head(model)}, weights, metadata={"format": "pt"})
     fuse_experts(weights)
+    if args.arch == "qwen3_asr":
+        released_asr_layout(args.out)
     with open(os.path.join(args.tokenizer_from, "config.json")) as f:
         auto_map = json.load(f).get("auto_map")
     code = [f for f in os.listdir(args.tokenizer_from) if f.endswith(".py")] if auto_map else []

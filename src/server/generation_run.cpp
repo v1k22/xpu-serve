@@ -2,49 +2,17 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <deque>
 #include <exception>
-#include <mutex>
 #include <thread>
 #include <utility>
+
+#include "server/channel.h"
 
 namespace xs::server {
 namespace {
 
 constexpr auto kAlivePollInterval = std::chrono::milliseconds(100);
-
-// Deltas from the generating thread to the HTTP thread.
-class DeltaChannel {
-public:
-    void push(chat::ParsedDelta delta) {
-        {
-            std::lock_guard lock(mutex_);
-            queue_.push_back(std::move(delta));
-        }
-        ready_.notify_one();
-    }
-    void close() {
-        {
-            std::lock_guard lock(mutex_);
-            closed_ = true;
-        }
-        ready_.notify_one();
-    }
-    // Waits up to `timeout` for output. Returns false once the channel is closed and drained.
-    bool wait_take(std::deque<chat::ParsedDelta>& out, std::chrono::milliseconds timeout) {
-        std::unique_lock lock(mutex_);
-        ready_.wait_for(lock, timeout, [this] { return closed_ || !queue_.empty(); });
-        out = std::exchange(queue_, {});
-        return !(closed_ && out.empty());
-    }
-
-private:
-    std::mutex mutex_;
-    std::condition_variable ready_;
-    std::deque<chat::ParsedDelta> queue_;
-    bool closed_ = false;
-};
 
 GenerateResult generate_or_error(InferenceService& service, const GenerateRequest& request,
                                  const TokenCallback& on_token) {
@@ -64,7 +32,7 @@ GenerationOutcome run_generation(InferenceService& service, const GenerateReques
                                  const std::function<bool(const chat::ParsedDelta&)>& on_delta,
                                  const std::function<bool()>& client_alive) {
     std::atomic<bool> client_gone = false;
-    DeltaChannel channel;
+    Channel<chat::ParsedDelta> channel;
     GenerateResult result;
 
     const TokenCallback on_token = [&](int32_t token) {

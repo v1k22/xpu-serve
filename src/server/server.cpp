@@ -17,6 +17,7 @@
 #include "server/openai_format.h"
 #include "server/openai_request.h"
 #include "server/policy_handlers.h"
+#include "server/transcription_handlers.h"
 #include "util/log.h"
 
 namespace xs::server {
@@ -50,6 +51,7 @@ Handler guarded(Handler handler) {
 struct Server::Impl {
     Impl(InferenceService& svc, ServerOptions opts) : service(&svc), options(std::move(opts)) {
         handlers.emplace(svc);
+        if (svc.transcribes()) transcription_handlers.emplace(svc);
         install_routes();
     }
     Impl(PolicyService& p, ServerOptions opts) : policy(&p), options(std::move(opts)) {
@@ -79,6 +81,7 @@ struct Server::Impl {
     EmbeddingService* embeddings = nullptr;
     const ServerOptions options;
     std::optional<CompletionHandlers> handlers;
+    std::optional<TranscriptionHandlers> transcription_handlers;
     std::optional<PolicyHandlers> policy_handlers;
     std::optional<DecisionHandlers> decision_handlers;
     std::optional<EmbeddingHandlers> embedding_handlers;
@@ -153,6 +156,14 @@ void Server::Impl::install_routes() {
               guarded([this](const httplib::Request& req, httplib::Response& res) { handlers->chat(req, res); }));
     http.Post("/v1/completions",
               guarded([this](const httplib::Request& req, httplib::Response& res) { handlers->completion(req, res); }));
+    if (transcription_handlers) {
+        http.Post("/v1/audio/transcriptions", guarded([this](const httplib::Request& req, httplib::Response& res) {
+                      transcription_handlers->transcribe(req, res);
+                  }));
+        http.Post("/v1/audio/translations", guarded([this](const httplib::Request& req, httplib::Response& res) {
+                      transcription_handlers->translate(req, res);
+                  }));
+    }
 }
 
 Server::Server(InferenceService& service, ServerOptions options)

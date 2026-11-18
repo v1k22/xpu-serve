@@ -145,6 +145,39 @@ public:
         return out;
     }
 
+    bool transcribes() const override { return transcriber; }
+    // Hands `reply` to on_text three bytes at a time, as a transcript decoding.
+    TranscriptionResult transcribe(const TranscriptionRequest& request, const TextCallback& on_text) override {
+        if (!transcriber) return InferenceService::transcribe(request, on_text);
+        {
+            std::lock_guard lock(serial_);
+            last_transcription_ = request;
+        }
+        TranscriptionResult r;
+        if (!error.empty()) {
+            r.finish = FinishReason::Error;
+            r.error = error;
+            return r;
+        }
+        for (size_t at = 0; at < reply.size(); at += 3) {
+            if (on_text && !on_text(std::string_view(reply).substr(at, 3))) {
+                r.finish = FinishReason::Cancelled;
+                return r;
+            }
+        }
+        r.text = reply;
+        r.language = "English";
+        r.seconds = 1.5;
+        r.pieces = 1;
+        r.stats.prompt_tokens = 30;
+        r.stats.generated_tokens = 7;
+        return r;
+    }
+    TranscriptionRequest last_transcription() const {
+        std::lock_guard lock(serial_);
+        return last_transcription_;
+    }
+
     GenerateRequest last_request() const {
         std::lock_guard lock(serial_);
         return last_request_;
@@ -159,6 +192,7 @@ public:
     std::string reply = "Hello!";
     std::string error;  // non-empty: every generation fails with this message
     bool images = false;  // accept image parts
+    bool transcriber = false;  // a speech recognition model
     std::chrono::milliseconds token_delay{0};
     std::atomic<bool> cancelled = false;
 
@@ -168,6 +202,7 @@ private:
     LineTemplate template_;
     mutable std::mutex serial_;
     GenerateRequest last_request_;
+    TranscriptionRequest last_transcription_;
     int calls_ = 0;
 };
 

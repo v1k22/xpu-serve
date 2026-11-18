@@ -5,6 +5,7 @@
 #include <future>
 
 #include "audio/audio.h"
+#include "audio/split.h"
 #include "chat/chat_template.h"
 #include "engine/media.h"
 #include "image/image.h"
@@ -179,6 +180,75 @@ std::vector<int32_t> EngineService::expand_media(std::vector<int32_t> prompt,
         if (accepts(static_cast<Modality>(k))) encoders[k] = engine_->model().encoder(static_cast<Modality>(k));
     }
     return expand_media_placeholders(prompt, media, encoders);
+}
+
+bool EngineService::transcribes() const {
+    return accepts(Modality::Audio) && engine_->model().transcription() != nullptr;
+}
+
+TranscriptionResult EngineService::transcribe(const TranscriptionRequest& request, const TextCallback& on_text) {
+    if (!transcribes()) return InferenceService::transcribe(request, on_text);
+    const Model& model = engine_->model();
+    const Transcription& format = *model.transcription();
+    const std::string prefix = format.language_prefix(request.language);
+    const audio::Audio clip = audio::decode(request.audio);
+    TranscriptionResult result;
+    result.seconds = static_cast<double>(clip.samples.size()) / clip.sample_rate;
+    std::vector<std::string> languages;
+    bool cancelled = false;
+    for (const auto& [first, last] : audio::split_at_quiet(clip, format.max_piece_seconds())) {
+        audio::Audio piece{clip.sample_rate, {clip.samples.begin() + first, clip.samples.begin() + last}};
+        MediaInput media = model.audio()->prepare(piece);
+        media.key = audio::content_hash(piece);
+        // The reference package's turn: a system message (empty without a prompt), the user's audio.
+        const nlohmann::json messages = nlohmann::json::array(
+            {{{"role", "system"}, {"content", request.prompt}},
+             {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "audio"}}})}}});
+        const std::string text = template_->render(messages, nullptr, true, nlohmann::json::object()) + prefix;
+        GenerateRequest g;
+        g.media.push_back(std::move(media));
+        g.prompt = expand_media(tokenizer_->encode(text, /*parse_special=*/true), g.media);
+        g.sampling = request.sampling;
+        g.max_new_tokens = request.max_tokens.value_or(format.max_reply_tokens());
+        g.stop_token_ids = card_.stop_token_ids;
+
+        tok::StreamDecoder decoder(*tokenizer_, /*skip_special=*/true);
+        std::string reply;
+        size_t sent = 0;  // of this piece's transcript, the part passed to on_text
+        const auto pass_on = [&](bool finished) {
+            const std::string piece_text = format.parse(prefix, reply, finished).text;
+            if (piece_text.size() <= sent) return true;
+            const std::string delta = piece_text.substr(sent);
+            sent = piece_text.size();
+            return !on_text || on_text(delta);
+        };
+        const GenerateResult r = generate(g, [&](int32_t token) {
+            reply += decoder.push(token);
+            return pass_on(false);
+        });
+        reply += decoder.flush();
+        const Transcription::Transcript t = format.parse(prefix, reply, true);
+        if (r.finish != FinishReason::Cancelled) pass_on(true);
+        result.text += t.text;
+        if (!t.language.empty() && (languages.empty() || languages.back() != t.language)) {
+            languages.push_back(t.language);
+        }
+        accumulate(result.stats, r.stats);
+        ++result.pieces;
+        if (r.finish == FinishReason::Error) {
+            result.finish = FinishReason::Error;
+            result.error = r.error;
+            return result;
+        }
+        if (r.finish == FinishReason::Cancelled) {
+            cancelled = true;
+            break;
+        }
+        if (r.finish == FinishReason::Length) result.finish = FinishReason::Length;
+    }
+    for (const std::string& l : languages) result.language += (result.language.empty() ? "" : ",") + l;
+    if (cancelled) result.finish = FinishReason::Cancelled;
+    return result;
 }
 
 void EngineService::worker_loop() {

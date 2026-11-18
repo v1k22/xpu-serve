@@ -4,6 +4,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "tensor/tensor.h"
@@ -82,6 +83,31 @@ struct GenerateResult {
     GenerateStats stats;
     std::string error;  // set when finish == Error
 };
+
+// Adds `more` (another generation's) to `total`.
+void accumulate(GenerateStats& total, const GenerateStats& more);
+
+// A speech recognition request (OpenAI's /v1/audio/transcriptions).
+struct TranscriptionRequest {
+    std::vector<uint8_t> audio;     // the file's bytes (WAV, MP3, FLAC)
+    std::string language;           // an ISO 639-1 code or a language name; empty: the model detects it
+    std::string prompt;             // context for the model (names, terms): its system turn
+    SamplingParams sampling;
+    std::optional<int> max_tokens;  // per piece of audio; nullopt: the model's (Transcription::max_reply_tokens)
+};
+
+struct TranscriptionResult {
+    FinishReason finish = FinishReason::Stop;
+    std::string error;     // when finish == Error
+    std::string text;
+    std::string language;  // as the model names it; pieces in other languages are listed in order, comma-separated
+    double seconds = 0;    // of audio
+    int pieces = 0;        // long audio is transcribed in pieces
+    GenerateStats stats;   // summed over the pieces
+};
+
+// Receives transcript text as it decodes; returning false cancels.
+using TextCallback = std::function<bool(std::string_view delta)>;
 
 
 // Called on the engine thread for every generated token (stop tokens are not passed). Return false to stop

@@ -42,6 +42,9 @@ APIs look; the numbers live here.
   - [Laya](#laya)
   - [Julia-1](#julia-1)
   - [Decision models: latency by prompt length, and what a pack changes](#decision-models-latency-by-prompt-length-and-what-a-pack-changes)
+- [Speech recognition](#speech-recognition)
+  - [Qwen3-ASR-1.7B](#qwen3-asr-17b)
+  - [Qwen3-ASR-0.6B](#qwen3-asr-06b)
 - [Embedding models](#embedding-models)
   - [all-MiniLM-L6-v2](#all-minilm-l6-v2)
   - [bge-small-en-v1.5](#bge-small-en-v15)
@@ -1351,6 +1354,72 @@ within 0.003 at q8, 0.05 at q4). So f16 where it fits, q8 where memory is short,
 is treated as unsure anyway. An AWQ-calibrated q4 of the decoder narrows the shift by a quarter to a third and
 changes four fewer answers of the 300: better, not q8
 ([docs/decisions/0015](docs/decisions/0015-decision-models.md)).
+
+## Speech recognition
+
+A speech recognition model is served behind OpenAI's transcription API ([README](README.md#transcriptions)) and
+takes `input_audio` parts in chat. WAV, MP3 and FLAC at any sample rate; audio longer than the model's piece is cut
+at quiet points and transcribed piece by piece.
+
+### Qwen3-ASR-1.7B
+
+`Qwen/Qwen3-ASR-1.7B` (`qwen3_asr`): an audio encoder (convolutions over the log-mel features, attention within
+windows of 8 seconds) and a Qwen3 decoder; 30 languages and 22 Chinese dialects, found by the model or forced with
+`language`. Pieces of up to 20 minutes. No timestamps (they need Qwen3-ForcedAligner, not supported yet).
+
+Reference:
+
+```bash
+xpu-serve serve -hf Qwen/Qwen3-ASR-1.7B --device GPU
+curl -s http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en
+```
+
+Optimized (its q8 pack: 1.5 times as fast as f16 at nearly the same word error rate):
+
+```bash
+xpu-serve convert -hf Qwen/Qwen3-ASR-1.7B --out ~/models/Qwen3-ASR-1.7B-q8 --quant q8
+xpu-serve serve ~/models/Qwen3-ASR-1.7B-q8 --device GPU
+```
+
+- `"stream": "true"` in the form sends the text as it is decoded (`transcript.text.delta` events).
+- q4 is faster on clips of a few minutes, but on a 10-minute clip it missed the end of the speech and began the clip
+  again, until the reply's limit of 4,096 tokens; f16 and q8 stopped where the speech did. Use q8 for long audio.
+
+Measured on an Arc Pro B60, through the API, each request a clip the server had not seen (no cached prompt). Word
+error rate on LibriSpeech's 73 clips of `hf-internal-testing/librispeech_asr_dummy` (481 s, 1,169 words; Whisper's
+English text normalizer on both sides); the longer clips are those clips joined:
+
+| | f16 | q8 | q4 |
+|---|---|---|---|
+| Word error rate | 3.34 % | 3.51 % | 4.11 % |
+| A clip of 6.6 s on average (median) | 237 ms | 156 ms | 119 ms |
+| All 73 clips, one after another | 20.6 s (23x real time) | 13.3 s (36x) | 10.3 s (47x) |
+| 33 s clip | 1.42 s | 0.89 s | 0.69 s |
+| 120 s clip | 5.01 s | 3.15 s | 2.45 s |
+| 600 s clip | 28.4 s (21x) | 19.7 s (30x) | (missed the end) |
+| First streamed text: 33 s / 120 s / 600 s | 198 / 515 / 2,691 ms | 192 / 536 / 2,874 ms | 205 / 537 / 2,866 ms |
+| Decode (a 120 s clip's reply) | 79 tok/s | 133 tok/s | 182 tok/s |
+| GPU memory, the 600 s clip | 6.8 GB | 5.0 GB | |
+
+Where a 600 s clip's time goes (q8): the encoder 0.87 s (75 windows of 8 s), prefill of 7,818 prompt tokens 1.27 s,
+decoding 1,788 tokens 17.1 s, and about 0.5 s on the CPU (upload, decoding, log-mel). The encoder's windows are
+stateless: a clip's are run one after another.
+
+Checked against transformers' Qwen3-ASR in fp32: log-mel features, the encoder's rows, the prompt, last-token logits
+and greedy text, on LibriSpeech clips of 6 to 33 s and synthetic ones; f32 on the GPU: logits within 1.8e-4 and every
+greedy token equal; f16: logits cosine 0.999998, every greedy token equal.
+
+### Qwen3-ASR-0.6B
+
+`Qwen/Qwen3-ASR-0.6B` (`qwen3_asr`): the same model, smaller (a 1,024-wide decoder), served the same way.
+
+```bash
+xpu-serve serve -hf Qwen/Qwen3-ASR-0.6B --device GPU
+```
+
+Measured as Qwen3-ASR-1.7B, at f16: word error rate 3.93 %; a clip of 6.6 s in 113 ms (median), all 73 clips in 9.9 s
+(48x real time); 33 s in 0.70 s, 120 s in 2.55 s, 600 s in 16.4 s; first streamed text after 132 / 358 / 2,246 ms;
+decode 167 tok/s. At f16 it is about as fast as the 1.7B's q4, with a lower word error rate.
 
 ## Embedding models
 
