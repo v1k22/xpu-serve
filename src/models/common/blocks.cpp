@@ -1,5 +1,6 @@
 #include "models/common/blocks.h"
 
+#include <algorithm>
 #include <cmath>
 
 #include "util/error.h"
@@ -63,6 +64,25 @@ Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p) {
         out = g.add(out, shared);
     }
     return out;
+}
+
+Value splice_media(Graph& g, Value embedded, int64_t width) {
+    const Value media = g.input("media", DType::F32, {graph::kT, width});
+    const Value keep = g.input("media_keep", DType::F32, {graph::kT, 1});
+    return g.add(g.mul(embedded, keep), media);
+}
+
+void media_inputs(std::span<const float* const> rows, int64_t n, int64_t width, TensorMap& inputs) {
+    XS_CHECK(rows.empty() || static_cast<int64_t>(rows.size()) == n, rows.size(), " media rows for ", n, " tokens");
+    HostTensor media(DType::F32, {n, width});
+    HostTensor keep(DType::F32, {n, 1});
+    for (int64_t i = 0; i < n; ++i) {
+        const float* row = rows.empty() ? nullptr : rows[static_cast<size_t>(i)];
+        keep.data<float>()[i] = row == nullptr ? 1.0f : 0.0f;
+        if (row != nullptr) std::copy(row, row + width, media.data<float>() + i * width);
+    }
+    inputs["media"] = std::move(media);
+    inputs["media_keep"] = std::move(keep);
 }
 
 Value rms_norm_one_plus(Graph& g, Value x, const WeightStore& weights, const std::string& name, float eps) {

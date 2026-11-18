@@ -20,6 +20,10 @@
 
 namespace xs {
 
+namespace audio {
+struct Audio;
+}
+
 struct ModelInfo {
     std::string arch;     // e.g. "gemma4"
     std::string id;       // display name, the model directory name by default
@@ -31,22 +35,36 @@ struct ModelInfo {
     SamplingParams default_sampling;  // generation_config.json
 };
 
-// The image side of a vision-language model: preprocessing, the encoder graph and the prompt layout of an image.
-class VisionEncoder {
+// The encoder side of one input modality of a model: the encoder graph and the prompt layout of one item.
+class MediaEncoder {
 public:
-    virtual ~VisionEncoder() = default;
-    // Run once per image (stateless). Its inputs are what prepare() fills; its output "embeddings" is [N, hidden]
-    // f32 whose first MediaInput::num_tokens rows are the image's soft tokens (the rest pads to a static shape).
+    virtual ~MediaEncoder() = default;
+    virtual Modality modality() const = 0;
+    // Run once per EncoderRun of an item (stateless). Its inputs are what the subclass's prepare() fills; its output
+    // "embeddings" is [N, hidden] f32 whose first EncoderRun::rows rows are the item's soft tokens.
     virtual const graph::Graph& graph() const = 0;
-    // Decoded pixels -> encoder inputs and soft-token count (key is left for the caller). Throws xs::Error for an
-    // image the model cannot take.
-    virtual MediaInput prepare(const image::Image& img) const = 0;
-    // The token the chat template renders once per image.
+    // The token the chat template renders once per item.
     virtual int32_t placeholder_token() const = 0;
-    // What one placeholder becomes in the prompt for an image of `num_tokens` soft tokens.
+    // What one placeholder becomes in the prompt for an item of `num_tokens` soft tokens.
     virtual std::vector<int32_t> token_run(int64_t num_tokens) const = 0;
     // The token at every soft-token position of a run.
     virtual int32_t soft_token() const = 0;
+};
+
+class VisionEncoder : public MediaEncoder {
+public:
+    Modality modality() const final { return Modality::Image; }
+    // Decoded pixels -> encoder runs and soft-token count (key is left for the caller). Throws xs::Error for an
+    // image the model cannot take.
+    virtual MediaInput prepare(const image::Image& img) const = 0;
+};
+
+class AudioEncoder : public MediaEncoder {
+public:
+    Modality modality() const final { return Modality::Audio; }
+    // A decoded clip at its own sample rate (the encoder brings it to the rate it reads) -> encoder runs and
+    // soft-token count (key is left for the caller). Throws xs::Error for a clip the model cannot take.
+    virtual MediaInput prepare(const audio::Audio& clip) const = 0;
 };
 
 // A drafter that proposes one token a run (an MTP head, an assistant): Speculation::draft_graph takes pairs (the
@@ -116,6 +134,10 @@ public:
                                 std::span<const float* const> embeddings, TensorMap& inputs) const = 0;
     // Null for a text-only model, or when vision was not loaded.
     virtual const VisionEncoder* vision() const { return nullptr; }
+    // Null for a model that takes no audio.
+    virtual const AudioEncoder* audio() const { return nullptr; }
+    // The encoder of `m`: vision() or audio().
+    const MediaEncoder* encoder(Modality m) const;
     // Weights the model reads on the host one row at a time (embedding tables kept out of device memory, like Gemma
     // 4's per-layer embeddings). They never appear in a graph, so convert asks for them here; they may be Q8 / Q4.
     virtual std::vector<std::string> host_tables() const { return {}; }

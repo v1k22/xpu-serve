@@ -134,8 +134,30 @@ std::vector<uint8_t> image_url_bytes(const json& part, const std::string& param)
     return std::move(*bytes);
 }
 
-// Validates messages and takes the images out of their content parts.
-json parse_messages(const json& body, std::vector<ImagePart>& images) {
+// The bytes of an OpenAI input_audio part: {"input_audio": {"data": "<base64 of the file>", "format": "wav"}}.
+std::vector<uint8_t> input_audio_bytes(const json& part, const std::string& param) {
+    const json* audio = find_field(part, "input_audio");
+    if (audio == nullptr || !audio->is_object()) {
+        reject(param, str_cat("'", param, ".input_audio' must be an object with 'data' and 'format'"));
+    }
+    const json* data = find_field(*audio, "data");
+    const json* format = find_field(*audio, "format");
+    if (data == nullptr || !data->is_string()) {
+        reject(param, str_cat("'", param, ".input_audio.data' must be a base64 string"));
+    }
+    if (format != nullptr) {
+        const std::string f = format->is_string() ? format->get<std::string>() : "";
+        if (f != "wav" && f != "mp3" && f != "flac") {
+            reject(param, str_cat("'", param, ".input_audio.format' must be wav, mp3 or flac"));
+        }
+    }
+    auto bytes = base64_decode(data->get_ref<const std::string&>());
+    if (!bytes.has_value()) reject(param, str_cat("'", param, ".input_audio.data' holds invalid base64"));
+    return std::move(*bytes);
+}
+
+// Validates messages and takes the media items out of their content parts.
+json parse_messages(const json& body, std::vector<MediaPart>& media) {
     const json* v = find_field(body, "messages");
     if (v == nullptr) reject("messages", "'messages' is a required field");
     if (!v->is_array() || v->empty()) reject("messages", "'messages' must be a non-empty array");
@@ -157,12 +179,18 @@ json parse_messages(const json& body, std::vector<ImagePart>& images) {
             if (type == nullptr || !type->is_string()) continue;
             const std::string& t = type->get_ref<const std::string&>();
             if (t == "image_url") {
-                images.push_back(ImagePart{part_param, image_url_bytes(part, part_param)});
+                media.push_back(MediaPart{part_param, Modality::Image, image_url_bytes(part, part_param)});
                 part = json{{"type", "image"}};  // what templates need, without megabytes of base64
+            } else if (t == "input_audio") {
+                media.push_back(MediaPart{part_param, Modality::Audio, input_audio_bytes(part, part_param)});
+                part = json{{"type", "audio"}};
             } else if (t == "image") {
                 reject(part_param, str_cat("'", part_param, "': send images as {\"type\": \"image_url\", ",
                                            "\"image_url\": {\"url\": \"data:image/...;base64,...\"}}"));
-            } else if (t == "input_audio" || t == "audio" || t == "video" || t == "video_url" || t == "file") {
+            } else if (t == "audio" || t == "audio_url") {
+                reject(part_param, str_cat("'", part_param, "': send audio as {\"type\": \"input_audio\", ",
+                                           "\"input_audio\": {\"data\": \"<base64>\", \"format\": \"wav\"}}"));
+            } else if (t == "video" || t == "video_url" || t == "file") {
                 reject(part_param, str_cat("'", part_param, "': content of type '", t, "' is not supported yet"));
             }
         }
@@ -225,7 +253,7 @@ json parse_json_body(std::string_view body) {
 
 ChatRequest parse_chat_request(const json& body, const SamplingParams& defaults) {
     ChatRequest r;
-    r.messages = parse_messages(body, r.images);
+    r.messages = parse_messages(body, r.media);
     r.tools = parse_tools(body);
     check_response_format(body);
     const json* kwargs = object_field(body, "chat_template_kwargs");

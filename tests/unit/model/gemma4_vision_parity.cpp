@@ -5,6 +5,7 @@
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <map>
 #include <nlohmann/json.hpp>
 
@@ -74,7 +75,7 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
         CHECK(m.num_tokens == im["soft_tokens"].get<int64_t>());
 
         // The processor's pixel values are in [0, 1]; the tower's first step, 2 * (x - 0.5), is part of our input.
-        const xs::HostTensor& pixels = m.encoder_inputs.at("pixels");
+        const xs::HostTensor& pixels = m.runs.at(0).inputs.at("pixels");
         const std::vector<float> ref_pixels = read_f32(fixtures() / im["pixels"].get<std::string>());
         REQUIRE(pixels.numel() == static_cast<int64_t>(ref_pixels.size()));
         double max_diff = 0, sum_diff = 0;
@@ -93,7 +94,7 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
             CHECK(mean_diff < 0.01);  // one 8-bit level is 2/255 = 0.0078 after the tower's 2x - 1
         }
         const auto ref_pos = im["positions"].get<std::vector<std::vector<int32_t>>>();
-        const xs::HostTensor& pos = m.encoder_inputs.at("patch_pos");
+        const xs::HostTensor& pos = m.runs.at(0).inputs.at("patch_pos");
         bool same_positions = pos.numel() == static_cast<int64_t>(2 * ref_pos.size());
         for (size_t i = 0; same_positions && i < ref_pos.size(); ++i) {
             same_positions = pos.data<int32_t>()[2 * i] == ref_pos[i][0] && pos.data<int32_t>()[2 * i + 1] == ref_pos[i][1];
@@ -101,7 +102,7 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
         CHECK(same_positions);
 
         xs::TensorMap out;
-        vision_session->run(m.encoder_inputs, out);
+        vision_session->run(m.runs.at(0).inputs, out);
         const xs::HostTensor& rows = out.at("embeddings");
         REQUIRE(rows.dim(1) == hidden);
         const std::vector<float> ref = read_f32(fixtures() / im["features"].get<std::string>());
@@ -140,7 +141,8 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
             k.exact = k.exact && exact_pixels.at(n.get<std::string>());
         }
         const std::string text = chat_template->render(c["messages"], nullptr, true);
-        k.prompt = xs::expand_media_placeholders(tokenizer->encode(text), k.media, vision);
+        const std::array<const xs::MediaEncoder*, xs::kModalities> encoders{&vision, nullptr};
+        k.prompt = xs::expand_media_placeholders(tokenizer->encode(text), k.media, encoders);
         CHECK(k.prompt == c["input_ids"].get<std::vector<int32_t>>());
 
         // Prompt logits: one session run with the soft-token rows spliced in.
@@ -170,7 +172,9 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
     // 97 tokens so chunk boundaries fall inside images; both must reproduce the reference.
     xs::EngineOptions eo;
     eo.max_context = 4096;
-    xs::Engine engine(std::move(model), std::move(session), std::move(vision_session), eo);
+    xs::EncoderSessions encoders;
+    encoders[static_cast<size_t>(xs::Modality::Image)] = std::move(vision_session);
+    xs::Engine engine(std::move(model), std::move(session), std::move(encoders), eo);
     for (const int64_t chunk : {int64_t{4096}, int64_t{97}}) {
         CAPTURE(chunk);
         engine.set_prefill_chunk(chunk);
@@ -189,7 +193,7 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
             while (same < ref.size() && same < r.tokens.size() && ref[same] == r.tokens[same]) ++same;
             const std::string ours = tokenizer->decode(r.tokens);
             MESSAGE(k.name, " (chunk ", chunk, "): greedy matches ", same, "/", ref.size(), "; encoded ",
-                    r.stats.images_encoded, " images in ", r.stats.encode_ms, " ms; \"", ours, "\"",
+                    r.stats.media_encoded, " images in ", r.stats.encode_ms, " ms; \"", ours, "\"",
                     same < ref.size() ? str_cat(" (reference: \"", c["greedy_text"].get<std::string>(), "\")") : "");
             if (k.exact) CHECK(same >= std::min(greedy_must_match, ref.size()));
         }
@@ -211,5 +215,5 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
     CHECK(other.stats.cached_tokens == first_image);
     const xs::GenerateResult again = engine.generate(req, {});
     CHECK(again.stats.cached_tokens == static_cast<int>(k.prompt.size()) - 1);
-    CHECK(again.stats.images_encoded == 0);
+    CHECK(again.stats.media_encoded == 0);
 }

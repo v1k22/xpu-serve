@@ -115,18 +115,10 @@ public:
         if (vision_ != nullptr) {
             // Rows replace the scaled token embedding; their per-layer embedding reads the pad token, as the
             // reference does for every multimodal position.
-            const int64_t width = cfg_.hidden_size;
-            HostTensor media(DType::F32, {n, width});
-            HostTensor keep(DType::F32, {n, 1});
-            for (int64_t i = 0; i < n; ++i) {
-                const float* row = embeddings.empty() ? nullptr : embeddings[static_cast<size_t>(i)];
-                keep.data<float>()[i] = row == nullptr ? 1.0f : 0.0f;
-                if (row == nullptr) continue;
-                std::copy(row, row + width, media.data<float>() + i * width);
-                ple_ids[static_cast<size_t>(i)] = pad_token_id_;
+            blocks::media_inputs(embeddings, n, cfg_.hidden_size, inputs);
+            for (int64_t i = 0; i < n && !embeddings.empty(); ++i) {
+                if (embeddings[static_cast<size_t>(i)] != nullptr) ple_ids[static_cast<size_t>(i)] = pad_token_id_;
             }
-            inputs["media"] = std::move(media);
-            inputs["media_keep"] = std::move(keep);
         }
         if (ple_table_ != nullptr) inputs["ple"] = gather_ple_rows(ple_ids);
     }
@@ -265,12 +257,7 @@ private:
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
         Value h = g.scale(g.gather(weight(g, w("embed_tokens.weight")), ids), embed_scale_);
-        if (vision_ != nullptr) {
-            // Image soft tokens: keep is 0 and media holds the encoder's row; elsewhere keep is 1 and media 0.
-            const Value media = g.input("media", DType::F32, {kT, cfg_.hidden_size});
-            const Value keep = g.input("media_keep", DType::F32, {kT, 1});
-            h = g.add(g.mul(h, keep), media);
-        }
+        if (vision_ != nullptr) h = blocks::splice_media(g, h, cfg_.hidden_size);
         const Value per_layer = cfg_.ple_dim > 0 ? per_layer_inputs(g, h) : Value{};
         const Decoder d = decoder(g, cfg_, prefix_);
         std::vector<std::pair<Value, Value>> layer_kv(static_cast<size_t>(cfg_.num_layers));

@@ -70,7 +70,7 @@ TEST_CASE("model matches Hugging Face logits and greedy output" * doctest::skip(
     // continuation includes the stop token when one was produced, so it is compared like any other token.
     xs::EngineOptions eo;
     eo.max_context = 4096;
-    xs::Engine engine(std::move(model), std::move(session), nullptr, eo);
+    xs::Engine engine(std::move(model), std::move(session), xs::EncoderSessions{}, eo);
     for (const auto& c : manifest["cases"]) {
         const auto ref = c["greedy"].get<std::vector<int32_t>>();
         xs::GenerateRequest req;

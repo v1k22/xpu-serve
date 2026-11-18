@@ -1,8 +1,10 @@
 #include "service/engine_service.h"
 
 #include <algorithm>
+#include <array>
 #include <future>
 
+#include "audio/audio.h"
 #include "chat/chat_template.h"
 #include "engine/media.h"
 #include "image/image.h"
@@ -12,6 +14,24 @@
 #include "util/timer.h"
 
 namespace xs {
+
+namespace {
+
+// A neutral item of modality `m` (a gray square, a second of silence), for an encoder's first run.
+MediaInput warm_up_item(const Model& model, Modality m) {
+    if (m == Modality::Image) {
+        image::Image gray;
+        gray.width = gray.height = 768;
+        gray.rgb.assign(static_cast<size_t>(gray.width * gray.height * 3), 128);
+        return model.vision()->prepare(gray);
+    }
+    audio::Audio silence;
+    silence.sample_rate = 16000;
+    silence.samples.assign(16000, 0.0f);
+    return model.audio()->prepare(silence);
+}
+
+}  // namespace
 
 struct EngineService::Job {
     const GenerateRequest& request;
@@ -36,7 +56,8 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
                                                    .drafts = spec_k});
     const ModelInfo& info = model->info();
     log::info("model ", info.id, " (", info.arch, "): graph of ", model->graph().nodes().size(), " nodes, ",
-              model->graph().kv_slots().size(), " KV slots", model->vision() ? "; vision encoder" : "");
+              model->graph().kv_slots().size(), " KV slots", model->vision() ? "; vision encoder" : "",
+              model->audio() ? "; audio encoder" : "");
 
     EngineOptions engine_options = options.engine;
     engine_options.spec_k = spec_k;
@@ -79,21 +100,23 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     auto session = backend->compile(programs, model->weights(), session_options);
     log::info("compiled on ", options.backend, " ", session_options.device.empty() ? "(default device)" : session_options.device,
               " in ", static_cast<int>(compile_timer.elapsed_ms()), " ms");
-    std::unique_ptr<Session> vision_session;
-    if (const VisionEncoder* vision = model->vision()) {
-        SessionOptions vision_options = session_options;
-        vision_options.max_context = int64_t{1} << 20;  // stateless: bounds one image's patches only
-        Timer vision_timer;
-        vision_session = backend->compile(vision->graph(), model->weights(), vision_options);
-        // The first run of the encoder pays the plugin's kernel setup (about 2 s on a GPU): pay it here, with a gray
-        // square, rather than on the first image request.
-        image::Image gray;
-        gray.width = gray.height = 768;
-        gray.rgb.assign(static_cast<size_t>(gray.width * gray.height * 3), 128);
-        TensorMap warm;
-        vision_session->run(vision->prepare(gray).encoder_inputs, warm);
-        log::info("compiled and warmed up the vision encoder (", vision->graph().nodes().size(), " nodes) in ",
-                  static_cast<int>(vision_timer.elapsed_ms()), " ms");
+    EncoderSessions encoders;
+    for (size_t k = 0; k < kModalities; ++k) {
+        const auto m = static_cast<Modality>(k);
+        const MediaEncoder* encoder = model->encoder(m);
+        if (encoder == nullptr) continue;
+        SessionOptions encoder_options = session_options;
+        encoder_options.max_context = int64_t{1} << 20;  // stateless: bounds one run's rows only
+        Timer encoder_timer;
+        encoders[k] = backend->compile(encoder->graph(), model->weights(), encoder_options);
+        // The first run of an encoder pays the plugin's kernel setup (about 2 s on a GPU): pay it here, on a neutral
+        // item, rather than on the first request with media.
+        for (const EncoderRun& run : warm_up_item(*model, m).runs) {
+            TensorMap warm;
+            encoders[k]->run(run.inputs, warm);
+        }
+        log::info("compiled and warmed up the ", modality_name(m), " encoder (", encoder->graph().nodes().size(),
+                  " nodes) in ", static_cast<int>(encoder_timer.elapsed_ms()), " ms");
     }
 
     s->card_.id = options.model_id.empty() ? info.id : options.model_id;
@@ -102,8 +125,7 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     s->card_.dialect = info.dialect;
     s->card_.default_sampling = info.default_sampling;
     s->card_.stop_token_ids = info.stop_token_ids;
-    s->engine_ = std::make_unique<Engine>(std::move(model), std::move(session), std::move(vision_session),
-                                          engine_options);
+    s->engine_ = std::make_unique<Engine>(std::move(model), std::move(session), std::move(encoders), engine_options);
     s->worker_ = std::thread([raw = s.get()] { raw->worker_loop(); });
     log::info("ready in ", static_cast<int>(timer.elapsed_ms()), " ms");
     return s;
@@ -130,20 +152,33 @@ GenerateResult EngineService::generate(const GenerateRequest& request, const Tok
     return result.get();
 }
 
-MediaInput EngineService::prepare_image(std::span<const uint8_t> encoded) const {
-    const VisionEncoder* vision = accepts_images() ? engine_->model().vision() : nullptr;
-    if (vision == nullptr) fail("model '", card_.id, "' does not take images");
-    const image::Image img = image::decode(encoded);
-    MediaInput media = vision->prepare(img);
-    media.key = image::content_hash(img);
-    return media;
+MediaInput EngineService::prepare_media(Modality m, std::span<const uint8_t> encoded) const {
+    if (!accepts(m)) fail("model '", card_.id, "' does not take ", modality_name(m), " input");
+    const Model& model = engine_->model();
+    switch (m) {
+        case Modality::Image: {
+            const image::Image img = image::decode(encoded);
+            MediaInput media = model.vision()->prepare(img);
+            media.key = image::content_hash(img);
+            return media;
+        }
+        case Modality::Audio: {
+            const audio::Audio clip = audio::decode(encoded);
+            MediaInput media = model.audio()->prepare(clip);
+            media.key = audio::content_hash(clip);
+            return media;
+        }
+    }
+    fail("unknown modality");
 }
 
 std::vector<int32_t> EngineService::expand_media(std::vector<int32_t> prompt,
                                                  const std::vector<MediaInput>& media) const {
-    const VisionEncoder* vision = accepts_images() ? engine_->model().vision() : nullptr;
-    if (vision == nullptr) return InferenceService::expand_media(std::move(prompt), media);
-    return expand_media_placeholders(prompt, media, *vision);
+    std::array<const MediaEncoder*, kModalities> encoders{};
+    for (size_t k = 0; k < kModalities; ++k) {
+        if (accepts(static_cast<Modality>(k))) encoders[k] = engine_->model().encoder(static_cast<Modality>(k));
+    }
+    return expand_media_placeholders(prompt, media, encoders);
 }
 
 void EngineService::worker_loop() {

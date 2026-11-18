@@ -21,11 +21,24 @@ struct SamplingParams {
     std::optional<uint64_t> seed;
 };
 
-// One image of a request, preprocessed for the model's vision encoder.
+// What a request's media item is: which of the model's encoders reads it.
+enum class Modality : uint8_t { Image, Audio };
+inline constexpr size_t kModalities = 2;
+const char* modality_name(Modality m);  // "image", "audio"
+
+// One run of an encoder graph over (a part of) a media item: its inputs, and how many leading rows of its
+// "embeddings" output are the item's (the rest pads the graph's static shape).
+struct EncoderRun {
+    TensorMap inputs;
+    int64_t rows = 0;
+};
+
+// One media item of a request (an image, an audio clip), preprocessed for the model's encoder of its modality.
 struct MediaInput {
-    uint64_t key = 0;          // content hash of the decoded pixels; tells images apart in the prefix cache
-    TensorMap encoder_inputs;  // inputs of the encoder graph
-    int64_t num_tokens = 0;    // embedding rows the encoder yields = soft tokens the prompt holds for this image
+    Modality modality = Modality::Image;
+    uint64_t key = 0;               // content hash of the decoded item; tells items apart in the prefix cache
+    std::vector<EncoderRun> runs;   // in order: the item's rows are each run's leading `rows`, one after another
+    int64_t num_tokens = 0;         // the rows of all runs = soft tokens the prompt holds for this item
 };
 
 struct GenerateRequest {
@@ -44,8 +57,8 @@ struct GenerateStats {
     int prompt_tokens = 0;
     int cached_tokens = 0;  // prompt tokens reused from the KV state of the previous request
     int generated_tokens = 0;
-    int images_encoded = 0;  // images that ran through the vision encoder (not served from its cache)
-    double encode_ms = 0.0;  // time in the vision encoder, not part of prefill_ms
+    int media_encoded = 0;   // media items that ran through their encoder (not served from its cache)
+    double encode_ms = 0.0;  // time in the media encoders, not part of prefill_ms
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     // Speculative decoding: verify rounds, drafts proposed, drafts the target accepted; of decode_ms, the time in the
@@ -69,6 +82,7 @@ struct GenerateResult {
     GenerateStats stats;
     std::string error;  // set when finish == Error
 };
+
 
 // Called on the engine thread for every generated token (stop tokens are not passed). Return false to stop
 // generation (finish = Cancelled); the caller uses this for stop strings and client disconnects.

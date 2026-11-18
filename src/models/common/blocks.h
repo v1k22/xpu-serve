@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 #include <utility>
 
@@ -78,6 +79,14 @@ Shortlist shortlist_head(Graph& g, Value x, Value head, const quant::SignSketch&
 // The index of each row's largest logit (ties to the lower index), [rows] i32: the "argmax" output a target program
 // offers beside "logits", so that greedy decoding never brings the logits back from the device.
 Value argmax_rows(Graph& g, Value logits);
+
+// ---- Media rows in a decoder's input
+
+// The embedded step with media rows in place of their soft tokens' embeddings, from the inputs "media" [T, width]
+// (an encoder's row where one goes, 0 elsewhere) and "media_keep" [T, 1] (0 at a media row, 1 elsewhere).
+Value splice_media(Graph& g, Value embedded, int64_t width);
+// Fills those inputs for a step of `n` tokens: `rows` is empty, or holds one entry per token, a row or null.
+void media_inputs(std::span<const float* const> rows, int64_t n, int64_t width, TensorMap& inputs);
 
 // ---- RMSNorm variants (plain x * w is Graph::rms_norm)
 

@@ -35,9 +35,11 @@ struct GenerationOptions {
     bool include_usage = false;  // stream_options.include_usage
 };
 
-// An image part of a chat message, decoded from its data: URL (not yet decoded as an image).
-struct ImagePart {
+// A media part of a chat message: an image from its data: URL, an audio clip from input_audio's base64 (the bytes
+// of the file, not yet decoded).
+struct MediaPart {
     std::string param;  // where it came from, e.g. "messages[1].content[0]", for error messages
+    Modality modality = Modality::Image;
     std::vector<uint8_t> bytes;
 };
 
@@ -45,11 +47,11 @@ struct ImagePart {
 using RequestJson = nlohmann::ordered_json;
 
 struct ChatRequest {
-    RequestJson messages;         // validated: non-empty array of objects with a string "role"; image parts are
-                                  // reduced to {"type": "image"}, their bytes are in `images`
+    RequestJson messages;         // validated: non-empty array of objects with a string "role"; media parts are
+                                  // reduced to {"type": "image"} or {"type": "audio"}, their bytes are in `media`
     RequestJson tools;            // array, or null when absent, empty or tool_choice is "none"
     RequestJson template_kwargs;  // chat_template_kwargs, always an object
-    std::vector<ImagePart> images;   // in message order, then part order
+    std::vector<MediaPart> media;    // in message order, then part order
     GenerationOptions options;
 };
 

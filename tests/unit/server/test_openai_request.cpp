@@ -142,10 +142,11 @@ TEST_SUITE("server.request") {
             {{{"role", "system"}, {"content", "be brief"}},
              {{"role", "user"}, {"content", json::array({image, text, {{"type", "image_url"}, {"image_url", "data:image/jpeg;base64,/9j/"}}})}}});
         const auto r = parse_chat_request(chat_body({{"messages", messages}}), {});
-        REQUIRE(r.images.size() == 2);
-        CHECK(r.images[0].param == "messages[1].content[0]");
-        CHECK(r.images[0].bytes == std::vector<uint8_t>{0x89, 'P', 'N', 'G', '\r', '\n'});
-        CHECK(r.images[1].param == "messages[1].content[2]");
+        REQUIRE(r.media.size() == 2);
+        CHECK(r.media[0].param == "messages[1].content[0]");
+        CHECK(r.media[0].modality == xs::Modality::Image);
+        CHECK(r.media[0].bytes == std::vector<uint8_t>{0x89, 'P', 'N', 'G', '\r', '\n'});
+        CHECK(r.media[1].param == "messages[1].content[2]");
         CHECK(r.messages[1]["content"][0] == json{{"type", "image"}});
         CHECK(r.messages[1]["content"][1] == text);
 
@@ -160,7 +161,31 @@ TEST_SUITE("server.request") {
         CHECK(param_of({{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,!!"}}}}) == where);
         CHECK(param_of({{"type", "image_url"}, {"image_url", 42}}) == where);
         CHECK(param_of({{"type", "image"}, {"image", "cat.png"}}) == where);
-        CHECK(param_of({{"type", "input_audio"}, {"input_audio", {{"data", "AAAA"}, {"format", "wav"}}}}) == where);
+        CHECK(param_of({{"type", "audio"}}) == where);
+    }
+
+    TEST_CASE("input_audio parts: base64 decoded, reduced to {type: audio} for the template, the rest refused") {
+        const json audio = {{"type", "input_audio"}, {"input_audio", {{"data", "UklGRg=="}, {"format", "wav"}}}};
+        const json text = {{"type", "text"}, {"text", "transcribe"}};
+        const json image = {{"type", "image_url"}, {"image_url", {{"url", "data:image/png;base64,iVBORw0K"}}}};
+        const json messages = json::array({{{"role", "user"}, {"content", json::array({image, audio, text})}}});
+        const auto r = parse_chat_request(chat_body({{"messages", messages}}), {});
+        REQUIRE(r.media.size() == 2);
+        CHECK(r.media[0].modality == xs::Modality::Image);
+        CHECK(r.media[1].modality == xs::Modality::Audio);
+        CHECK(r.media[1].param == "messages[0].content[1]");
+        CHECK(r.media[1].bytes == std::vector<uint8_t>{'R', 'I', 'F', 'F'});
+        CHECK(r.messages[0]["content"][1] == json{{"type", "audio"}});
+
+        const auto param_of = [&text](const json& part) {
+            return rejected_param(chat_body(
+                {{"messages", json::array({{{"role", "user"}, {"content", json::array({text, part})}}})}}));
+        };
+        const std::string where = "messages[0].content[1]";
+        CHECK(param_of({{"type", "input_audio"}, {"input_audio", {{"data", "UklGRg=="}, {"format", "ogg"}}}}) == where);
+        CHECK(param_of({{"type", "input_audio"}, {"input_audio", {{"data", "!!"}, {"format", "wav"}}}}) == where);
+        CHECK(param_of({{"type", "input_audio"}, {"input_audio", "UklGRg=="}}) == where);
+        CHECK(param_of({{"type", "audio_url"}, {"audio_url", {{"url", "https://example.com/a.wav"}}}}) == where);
     }
 
     TEST_CASE("request JSON keeps the client's key order, which templates can print") {

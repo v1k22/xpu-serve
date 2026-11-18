@@ -470,7 +470,7 @@ SamplingParams sampling_from(const Args& a, SamplingParams p) {
 }
 
 // Streams one assistant turn to stdout and returns the raw generated text (for the conversation history). `media`
-// holds every image of the conversation so far, in order.
+// holds every media item of the conversation so far, in order.
 std::string run_turn(EngineService& service, std::string_view prompt_text, const std::vector<MediaInput>& media,
                      const SamplingParams& sampling, int max_tokens) {
     const std::vector<int32_t> prompt = service.expand_media(service.tokenizer().encode(prompt_text), media);
@@ -514,8 +514,8 @@ std::string run_turn(EngineService& service, std::string_view prompt_text, const
     if (r.finish == FinishReason::Error) fail("generation failed: ", r.error);
     const GenerateStats& s = r.stats;
     std::string images;
-    if (s.images_encoded > 0) {
-        images = str_cat(s.images_encoded, s.images_encoded == 1 ? " image" : " images", " encoded in ",
+    if (s.media_encoded > 0) {
+        images = str_cat(s.media_encoded, " media ", s.media_encoded == 1 ? "item" : "items", " encoded in ",
                          static_cast<int>(s.encode_ms), " ms | ");
     }
     char spec[48] = "";
@@ -566,7 +566,8 @@ int run_decision(const Args& a, const std::string& dir) {
 // One text through an embedding model: the embedding on stdout as a JSON array; its size, norm, tokens and time on
 // stderr.
 int run_embedding(const Args& a, const std::string& dir) {
-    refuse_flags(a, {"image", "request", "system", "raw", "think", "max-tokens", "temperature", "top-k", "top-p", "seed"},
+    refuse_flags(a, {"image", "audio", "request", "system", "raw", "think", "max-tokens", "temperature", "top-k",
+                     "top-p", "seed"},
                  "an embedding model");
     XS_CHECK(a.has("prompt"), "an embedding model embeds a text: --prompt \"...\"");
     const auto tokenizer = tok::Tokenizer::load(dir);
@@ -596,6 +597,7 @@ int cmd_run(const std::vector<std::string>& argv) {
         .value("top-p", "top-p (default: the model's)")
         .value("seed", "sampling seed")
         .value("image", "image file(s) for the first message, comma-separated (PNG, JPEG, BMP, GIF)")
+        .value("audio", "audio file(s) for the first message, comma-separated (WAV, MP3, FLAC)")
         .value("request",
                "decision models: a file holding a System One request ({\"state\", \"questions\"}); its "
                "answers are printed as the API returns them")
@@ -615,28 +617,33 @@ int cmd_run(const std::vector<std::string>& argv) {
 
     if (a.has("raw")) {
         XS_CHECK(a.has("prompt"), "--raw needs --prompt");
-        XS_CHECK(!a.has("image"), "--image needs the chat template; drop --raw");
+        XS_CHECK(!a.has("image") && !a.has("audio"), "--image and --audio need the chat template; drop --raw");
         run_turn(*service, a.get("prompt"), {}, sampling, max_tokens);
         return 0;
     }
     nlohmann::json messages = nlohmann::json::array();
     if (a.has("system")) messages.push_back({{"role", "system"}, {"content", a.get("system")}});
     std::vector<MediaInput> media;
-    std::string pending_images = a.get("image");
+    // The first message's media parts: --image files, then --audio files.
+    std::vector<std::pair<Modality, std::string>> pending;
+    for (const auto& [flag, m] : {std::pair{"image", Modality::Image}, std::pair{"audio", Modality::Audio}}) {
+        const std::string list = a.get(flag);
+        for (size_t pos = 0; pos <= list.size();) {
+            const size_t comma = std::min(list.find(',', pos), list.size());
+            if (comma > pos) pending.emplace_back(m, list.substr(pos, comma - pos));
+            pos = comma + 1;
+        }
+    }
     auto turn = [&](const std::string& user_text) {
         nlohmann::json content = user_text;
-        if (!pending_images.empty()) {
+        if (!pending.empty()) {
             content = nlohmann::json::array();
-            for (size_t pos = 0; pos <= pending_images.size();) {
-                const size_t comma = std::min(pending_images.find(',', pos), pending_images.size());
-                const std::string path = pending_images.substr(pos, comma - pos);
-                pos = comma + 1;
-                if (path.empty()) continue;
-                media.push_back(service->prepare_image(read_file(path)));
-                content.push_back({{"type", "image"}});
+            for (const auto& [m, path] : pending) {
+                media.push_back(service->prepare_media(m, read_file(path)));
+                content.push_back({{"type", modality_name(m)}});
             }
-            content.push_back({{"type", "text"}, {"text", user_text}});
-            pending_images.clear();
+            if (!user_text.empty()) content.push_back({{"type", "text"}, {"text", user_text}});
+            pending.clear();
         }
         messages.push_back({{"role", "user"}, {"content", content}});
         const std::string text = service->chat_template().render(messages, nullptr, true, extra);

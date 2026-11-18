@@ -144,9 +144,9 @@ void log_summary(std::string_view id, const GenerationOutcome& outcome, bool has
     } else {
         finish = outcome_finish_reason(outcome, has_tool_calls);
     }
-    const std::string images =
-        s.images_encoded > 0 ? str_cat(" images_encoded=", s.images_encoded, " (", fixed1(s.encode_ms), " ms)") : "";
-    log::info(id, ": prompt=", s.prompt_tokens, " cached=", s.cached_tokens, images, " generated=", s.generated_tokens,
+    const std::string media =
+        s.media_encoded > 0 ? str_cat(" media_encoded=", s.media_encoded, " (", fixed1(s.encode_ms), " ms)") : "";
+    log::info(id, ": prompt=", s.prompt_tokens, " cached=", s.cached_tokens, media, " generated=", s.generated_tokens,
               " prefill=", fixed1(s.prefill_tok_per_s()), " tok/s decode=", fixed1(s.decode_tok_per_s()),
               " tok/s finish=", finish);
 }
@@ -157,14 +157,15 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
     const ModelCard& card = service_.model();
     ChatRequest chat = parse_chat_request(parse_json_body(req.body), card.default_sampling);
     std::vector<MediaInput> media;
-    if (!chat.images.empty() && !service_.accepts_images()) {
-        throw InvalidRequest(str_cat("model '", card.id, "' does not take images"), chat.images.front().param);
-    }
-    for (const ImagePart& image : chat.images) {
+    for (const MediaPart& part : chat.media) {
+        if (!service_.accepts(part.modality)) {
+            const char* kind = modality_name(part.modality);
+            throw InvalidRequest(str_cat("model '", card.id, "' does not take ", kind, " input"), part.param);
+        }
         try {
-            media.push_back(service_.prepare_image(image.bytes));
+            media.push_back(service_.prepare_media(part.modality, part.bytes));
         } catch (const Error& e) {
-            throw InvalidRequest(str_cat(image.param, ": ", e.what()), image.param);
+            throw InvalidRequest(str_cat(part.param, ": ", e.what()), part.param);
         }
     }
     std::vector<int32_t> prompt;

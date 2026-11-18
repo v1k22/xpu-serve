@@ -40,17 +40,17 @@ public:
     // `on_token` runs on the engine thread. Thread-safe.
     virtual GenerateResult generate(const GenerateRequest& request, const TokenCallback& on_token) = 0;
 
-    // Images. Only a model with a loaded vision encoder takes them.
-    virtual bool accepts_images() const { return false; }
-    // Decodes one encoded image (PNG, JPEG, BMP, GIF) and preprocesses it for the vision encoder. Throws xs::Error
-    // with a message meant for the client. Thread-safe.
-    virtual MediaInput prepare_image(std::span<const uint8_t> /*encoded*/) const {
-        fail("model '", model().id, "' does not take images");
+    // Media. Only a model with a loaded encoder of a modality takes input of it.
+    virtual bool accepts(Modality /*m*/) const { return false; }
+    // Decodes one encoded item (an image: PNG, JPEG, BMP, GIF; an audio clip: WAV, MP3, FLAC) and preprocesses it
+    // for the model's encoder of `m`. Throws xs::Error with a message meant for the client. Thread-safe.
+    virtual MediaInput prepare_media(Modality m, std::span<const uint8_t> /*encoded*/) const {
+        fail("model '", model().id, "' does not take ", modality_name(m), " input");
     }
-    // `prompt` with each image placeholder the chat template rendered replaced by its image's token run. Throws
-    // xs::Error when placeholders and images do not pair up.
+    // `prompt` with each media placeholder the chat template rendered replaced by its item's token run. Throws
+    // xs::Error when placeholders and items do not pair up.
     virtual std::vector<int32_t> expand_media(std::vector<int32_t> prompt, const std::vector<MediaInput>& media) const {
-        XS_CHECK(media.empty(), "model '", model().id, "' does not take images");
+        XS_CHECK(media.empty(), "model '", model().id, "' does not take media input");
         return prompt;
     }
 };

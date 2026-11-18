@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -18,19 +19,22 @@ class Sampler;
 struct EngineOptions {
     int64_t max_context = 8192;  // tokens per sequence (prompt + generated)
     int64_t prefill_chunk = 1024;
-    size_t encoded_media_cache = 16;  // images whose encoder output stays cached (LRU)
+    size_t encoded_media_cache = 16;  // media items whose encoder output stays cached (LRU)
     // Speculative decoding with the model's drafter: drafts per round, 0 = off. The session must hold the programs
     // of spec::Program (the model's Speculation) and rewind steps of spec_k + 1 tokens.
     int spec_k = 0;
 };
 
+// The stateless sessions of a model's media encoders, by modality: null where the model has none (or it is not
+// loaded).
+using EncoderSessions = std::array<std::unique_ptr<Session>, kModalities>;
+
 // Runs generations for one sequence at a time on one backend session. Not thread-safe: one caller (the engine
-// thread) owns it. Consecutive requests that share a prompt prefix reuse the cached KV; an image's soft tokens count
-// as shared only when the image's pixels are the same.
+// thread) owns it. Consecutive requests that share a prompt prefix reuse the cached KV; a media item's soft tokens
+// count as shared only when the item's content is the same.
 class Engine {
 public:
-    // `vision_session` runs the model's vision encoder graph; null when the model has none (or it is not loaded).
-    Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, std::unique_ptr<Session> vision_session,
+    Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, EncoderSessions encoders,
            EngineOptions options);
 
     GenerateResult generate(const GenerateRequest& request, const TokenCallback& on_token);
@@ -38,10 +42,10 @@ public:
     const Model& model() const { return *model_; }
     const EngineOptions& options() const { return options_; }
     void set_prefill_chunk(int64_t tokens);
-    bool accepts_images() const { return vision_session_ != nullptr; }
+    bool accepts(Modality m) const { return encoders_[static_cast<size_t>(m)] != nullptr; }
 
 private:
-    // What a cached position holds: the token id, or for an image's soft token the image's hash and the row.
+    // What a cached position holds: the token id, or for a media item's soft token the item's hash and the row.
     using PositionKey = uint64_t;
 
     // Runs a target program over `tokens` (appended after the cached ones); the outputs the round reads are in
@@ -66,12 +70,12 @@ private:
     void reset_sequence();
     // Makes the session hold a prefix of the prompt and returns how many prompt positions are already cached.
     int64_t reuse_prefix(const std::vector<PositionKey>& prompt_keys);
-    // The encoder output of one image ([rows, hidden] f32), from the cache or a vision run.
+    // The encoder rows of one media item ([num_tokens, hidden] f32), from the cache or its encoder's runs.
     std::shared_ptr<const HostTensor> encode(const MediaInput& media, GenerateStats& stats);
 
     std::unique_ptr<Model> model_;
     std::unique_ptr<Session> session_;
-    std::unique_ptr<Session> vision_session_;
+    EncoderSessions encoders_;
     EngineOptions options_;
     std::unique_ptr<spec::Drafter> drafter_;  // speculating
     std::vector<PositionKey> cached_;  // positions whose KV the session holds, in order

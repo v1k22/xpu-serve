@@ -17,9 +17,9 @@ constexpr uint64_t kMediaKeyBit = 1ULL << 63;
 
 uint64_t text_key(int32_t token) { return static_cast<uint32_t>(token); }
 
-// Distinct from every text key (top bit) and from the rows of other images (the image hash).
-uint64_t media_key(uint64_t image, int64_t row) {
-    uint64_t h = image ^ (static_cast<uint64_t>(row) * 0x9e3779b97f4a7c15ULL);
+// Distinct from every text key (top bit) and from the rows of other media items (the item's hash).
+uint64_t media_key(uint64_t item, int64_t row) {
+    uint64_t h = item ^ (static_cast<uint64_t>(row) * 0x9e3779b97f4a7c15ULL);
     h ^= h >> 33;
     h *= 0xff51afd7ed558ccdULL;
     h ^= h >> 33;
@@ -28,14 +28,15 @@ uint64_t media_key(uint64_t image, int64_t row) {
 
 }  // namespace
 
-Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, std::unique_ptr<Session> vision_session,
+Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, EncoderSessions encoders,
                EngineOptions options)
-    : model_(std::move(model)),
-      session_(std::move(session)),
-      vision_session_(std::move(vision_session)),
-      options_(options) {
+    : model_(std::move(model)), session_(std::move(session)), encoders_(std::move(encoders)), options_(options) {
     XS_CHECK(options_.max_context > 1 && options_.prefill_chunk > 0, "invalid engine options");
-    XS_CHECK(vision_session_ == nullptr || model_->vision() != nullptr, "a vision session for a model without vision");
+    for (size_t k = 0; k < kModalities; ++k) {
+        const auto m = static_cast<Modality>(k);
+        XS_CHECK(encoders_[k] == nullptr || model_->encoder(m) != nullptr, "an encoder session for ", modality_name(m),
+                 " input, which model ", model_->info().id, " does not take");
+    }
     XS_CHECK(options_.spec_k >= 0, "spec_k must not be negative, got ", options_.spec_k);
     const auto offers_argmax = [](const graph::Graph& g) {
         return std::any_of(g.outputs().begin(), g.outputs().end(), [](const auto& o) { return o.name == "argmax"; });
@@ -179,15 +180,24 @@ std::shared_ptr<const HostTensor> Engine::encode(const MediaInput& media, Genera
         return encoded_.front().second;
     }
     Timer timer;
-    TensorMap out;
-    vision_session_->run(media.encoder_inputs, out);
-    auto rows = std::make_shared<const HostTensor>(std::move(out.at("embeddings")));
+    const int64_t width = model_->info().hidden_size;
+    auto rows = std::make_shared<HostTensor>(DType::F32, Dims{media.num_tokens, width});
+    int64_t at = 0;
+    for (const EncoderRun& run : media.runs) {
+        TensorMap out;
+        encoders_[static_cast<size_t>(media.modality)]->run(run.inputs, out);
+        const HostTensor& e = out.at("embeddings");
+        XS_CHECK(e.dtype() == DType::F32 && e.rank() == 2 && e.dim(1) == width && e.dim(0) >= run.rows &&
+                     at + run.rows <= media.num_tokens,
+                 modality_name(media.modality), " encoder output is ", dtype_name(e.dtype()), dims_to_string(e.shape()),
+                 "; expected ", run.rows, " rows of ", width, " (", at, " of ", media.num_tokens, " so far)");
+        std::copy_n(e.data<float>(), run.rows * width, rows->data<float>() + at * width);
+        at += run.rows;
+    }
+    XS_CHECK(at == media.num_tokens, "a ", modality_name(media.modality), " item's runs give ", at, " rows for ",
+             media.num_tokens, " soft tokens");
     stats.encode_ms += timer.elapsed_ms();
-    ++stats.images_encoded;
-    XS_CHECK(rows->dtype() == DType::F32 && rows->rank() == 2 && rows->dim(1) == model_->info().hidden_size &&
-                 rows->dim(0) >= media.num_tokens,
-             "vision encoder output is ", dtype_name(rows->dtype()), dims_to_string(rows->shape()), "; expected ",
-             media.num_tokens, " rows of ", model_->info().hidden_size);
+    ++stats.media_encoded;
     encoded_.emplace_front(media.key, rows);
     if (encoded_.size() > options_.encoded_media_cache) encoded_.pop_back();
     return rows;
@@ -210,23 +220,34 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
     result.stats.prompt_tokens = static_cast<int>(prompt.size());
 
     try {
-        // Soft-token positions take the encoder rows of the request's images, in order.
+        // Soft-token positions take the encoder rows of the request's media items, in order.
         const auto n = prompt.size();
         std::vector<PositionKey> keys(n);
         std::vector<int32_t> media_item(n, -1);
         std::vector<int64_t> media_row(n, 0);
-        const VisionEncoder* vision = vision_session_ != nullptr ? model_->vision() : nullptr;
-        if (!request.media.empty() && vision == nullptr) fail("this model does not take images");
+        for (const MediaInput& m : request.media) {
+            if (!accepts(m.modality)) fail("this model does not take ", modality_name(m.modality), " input");
+        }
+        // The modality whose soft token `token` is, among the loaded encoders; -1 for none.
+        const auto soft_modality = [&](int32_t token) {
+            for (size_t k = 0; k < kModalities; ++k) {
+                if (encoders_[k] != nullptr && model_->encoder(static_cast<Modality>(k))->soft_token() == token) {
+                    return static_cast<int>(k);
+                }
+            }
+            return -1;
+        };
         const int64_t needed = std::accumulate(request.media.begin(), request.media.end(), int64_t{0},
                                                [](int64_t sum, const MediaInput& m) { return sum + m.num_tokens; });
         int64_t found = 0;
-        for (size_t i = 0; i < n; ++i) found += vision != nullptr && prompt[i] == vision->soft_token();
-        XS_CHECK(found == needed, "the prompt holds ", found, " image tokens but its ", request.media.size(),
-                 " images need ", needed);
+        for (size_t i = 0; i < n; ++i) found += soft_modality(prompt[i]) >= 0;
+        XS_CHECK(found == needed, "the prompt holds ", found, " media tokens but its ", request.media.size(),
+                 " media items need ", needed);
         size_t item = 0;
         int64_t row = 0;
         for (size_t i = 0; i < n; ++i) {
-            if (vision == nullptr || prompt[i] != vision->soft_token()) {
+            const int k = soft_modality(prompt[i]);
+            if (k < 0) {
                 keys[i] = text_key(prompt[i]);
                 continue;
             }
@@ -234,6 +255,9 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
                 ++item;
                 row = 0;
             }
+            XS_CHECK(static_cast<int>(request.media[item].modality) == k, "the prompt's ",
+                     modality_name(static_cast<Modality>(k)), " tokens at position ", i, " fall to media item ", item,
+                     ", which is ", modality_name(request.media[item].modality));
             media_item[i] = static_cast<int32_t>(item);
             media_row[i] = row;
             keys[i] = media_key(request.media[item].key, row++);

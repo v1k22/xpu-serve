@@ -29,6 +29,14 @@ bool is_embedding_type(const std::string& type) {
 
 }  // namespace
 
+const MediaEncoder* Model::encoder(Modality m) const {
+    switch (m) {
+        case Modality::Image: return vision();
+        case Modality::Audio: return audio();
+    }
+    return nullptr;
+}
+
 std::vector<std::string> supported_model_types() {
     return {"gemma4",       "gemma4_text", "lfm3",             "qwen3_5",
             "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "sensenova_loop"};

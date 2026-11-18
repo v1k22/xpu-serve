@@ -138,10 +138,13 @@ public:
         }
 
         MediaInput media;
+        media.modality = Modality::Image;
         media.num_tokens = patches / (k * k);
-        media.encoder_inputs.emplace("pixels", std::move(pixels));
-        media.encoder_inputs.emplace("patch_pos", std::move(positions));
-        media.encoder_inputs.emplace("pool", std::move(pool));
+        EncoderRun& run = media.runs.emplace_back();
+        run.rows = media.num_tokens;
+        run.inputs.emplace("pixels", std::move(pixels));
+        run.inputs.emplace("patch_pos", std::move(positions));
+        run.inputs.emplace("pool", std::move(pool));
         return media;
     }
 

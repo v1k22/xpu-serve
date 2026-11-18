@@ -120,15 +120,15 @@ public:
         return result;
     }
 
-    bool accepts_images() const override { return images; }
+    bool accepts(Modality m) const override { return images && m == Modality::Image; }
     // Decodes for real (so bad images fail as they would), then stands in two soft tokens per image.
-    MediaInput prepare_image(std::span<const uint8_t> encoded) const override {
-        if (!images) return InferenceService::prepare_image(encoded);
+    MediaInput prepare_media(Modality m, std::span<const uint8_t> encoded) const override {
+        if (!accepts(m)) return InferenceService::prepare_media(m, encoded);
         const image::Image img = image::decode(encoded);
-        MediaInput m;
-        m.key = image::content_hash(img);
-        m.num_tokens = 2;
-        return m;
+        MediaInput item;
+        item.key = image::content_hash(img);
+        item.num_tokens = 2;
+        return item;
     }
     std::vector<int32_t> expand_media(std::vector<int32_t> prompt, const std::vector<MediaInput>& media) const override {
         std::vector<int32_t> out;

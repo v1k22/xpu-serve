@@ -205,7 +205,7 @@ std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argm
     engine.max_context = options.max_context;
     engine.prefill_chunk = prefill_chunk;
     engine.spec_k = spec_k;
-    return std::make_unique<Engine>(std::move(model), std::move(session), nullptr, engine);
+    return std::make_unique<Engine>(std::move(model), std::move(session), EncoderSessions{}, engine);
 }
 
 GenerateRequest greedy(std::vector<int32_t> prompt, int max_new, std::vector<int32_t> stops = {}) {

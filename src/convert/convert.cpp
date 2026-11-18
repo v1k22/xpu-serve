@@ -151,16 +151,20 @@ void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_
     }
 }
 
-// A language model: the text decoder's graph and its drafter's (speculative decoding) at the requested format, the
-// vision tower's at q8 (it runs once per image and is compute-bound: only with scope All; its quality is not measured
-// at q4 yet), and the tables the model reads on the host at q8.
+// A language model: the text decoder's graph and its drafter's (speculative decoding) at the requested format, its
+// media encoders' (vision, audio) at q8 (they run once per item and are compute-bound: only with scope All; their
+// quality is not measured at q4 yet), and the tables the model reads on the host at q8.
 std::map<std::string, DType> plan_formats(const Model& model, const ConvertOptions& o) {
     std::map<std::string, DType> plan;
     plan_graph(model.graph(), model.weights(), o.format, o.scope, o, plan);
     if (const Speculation* spec = model.speculation()) {
         plan_graph(spec->draft_graph(), model.weights(), o.format, o.scope, o, plan);
     }
-    if (model.vision() != nullptr) plan_graph(model.vision()->graph(), model.weights(), DType::Q8, o.scope, o, plan);
+    for (size_t k = 0; k < kModalities; ++k) {
+        if (const MediaEncoder* e = model.encoder(static_cast<Modality>(k))) {
+            plan_graph(e->graph(), model.weights(), DType::Q8, o.scope, o, plan);
+        }
+    }
     for (const std::string& name : model.host_tables()) {
         if (const auto f = fitting(name, model.weights().get(name), DType::Q8, o)) plan[name] = *f;
     }
