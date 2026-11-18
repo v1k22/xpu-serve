@@ -1,12 +1,12 @@
 #include "image/image.h"
 
 #include <climits>
-#include <cstring>
 #include <memory>
 
 #include <stb_image.h>
 
 #include "util/error.h"
+#include "util/hash.h"
 
 namespace xs::image {
 
@@ -28,29 +28,11 @@ Image decode(std::span<const uint8_t> encoded) {
 }
 
 uint64_t content_hash(const Image& img) {
-    // FNV-1a over 64-bit words, then the murmur3 finalizer so nearby inputs spread over all bits.
-    uint64_t h = 0xcbf29ce484222325ULL;
-    const auto mix = [&h](uint64_t word) {
-        h ^= word;
-        h *= 0x100000001b3ULL;
-    };
-    mix(static_cast<uint64_t>(img.width));
-    mix(static_cast<uint64_t>(img.height));
-    const size_t words = img.rgb.size() / 8;
-    for (size_t i = 0; i < words; ++i) {
-        uint64_t w;
-        std::memcpy(&w, img.rgb.data() + i * 8, 8);
-        mix(w);
-    }
-    uint64_t tail = 0;
-    std::memcpy(&tail, img.rgb.data() + words * 8, img.rgb.size() - words * 8);
-    mix(tail);
-    h ^= h >> 33;
-    h *= 0xff51afd7ed558ccdULL;
-    h ^= h >> 33;
-    h *= 0xc4ceb9fe1a85ec53ULL;
-    h ^= h >> 33;
-    return h;
+    ContentHash h;
+    h.add(static_cast<uint64_t>(img.width));
+    h.add(static_cast<uint64_t>(img.height));
+    h.add_bytes(img.rgb);
+    return h.finish();
 }
 
 }  // namespace xs::image
