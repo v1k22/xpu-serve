@@ -12,11 +12,6 @@ namespace {
 using graph::Graph;
 using graph::Value;
 
-// The encoder's rows for a minute of audio, per second.
-double audio_tokens_per_second(const Config& cfg, const audio::MelParams& mel) {
-    return static_cast<double>(encoder_rows(cfg.audio, 60 * mel.sample_rate / mel.hop_length)) / 60.0;
-}
-
 class Qwen3AsrModel final : public Model {
 public:
     Qwen3AsrModel(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights, const std::filesystem::path& dir)
@@ -25,8 +20,10 @@ public:
           weights_(std::move(weights)),
           decoder_(cfg_.text, *weights_, cfg_.released_layout ? "thinker.model." : "model.language_model.",
                    lm_head_name()),
-          audio_(make_audio_tower(cfg_, *weights_, mel_spec(dir))),
-          transcription_(make_transcription(cfg_.languages, audio_tokens_per_second(cfg_, mel_spec(dir)))) {
+          audio_(qwen3_audio::make_encoder(cfg_.audio, *weights_, qwen3_audio::mel_spec(dir), audio_weights(),
+                                           cfg_.audio_token)),
+          transcription_(make_transcription(cfg_.languages,
+                                            qwen3_audio::rows_per_second(cfg_.audio, qwen3_audio::mel_spec(dir)))) {
         const qwen3::Decoder::Inputs in = decoder_.inputs(graph_);
         Value h = blocks::splice_media(graph_, decoder_.embed(graph_, in.ids), cfg_.text.hidden_size);
         h = decoder_.layers(graph_, h, in.pos);
@@ -51,6 +48,13 @@ public:
     }
 
 private:
+    qwen3_audio::WeightNames audio_weights() const {
+        if (cfg_.released_layout) {
+            return {"thinker.audio_tower.", "thinker.audio_tower.proj1", "thinker.audio_tower.proj2"};
+        }
+        return {"model.audio_tower.", "model.multi_modal_projector.linear_1", "model.multi_modal_projector.linear_2"};
+    }
+
     // The released checkpoint keeps an lm_head even with tied embeddings; a converted one may leave it out.
     std::string lm_head_name() const {
         const std::string head = cfg_.released_layout ? "thinker.lm_head.weight" : "lm_head.weight";

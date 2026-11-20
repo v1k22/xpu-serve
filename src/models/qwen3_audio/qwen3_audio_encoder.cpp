@@ -1,16 +1,17 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 #include "audio/audio.h"
 #include "audio/mel.h"
 #include "audio/resample.h"
 #include "models/common/torch_nn.h"
 #include "models/config_util.h"
-#include "models/qwen3_asr/qwen3_asr.h"
+#include "models/qwen3_audio/qwen3_audio.h"
 #include "util/error.h"
 
-namespace xs::qwen3_asr {
+namespace xs::qwen3_audio {
 namespace {
 
 using graph::Graph;
@@ -40,12 +41,11 @@ HostTensor sinusoids(int64_t length, int64_t channels) {
 
 class AudioTower final : public AudioEncoder {
 public:
-    AudioTower(const Config& cfg, const WeightStore& weights, audio::MelParams mel)
-        : cfg_(cfg.audio), weights_(weights), mel_(mel), audio_token_(cfg.audio_token) {
-        tower_ = cfg.released_layout ? "thinker.audio_tower." : "model.audio_tower.";
-        proj1_ = cfg.released_layout ? tower_ + "proj1" : "model.multi_modal_projector.linear_1";
-        proj2_ = cfg.released_layout ? tower_ + "proj2" : "model.multi_modal_projector.linear_2";
-        XS_CHECK(mel_.n_mels == cfg_.mel_bins, "qwen3_asr: the feature extractor makes ", mel_.n_mels,
+    AudioTower(const Config& cfg, const WeightStore& weights, audio::MelParams mel, WeightNames names,
+               int32_t audio_token)
+        : cfg_(cfg), weights_(weights), mel_(mel), audio_token_(audio_token), tower_(std::move(names.tower)),
+          proj1_(std::move(names.proj1)), proj2_(std::move(names.proj2)) {
+        XS_CHECK(mel_.n_mels == cfg_.mel_bins, "qwen3_audio: the feature extractor makes ", mel_.n_mels,
                  " mel bins; the encoder reads ", cfg_.mel_bins);
         chunk_frames_ = 2 * cfg_.n_window;
         chunks_ = cfg_.n_window_infer / chunk_frames_;
@@ -64,7 +64,7 @@ public:
     // Windows of n_window_infer frames, kBatchWindows a run while that many remain, then one a run; the clip's last
     // chunk zero-padded (as the reference pads it) and the keys past the clip in its window masked.
     MediaInput prepare(const audio::Audio& clip) const override {
-        XS_CHECK(clip.sample_rate > 0 && !clip.samples.empty(), "qwen3_asr: an empty audio clip");
+        XS_CHECK(clip.sample_rate > 0 && !clip.samples.empty(), "qwen3_audio: an empty audio clip");
         const std::vector<float> pcm = clip.sample_rate == mel_.sample_rate
                                            ? clip.samples
                                            : audio::resample(clip.samples, clip.sample_rate, mel_.sample_rate);
@@ -139,11 +139,11 @@ private:
         }
         // [chunks, channels, freq, time] -> [chunks, time, channels * freq] -> conv_out, plus positions per chunk
         const Dims conv_shape = g.type(x).shape;
-        XS_CHECK(conv_shape[3] == chunk_rows_, "qwen3_asr: a chunk convolves to ", conv_shape[3], " rows, not ",
+        XS_CHECK(conv_shape[3] == chunk_rows_, "qwen3_audio: a chunk convolves to ", conv_shape[3], " rows, not ",
                  chunk_rows_);
         x = g.reshape(g.transpose(x, {0, 3, 1, 2}), {chunks, chunk_rows_, conv_shape[1] * conv_shape[2]});
         x = g.matmul(x, g.weight(weights_, tower_ + "conv_out.weight"));
-        XS_CHECK(chunk_rows_ <= cfg_.max_positions, "qwen3_asr: ", chunk_rows_, " rows a chunk past the table of ",
+        XS_CHECK(chunk_rows_ <= cfg_.max_positions, "qwen3_audio: ", chunk_rows_, " rows a chunk past the table of ",
                  cfg_.max_positions);
         x = g.reshape(g.add(x, g.constant(sinusoids(chunk_rows_, width))), {rows, width});
 
@@ -168,7 +168,7 @@ private:
         g.validate();
     }
 
-    AudioConfig cfg_;
+    Config cfg_;
     const WeightStore& weights_;
     audio::MelParams mel_;
     int32_t audio_token_;
@@ -180,29 +180,9 @@ private:
 
 }  // namespace
 
-// WhisperFeatureExtractor's or Qwen3ASRFeatureExtractor's settings.
-audio::MelParams mel_spec(const std::filesystem::path& dir) {
-    audio::MelParams m;
-    const std::filesystem::path path = dir / "preprocessor_config.json";
-    if (!std::filesystem::exists(path)) return m;  // the extractor's defaults
-    const nlohmann::json p = cfg::read_json(path);
-    const std::string where = "preprocessor_config.json";
-    const std::string type = p.contains("feature_extractor_type") ? cfg::get_string(p, "feature_extractor_type", where)
-                                                                  : "WhisperFeatureExtractor";
-    if (type != "WhisperFeatureExtractor" && type != "Qwen3ASRFeatureExtractor") {
-        fail(where, ": feature_extractor_type '", type, "' is not supported");
-    }
-    if (p.contains("dither") && cfg::get_float(p, "dither", where) != 0.0) fail(where, ": dither is not supported");
-    m.sample_rate = static_cast<int>(cfg::get_int_or(p, "sampling_rate", m.sample_rate, where));
-    m.n_fft = static_cast<int>(cfg::get_int_or(p, "n_fft", m.n_fft, where));
-    m.hop_length = static_cast<int>(cfg::get_int_or(p, "hop_length", m.hop_length, where));
-    m.n_mels = static_cast<int>(cfg::get_int_or(p, "feature_size", m.n_mels, where));
-    return m;
+std::unique_ptr<AudioEncoder> make_encoder(const Config& c, const WeightStore& weights, const audio::MelParams& mel,
+                                           WeightNames names, int32_t audio_token) {
+    return std::make_unique<AudioTower>(c, weights, mel, std::move(names), audio_token);
 }
 
-std::unique_ptr<AudioEncoder> make_audio_tower(const Config& cfg, const WeightStore& weights,
-                                               const audio::MelParams& mel) {
-    return std::make_unique<AudioTower>(cfg, weights, mel);
-}
-
-}  // namespace xs::qwen3_asr
+}  // namespace xs::qwen3_audio
