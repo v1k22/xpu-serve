@@ -4,6 +4,7 @@
 
 #include "io/joined_weights.h"
 #include "models/common/blocks.h"
+#include "models/common/expert_banks.h"
 #include "models/config_util.h"
 #include "models/drafters/dflash.h"
 #include "models/qwen3_5/qwen3_5.h"
@@ -20,29 +21,19 @@ using graph::Graph;
 using graph::kT;
 using graph::Value;
 
-// A mixture-of-experts checkpoint that stores each expert's projections on their own (the FP8 releases; an MTP head's
-// experts in some original ones): the banks the model reads are their rows in expert order, an expert's gate rows
-// before its up rows.
+// The FP8 releases (and an MTP head's experts in some original checkpoints) store each expert's projections on their
+// own: the banks the model reads are joined from them.
 void join_expert_banks(SafetensorsWeights& weights, const Config& cfg) {
     if (cfg.num_experts == 0) return;
-    std::vector<std::string> layers;
+    std::vector<std::string> experts;
     const std::string prefix = Decoder(cfg, weights).prefix();
-    for (int64_t i = 0; i < cfg.num_layers; ++i) layers.push_back(prefix + "layers." + std::to_string(i));
-    for (int64_t i = 0; i < cfg.mtp_layers; ++i) layers.push_back("mtp.layers." + std::to_string(i));
-    for (const std::string& layer : layers) {
-        const std::string E = layer + ".mlp.experts.";
-        if (weights.contains(E + "gate_up_proj") || !weights.contains(E + "0.gate_proj.weight")) continue;
-        std::vector<std::string> gate_up, down;
-        for (int64_t e = 0; e < cfg.num_experts; ++e) {
-            const std::string X = E + std::to_string(e) + ".";
-            gate_up.push_back(X + "gate_proj.weight");
-            gate_up.push_back(X + "up_proj.weight");
-            down.push_back(X + "down_proj.weight");
-        }
-        const int64_t experts = cfg.num_experts, inter = cfg.moe_intermediate_size;
-        weights.join_rows(E + "gate_up_proj", gate_up, {experts, 2 * inter, cfg.hidden_size});
-        weights.join_rows(E + "down_proj", down, {experts, cfg.hidden_size, inter});
+    for (int64_t i = 0; i < cfg.num_layers; ++i) {
+        experts.push_back(prefix + "layers." + std::to_string(i) + ".mlp.experts.");
     }
+    for (int64_t i = 0; i < cfg.mtp_layers; ++i) {
+        experts.push_back("mtp.layers." + std::to_string(i) + ".mlp.experts.");
+    }
+    xs::join_expert_banks(weights, experts, cfg.num_experts, cfg.moe_intermediate_size, cfg.hidden_size);
 }
 
 // Where a block drafter's weights sit beside the target's.

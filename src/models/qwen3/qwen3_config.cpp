@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "models/config_util.h"
 #include "models/qwen3/qwen3.h"
 #include "util/error.h"
@@ -7,8 +9,8 @@ namespace xs::qwen3 {
 Config parse_config(const nlohmann::json& t, const std::string& where) {
     if (cfg::get_bool_or(t, "attention_bias", false, where)) fail(where, ": attention_bias is not supported");
     if (cfg::get_bool_or(t, "use_sliding_window", false, where)) fail(where, ": use_sliding_window is not supported");
-    if (t.contains("num_experts") && !t.at("num_experts").is_null() && cfg::get_int(t, "num_experts", where) > 0) {
-        fail(where, ": num_experts (Qwen3 MoE) is not supported yet");
+    if (cfg::get_int_or(t, "shared_expert_intermediate_size", 0, where) > 0) {
+        fail(where, ": a shared expert (shared_expert_intermediate_size) is not supported");
     }
     const std::string act = cfg::get_string(t, "hidden_act", where);
     if (act != "silu") fail(where, ": hidden_act '", act, "' is not supported (silu is)");
@@ -26,6 +28,21 @@ Config parse_config(const nlohmann::json& t, const std::string& where) {
     c.tie_word_embeddings = cfg::get_bool_or(t, "tie_word_embeddings", false, where);
     XS_CHECK(c.num_heads % c.num_kv_heads == 0, where, ": num_attention_heads ", c.num_heads,
              " is not a multiple of num_key_value_heads ", c.num_kv_heads);
+    if (t.contains("num_experts") && !t.at("num_experts").is_null()) {
+        c.num_experts = cfg::get_int(t, "num_experts", where);
+    }
+    if (c.num_experts > 0) {
+        c.experts_per_token = cfg::get_int(t, "num_experts_per_tok", where);
+        c.moe_intermediate_size = cfg::get_int(t, "moe_intermediate_size", where);
+        c.norm_topk_prob = cfg::get_bool_or(t, "norm_topk_prob", true, where);
+        c.decoder_sparse_step = cfg::get_int_or(t, "decoder_sparse_step", 1, where);
+        if (t.contains("mlp_only_layers")) {
+            for (const int32_t layer : cfg::get_int_list(t, "mlp_only_layers", where)) c.mlp_only_layers.push_back(layer);
+        }
+        XS_CHECK(c.experts_per_token >= 1 && c.experts_per_token <= c.num_experts && c.decoder_sparse_step >= 1, where,
+                 ": num_experts_per_tok ", c.experts_per_token, " of ", c.num_experts, " experts, decoder_sparse_step ",
+                 c.decoder_sparse_step);
+    }
 
     // rope_theta at the top (transformers 4) or in rope_parameters (5); rope_scaling may name the RoPE type.
     const nlohmann::json* rope = t.contains("rope_parameters") ? &t.at("rope_parameters") : nullptr;
@@ -45,6 +62,11 @@ Config parse_config(const nlohmann::json& t, const std::string& where) {
         }
     }
     return c;
+}
+
+bool Config::sparse(int64_t layer) const {
+    return num_experts > 0 && (layer + 1) % decoder_sparse_step == 0 &&
+           std::find(mlp_only_layers.begin(), mlp_only_layers.end(), layer) == mlp_only_layers.end();
 }
 
 }  // namespace xs::qwen3

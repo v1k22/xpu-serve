@@ -69,11 +69,46 @@ Value Decoder::layers(Graph& g, Value h, Value pos) const {
         parts.q_norm = [this, &g, A](Value q) { return norm(g, q, A + "q_norm.weight"); };
         parts.k_norm = [this, &g, A](Value k) { return norm(g, k, A + "k_norm.weight"); };
         h = g.add(h, blocks::attention(g, spec, parts, norm(g, h, L + "input_layernorm.weight"), pos, freq).out);
-        const Value y = norm(g, h, L + "post_attention_layernorm.weight");
-        h = g.add(h, blocks::gated_mlp(g, y, proj(L + "mlp.gate_proj.weight"), proj(L + "mlp.up_proj.weight"),
-                                       proj(L + "mlp.down_proj.weight"), blocks::Act::Silu));
+        h = g.add(h, mlp(g, L, i, norm(g, h, L + "post_attention_layernorm.weight")));
     }
     return h;
+}
+
+// Qwen3MoeMLP, or Qwen3MoeSparseMoeBlock in a sparse layer: the banks experts.gate_up_proj and experts.down_proj
+// (join_expert_banks shows a checkpoint's experts that way).
+Value Decoder::mlp(Graph& g, const std::string& L, int64_t index, Value y) const {
+    const auto proj = [&](const std::string& name) -> blocks::Linear {
+        return [this, &g, name](Value x) { return g.matmul(x, weight(g, name)); };
+    };
+    if (!cfg_.sparse(index)) {
+        return blocks::gated_mlp(g, y, proj(L + "mlp.gate_proj.weight"), proj(L + "mlp.up_proj.weight"),
+                                 proj(L + "mlp.down_proj.weight"), blocks::Act::Silu);
+    }
+    blocks::MoeSpec spec;
+    spec.experts = cfg_.num_experts;
+    spec.top_k = cfg_.experts_per_token;
+    spec.router = blocks::Router::Softmax;
+    spec.normalize = cfg_.norm_topk_prob;
+    blocks::MoeParts parts;
+    parts.router = weight(g, L + "mlp.gate.weight");
+    const int64_t e = cfg_.num_experts, hidden = cfg_.hidden_size, inter = cfg_.moe_intermediate_size;
+    const auto bank = [&](const std::string& name, const Dims& shape) {
+        const Value w = weight(g, L + "mlp.experts." + name);
+        XS_CHECK(g.type(w).shape == shape, "qwen3: ", L, "mlp.experts.", name, " has shape ",
+                 dims_to_string(g.type(w).shape), ", expected ", dims_to_string(shape));
+        return w;
+    };
+    parts.gate_up = bank("gate_up_proj", {e, 2 * inter, hidden});
+    parts.down = bank("down_proj", {e, hidden, inter});
+    return blocks::moe(g, y, spec, parts);
+}
+
+std::vector<std::string> Decoder::expert_prefixes() const {
+    std::vector<std::string> out;
+    for (int64_t i = 0; i < cfg_.num_layers; ++i) {
+        if (cfg_.sparse(i)) out.push_back(prefix_ + "layers." + std::to_string(i) + ".mlp.experts.");
+    }
+    return out;
 }
 
 Value Decoder::final_norm(Graph& g, Value h) const { return norm(g, h, prefix_ + "norm.weight"); }
