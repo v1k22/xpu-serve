@@ -26,17 +26,23 @@ and deterministic. Only the decoding of container formats really needs outside c
 - **Media by modality.** A `MediaInput` names its modality and holds encoder runs, each with the rows of its output that
   belong to the item; `VisionEncoder` and `AudioEncoder` share a `MediaEncoder` interface; the engine keeps an encoder
   session per modality and maps each soft token to the next item of its kind.
-- **Qwen3-ASR's encoder runs one window at a time.** Its convolutions read chunks of 100 mel frames, its positions
-  restart in each chunk and its attention never crosses a window of 8 chunks (8 s, 104 rows), so a window is a static,
+- **Qwen3-ASR's encoder runs by windows.** Its convolutions read chunks of 100 mel frames, its positions restart in
+  each chunk and its attention never crosses a window of 8 chunks (8 s, 104 rows), so a window is a static,
   stateless graph: a clip's last chunk is zero-padded (as the reference pads it) and the padded rows' keys are masked.
-  The result is exact, not an approximation, and needs no new attention mode.
+  The result is exact, not an approximation. An encoder may have several programs and each run names its own
+  (`MediaEncoder::programs`, `EncoderRun::program`): Qwen3-ASR's are one window and eight (attention in blocks of a
+  window), eight a run while that many remain. The encoder's cost grows with its rows, so a batch saves the per-run
+  cost only (10 minutes: 0.70 s to 0.52 s), and a single window stays a single window's cost.
 - **One graph op: Conv2d** (stride, padding per side, dilation, groups; im2col and a GEMM on SYCL), general enough for
   the codecs and VAEs of the next models.
 - **A `Transcription` interface on Model** says what is model-specific: how long a piece of audio may be, the text that
-  forces a language (`language English<asr_text>`), and how a reply becomes a transcript (held back while streaming
-  until the header is past). The service does the rest for any such model: decode, cut long audio at quiet points
-  (Qwen's rule: the quietest 100 ms within 5 s of 1,200 s), render the turn through the chat template with an empty
-  system turn as the reference package does, generate, and join the pieces.
+  forces a language (`language English<asr_text>`), how a reply becomes a transcript (held back while streaming
+  until the header is past), and the prompt tokens a second of audio takes. The service does the rest for any such
+  model: cut long audio at quiet points (Qwen's rule: the quietest 100 ms within 5 s of the limit) into pieces no
+  longer than the model's 1,200 s nor than the server's context holds with the longest reply (at the default 8,192
+  tokens, about 5 minutes: a 10-minute clip at that context was otherwise cut off at the context's end, silently),
+  render the turn through the chat template with an empty system turn as the reference package does, generate, and
+  join the pieces.
 - **A piece's reply stops at 4,096 tokens, and repeated text is cleaned**, both as the reference package does
   (`max_new_tokens`, `detect_and_fix_repetitions`: a character repeated more than 20 times, or a pattern of up to 20
   characters repeated 20 times, kept once). Greedy decoding can fall into a loop; without the limit a reply ran to the

@@ -9,6 +9,7 @@
 
 #include <httplib/httplib.h>
 
+#include "audio/audio.h"
 #include "server/server.h"
 #include "unit/server/fake_service.h"
 
@@ -43,11 +44,18 @@ private:
     std::thread thread_;
 };
 
-const std::string kWav = "RIFF....WAVEfmt ";  // the fake service does not decode it
+// A quarter second at 16 kHz, as 16-bit PCM.
+std::string wav() {
+    xs::audio::Audio clip;
+    clip.sample_rate = 16000;
+    for (int i = 0; i < 4000; ++i) clip.samples.push_back(i % 100 < 50 ? 0.25f : -0.25f);
+    const std::vector<uint8_t> bytes = xs::audio::encode_wav(clip);
+    return std::string(bytes.begin(), bytes.end());
+}
 
 httplib::UploadFormDataItems form(std::vector<std::pair<std::string, std::string>> fields, bool with_file = true) {
     httplib::UploadFormDataItems items;
-    if (with_file) items.push_back({"file", kWav, "clip.wav", "audio/wav"});
+    if (with_file) items.push_back({"file", wav(), "clip.wav", "audio/wav"});
     for (auto& [name, value] : fields) items.push_back({name, value, "", ""});
     return items;
 }
@@ -84,7 +92,8 @@ TEST_SUITE("transcriptions http") {
         CHECK(r.language == "en");
         CHECK(r.prompt == "names: Bhavik");
         CHECK(r.sampling.temperature == 0.0f);
-        CHECK(std::string(r.audio.begin(), r.audio.end()) == kWav);
+        CHECK(r.clip.sample_rate == 16000);  // the server decoded the file
+        CHECK(r.clip.samples.size() == 4000);
 
         const auto text = c.Post("/v1/audio/transcriptions", form({{"response_format", "text"}}));
         REQUIRE(text);
@@ -146,7 +155,9 @@ TEST_SUITE("transcriptions http") {
         REQUIRE(json_body);
         CHECK(json_body->status == 400);
 
-        service.error = "audio: Ogg files are not supported";
+        httplib::UploadFormDataItems not_audio = {{"file", "OggS\0\2 not decodable", "clip.ogg", "audio/ogg"}};
+        check_refused(c, not_audio, "file");  // refused by the server's decoding, before the service
+        service.error = "qwen3_asr: language 'xx' is not one the model knows";
         check_refused(c, form({}), "file");
 
         xs::test::FakeService chat_only;

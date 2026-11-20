@@ -530,10 +530,13 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       4,096 reply tokens and its clean-up of repeated text — docs/decisions/0023
 - [x] Measured on the B60 (1.7B at f16, q8, q4; 0.6B at f16 from `-hf`): word error rate, latency by clip length,
       first streamed text, memory
-- [ ] A clip's encoder windows in one run (75 runs for 10 minutes today: 0.87 s of a 2.9 s wait for the first text)
-- [ ] Log-mel features on several threads (about 0.5 s of CPU for 10 minutes of audio)
+- [x] Long audio: encoder programs (eight windows a run while that many remain), Conv2d's unfold with 32-bit indices,
+      log-mel on threads, pieces sized to the server's context (a long clip was cut off at the default 8,192 tokens):
+      first text of 10 minutes 2.9 s -> 1.0 s, the whole 19.7 s -> 15.8 s (q8)
+- [x] Realtime transcription: `GET /v1/realtime`, OpenAI's GA transcription session (server VAD by frame energy, or
+      client commits), turns transcribed whole in order — docs/decisions/0024
+- [ ] Realtime: G.711 formats; a model VAD (Silero) or `semantic_vad`; text while a turn is still going
 - [ ] Timestamps: Qwen3-ForcedAligner (`verbose_json`, `srt`, `vtt`, `timestamp_granularities[]`)
-- [ ] Realtime transcription: a WebSocket with OpenAI's realtime events, audio appended as it arrives
 - [ ] Qwen3-Omni: its thinker (audio, images and video in chat), then speech out (talker, code predictor, Code2Wav:
       `/v1/audio/speech`, chat `modalities`)
 - [ ] Image generation: BAGEL, Qwen-Image-2.1 (`/v1/images/generations`, `/v1/images/edits`)

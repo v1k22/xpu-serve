@@ -36,8 +36,9 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3
 - ✅ **Image input** (Gemma 4 E2B / E4B), as base64 `data:` URLs
-- ✅ **Speech recognition** (Qwen3-ASR) behind `/v1/audio/transcriptions` (json, text or streamed) and as
-  `input_audio` in chat: WAV, MP3 or FLAC, long audio cut at quiet points
+- ✅ **Speech recognition** (Qwen3-ASR) behind `/v1/audio/transcriptions` (json, text or streamed), OpenAI's
+  realtime API (`/v1/realtime`: audio streamed over a WebSocket, turns found by voice activity) and as `input_audio`
+  in chat: WAV, MP3 or FLAC, long audio cut at quiet points
 - ✅ **Quantized packs**: q8 and q4 from `xpu-serve convert` (round to nearest; AWQ calibration opt-in)
 - ✅ **FP8 checkpoints** (Qwen3.8-27B-FP8, Qwen3.6-35B-A3B-FP8, Ornith-1.5-35B-A3B-FP8: a scale per 128 x 128 block,
   or compressed-tensors' scale per channel), served as they are or converted to a pack
@@ -256,7 +257,7 @@ bits a value); `<keys>:<values>` sets the two apart, e.g. `i8:turbo4`. All of th
 ## APIs
 
 `xpu-serve serve <dir>` serves whatever the directory holds: a language model behind the OpenAI API, a speech
-recognition model behind `/v1/audio/transcriptions`, an embedding model behind `/v1/embeddings`, a decision model behind the System One API, a robot policy behind the policy API.
+recognition model behind `/v1/audio/transcriptions` and `/v1/realtime`, an embedding model behind `/v1/embeddings`, a decision model behind the System One API, a robot policy behind the policy API.
 `--host` and `--port` set the address (127.0.0.1:8080 by default), `--api-key` asks for `Authorization: Bearer <key>`,
 `--model-id` names the model in `/v1/models`. `GET /health` answers once the server is up. A request that names
 something unsupported is refused with the field's name, never served differently.
@@ -317,6 +318,36 @@ curl -s http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F lan
   `/v1/audio/translations` (the model transcribes only).
 
 Decision [0023](docs/decisions/0023-speech-recognition.md) has the details.
+
+### Realtime transcription
+
+`GET /v1/realtime` is OpenAI's Realtime API with a transcription session: a WebSocket that takes audio as it is
+recorded and sends back each turn's text as it is decoded. The events are OpenAI's (GA), so its clients work:
+
+```text
+client: {"type": "session.update", "session": {"type": "transcription", "audio": {"input": {
+           "transcription": {"language": "en"},
+           "turn_detection": {"type": "server_vad", "silence_duration_ms": 500}}}}}
+client: {"type": "input_audio_buffer.append", "audio": "<base64: 16-bit PCM, mono, 24 kHz>"}   (every ~100 ms)
+server: input_audio_buffer.speech_started, ... .speech_stopped, input_audio_buffer.committed,
+        conversation.item.added, conversation.item.input_audio_transcription.delta ...,
+        conversation.item.input_audio_transcription.completed {"transcript", "usage"}, conversation.item.done
+```
+
+- Turns: with `server_vad` (the default) the server ends a turn after `silence_duration_ms` of silence and
+  transcribes it; with `turn_detection: null` the client ends one with `input_audio_buffer.commit`.
+  `input_audio_buffer.clear` drops what is buffered. A turn is transcribed whole, as `/v1/audio/transcriptions` would
+  transcribe it; turns are transcribed one after another while audio keeps coming.
+- The server's VAD measures frame energy against a noise floor it tracks (`threshold` 0 to 1 sets the absolute level
+  speech must reach, `prefix_padding_ms` the audio kept before speech); it is not a model.
+- Refused by name, as `error` events: `semantic_vad`, noise reduction, logprobs, formats other than `audio/pcm` at
+  24 kHz (G.711 included), and any event a transcription session does not take (responses, conversation items).
+- A browser cannot set headers on a WebSocket: with `--api-key`, the key goes as the subprotocol
+  `openai-insecure-api-key.<key>`, as OpenAI's own browser clients send it.
+
+On an Arc Pro B60 (Qwen3-ASR-1.7B, q8) a 3 to 7 s turn's whole transcript comes 130 to 250 ms after the VAD ends it
+([recipe](model_recipes.md#qwen3-asr-17b)). Decision [0024](docs/decisions/0024-realtime-transcription.md) has the
+details.
 
 ### Embeddings
 
@@ -428,6 +459,7 @@ Every layer is tested against a reference:
 | Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/gemma4_vision_parity.cpp` |
 | Audio decoding, resampling and log-mel features | libsndfile, torchaudio and transformers' feature extractor | `tests/unit/audio/` |
 | Speech recognition (Qwen3-ASR) | transformers fp32 log-mel, encoder rows, prompt, logits and greedy text | `tests/unit/model/audio_parity.cpp` |
+| Realtime transcription | OpenAI's GA event shapes over a real WebSocket; turns at the samples the VAD should find | `tests/unit/server/test_realtime_*.cpp`, `tests/unit/audio/test_vad.cpp` |
 | Robot policy (π0.5) | LeRobot fp32 actions and prompt token ids, 3 cameras and 1 | `tests/unit/model/policy_parity.cpp` |
 | Decision models | the checkpoint's own Python code in fp32: prompt token ids and every option's probability | `tests/unit/model/decision_parity.cpp` |
 | Embedding models | sentence-transformers in fp32: token ids, hidden states and embeddings | `tests/unit/model/embedding_parity.cpp` |

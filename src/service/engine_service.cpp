@@ -180,7 +180,8 @@ TranscriptionResult EngineService::transcribe(const TranscriptionRequest& reques
     const Model& model = engine_->model();
     const Transcription& format = *model.transcription();
     const std::string prefix = format.language_prefix(request.language);
-    const audio::Audio clip = audio::decode(request.audio);
+    const audio::Audio& clip = request.clip;
+    XS_CHECK(clip.sample_rate > 0 && !clip.samples.empty(), "transcription: an empty audio clip");
     // The reference package's turn: a system message (empty without a prompt), the user's audio.
     const nlohmann::json messages = nlohmann::json::array(
         {{{"role", "system"}, {"content", request.prompt}},

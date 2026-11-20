@@ -6,6 +6,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -17,6 +18,7 @@
 #include "server/openai_format.h"
 #include "server/openai_request.h"
 #include "server/policy_handlers.h"
+#include "server/realtime_session.h"
 #include "server/transcription_handlers.h"
 #include "util/log.h"
 
@@ -24,6 +26,21 @@ namespace xs::server {
 namespace {
 
 using Handler = std::function<void(const httplib::Request&, httplib::Response&)>;
+
+// The subprotocols a WebSocket upgrade offers (Sec-WebSocket-Protocol, comma-separated).
+std::set<std::string> websocket_protocols(const httplib::Request& req) {
+    std::set<std::string> out;
+    std::string list = req.get_header_value("Sec-WebSocket-Protocol");
+    for (size_t at = 0; at <= list.size();) {
+        const size_t comma = std::min(list.find(',', at), list.size());
+        std::string p = list.substr(at, comma - at);
+        p.erase(0, p.find_first_not_of(' '));
+        p.erase(p.find_last_not_of(' ') + 1);
+        if (!p.empty()) out.insert(p);
+        at = comma + 1;
+    }
+    return out;
+}
 
 void set_error(httplib::Response& res, int status, std::string_view message, std::string_view type,
                std::string_view param = {}, std::string_view code = {}) {
@@ -68,6 +85,7 @@ struct Server::Impl {
     }
 
     void install_routes();
+    void serve_realtime(const httplib::Request& req, httplib::ws::WebSocket& ws);
     bool authorized(const httplib::Request& req) const;
     std::string model_id() const {
         if (service != nullptr) return service->model().id;
@@ -93,8 +111,40 @@ struct Server::Impl {
 };
 
 bool Server::Impl::authorized(const httplib::Request& req) const {
-    return options.api_key.empty() || req.path == "/health" || req.path == "/ready" ||
-           req.get_header_value("Authorization") == "Bearer " + options.api_key;
+    if (options.api_key.empty() || req.path == "/health" || req.path == "/ready" ||
+        req.get_header_value("Authorization") == "Bearer " + options.api_key) {
+        return true;
+    }
+    // A browser cannot set headers on a WebSocket: OpenAI's clients send the key as a subprotocol.
+    return websocket_protocols(req).count("openai-insecure-api-key." + options.api_key) != 0;
+}
+
+// One realtime transcription session per connection, until the client closes it.
+void Server::Impl::serve_realtime(const httplib::Request& req, httplib::ws::WebSocket& ws) {
+    const std::string intent = req.get_param_value("intent");
+    if (!intent.empty() && intent != "transcription") {
+        ws.send(nlohmann::ordered_json{{"type", "error"},
+                                       {"error",
+                                        {{"type", "invalid_request_error"},
+                                         {"code", "invalid_value"},
+                                         {"message", "this server's realtime sessions transcribe audio"},
+                                         {"param", "intent"}}}}
+                    .dump());
+        ws.close();
+        return;
+    }
+    log::info("realtime: a session opened");
+    {
+        RealtimeSession session(*service, [&ws](const nlohmann::ordered_json& event) { ws.send(event.dump()); });
+        std::string message;
+        for (;;) {
+            const httplib::ws::ReadResult r = ws.read(message);
+            if (r == httplib::ws::Fail) break;
+            // A binary frame is read as text too: what is not a JSON event gets an error event.
+            if (r == httplib::ws::Text || r == httplib::ws::Binary) session.handle(message);
+        }
+    }
+    log::info("realtime: a session closed");
 }
 
 void Server::Impl::install_routes() {
@@ -160,6 +210,12 @@ void Server::Impl::install_routes() {
         http.Post("/v1/audio/transcriptions", guarded([this](const httplib::Request& req, httplib::Response& res) {
                       transcription_handlers->transcribe(req, res);
                   }));
+        http.WebSocket(
+            "/v1/realtime",
+            [this](const httplib::Request& req, httplib::ws::WebSocket& ws) { serve_realtime(req, ws); },
+            [](const std::vector<std::string>& offered) {
+                return std::find(offered.begin(), offered.end(), "realtime") != offered.end() ? "realtime" : "";
+            });
         http.Post("/v1/audio/translations", guarded([this](const httplib::Request& req, httplib::Response& res) {
                       transcription_handlers->translate(req, res);
                   }));

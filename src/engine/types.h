@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 
+#include "audio/audio.h"
 #include "tensor/tensor.h"
 
 namespace xs {
@@ -90,7 +91,7 @@ void accumulate(GenerateStats& total, const GenerateStats& more);
 
 // A speech recognition request (OpenAI's /v1/audio/transcriptions).
 struct TranscriptionRequest {
-    std::vector<uint8_t> audio;     // the file's bytes (WAV, MP3, FLAC)
+    audio::Audio clip;              // decoded, at its own sample rate
     std::string language;           // an ISO 639-1 code or a language name; empty: the model detects it
     std::string prompt;             // context for the model (names, terms): its system turn
     SamplingParams sampling;

@@ -1357,15 +1357,17 @@ changes four fewer answers of the 300: better, not q8
 
 ## Speech recognition
 
-A speech recognition model is served behind OpenAI's transcription API ([README](README.md#transcriptions)) and
-takes `input_audio` parts in chat. WAV, MP3 and FLAC at any sample rate; audio longer than the model's piece is cut
-at quiet points and transcribed piece by piece.
+A speech recognition model is served behind OpenAI's transcription API ([README](README.md#transcriptions)), its
+realtime API ([README](README.md#realtime-transcription)) and as `input_audio` parts in chat. WAV, MP3 and FLAC at any
+sample rate. Audio longer than a piece is cut at quiet points and transcribed piece by piece: the model's own limit
+(20 minutes for Qwen3-ASR), or less where the server's `--ctx` holds less (at the default 8,192 tokens, about 5
+minutes of Qwen3-ASR's audio with room for its longest reply).
 
 ### Qwen3-ASR-1.7B
 
 `Qwen/Qwen3-ASR-1.7B` (`qwen3_asr`): an audio encoder (convolutions over the log-mel features, attention within
 windows of 8 seconds) and a Qwen3 decoder; 30 languages and 22 Chinese dialects, found by the model or forced with
-`language`. Pieces of up to 20 minutes. No timestamps (they need Qwen3-ForcedAligner, not supported yet).
+`language`. No timestamps (they need Qwen3-ForcedAligner, not supported yet).
 
 Reference:
 
@@ -1374,51 +1376,60 @@ xpu-serve serve -hf Qwen/Qwen3-ASR-1.7B --device GPU
 curl -s http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en
 ```
 
-Optimized (its q8 pack: 1.5 times as fast as f16 at nearly the same word error rate):
+Optimized (its q8 pack: 1.5 times as fast as f16 at nearly the same word error rate; larger prefill steps for long
+audio):
 
 ```bash
 xpu-serve convert -hf Qwen/Qwen3-ASR-1.7B --out ~/models/Qwen3-ASR-1.7B-q8 --quant q8
-xpu-serve serve ~/models/Qwen3-ASR-1.7B-q8 --device GPU
+xpu-serve serve ~/models/Qwen3-ASR-1.7B-q8 --device GPU --prefill-chunk 8192
 ```
 
 - `"stream": "true"` in the form sends the text as it is decoded (`transcript.text.delta` events).
-- q4 is faster on clips of a few minutes, but on a 10-minute clip it missed the end of the speech and began the clip
-  again, until the reply's limit of 4,096 tokens; f16 and q8 stopped where the speech did. Use q8 for long audio.
+- q4 is faster still and transcribed every clip here, but in a 10-minute piece (`--ctx 32768`) it missed the end of
+  the speech and began the clip again, until the reply's limit of 4,096 tokens; f16 and q8 stopped where the speech
+  did. q8 is the safer pack for long pieces.
 
-Measured on an Arc Pro B60, through the API, each request a clip the server had not seen (no cached prompt). Word
-error rate on LibriSpeech's 73 clips of `hf-internal-testing/librispeech_asr_dummy` (481 s, 1,169 words; Whisper's
-English text normalizer on both sides); the longer clips are those clips joined:
+Measured on an Arc Pro B60 with the commands above (`--prefill-chunk 8192`, the default `--ctx`), through the API,
+each request a clip the server had not seen (no cached prompt). Word error rate on LibriSpeech's 73 clips of
+`hf-internal-testing/librispeech_asr_dummy` (481 s, 1,169 words; Whisper's English text normalizer on both sides);
+the longer clips are those clips joined:
 
 | | f16 | q8 | q4 |
 |---|---|---|---|
 | Word error rate | 3.34 % | 3.51 % | 4.11 % |
-| A clip of 6.6 s on average (median) | 237 ms | 156 ms | 119 ms |
-| All 73 clips, one after another | 20.6 s (23x real time) | 13.3 s (36x) | 10.3 s (47x) |
-| 33 s clip | 1.42 s | 0.89 s | 0.69 s |
-| 120 s clip | 5.01 s | 3.15 s | 2.45 s |
-| 600 s clip | 28.4 s (21x) | 19.7 s (30x) | (missed the end) |
-| First streamed text: 33 s / 120 s / 600 s | 198 / 515 / 2,691 ms | 192 / 536 / 2,874 ms | 205 / 537 / 2,866 ms |
+| A clip of 6.6 s on average (median) | 235 ms | 157 ms | 118 ms |
+| All 73 clips, one after another | 20.2 s (24x real time) | 13.2 s (36x) | 10.2 s (47x) |
+| 33 s clip | 1.42 s | 0.92 s | 0.70 s |
+| 120 s clip | 4.79 s | 3.01 s | 2.31 s |
+| 600 s clip (two pieces) | 24.6 s (24x) | 15.8 s (38x) | 12.2 s (49x) |
+| First streamed text: 33 s / 120 s / 600 s | 149 / 351 / 926 ms | 160 / 361 / 986 ms | 157 / 365 / 985 ms |
 | Decode (a 120 s clip's reply) | 79 tok/s | 133 tok/s | 182 tok/s |
-| GPU memory, the 600 s clip | 6.8 GB | 5.0 GB | |
+| GPU memory, the 600 s clip | 7.6 GB | 5.8 GB | 5.1 GB |
 
-Where a 600 s clip's time goes (q8): the encoder 0.87 s (75 windows of 8 s), prefill of 7,818 prompt tokens 1.27 s,
-decoding 1,788 tokens 17.1 s, and about 0.5 s on the CPU (upload, decoding, log-mel). The encoder's windows are
-stateless: a clip's are run one after another.
+Where a 600 s clip's time goes (q8): the encoder 0.52 s (75 windows of 8 s: 8 a run, then one a run), prefill of
+7,837 prompt tokens 0.86 s, decoding 1,786 tokens 14.1 s, the log-mel features about 0.08 s on the CPU. The first text
+comes after the first piece's encoder and prefill.
 
 Checked against transformers' Qwen3-ASR in fp32: log-mel features, the encoder's rows, the prompt, last-token logits
-and greedy text, on LibriSpeech clips of 6 to 33 s and synthetic ones; f32 on the GPU: logits within 1.8e-4 and every
-greedy token equal; f16: logits cosine 0.999998, every greedy token equal.
+and greedy text, on LibriSpeech clips of 6 to 120 s (one to fifteen windows) and synthetic ones; f32 on the GPU:
+every greedy token equal; f16: logits cosine 0.999997 or more, every greedy token equal.
+
+Realtime (`/v1/realtime`, q8, LibriSpeech read aloud at real time in 100 ms pieces): with the server's VAD a turn ends
+500 ms (`silence_duration_ms`) after the speech does; from then, the first text about 50 ms and the whole
+transcript 130 to 250 ms later for turns of 3 to 7 s. With the client committing at the end of the speech instead:
+first text 55 to 150 ms after the commit, the whole transcript 145 to 345 ms after it for 5 to 12 s of speech, 780 ms
+for 29 s.
 
 ### Qwen3-ASR-0.6B
 
 `Qwen/Qwen3-ASR-0.6B` (`qwen3_asr`): the same model, smaller (a 1,024-wide decoder), served the same way.
 
 ```bash
-xpu-serve serve -hf Qwen/Qwen3-ASR-0.6B --device GPU
+xpu-serve serve -hf Qwen/Qwen3-ASR-0.6B --device GPU --prefill-chunk 8192
 ```
 
-Measured as Qwen3-ASR-1.7B, at f16: word error rate 3.93 %; a clip of 6.6 s in 113 ms (median), all 73 clips in 9.9 s
-(48x real time); 33 s in 0.70 s, 120 s in 2.55 s, 600 s in 16.4 s; first streamed text after 132 / 358 / 2,246 ms;
+Measured as Qwen3-ASR-1.7B, at f16: word error rate 3.93 %; a clip of 6.6 s in 107 ms (median), all 73 clips in 9.4 s
+(51x real time); 33 s in 0.68 s, 120 s in 2.30 s, 600 s in 12.0 s; first streamed text after 111 / 266 / 776 ms;
 decode 167 tok/s. At f16 it is about as fast as the 1.7B's q4, with a lower word error rate.
 
 ## Embedding models

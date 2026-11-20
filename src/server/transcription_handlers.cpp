@@ -7,6 +7,7 @@
 #include <string>
 #include <thread>
 
+#include "audio/audio.h"
 #include "server/channel.h"
 #include "server/openai_format.h"
 #include "server/openai_request.h"
@@ -67,9 +68,13 @@ TranscriptionForm parse_transcription_form(const httplib::MultipartFormData& for
         throw InvalidRequest("'file' is required: the audio, sent as a file part (curl -F file=@clip.wav)", "file");
     }
     TranscriptionForm f;
-    const std::string audio = form.get_file("file").content;
-    f.request.audio.assign(audio.begin(), audio.end());
-    if (f.request.audio.empty()) throw InvalidRequest("'file' is empty", "file");
+    const std::string bytes = form.get_file("file").content;
+    if (bytes.empty()) throw InvalidRequest("'file' is empty", "file");
+    try {
+        f.request.clip = audio::decode(std::span(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()));
+    } catch (const Error& e) {
+        throw InvalidRequest(e.what(), "file");
+    }
     f.request.language = form.get_field("language");
     f.request.prompt = form.get_field("prompt");
     f.request.sampling = defaults;
