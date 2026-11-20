@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -16,6 +17,9 @@ using graph::Graph;
 using graph::Value;
 
 constexpr float kLayerNormEps = 1e-5f;  // nn.LayerNorm's default
+// A long clip's windows run this many at a time (program 1), the rest one at a time (program 0): the encoder's cost
+// grows with its rows, so a batch only saves the per-run cost, and a short clip would pay for the windows it pads.
+constexpr int64_t kBatchWindows = 8;
 
 // Rows `length` of the encoder's sinusoidal table (SinusoidsPositionEmbedding): [sin(t f_i) | cos(t f_i)] with
 // f_i = exp(-i log(10000) / (channels / 2 - 1)).
@@ -46,62 +50,83 @@ public:
         chunk_frames_ = 2 * cfg_.n_window;
         chunks_ = cfg_.n_window_infer / chunk_frames_;
         chunk_rows_ = encoder_rows(cfg_, chunk_frames_);
-        build();
+        build(single_, 1);
+        build(batch_, kBatchWindows);
     }
 
-    const graph::Graph& graph() const override { return graph_; }
+    std::vector<const graph::Graph*> programs() const override { return {&single_, &batch_}; }
     int32_t placeholder_token() const override { return audio_token_; }
     int32_t soft_token() const override { return audio_token_; }
     std::vector<int32_t> token_run(int64_t n) const override {
         return std::vector<int32_t>(static_cast<size_t>(n), audio_token_);
     }
 
-    // One run per window of n_window_infer frames: its chunks zero-padded to whole chunks and windows (as the
-    // reference pads a clip's last chunk), the keys past the clip's rows masked.
+    // Windows of n_window_infer frames, kBatchWindows a run while that many remain, then one a run; the clip's last
+    // chunk zero-padded (as the reference pads it) and the keys past the clip in its window masked.
     MediaInput prepare(const audio::Audio& clip) const override {
         XS_CHECK(clip.sample_rate > 0 && !clip.samples.empty(), "qwen3_asr: an empty audio clip");
         const std::vector<float> pcm = clip.sample_rate == mel_.sample_rate
                                            ? clip.samples
                                            : audio::resample(clip.samples, clip.sample_rate, mel_.sample_rate);
         const HostTensor mel = audio::log_mel_spectrogram(pcm, mel_);  // [mel bins, frames]
-        const int64_t bins = mel.dim(0), frames = mel.dim(1);
         const int64_t window_frames = chunks_ * chunk_frames_;
+        const int64_t windows = (mel.dim(1) + window_frames - 1) / window_frames;
         MediaInput media;
         media.modality = Modality::Audio;
-        for (int64_t first = 0; first < frames; first += window_frames) {
-            const int64_t count = std::min(window_frames, frames - first);
-            EncoderRun& run = media.runs.emplace_back();
-            HostTensor chunks(DType::F32, {chunks_, 1, bins, chunk_frames_});
-            for (int64_t b = 0; b < bins; ++b) {
-                for (int64_t f = 0; f < count; ++f) {
-                    const int64_t chunk = f / chunk_frames_, t = f % chunk_frames_;
-                    chunks.data<float>()[(chunk * bins + b) * chunk_frames_ + t] =
-                        mel.data<float>()[b * frames + first + f];
-                }
-            }
-            run.rows = encoder_rows(cfg_, count);
-            HostTensor key_bias(DType::F32, {chunks_ * chunk_rows_});
-            for (int64_t r = 0; r < key_bias.numel(); ++r) {
-                key_bias.data<float>()[r] = r < run.rows ? 0.0f : -std::numeric_limits<float>::infinity();
-            }
-            run.inputs.emplace("mel", std::move(chunks));
-            run.inputs.emplace("key_bias", std::move(key_bias));
-            media.num_tokens += run.rows;
+        for (int64_t w = 0; w < windows;) {
+            const int64_t count = windows - w >= kBatchWindows ? kBatchWindows : 1;
+            media.runs.push_back(windows_run(mel, w, count));
+            media.num_tokens += media.runs.back().rows;
+            w += count;
         }
         return media;
     }
 
-private:
-    Value linear(Value x, const std::string& stem) { return torch_nn::linear(graph_, weights_, x, stem); }
-    Value layer_norm(Value x, const std::string& stem) {
-        return torch_nn::layer_norm(graph_, weights_, x, stem, kLayerNormEps);
+    // Silence of a batch and one window more: a run of each program.
+    MediaInput warm_up_item() const override {
+        audio::Audio silence;
+        silence.sample_rate = mel_.sample_rate;
+        const int64_t frames = (kBatchWindows + 1) * chunks_ * chunk_frames_;
+        silence.samples.assign(static_cast<size_t>(frames * mel_.hop_length), 0.0f);
+        return prepare(silence);
     }
 
-    // A window: the chunks' convolutions, conv_out and positions, the layers over its rows, ln_post, the projector.
-    void build() {
-        Graph& g = graph_;
-        const int64_t width = cfg_.d_model, rows = chunks_ * chunk_rows_, head_dim = width / cfg_.heads;
-        const Value mel = g.input("mel", DType::F32, {chunks_, 1, cfg_.mel_bins, chunk_frames_});
+private:
+    // The run of `count` windows from window `first`: their chunks, and a key bias that masks the rows past the clip.
+    EncoderRun windows_run(const HostTensor& mel, int64_t first, int64_t count) const {
+        const int64_t bins = mel.dim(0), frames = mel.dim(1), window_frames = chunks_ * chunk_frames_;
+        const int64_t begin = first * window_frames, used = std::min(count * window_frames, frames - begin);
+        EncoderRun run;
+        run.program = count == 1 ? 0 : 1;
+        HostTensor chunks(DType::F32, {count * chunks_, 1, bins, chunk_frames_});
+        for (int64_t b = 0; b < bins; ++b) {
+            for (int64_t f = 0; f < used; ++f) {
+                const int64_t chunk = f / chunk_frames_, t = f % chunk_frames_;
+                chunks.data<float>()[(chunk * bins + b) * chunk_frames_ + t] =
+                    mel.data<float>()[b * frames + begin + f];
+            }
+        }
+        run.rows = encoder_rows(cfg_, used);
+        HostTensor key_bias(DType::F32, {count * chunks_ * chunk_rows_});
+        for (int64_t r = 0; r < key_bias.numel(); ++r) {
+            key_bias.data<float>()[r] = r < run.rows ? 0.0f : -std::numeric_limits<float>::infinity();
+        }
+        run.inputs.emplace("mel", std::move(chunks));
+        run.inputs.emplace("key_bias", std::move(key_bias));
+        return run;
+    }
+
+    Value linear(Graph& g, Value x, const std::string& stem) { return torch_nn::linear(g, weights_, x, stem); }
+    Value layer_norm(Graph& g, Value x, const std::string& stem) {
+        return torch_nn::layer_norm(g, weights_, x, stem, kLayerNormEps);
+    }
+
+    // `windows` windows: the chunks' convolutions, conv_out and positions, the layers over each window's rows (a
+    // block of attention), ln_post, the projector.
+    void build(Graph& g, int64_t windows) {
+        const int64_t width = cfg_.d_model, head_dim = width / cfg_.heads, chunks = windows * chunks_;
+        const int64_t rows = chunks * chunk_rows_;
+        const Value mel = g.input("mel", DType::F32, {chunks, 1, cfg_.mel_bins, chunk_frames_});
         const Value key_bias = g.input("key_bias", DType::F32, {rows});
         graph::Conv2dAttrs s2;
         s2.stride_h = s2.stride_w = 2;
@@ -116,7 +141,7 @@ private:
         const Dims conv_shape = g.type(x).shape;
         XS_CHECK(conv_shape[3] == chunk_rows_, "qwen3_asr: a chunk convolves to ", conv_shape[3], " rows, not ",
                  chunk_rows_);
-        x = g.reshape(g.transpose(x, {0, 3, 1, 2}), {chunks_, chunk_rows_, conv_shape[1] * conv_shape[2]});
+        x = g.reshape(g.transpose(x, {0, 3, 1, 2}), {chunks, chunk_rows_, conv_shape[1] * conv_shape[2]});
         x = g.matmul(x, g.weight(weights_, tower_ + "conv_out.weight"));
         XS_CHECK(chunk_rows_ <= cfg_.max_positions, "qwen3_asr: ", chunk_rows_, " rows a chunk past the table of ",
                  cfg_.max_positions);
@@ -124,21 +149,22 @@ private:
 
         graph::AttentionAttrs attrs;
         attrs.causal = false;
+        attrs.block = chunks_ * chunk_rows_;
         attrs.scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim)));
         for (int64_t i = 0; i < cfg_.layers; ++i) {
             const std::string L = tower_ + "layers." + std::to_string(i) + ".";
             Graph::Scope s(g, "layers." + std::to_string(i));
-            Value h = layer_norm(x, L + "self_attn_layer_norm");
+            Value h = layer_norm(g, x, L + "self_attn_layer_norm");
             const auto heads = [&](const char* proj) {
-                return g.reshape(linear(h, L + "self_attn." + proj), {rows, cfg_.heads, head_dim});
+                return g.reshape(linear(g, h, L + "self_attn." + proj), {rows, cfg_.heads, head_dim});
             };
             const Value attn = g.attention(heads("q_proj"), heads("k_proj"), heads("v_proj"), key_bias, attrs);
-            x = g.add(x, linear(g.reshape(attn, {rows, width}), L + "self_attn.out_proj"));
-            h = layer_norm(x, L + "final_layer_norm");
-            x = g.add(x, linear(g.gelu(linear(h, L + "fc1")), L + "fc2"));
+            x = g.add(x, linear(g, g.reshape(attn, {rows, width}), L + "self_attn.out_proj"));
+            h = layer_norm(g, x, L + "final_layer_norm");
+            x = g.add(x, linear(g, g.gelu(linear(g, h, L + "fc1")), L + "fc2"));
         }
-        x = layer_norm(x, tower_ + "ln_post");
-        g.output("embeddings", linear(g.gelu(linear(x, proj1_)), proj2_));
+        x = layer_norm(g, x, tower_ + "ln_post");
+        g.output("embeddings", linear(g, g.gelu(linear(g, x, proj1_)), proj2_));
         g.validate();
     }
 
@@ -148,10 +174,13 @@ private:
     int32_t audio_token_;
     std::string tower_, proj1_, proj2_;
     int64_t chunk_frames_ = 0, chunks_ = 0, chunk_rows_ = 0;
-    Graph graph_;
+    Graph single_, batch_;  // programs 0 and 1
 };
 
-// preprocessor_config.json's WhisperFeatureExtractor / Qwen3ASRFeatureExtractor settings.
+
+}  // namespace
+
+// WhisperFeatureExtractor's or Qwen3ASRFeatureExtractor's settings.
 audio::MelParams mel_spec(const std::filesystem::path& dir) {
     audio::MelParams m;
     const std::filesystem::path path = dir / "preprocessor_config.json";
@@ -171,11 +200,9 @@ audio::MelParams mel_spec(const std::filesystem::path& dir) {
     return m;
 }
 
-}  // namespace
-
 std::unique_ptr<AudioEncoder> make_audio_tower(const Config& cfg, const WeightStore& weights,
-                                               const std::filesystem::path& dir) {
-    return std::make_unique<AudioTower>(cfg, weights, mel_spec(dir));
+                                               const audio::MelParams& mel) {
+    return std::make_unique<AudioTower>(cfg, weights, mel);
 }
 
 }  // namespace xs::qwen3_asr

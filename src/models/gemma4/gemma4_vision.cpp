@@ -81,7 +81,7 @@ public:
         build_graph();
     }
 
-    const graph::Graph& graph() const override { return graph_; }
+    std::vector<const graph::Graph*> programs() const override { return {&graph_}; }
     int32_t placeholder_token() const override { return vc_.image_token_id; }
     int32_t soft_token() const override { return vc_.image_token_id; }
 

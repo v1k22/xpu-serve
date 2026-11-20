@@ -106,6 +106,25 @@ TEST_SUITE("audio mel") {
         CHECK(audio::log_mel_spectrogram(std::vector<float>(320, 0.1f), params).dim(1) == 1);
     }
 
+    TEST_CASE("audio mel: frames computed in parts on threads: a clip of period 1 s gives equal frames 1 s apart") {
+        std::mt19937 rng(3);
+        std::normal_distribution<float> noise(0.0f, 0.2f);
+        std::vector<float> second(16000);
+        for (float& v : second) v = noise(rng);
+        std::vector<float> clip;
+        for (int i = 0; i < 40; ++i) clip.insert(clip.end(), second.begin(), second.end());
+        const HostTensor mel = audio::log_mel_spectrogram(clip);  // 4,000 frames: parts on several threads
+        const int64_t bins = mel.dim(0), frames = mel.dim(1), period = 100;  // frames a second
+        REQUIRE(frames == 4000);
+        int64_t differ = 0;
+        for (int64_t b = 0; b < bins; ++b) {
+            for (int64_t t = 2 * period; t < frames - period; ++t) {  // past the reflected ends
+                differ += mel.data<float>()[b * frames + t] != mel.data<float>()[b * frames + t - period];
+            }
+        }
+        CHECK(differ == 0);
+    }
+
     TEST_CASE("audio mel: silence is the floor everywhere: log10(1e-10) mapped to -1.5") {
         const HostTensor mel = audio::log_mel_spectrogram(std::vector<float>(1000, 0.0f));
         for (const float v : mel.span<float>()) CHECK(v == -1.5f);

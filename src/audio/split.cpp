@@ -14,7 +14,7 @@ std::vector<std::pair<int64_t, int64_t>> split_at_quiet(const Audio& clip, doubl
         return pieces;
     }
     const auto max_len = static_cast<int64_t>(max_seconds * rate);
-    const auto expand = static_cast<int64_t>(5.0 * rate);
+    const auto expand = static_cast<int64_t>(kQuietSearchSeconds * rate);
     const int64_t window = std::max<int64_t>(4, static_cast<int64_t>(0.1 * rate));
     const float* x = clip.samples.data();
     int64_t start = 0;

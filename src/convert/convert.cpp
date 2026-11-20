@@ -162,7 +162,9 @@ std::map<std::string, DType> plan_formats(const Model& model, const ConvertOptio
     }
     for (size_t k = 0; k < kModalities; ++k) {
         if (const MediaEncoder* e = model.encoder(static_cast<Modality>(k))) {
-            plan_graph(e->graph(), model.weights(), DType::Q8, o.scope, o, plan);
+            for (const graph::Graph* program : e->programs()) {
+                plan_graph(*program, model.weights(), DType::Q8, o.scope, o, plan);
+            }
         }
     }
     for (const std::string& name : model.host_tables()) {

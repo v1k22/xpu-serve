@@ -8,7 +8,7 @@
 
 namespace {
 
-std::unique_ptr<xs::Transcription> format() { return xs::qwen3_asr::make_transcription({}); }
+std::unique_ptr<xs::Transcription> format() { return xs::qwen3_asr::make_transcription({}, 13.0); }
 
 }  // namespace
 
@@ -24,7 +24,7 @@ TEST_SUITE("qwen3_asr transcription") {
         CHECK_THROWS_WITH_AS(f->language_prefix("klingon"), doctest::Contains("klingon"), xs::Error);
         CHECK_THROWS_AS(f->language_prefix("sw"), xs::Error);  // Swahili: not one of the 30
         // a checkpoint's own list narrows the names
-        const auto narrow = xs::qwen3_asr::make_transcription({"English"});
+        const auto narrow = xs::qwen3_asr::make_transcription({"English"}, 13.0);
         CHECK_THROWS_AS(narrow->language_prefix("de"), xs::Error);
     }
 

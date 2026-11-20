@@ -40,9 +40,12 @@ class MediaEncoder {
 public:
     virtual ~MediaEncoder() = default;
     virtual Modality modality() const = 0;
-    // Run once per EncoderRun of an item (stateless). Its inputs are what the subclass's prepare() fills; its output
-    // "embeddings" is [N, hidden] f32 whose first EncoderRun::rows rows are the item's soft tokens.
-    virtual const graph::Graph& graph() const = 0;
+    // The stateless programs an item's runs choose from (EncoderRun::program), compiled as one session: e.g. one
+    // window of audio and several at once. A run's inputs are what the subclass's prepare() fills; each program's
+    // output "embeddings" is [N, hidden] f32 whose first EncoderRun::rows rows are the item's soft tokens.
+    virtual std::vector<const graph::Graph*> programs() const = 0;
+    // A neutral item whose runs use every program: run once at load, so no request pays a program's first-run setup.
+    virtual MediaInput warm_up_item() const = 0;
     // The token the chat template renders once per item.
     virtual int32_t placeholder_token() const = 0;
     // What one placeholder becomes in the prompt for an item of `num_tokens` soft tokens.
@@ -54,6 +57,7 @@ public:
 class VisionEncoder : public MediaEncoder {
 public:
     Modality modality() const final { return Modality::Image; }
+    MediaInput warm_up_item() const override;  // a gray 768 x 768 image
     // Decoded pixels -> encoder runs and soft-token count (key is left for the caller). Throws xs::Error for an
     // image the model cannot take.
     virtual MediaInput prepare(const image::Image& img) const = 0;
@@ -62,6 +66,7 @@ public:
 class AudioEncoder : public MediaEncoder {
 public:
     Modality modality() const final { return Modality::Audio; }
+    MediaInput warm_up_item() const override;  // a second of silence at 16 kHz
     // A decoded clip at its own sample rate (the encoder brings it to the rate it reads) -> encoder runs and
     // soft-token count (key is left for the caller). Throws xs::Error for a clip the model cannot take.
     virtual MediaInput prepare(const audio::Audio& clip) const = 0;
@@ -131,6 +136,8 @@ public:
     virtual double max_piece_seconds() const = 0;
     // A piece's reply stops after this many tokens: where a model that fell into repeating itself ends.
     virtual int max_reply_tokens() const = 0;
+    // Prompt tokens a second of audio takes. With max_reply_tokens(), how long a piece a context of N tokens holds.
+    virtual double audio_tokens_per_second() const = 0;
     // The text after the chat template's generation prompt that has the model write in `language` (an ISO 639-1
     // code or a language name, case-insensitive), or "" when `language` is empty (the model detects it). Throws
     // xs::Error naming a language the model does not know.

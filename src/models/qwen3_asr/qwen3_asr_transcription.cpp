@@ -111,7 +111,8 @@ std::string fix_repetitions(std::string_view text) {
 
 class AsrTranscription final : public Transcription {
 public:
-    explicit AsrTranscription(std::vector<std::string> languages) : languages_(std::move(languages)) {
+    AsrTranscription(std::vector<std::string> languages, double audio_tokens_per_second)
+        : languages_(std::move(languages)), audio_tokens_per_second_(audio_tokens_per_second) {
         if (languages_.empty()) {
             for (const auto& [code, name] : kCodes) {
                 if (std::find(languages_.begin(), languages_.end(), name) == languages_.end()) {
@@ -123,6 +124,7 @@ public:
 
     double max_piece_seconds() const override { return 1200.0; }
     int max_reply_tokens() const override { return 4096; }
+    double audio_tokens_per_second() const override { return audio_tokens_per_second_; }
 
     std::string language_prefix(std::string_view language) const override {
         if (trim(language).empty()) return "";
@@ -178,12 +180,14 @@ public:
 
 private:
     std::vector<std::string> languages_;
+    double audio_tokens_per_second_;
 };
 
 }  // namespace
 
-std::unique_ptr<Transcription> make_transcription(std::vector<std::string> languages) {
-    return std::make_unique<AsrTranscription>(std::move(languages));
+std::unique_ptr<Transcription> make_transcription(std::vector<std::string> languages,
+                                                  double audio_tokens_per_second) {
+    return std::make_unique<AsrTranscription>(std::move(languages), audio_tokens_per_second);
 }
 
 }  // namespace xs::qwen3_asr

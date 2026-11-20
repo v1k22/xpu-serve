@@ -19,19 +19,6 @@ namespace xs {
 namespace {
 
 // A neutral item of modality `m` (a gray square, a second of silence), for an encoder's first run.
-MediaInput warm_up_item(const Model& model, Modality m) {
-    if (m == Modality::Image) {
-        image::Image gray;
-        gray.width = gray.height = 768;
-        gray.rgb.assign(static_cast<size_t>(gray.width * gray.height * 3), 128);
-        return model.vision()->prepare(gray);
-    }
-    audio::Audio silence;
-    silence.sample_rate = 16000;
-    silence.samples.assign(16000, 0.0f);
-    return model.audio()->prepare(silence);
-}
-
 }  // namespace
 
 struct EngineService::Job {
@@ -109,15 +96,17 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
         SessionOptions encoder_options = session_options;
         encoder_options.max_context = int64_t{1} << 20;  // stateless: bounds one run's rows only
         Timer encoder_timer;
-        encoders[k] = backend->compile(encoder->graph(), model->weights(), encoder_options);
-        // The first run of an encoder pays the plugin's kernel setup (about 2 s on a GPU): pay it here, on a neutral
+        const std::vector<const graph::Graph*> encoder_programs = encoder->programs();
+        encoders[k] = backend->compile(encoder_programs, model->weights(), encoder_options);
+        // The first run of a program pays the plugin's kernel setup (about 2 s on a GPU): pay it here, on a neutral
         // item, rather than on the first request with media.
-        for (const EncoderRun& run : warm_up_item(*model, m).runs) {
+        for (const EncoderRun& run : encoder->warm_up_item().runs) {
             TensorMap warm;
-            encoders[k]->run(run.inputs, warm);
+            encoders[k]->run(run.program, run.inputs, warm);
         }
-        log::info("compiled and warmed up the ", modality_name(m), " encoder (", encoder->graph().nodes().size(),
-                  " nodes) in ", static_cast<int>(encoder_timer.elapsed_ms()), " ms");
+        log::info("compiled and warmed up the ", modality_name(m), " encoder (", encoder_programs.size(),
+                  " program(s), ", encoder_programs.front()->nodes().size(), " nodes) in ",
+                  static_cast<int>(encoder_timer.elapsed_ms()), " ms");
     }
 
     s->card_.id = options.model_id.empty() ? info.id : options.model_id;
@@ -192,24 +181,33 @@ TranscriptionResult EngineService::transcribe(const TranscriptionRequest& reques
     const Transcription& format = *model.transcription();
     const std::string prefix = format.language_prefix(request.language);
     const audio::Audio clip = audio::decode(request.audio);
+    // The reference package's turn: a system message (empty without a prompt), the user's audio.
+    const nlohmann::json messages = nlohmann::json::array(
+        {{{"role", "system"}, {"content", request.prompt}},
+         {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "audio"}}})}}});
+    const std::vector<int32_t> turn =
+        tokenizer_->encode(template_->render(messages, nullptr, true, nlohmann::json::object()) + prefix,
+                           /*parse_special=*/true);
+    // Pieces short enough that each one's prompt and longest reply fit the context (a cut may land past the limit).
+    const int reply_tokens = request.max_tokens.value_or(format.max_reply_tokens());
+    const double fits = static_cast<double>(card_.context_length - static_cast<int64_t>(turn.size()) - reply_tokens) /
+                            format.audio_tokens_per_second() -
+                        audio::kQuietSearchSeconds;
+    XS_CHECK(fits >= 1.0, "transcription: a context of ", card_.context_length, " tokens holds too little audio after ",
+             "the ", turn.size(), "-token turn and a reply of ", reply_tokens, " tokens: serve with a larger --ctx");
     TranscriptionResult result;
     result.seconds = static_cast<double>(clip.samples.size()) / clip.sample_rate;
     std::vector<std::string> languages;
     bool cancelled = false;
-    for (const auto& [first, last] : audio::split_at_quiet(clip, format.max_piece_seconds())) {
+    for (const auto& [first, last] : audio::split_at_quiet(clip, std::min(format.max_piece_seconds(), fits))) {
         audio::Audio piece{clip.sample_rate, {clip.samples.begin() + first, clip.samples.begin() + last}};
         MediaInput media = model.audio()->prepare(piece);
         media.key = audio::content_hash(piece);
-        // The reference package's turn: a system message (empty without a prompt), the user's audio.
-        const nlohmann::json messages = nlohmann::json::array(
-            {{{"role", "system"}, {"content", request.prompt}},
-             {{"role", "user"}, {"content", nlohmann::json::array({{{"type", "audio"}}})}}});
-        const std::string text = template_->render(messages, nullptr, true, nlohmann::json::object()) + prefix;
         GenerateRequest g;
         g.media.push_back(std::move(media));
-        g.prompt = expand_media(tokenizer_->encode(text, /*parse_special=*/true), g.media);
+        g.prompt = expand_media(turn, g.media);
         g.sampling = request.sampling;
-        g.max_new_tokens = request.max_tokens.value_or(format.max_reply_tokens());
+        g.max_new_tokens = reply_tokens;
         g.stop_token_ids = card_.stop_token_ids;
 
         tok::StreamDecoder decoder(*tokenizer_, /*skip_special=*/true);

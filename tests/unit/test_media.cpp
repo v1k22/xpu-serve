@@ -11,7 +11,7 @@ namespace {
 // Placeholder 9 becomes [5, 9 x n, 6], like Gemma's <boi> <image>... <eoi>.
 class FakeVision final : public xs::VisionEncoder {
 public:
-    const xs::graph::Graph& graph() const override { return graph_; }
+    std::vector<const xs::graph::Graph*> programs() const override { return {&graph_}; }
     xs::MediaInput prepare(const xs::image::Image&) const override { return {}; }
     int32_t placeholder_token() const override { return 9; }
     int32_t soft_token() const override { return 9; }
@@ -29,7 +29,7 @@ private:
 // Placeholder 8 becomes 8 x n, like Qwen3-ASR's <|audio_pad|> between the template's own start and end tokens.
 class FakeAudio final : public xs::AudioEncoder {
 public:
-    const xs::graph::Graph& graph() const override { return graph_; }
+    std::vector<const xs::graph::Graph*> programs() const override { return {&graph_}; }
     xs::MediaInput prepare(const xs::audio::Audio&) const override { return {}; }
     int32_t placeholder_token() const override { return 8; }
     int32_t soft_token() const override { return 8; }

@@ -56,7 +56,7 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
     options.precision = f32 ? xs::DType::F32 : xs::DType::F16;
     options.max_context = 4096;
     const auto backend = xs::make_backend(backend_name);
-    auto vision_session = backend->compile(vision.graph(), model->weights(), options);
+    auto vision_session = backend->compile(vision.programs(), model->weights(), options);
     const int64_t hidden = model->info().hidden_size;
 
     // Preprocessing and the tower, image by image.
@@ -102,7 +102,7 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
         CHECK(same_positions);
 
         xs::TensorMap out;
-        vision_session->run(m.runs.at(0).inputs, out);
+        vision_session->run(m.runs.at(0).program, m.runs.at(0).inputs, out);
         const xs::HostTensor& rows = out.at("embeddings");
         REQUIRE(rows.dim(1) == hidden);
         const std::vector<float> ref = read_f32(fixtures() / im["features"].get<std::string>());

@@ -61,7 +61,7 @@ TEST_CASE("speech recognition matches Hugging Face: mel, encoder rows, prompt, l
     const auto backend = xs::make_backend(env_or("XS_PARITY_BACKEND", "cpu-ref"));
     xs::SessionOptions encoder_options = parity_options();
     encoder_options.max_context = int64_t{1} << 20;
-    auto audio_session = backend->compile(tower->graph(), model->weights(), encoder_options);
+    auto audio_session = backend->compile(tower->programs(), model->weights(), encoder_options);
     auto session = backend->compile(model->graph(), model->weights(), parity_options());
     const int64_t hidden = model->info().hidden_size;
     const std::array<const xs::MediaEncoder*, xs::kModalities> encoders{nullptr, tower};
@@ -104,7 +104,7 @@ TEST_CASE("speech recognition matches Hugging Face: mel, encoder rows, prompt, l
             REQUIRE(m.num_tokens == c["rows"].get<int64_t>());
             for (const xs::EncoderRun& run : m.runs) {
                 xs::TensorMap out;
-                audio_session->run(run.inputs, out);
+                audio_session->run(run.program, run.inputs, out);
                 const xs::HostTensor& e = out.at("embeddings");
                 p.rows.insert(p.rows.end(), e.data<float>(), e.data<float>() + run.rows * hidden);
             }

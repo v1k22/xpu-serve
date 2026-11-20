@@ -80,8 +80,8 @@ def load_model(model_dir, converted_out=None):
 
 
 def synthetic_clips():
-    """(name, sample rate, float32 samples): tones and noise at several lengths, two windows long, below the 0.5 s
-    minimum, and at 44.1 kHz (resampled)."""
+    """(name, sample rate, float32 samples): tones and noise at several lengths, two windows long, nine windows long
+    (more than one encoder run), below the 0.5 s minimum, and at 44.1 kHz (resampled)."""
     rng = np.random.default_rng(7)
 
     def clip(seconds, rate):
@@ -90,7 +90,8 @@ def synthetic_clips():
         return (tone + 0.05 * rng.standard_normal(t.size)).astype(np.float32)
 
     return [("short_16k", 16000, clip(2.37, 16000)), ("tiny_16k", 16000, clip(0.3, 16000)),
-            ("two_windows_16k", 16000, clip(9.5, 16000)), ("cd_44k", 44100, clip(3.1, 44100))]
+            ("two_windows_16k", 16000, clip(9.5, 16000)), ("nine_windows_16k", 16000, clip(70.3, 16000)),
+            ("cd_44k", 44100, clip(3.1, 44100))]
 
 
 def read_wav(path):

@@ -1,5 +1,6 @@
 #include <algorithm>
 
+#include "audio/audio.h"
 #include "models/bert/bert.h"
 #include "models/clef/clef.h"
 #include "models/d1/d1.h"
@@ -29,6 +30,20 @@ bool is_embedding_type(const std::string& type) {
 }
 
 }  // namespace
+
+MediaInput VisionEncoder::warm_up_item() const {
+    image::Image gray;
+    gray.width = gray.height = 768;
+    gray.rgb.assign(static_cast<size_t>(gray.width * gray.height * 3), 128);
+    return prepare(gray);
+}
+
+MediaInput AudioEncoder::warm_up_item() const {
+    audio::Audio silence;
+    silence.sample_rate = 16000;
+    silence.samples.assign(16000, 0.0f);
+    return prepare(silence);
+}
 
 const MediaEncoder* Model::encoder(Modality m) const {
     switch (m) {

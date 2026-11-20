@@ -7,6 +7,8 @@
 #include <cmath>
 #include <limits>
 #include <numbers>
+#include <thread>
+#include <vector>
 
 #include "audio/fft.h"
 #include "util/error.h"
@@ -14,6 +16,9 @@
 namespace xs::audio {
 
 namespace {
+
+constexpr int64_t kFramesPerThread = 500;  // a part's least work: 5 s at a 10 ms hop, about 7 ms on one core
+constexpr int64_t kMaxThreads = 16;
 
 // numpy.linspace(start, stop, num): start + i * step, the last point exactly stop.
 std::vector<double> linspace(double start, double stop, int num) {
@@ -94,10 +99,6 @@ HostTensor log_mel_spectrogram(std::span<const float> samples, const MelParams& 
         window[static_cast<size_t>(j)] = 0.5 - 0.5 * std::cos(2.0 * std::numbers::pi * j / p.n_fft);
     }
     const std::vector<Filter> filters = mel_filter_bank(p);
-    RealFft fft(p.n_fft);
-    std::vector<double> frame(static_cast<size_t>(p.n_fft));
-    std::vector<std::complex<double>> spectrum(static_cast<size_t>(bins));
-    std::vector<double> power(static_cast<size_t>(bins));
 
     // The clip zero-padded to `length`, reflected (without repeating the edge sample) over pad samples at each end.
     const auto sample_at = [&](int64_t i) -> double {
@@ -107,27 +108,46 @@ HostTensor log_mel_spectrogram(std::span<const float> samples, const MelParams& 
 
     HostTensor out(DType::F32, {p.n_mels, frames});
     float* values = out.data<float>();
-    float peak = -std::numeric_limits<float>::infinity();
-    for (int64_t t = 0; t < frames; ++t) {
-        const int64_t start = t * p.hop_length - pad;
-        if (start >= 0 && start + p.n_fft <= given) {
-            for (int j = 0; j < p.n_fft; ++j) frame[static_cast<size_t>(j)] = samples[start + j] * window[j];
-        } else {
-            for (int j = 0; j < p.n_fft; ++j) frame[static_cast<size_t>(j)] = sample_at(start + j) * window[j];
+    // Frames [begin, end) into `values`; returns their largest value.
+    const auto compute = [&](int64_t begin, int64_t end) {
+        RealFft fft(p.n_fft);
+        std::vector<double> frame(static_cast<size_t>(p.n_fft));
+        std::vector<std::complex<double>> spectrum(static_cast<size_t>(bins));
+        std::vector<double> power(static_cast<size_t>(bins));
+        float peak = -std::numeric_limits<float>::infinity();
+        for (int64_t t = begin; t < end; ++t) {
+            const int64_t start = t * p.hop_length - pad;
+            if (start >= 0 && start + p.n_fft <= given) {
+                for (int j = 0; j < p.n_fft; ++j) frame[static_cast<size_t>(j)] = samples[start + j] * window[j];
+            } else {
+                for (int j = 0; j < p.n_fft; ++j) frame[static_cast<size_t>(j)] = sample_at(start + j) * window[j];
+            }
+            fft.forward(frame.data(), spectrum.data());
+            for (int k = 0; k < bins; ++k) power[static_cast<size_t>(k)] = std::norm(spectrum[static_cast<size_t>(k)]);
+            for (size_t m = 0; m < filters.size(); ++m) {
+                const Filter& f = filters[m];
+                double mel = 0.0;
+                for (size_t i = 0; i < f.weights.size(); ++i) mel += f.weights[i] * power[f.first + i];
+                const auto v = static_cast<float>(std::log10(std::max(mel, 1e-10)));
+                values[static_cast<int64_t>(m) * frames + t] = v;
+                peak = std::max(peak, v);
+            }
         }
-        fft.forward(frame.data(), spectrum.data());
-        for (int k = 0; k < bins; ++k) power[static_cast<size_t>(k)] = std::norm(spectrum[static_cast<size_t>(k)]);
-        for (size_t m = 0; m < filters.size(); ++m) {
-            const Filter& f = filters[m];
-            double mel = 0.0;
-            for (size_t i = 0; i < f.weights.size(); ++i) mel += f.weights[i] * power[f.first + i];
-            const auto v = static_cast<float>(std::log10(std::max(mel, 1e-10)));
-            values[static_cast<int64_t>(m) * frames + t] = v;
-            peak = std::max(peak, v);
+        return peak;
+    };
+    // Frames are independent: parts of them on threads of their own, the first on the caller's.
+    const int64_t cores = std::max<int64_t>(1, std::thread::hardware_concurrency());
+    const int64_t parts = std::clamp<int64_t>(frames / kFramesPerThread, 1, std::min(cores, kMaxThreads));
+    std::vector<float> peaks(static_cast<size_t>(parts));
+    {
+        std::vector<std::jthread> threads;
+        for (int64_t i = 1; i < parts; ++i) {
+            threads.emplace_back([&, i] { peaks[i] = compute(frames * i / parts, frames * (i + 1) / parts); });
         }
+        peaks[0] = compute(0, frames / parts);
     }
     // As the extractor does it, in float32.
-    const float floor = peak - 8.0f;
+    const float floor = *std::max_element(peaks.begin(), peaks.end()) - 8.0f;
     for (float& v : out.span<float>()) v = (std::max(v, floor) + 4.0f) / 4.0f;
     return out;
 }

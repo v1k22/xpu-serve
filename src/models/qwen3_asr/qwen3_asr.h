@@ -18,6 +18,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "audio/mel.h"
 #include "models/model.h"
 #include "models/qwen3/qwen3.h"
 
@@ -52,12 +53,17 @@ Config parse_config(const nlohmann::json& config_json);
 int64_t encoder_rows(const AudioConfig& a, int64_t mel_frames);
 
 // Qwen3-ASR's transcription format: "language <Name><asr_text>" heads a reply (and forces a language in the prompt),
-// "language None" is silence; `languages` the names it knows (empty: Qwen3-ASR's 30).
-std::unique_ptr<Transcription> make_transcription(std::vector<std::string> languages);
+// "language None" is silence; `languages` the names it knows (empty: Qwen3-ASR's 30); a second of audio takes
+// `audio_tokens_per_second` prompt tokens.
+std::unique_ptr<Transcription> make_transcription(std::vector<std::string> languages,
+                                                  double audio_tokens_per_second);
 
-// The audio encoder over `weights`, its front end set by the checkpoint's preprocessor_config.json in `dir`.
+// The log-mel settings of the checkpoint's preprocessor_config.json in `dir` (the extractor's defaults without one).
+audio::MelParams mel_spec(const std::filesystem::path& dir);
+
+// The audio encoder over `weights`, its front end set by `mel`.
 std::unique_ptr<AudioEncoder> make_audio_tower(const Config& cfg, const WeightStore& weights,
-                                               const std::filesystem::path& dir);
+                                               const audio::MelParams& mel);
 
 std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
                             const LoadOptions& options);

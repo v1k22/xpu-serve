@@ -185,7 +185,7 @@ std::shared_ptr<const HostTensor> Engine::encode(const MediaInput& media, Genera
     int64_t at = 0;
     for (const EncoderRun& run : media.runs) {
         TensorMap out;
-        encoders_[static_cast<size_t>(media.modality)]->run(run.inputs, out);
+        encoders_[static_cast<size_t>(media.modality)]->run(run.program, run.inputs, out);
         const HostTensor& e = out.at("embeddings");
         XS_CHECK(e.dtype() == DType::F32 && e.rank() == 2 && e.dim(1) == width && e.dim(0) >= run.rows &&
                      at + run.rows <= media.num_tokens,

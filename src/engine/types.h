@@ -27,9 +27,10 @@ enum class Modality : uint8_t { Image, Audio };
 inline constexpr size_t kModalities = 2;
 const char* modality_name(Modality m);  // "image", "audio"
 
-// One run of an encoder graph over (a part of) a media item: its inputs, and how many leading rows of its
-// "embeddings" output are the item's (the rest pads the graph's static shape).
+// One run of an encoder program over (a part of) a media item: its inputs, and how many leading rows of its
+// "embeddings" output are the item's (the rest pads the program's static shape).
 struct EncoderRun {
+    size_t program = 0;  // which of the encoder's programs runs it (MediaEncoder::programs)
     TensorMap inputs;
     int64_t rows = 0;
 };
