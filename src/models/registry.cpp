@@ -18,6 +18,7 @@
 #include "models/pplx_decider/pplx_decider.h"
 #include "models/qwen3_5/qwen3_5.h"
 #include "models/qwen3_asr/qwen3_asr.h"
+#include "models/qwen3_omni/qwen3_omni.h"
 #include "util/error.h"
 
 namespace xs {
@@ -54,8 +55,8 @@ const MediaEncoder* Model::encoder(Modality m) const {
 }
 
 std::vector<std::string> supported_model_types() {
-    return {"gemma4",       "gemma4_text", "lfm3",             "qwen3_5",
-            "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_asr",        "sensenova_loop"};
+    return {"gemma4",           "gemma4_text", "lfm3",           "qwen3_5",       "qwen3_5_text", "qwen3_5_moe",
+            "qwen3_5_moe_text", "qwen3_asr",   "qwen3_omni_moe", "sensenova_loop"};
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOptions& options) {
@@ -70,6 +71,7 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
     }
     if (type == "lfm3") return lfm3::load(dir, config, options);
     if (type == "qwen3_asr") return qwen3_asr::load(dir, config, options);
+    if (type == "qwen3_omni_moe") return qwen3_omni::load(dir, config, options);
     if (is_embedding_type(type)) {
         fail("model_type '", type, "' is served as an embedding model, from a sentence-transformers checkpoint ",
              "(modules.json with a Pooling module); '", dir.string(), "' has none");

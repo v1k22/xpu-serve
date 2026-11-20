@@ -1,7 +1,7 @@
-// End-to-end parity of a speech recognition model (Qwen3-ASR) against Hugging Face reference outputs
+// End-to-end parity of a model that hears (Qwen3-ASR, Qwen3-Omni's thinker) against Hugging Face reference outputs
 // (tests/parity/model/hf_audio_reference.py), for whichever model XS_TEST_MODEL_DIR holds: per clip the log-mel
-// features, the audio encoder's rows, the prompt (chat template, tokenizer, the audio token once per row), the last
-// prompt position's logits and the greedy continuation through the engine. Opt-in: needs XS_TEST_MODEL_DIR and the
+// features, the audio encoder's rows, the prompt (the case's messages through the chat template and tokenizer, the
+// audio token once per row), the last prompt position's logits and the greedy continuation through the engine. Opt-in: needs XS_TEST_MODEL_DIR and the
 // fixtures (XS_PARITY_FIXTURES, ...: as model_parity.cpp).
 
 #include <doctest/doctest.h>
@@ -44,7 +44,7 @@ bool enabled() {
 
 }  // namespace
 
-TEST_CASE("speech recognition matches Hugging Face: mel, encoder rows, prompt, logits, greedy" *
+TEST_CASE("audio input matches Hugging Face: mel, encoder rows, prompt, logits, greedy" *
           doctest::skip(!enabled())) {
     std::ifstream mf(fixtures() / "manifest.json");
     const auto manifest = nlohmann::json::parse(mf);
@@ -76,7 +76,6 @@ TEST_CASE("speech recognition matches Hugging Face: mel, encoder rows, prompt, l
         const std::string name = c["name"];
         CAPTURE(name);
         Prepared p;
-        nlohmann::json content = "Say hello in one word.";
         if (c.contains("wav")) {
             const std::vector<char> raw = xs::test::read_bytes(fixtures() / c["wav"].get<std::string>());
             const xs::audio::Audio clip =
@@ -87,7 +86,9 @@ TEST_CASE("speech recognition matches Hugging Face: mel, encoder rows, prompt, l
             const std::vector<float> pcm = clip.sample_rate == 16000
                                                ? clip.samples
                                                : xs::audio::resample(clip.samples, clip.sample_rate, 16000);
-            const xs::HostTensor mel = xs::audio::log_mel_spectrogram(pcm, xs::audio::MelParams{});
+            xs::audio::MelParams mel_params;
+            mel_params.min_length = manifest.value("mel_min_length", mel_params.min_length);
+            const xs::HostTensor mel = xs::audio::log_mel_spectrogram(pcm, mel_params);
             const std::vector<float> ref_mel = read_f32(fixtures() / c["mel"].get<std::string>());
             REQUIRE(mel.dim(1) == c["mel_frames"].get<int64_t>());
             double mel_diff = 0;
@@ -113,10 +114,8 @@ TEST_CASE("speech recognition matches Hugging Face: mel, encoder rows, prompt, l
                     ", max |diff| ", r.max_abs);
             CHECK(r.cosine >= min_cosine);
             p.media.push_back(std::move(m));
-            content = nlohmann::json::array({{{"type", "audio"}}});
         }
-        const nlohmann::json messages = nlohmann::json::array({{{"role", "user"}, {"content", content}}});
-        const std::string text = chat->render(messages, nullptr, true, nlohmann::json::object());
+        const std::string text = chat->render(c["messages"], nullptr, true, nlohmann::json::object());
         p.prompt = xs::expand_media_placeholders(tokenizer->encode(text), p.media, encoders);
         CHECK(p.prompt == c["input_ids"].get<std::vector<int32_t>>());
 

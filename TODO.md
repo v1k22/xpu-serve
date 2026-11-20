@@ -537,8 +537,12 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
       client commits), turns transcribed whole in order — docs/decisions/0024
 - [ ] Realtime: G.711 formats; a model VAD (Silero) or `semantic_vad`; text while a turn is still going
 - [ ] Timestamps: Qwen3-ForcedAligner (`verbose_json`, `srt`, `vtt`, `timestamp_granularities[]`)
-- [ ] Qwen3-Omni: its thinker (audio, images and video in chat), then speech out (talker, code predictor, Code2Wav:
-      `/v1/audio/speech`, chat `modalities`)
+- [x] Qwen3-Omni's thinker, text and audio in: the audio encoder shared with Qwen3-ASR (`models/qwen3_audio`), the
+      Qwen3 decoder with mixture-of-experts layers, the `qwen3` dialect (JSON tool calls); parity with transformers on
+      tiny checkpoints, a q4 pack on one Arc Pro B60 — docs/decisions/0025
+- [ ] Qwen3-Omni images and video: Qwen3-VL's vision tower and deepstack inputs, and rotary positions apart from
+      cache positions (positions on three axes; proposed in 0025)
+- [ ] Qwen3-Omni speech out: talker, code predictor, Code2Wav (`/v1/audio/speech`, chat `modalities`)
 - [ ] Image generation: BAGEL, Qwen-Image-2.1 (`/v1/images/generations`, `/v1/images/edits`)
 - [ ] Whisper-style encoder-decoders (cross-attention)
 

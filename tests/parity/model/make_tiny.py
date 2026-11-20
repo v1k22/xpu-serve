@@ -231,6 +231,70 @@ def released_asr_layout(out):
         json.dump(released, f, indent=2)
 
 
+def qwen3_omni(vocab_size, source):
+    """Qwen3-Omni's thinker from transformers' own classes: Qwen's audio encoder, a Qwen3-VL vision tower (saved, not
+    read yet), and a Qwen3 mixture-of-experts decoder whose second layer is dense (mlp_only_layers), with interleaved
+    multimodal RoPE; saved in the released checkpoint's layout (weights under thinker.*, one tensor per expert, a
+    thinker_config) by released_omni_layout(). Token ids are the --tokenizer-from checkpoint's."""
+    from transformers import AutoTokenizer, Qwen3OmniMoeThinkerConfig, Qwen3OmniMoeThinkerForConditionalGeneration
+
+    tok = AutoTokenizer.from_pretrained(source)
+    ids = {key: tok.convert_tokens_to_ids(token) for key, token in [
+        ("audio_token_id", "<|audio_pad|>"), ("image_token_id", "<|image_pad|>"), ("video_token_id", "<|video_pad|>"),
+        ("audio_start_token_id", "<|audio_start|>"), ("audio_end_token_id", "<|audio_end|>"),
+        ("vision_start_token_id", "<|vision_start|>"), ("vision_end_token_id", "<|vision_end|>")]}
+    config = Qwen3OmniMoeThinkerConfig(
+        audio_config=dict(num_mel_bins=128, encoder_layers=2, encoder_attention_heads=4, encoder_ffn_dim=128,
+                          d_model=64, n_window=50, n_window_infer=800, downsample_hidden_size=32, output_dim=96,
+                          max_source_positions=1500, activation_function="gelu"),
+        vision_config=dict(depth=2, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=96,
+                           deepstack_visual_indexes=[0, 1], patch_size=16, spatial_merge_size=2, temporal_patch_size=2),
+        text_config=dict(vocab_size=vocab_size, hidden_size=96, intermediate_size=192, moe_intermediate_size=48,
+                         num_experts=4, num_experts_per_tok=2, norm_topk_prob=True, decoder_sparse_step=1,
+                         mlp_only_layers=[1], num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2,
+                         head_dim=32, rms_norm_eps=1e-6, max_position_embeddings=4096, hidden_act="silu",
+                         rope_parameters={"rope_type": "default", "rope_theta": 1000000.0, "mrope_section": [6, 5, 5],
+                                          "interleaved": True, "mrope_interleaved": True},
+                         tie_word_embeddings=False),
+        position_id_per_seconds=13, seconds_per_chunk=2, initializer_range=0.05, **ids)
+    model = Qwen3OmniMoeThinkerForConditionalGeneration(config).float()
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dim() == 1 and "norm" in name:
+                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
+            elif p.dim() == 1:
+                p.normal_(0.0, 0.2)
+    return model
+
+
+# A Qwen3-Omni thinker's names as save_pretrained writes them (or as the module holds them) -> the released
+# checkpoint's.
+OMNI_RELEASED_PREFIXES = [("model.language_model.", "thinker.model."), ("model.audio_tower.", "thinker.audio_tower."),
+                          ("model.visual.", "thinker.visual."), ("audio_tower.", "thinker.audio_tower."),
+                          ("visual.", "thinker.visual."), ("model.", "thinker.model."), ("lm_head.", "thinker.lm_head.")]
+
+
+def released_omni_layout(out):
+    """Rewrites a Qwen3-Omni thinker saved by transformers into the released checkpoint's layout: its config as the
+    thinker_config of a qwen3_omni_moe config, its weights under thinker.* (one tensor per expert, as saved)."""
+    path = os.path.join(out, "model.safetensors")
+    tensors = {}
+    for name, t in load_file(path).items():
+        for old, new in OMNI_RELEASED_PREFIXES:
+            if name.startswith(old):
+                name = new + name[len(old):]
+                break
+        assert name.startswith("thinker."), name
+        tensors[name] = t
+    save_file(tensors, path, metadata={"format": "pt"})
+    with open(os.path.join(out, "config.json")) as f:
+        thinker = json.load(f)
+    released = {"architectures": ["Qwen3OmniMoeForConditionalGeneration"], "model_type": "qwen3_omni_moe",
+                "thinker_config": thinker, "enable_audio_output": False}
+    with open(os.path.join(out, "config.json"), "w") as f:
+        json.dump(released, f, indent=2)
+
+
 def bert(vocab_size, source):
     """BERT as all-MiniLM-L6-v2 and bge-small-en-v1.5 are: post-norm layers, biases everywhere, the exact GELU,
     absolute positions; head_dim 32 as theirs."""
@@ -274,7 +338,8 @@ def perturbed(model):
 
 
 ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3,
-         "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr, "bert": bert, "nomic_bert": nomic_bert}
+         "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr, "qwen3_omni": qwen3_omni, "bert": bert,
+         "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}
 ENCODER_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]
 
@@ -484,7 +549,10 @@ def main():
     weights = os.path.join(args.out, "model.safetensors")
     if qwen:
         save_file({**load_file(weights), **mtp_head(model)}, weights, metadata={"format": "pt"})
-    fuse_experts(weights)
+    if args.arch == "qwen3_omni":
+        released_omni_layout(args.out)  # experts stay one tensor each, as the release has them
+    else:
+        fuse_experts(weights)
     if args.arch == "qwen3_asr":
         released_asr_layout(args.out)
     with open(os.path.join(args.tokenizer_from, "config.json")) as f:

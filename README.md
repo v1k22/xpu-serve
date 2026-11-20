@@ -36,6 +36,8 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3
 - ✅ **Image input** (Gemma 4 E2B / E4B), as base64 `data:` URLs
+- ✅ **Audio in chat**: Qwen3-Omni-30B-A3B's thinker (text and audio in, text and tool calls out), as `input_audio`
+  parts
 - ✅ **Speech recognition** (Qwen3-ASR) behind `/v1/audio/transcriptions` (json, text or streamed), OpenAI's
   realtime API (`/v1/realtime`: audio streamed over a WebSocket, turns found by voice activity) and as `input_audio`
   in chat: WAV, MP3 or FLAC, long audio cut at quiet points
@@ -60,8 +62,8 @@ Not yet:
 
 - Several sequences at once (batching): one request runs at a time.
 - One model across two GPUs.
-- Timestamps and translation of speech; speech output; video input; images for Qwen3.5 (its vision tower is not
-  loaded) and Gemma 4 26B-A4B; images from remote URLs.
+- Timestamps and translation of speech; speech output; video input; images for Qwen3.5 and Qwen3-Omni (their vision
+  towers are not loaded) and Gemma 4 26B-A4B; images from remote URLs.
 - Gemma 4 26B-A4B from a GGUF file (a `gemma4` file with experts).
 - `response_format` (JSON mode), `n` above 1, a rerank API.
 
@@ -87,6 +89,7 @@ Each model's recipe has its commands and numbers.
 | d1-2B | decision | `LiquidAI/d1-2B` | original, q8 / q4 pack | [recipe](model_recipes.md#d1-2b) |
 | Laya | decision | `convaiinnovations/laya` | original, GGUF | [recipe](model_recipes.md#laya) |
 | Julia-1 | decision | `SupersonicLabs/Julia-1` | original, GGUF | [recipe](model_recipes.md#julia-1) |
+| Qwen3-Omni-30B-A3B-Instruct | language, audio in, MoE | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | q4 pack | [recipe](model_recipes.md#qwen3-omni-30b-a3b-instruct) |
 | Qwen3-ASR-1.7B / 0.6B | speech recognition | `Qwen/Qwen3-ASR-1.7B`, `Qwen/Qwen3-ASR-0.6B` | original, q8 / q4 pack | [1.7B](model_recipes.md#qwen3-asr-17b), [0.6B](model_recipes.md#qwen3-asr-06b) |
 | all-MiniLM-L6-v2 | embedding | `sentence-transformers/all-MiniLM-L6-v2` | original | [recipe](model_recipes.md#all-minilm-l6-v2) |
 | bge-small-en-v1.5 | embedding | `BAAI/bge-small-en-v1.5` | original | [recipe](model_recipes.md#bge-small-en-v15) |
@@ -284,7 +287,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 - **Images**: `image_url` parts with a base64 `data:` URL (PNG, JPEG, BMP or GIF); the server does not fetch remote
   URLs.
 - **Audio**: `input_audio` parts (`{"data": <base64>, "format": "wav" | "mp3" | "flac"}`), for a model that takes
-  audio (Qwen3-ASR, whose reply is `language <Name><asr_text><transcript>`).
+  audio (Qwen3-Omni; Qwen3-ASR, whose reply is `language <Name><asr_text><transcript>`).
 - **Sampling**: `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`,
   `repetition_penalty`, `seed`, `stop`, `max_tokens` / `max_completion_tokens`.
 - A response carries `usage` and `timings`. One choice per request (`n` is 1); `response_format` other than text and
