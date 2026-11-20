@@ -51,8 +51,9 @@ std::string rendered_prompt(const std::string& case_name, const std::string& set
 const std::string kThinkingOn = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n";
 const std::string kThinkingOff = "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
-Collected parse_chunks(const std::vector<std::string>& chunks, std::string_view prompt = {}) {
-    auto parser = make_output_parser("qwen3_5", xs::chat::prompt_tail(prompt));
+Collected parse_chunks(const std::vector<std::string>& chunks, std::string_view prompt = {},
+                       const char* dialect = "qwen3_5") {
+    auto parser = make_output_parser(dialect, xs::chat::prompt_tail(prompt));
     Collected out;
     for (const auto& chunk : chunks)
         out.add(parser->feed(chunk));
@@ -64,20 +65,15 @@ Collected parse(const std::string& text, std::string_view prompt = {}) {
     return parse_chunks({text}, prompt);
 }
 
-Collected parse_bytes(const std::string& text, std::string_view prompt = {}) {
-    std::vector<std::string> bytes;
-    for (const char ch : text)
-        bytes.emplace_back(1, ch);
-    return parse_chunks(bytes, prompt);
-}
-
 // Feeding whole, byte by byte, at every single split point and in random chunks all give the same result.
-Collected parse_every_way(const std::string& text, std::string_view prompt = {}) {
-    const Collected whole = parse(text, prompt);
-    CHECK(parse_bytes(text, prompt) == whole);
+Collected parse_every_way(const std::string& text, std::string_view prompt = {}, const char* dialect = "qwen3_5") {
+    const Collected whole = parse_chunks({text}, prompt, dialect);
+    std::vector<std::string> bytes;
+    for (const char ch : text) bytes.emplace_back(1, ch);
+    CHECK(parse_chunks(bytes, prompt, dialect) == whole);
     for (size_t i = 0; i <= text.size(); ++i) {
         CAPTURE(i);
-        CHECK(parse_chunks({text.substr(0, i), text.substr(i)}, prompt) == whole);
+        CHECK(parse_chunks({text.substr(0, i), text.substr(i)}, prompt, dialect) == whole);
     }
     std::mt19937 rng(1234);
     for (int trial = 0; trial < 100; ++trial) {
@@ -88,7 +84,7 @@ Collected parse_every_way(const std::string& text, std::string_view prompt = {})
             pos += len;
         }
         CAPTURE(trial);
-        CHECK(parse_chunks(chunks, prompt) == whole);
+        CHECK(parse_chunks(chunks, prompt, dialect) == whole);
     }
     return whole;
 }
@@ -449,5 +445,69 @@ TEST_SUITE("chat qwen3_5 parser on LFM3 prompts") {
         CHECK(c.calls[1].second.dump() == R"({"query":"rain \"gear\"","Limit":5,"exact":false,)"
                                           R"("filters":{"tags":["a","b"],"since":null,"score":0.75},"URL":"x.org"})");
         CHECK(c.calls[2].second.dump() == R"({"texte":"il pleut","langue":"日本語"})");
+    }
+}
+
+// Qwen 3's dialect (Qwen3-Omni): the same markers, each call's body a JSON object.
+TEST_SUITE("chat qwen3 parser") {
+    Collected json_parse(const std::string& text, std::string_view prompt = {}) {
+        return parse_chunks({text}, prompt, "qwen3");
+    }
+
+    TEST_CASE("reasoning, content and two JSON calls, however the text is cut") {
+        const std::string text =
+            "Weather first.\n</think>\n\nLet me check 🌦.\n"
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris, \\\"FR\\\"\", \"days\": 3,"
+            " \"opts\": {\"deep\": [1, null]}}}\n</tool_call>\n"
+            "<tool_call>\n{\"name\": \"list_files\", \"arguments\": {}}\n</tool_call>";
+        const Collected c = parse_every_way(text, kThinkingOn, "qwen3");
+        CHECK(c.reasoning == "Weather first.");
+        CHECK(c.content == "Let me check 🌦.");
+        REQUIRE(c.calls.size() == 2);
+        CHECK(c.calls[0].first == "get_weather");
+        CHECK(c.calls[0].second.dump() == R"({"city":"Paris, \"FR\"","days":3,"opts":{"deep":[1,null]}})");
+        CHECK(c.calls[1].first == "list_files");
+        CHECK(c.calls[1].second == ordered_json::object());
+    }
+
+    TEST_CASE("what Qwen3-Omni's template renders for a call parses back to it") {
+        // '<tool_call>\n{"name": "' + name + '", "arguments": ' + arguments | tojson + '}\n</tool_call>'
+        const std::string call =
+            "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"b\": 2, \"a\": \"x\"}}\n</tool_call>";
+        const Collected c = json_parse(call, kThinkingOff);
+        REQUIRE(c.calls.size() == 1);
+        CHECK(c.calls[0].second.dump() == R"({"b":2,"a":"x"})");  // the model's key order
+        CHECK(c.content.empty());
+    }
+
+    TEST_CASE("arguments as a string holding JSON, or none") {
+        Collected c = json_parse(R"(<tool_call>{"name": "f", "arguments": "{\"x\": 1}"}</tool_call>)");
+        REQUIRE(c.calls.size() == 1);
+        CHECK(c.calls[0].second == ordered_json{{"x", 1}});
+        c = json_parse(R"(<tool_call>{"name": "g"}</tool_call>)");
+        REQUIRE(c.calls.size() == 1);
+        CHECK(c.calls[0].second == ordered_json::object());
+    }
+
+    TEST_CASE("a body that is not a call is content with its markers; a call cut short too") {
+        for (const std::string body : {"{\"name\": 3}", "not json", "{\"arguments\": {}}", "[1, 2]",
+                                       "{\"name\": \"f\", \"arguments\": [1]}"}) {
+            CAPTURE(body);
+            const Collected c = json_parse("<tool_call>" + body + "</tool_call>");
+            CHECK(c.calls.empty());
+            CHECK(c.content == "<tool_call>" + body + "</tool_call>");
+        }
+        Collected cut = json_parse("<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\": 1");
+        CHECK(cut.calls.empty());
+        CHECK(cut.content == "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\": 1");
+        cut = json_parse("<tool_call>\n{\"name\": \"f\", \"arguments\": {\"x\": 1}}\n");  // only the closer missing
+        REQUIRE(cut.calls.size() == 1);
+        CHECK(cut.calls[0].second == ordered_json{{"x", 1}});
+    }
+
+    TEST_CASE("a <function=...> block is text in this dialect") {
+        const Collected c = json_parse("Use <function=f></function> like this.");
+        CHECK(c.calls.empty());
+        CHECK(c.content == "Use <function=f></function> like this.");
     }
 }

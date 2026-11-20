@@ -1,6 +1,8 @@
-// Qwen 3.5 output dialect. The chat template renders an assistant turn as
+// The Qwen 3 and Qwen 3.5 output dialects. The chat template renders an assistant turn as
 //   <think>\n REASONING \n</think>\n\n CONTENT [\n\n]
 //   <tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>[\n<tool_call>...]
+// (Qwen 3.5), or each call as <tool_call>\n{"name": NAME, "arguments": {...}}\n</tool_call> (Qwen 3, Qwen3-Omni: the
+// "hermes" format of vLLM's parsers)
 // and the generation prompt already holds the "<think>\n" opener (thinking on) or a whole empty block "<think>\n\n
 // </think>\n\n" (thinking off). This parser inverts that, one feed() at a time. End-of-turn tokens (<|im_end|>) are
 // stripped by the engine before text reaches here.
@@ -49,6 +51,13 @@ struct Marker {
 constexpr Marker kContentMarkers[] = {
     {kThinkOpen, Action::open_reasoning}, {kCallOpen, Action::open_call}, {kFunctionOpen, Action::open_bare_function},
     {kThinkClose, Action::drop},          {kCallClose, Action::drop},
+};
+// JSON calls have no bare form: a <function= in content is text.
+constexpr Marker kJsonContentMarkers[] = {
+    {kThinkOpen, Action::open_reasoning},
+    {kCallOpen, Action::open_call},
+    {kThinkClose, Action::drop},
+    {kCallClose, Action::drop},
 };
 constexpr Marker kReasoningMarkers[] = {
     {kThinkClose, Action::close_reasoning},
@@ -154,12 +163,31 @@ std::string random_hex(size_t digits) {
     return out;
 }
 
+// <tool_call>'s body as JSON: {"name": NAME, "arguments": OBJECT} (arguments as an object, or a string holding one;
+// none: {}), as vLLM's hermes parser reads it. Returns the name and the arguments as JSON text.
+std::optional<std::pair<std::string, std::string>> parse_json_call(std::string_view body) {
+    const ordered_json call = ordered_json::parse(trim(body), nullptr, /*allow_exceptions=*/false);
+    if (call.is_discarded() || !call.is_object() || !call.contains("name") || !call.at("name").is_string()) {
+        return std::nullopt;
+    }
+    ordered_json arguments = call.contains("arguments") ? call.at("arguments") : ordered_json::object();
+    if (arguments.is_string()) {
+        arguments = ordered_json::parse(arguments.get<std::string>(), nullptr, /*allow_exceptions=*/false);
+    }
+    if (!arguments.is_object()) return std::nullopt;
+    return std::pair{call.at("name").get<std::string>(),
+                     arguments.dump(-1, ' ', false, ordered_json::error_handler_t::replace)};
+}
+
+// How a <tool_call> body is written.
+enum class CallFormat { xml, json };
+
 // Which leading characters of the next text to drop.
 enum class Lead { keep, newlines, whitespace };
 
-class Qwen35Parser final : public OutputParser {
+class QwenParser final : public OutputParser {
 public:
-    explicit Qwen35Parser(std::string_view prompt_tail) : id_prefix_("call_" + random_hex(8)) {
+    QwenParser(std::string_view prompt_tail, CallFormat format) : format_(format), id_prefix_("call_" + random_hex(8)) {
         start_after(prompt_tail);
     }
 
@@ -175,7 +203,9 @@ public:
         drain(delta, /*at_end=*/true);
         // A call cut short is kept only when its function is complete and just </tool_call> is missing: a call whose
         // last argument may be truncated must not run. Otherwise its text is content.
-        if (mode_ == Mode::tool_call && call_body_.find(kFunctionClose) != std::string::npos) {
+        const bool whole = format_ == CallFormat::xml ? call_body_.find(kFunctionClose) != std::string::npos
+                                                      : parse_json_call(call_body_).has_value();
+        if (mode_ == Mode::tool_call && whole) {
             complete_call(delta);
         } else if (mode_ == Mode::tool_call || mode_ == Mode::bare_function) {
             delta.content += call_opener() + call_body_;
@@ -209,7 +239,9 @@ private:
 
     void drain(ParsedDelta& delta, bool at_end) {
         for (;;) {
-            const MarkerHit hit = find_marker(pending_, markers_for(mode_), at_end);
+            std::span<const Marker> markers = markers_for(mode_);
+            if (format_ == CallFormat::json && mode_ == Mode::content) markers = kJsonContentMarkers;
+            const MarkerHit hit = find_marker(pending_, markers, at_end);
             const size_t text_end = hit.pos == std::string::npos ? pending_.size() : hit.pos;
             emit(delta, std::string_view(pending_).substr(0, text_end));
             if (hit.marker == nullptr) {
@@ -280,7 +312,7 @@ private:
     // A body that is not one well-formed function is surfaced as content, markers included, rather than lost.
     void complete_call(ParsedDelta& delta) {
         const std::string body = mode_ == Mode::bare_function ? call_opener() + call_body_ : call_body_;
-        if (auto function = parse_function(body)) {
+        if (auto function = format_ == CallFormat::xml ? parse_function(body) : parse_json_call(body)) {
             delta.tool_calls.push_back(ToolCall{id_prefix_ + std::to_string(calls_made_++), std::move(function->first),
                                                 std::move(function->second)});
             lead_ = Lead::whitespace;
@@ -292,6 +324,7 @@ private:
         call_body_.clear();
     }
 
+    const CallFormat format_;
     const std::string id_prefix_;  // random per response; the call counter makes ids unique within it
     size_t calls_made_ = 0;
     Mode mode_ = Mode::content;
@@ -303,8 +336,12 @@ private:
 
 }  // namespace
 
+std::unique_ptr<OutputParser> make_qwen3_parser(std::string_view prompt_tail) {
+    return std::make_unique<QwenParser>(prompt_tail, CallFormat::json);
+}
+
 std::unique_ptr<OutputParser> make_qwen3_5_parser(std::string_view prompt_tail) {
-    return std::make_unique<Qwen35Parser>(prompt_tail);
+    return std::make_unique<QwenParser>(prompt_tail, CallFormat::xml);
 }
 
 }  // namespace xs::chat
