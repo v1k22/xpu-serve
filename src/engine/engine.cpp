@@ -4,6 +4,7 @@
 #include <deque>
 #include <numeric>
 
+#include "engine/media.h"
 #include "engine/sampler.h"
 #include "util/error.h"
 #include "util/log.h"
@@ -280,39 +281,9 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
             keys[i] = media_key(request.media[item].key, row++);
         }
 
-        // Rotary positions: text one past what came before; a media item's tokens at their offsets from the item's
-        // first position, the token after it one past its largest (transformers' get_rope_index).
-        std::vector<RotaryPosition> positions(n);
-        int64_t next = 0, base = 0;
-        for (size_t i = 0; i < n; ++i) {
-            const int32_t m = media_item[i];
-            if (m < 0) {
-                const auto p = static_cast<int32_t>(next++);
-                positions[i] = {p, p, p};
-                continue;
-            }
-            const MediaInput& media = request.media[static_cast<size_t>(m)];
-            const int64_t r = media_row[i];
-            XS_CHECK(media.positions.empty() || static_cast<int64_t>(media.positions.size()) == media.num_tokens,
-                     "a ", modality_name(media.modality), " item with ", media.positions.size(), " positions for ",
-                     media.num_tokens, " tokens");
-            if (r == 0) base = next;
-            const auto r32 = static_cast<int32_t>(r);
-            const RotaryPosition offset =
-                media.positions.empty() ? RotaryPosition{r32, r32, r32} : media.positions[static_cast<size_t>(r)];
-            for (size_t a = 0; a < 3; ++a) positions[i][a] = static_cast<int32_t>(base + offset[a]);
-            if (r + 1 == media.num_tokens) {
-                int64_t largest = media.num_tokens - 1;
-                if (!media.positions.empty()) {
-                    largest = 0;
-                    for (const RotaryPosition& p : media.positions) {
-                        largest = std::max<int64_t>({largest, p[0], p[1], p[2]});
-                    }
-                }
-                next = base + largest + 1;
-            }
-        }
-        rotary_delta_ = next - static_cast<int64_t>(n);
+        const PromptPositions rotary = rotary_positions(media_item, media_row, request.media);
+        const std::vector<RotaryPosition>& positions = rotary.positions;
+        rotary_delta_ = rotary.next - static_cast<int64_t>(n);
 
         Sampler sampler(request.sampling);
         argmax_only_ = has_argmax_ && !sampler.needs_logits();

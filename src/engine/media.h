@@ -16,4 +16,15 @@ namespace xs {
 std::vector<int32_t> expand_media_placeholders(std::span<const int32_t> prompt, std::span<const MediaInput> media,
                                                std::span<const MediaEncoder* const> encoders);
 
+// The rotary positions of a prompt's tokens (transformers' get_rope_index): text one past what came before, a media
+// item's tokens at their offsets from the item's first position (MediaInput::positions; none: one a token), the token
+// after an item one past its largest. `item[i]` is token i's media item (-1: text) and `row[i]` its row in it. `next`
+// is the position after the prompt, where generated tokens go on one a token.
+struct PromptPositions {
+    std::vector<RotaryPosition> positions;
+    int64_t next = 0;
+};
+PromptPositions rotary_positions(std::span<const int32_t> item, std::span<const int64_t> row,
+                                 std::span<const MediaInput> media);
+
 }  // namespace xs

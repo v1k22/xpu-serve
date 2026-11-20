@@ -37,7 +37,9 @@ Config parse_config(const nlohmann::json& t, const std::string& where) {
         c.norm_topk_prob = cfg::get_bool_or(t, "norm_topk_prob", true, where);
         c.decoder_sparse_step = cfg::get_int_or(t, "decoder_sparse_step", 1, where);
         if (t.contains("mlp_only_layers")) {
-            for (const int32_t layer : cfg::get_int_list(t, "mlp_only_layers", where)) c.mlp_only_layers.push_back(layer);
+            for (const int32_t layer : cfg::get_int_list(t, "mlp_only_layers", where)) {
+                c.mlp_only_layers.push_back(layer);
+            }
         }
         XS_CHECK(c.experts_per_token >= 1 && c.experts_per_token <= c.num_experts && c.decoder_sparse_step >= 1, where,
                  ": num_experts_per_tok ", c.experts_per_token, " of ", c.num_experts, " experts, decoder_sparse_step ",
@@ -52,6 +54,24 @@ Config parse_config(const nlohmann::json& t, const std::string& where) {
                                                                     : cfg::get_float(t, "rope_theta", where);
     for (const nlohmann::json* r : {rope, scaling}) {
         if (r == nullptr) continue;
+        if (r->contains("mrope_section") && c.mrope_axes.empty()) {
+            const std::vector<int32_t> section = cfg::get_int_list(*r, "mrope_section", where);
+            const bool plain_flag = cfg::get_bool_or(*r, "interleaved", false, where);
+            const bool interleaved = cfg::get_bool_or(*r, "mrope_interleaved", plain_flag, where);
+            const int64_t pairs = c.head_dim / 2;
+            XS_CHECK(section.size() == 3 && section[0] + section[1] + section[2] == pairs, where,
+                     ": mrope_section must be three counts that add up to the ", pairs, " frequencies of a head");
+            // Interleaved (Qwen3-Omni, Qwen3-VL): frequency i reads height when i % 3 == 1 and i < 3 h, width when
+            // i % 3 == 2 and i < 3 w, else time. Without the flag, sections in turn (Qwen2-VL), which is refused
+            // when positions on three axes are fed (Decoder).
+            if (interleaved) {
+                c.mrope_axes.assign(static_cast<size_t>(pairs), 0);
+                for (int64_t i = 0; i < pairs; ++i) {
+                    if (i % 3 == 1 && i < 3 * section[1]) c.mrope_axes[static_cast<size_t>(i)] = 1;
+                    if (i % 3 == 2 && i < 3 * section[2]) c.mrope_axes[static_cast<size_t>(i)] = 2;
+                }
+            }
+        }
         for (const char* key : {"rope_type", "type"}) {
             if (!r->contains(key)) continue;
             const std::string type = cfg::get_string(*r, key, where);

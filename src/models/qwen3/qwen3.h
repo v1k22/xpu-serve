@@ -6,12 +6,14 @@
 // of models that read it (Qwen3-ASR, Qwen3-Omni's thinker); it is not served as a language model of its own yet.
 
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "engine/types.h"
 #include "graph/graph.h"
 #include "io/safetensors.h"
 #include "tensor/tensor.h"
@@ -39,6 +41,9 @@ struct Config {
     std::vector<int64_t> mlp_only_layers;
     // Layer i's MLP is the mixture of experts (Qwen3MoeDecoderLayer's rule).
     bool sparse(int64_t layer) const;
+    // Multimodal RoPE (rope_scaling's mrope_section, interleaved): the position axis (0 time, 1 height, 2 width) each
+    // of the head's frequencies reads, when the model feeds positions on three axes. Empty: none in the config.
+    std::vector<int32_t> mrope_axes;
 };
 
 // A Qwen3 text config (`where` names it in errors). Multimodal RoPE (rope_scaling with mrope_section) is plain RoPE
@@ -50,22 +55,28 @@ class Decoder {
 public:
     // `prefix` holds embed_tokens, layers.<i> and norm (e.g. "model." or a multimodal checkpoint's
     // "thinker.model."); `lm_head` names the output layer (empty: the embedding table, tied).
-    Decoder(Config cfg, const WeightStore& weights, std::string prefix, std::string lm_head);
+    // `three_axes`: positions on three axes (time, height, width) through the config's multimodal RoPE, as a model
+    // with images feeds them; else one a token.
+    Decoder(Config cfg, const WeightStore& weights, std::string prefix, std::string lm_head, bool three_axes = false);
 
     const Config& config() const { return cfg_; }
 
     struct Inputs {
         graph::Value ids;  // "token_ids" [kT] i32
-        graph::Value pos;  // "positions" [kT] i32
+        graph::Value pos;  // "positions" [kT] i32, or [kT, 3] with three axes
     };
     Inputs inputs(graph::Graph& g) const;
-    // Fills those inputs for `tokens` at positions start_pos, start_pos + 1, ...
+    // Fills those inputs for `tokens` at positions start_pos, start_pos + 1, ... (one a token).
     void token_inputs(std::span<const int32_t> tokens, int64_t start_pos, TensorMap& inputs) const;
+    // The same at each token's position on three axes.
+    void token_inputs(std::span<const int32_t> tokens, std::span<const RotaryPosition> positions,
+                      TensorMap& inputs) const;
 
     graph::Value embed(graph::Graph& g, graph::Value ids) const;
     // The embedded step through every layer, each causal through a KV slot of its own ("layers.<i>"); before the final
-    // norm.
-    graph::Value layers(graph::Graph& g, graph::Value h, graph::Value pos) const;
+    // norm. `after_layer` (optional) takes each layer's output and gives what the next layer reads.
+    using LayerHook = std::function<graph::Value(int64_t layer, graph::Value h)>;
+    graph::Value layers(graph::Graph& g, graph::Value h, graph::Value pos, const LayerHook& after_layer = {}) const;
     graph::Value final_norm(graph::Graph& g, graph::Value h) const;
     graph::Value lm_head(graph::Graph& g) const;
 
@@ -82,6 +93,7 @@ private:
     const WeightStore& weights_;
     std::string prefix_;
     std::string lm_head_;
+    bool three_axes_;
 };
 
 }  // namespace xs::qwen3
