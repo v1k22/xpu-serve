@@ -38,6 +38,7 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     int spec_k = options.engine.spec_k;
     if (own_count) spec_k = options.spec == "dflash" || options.spec == "dspine" ? kBlockDrafts : kChainDrafts;
     auto model = load_model(model_dir, LoadOptions{.vision = options.vision,
+                                                   .image_max_pixels = options.image_max_pixels,
                                                    .speculation = speculate,
                                                    .drafter = options.drafter,
                                                    .draft_shortlist = options.draft_shortlist,

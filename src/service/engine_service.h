@@ -27,6 +27,7 @@ struct ServiceOptions {
     EngineOptions engine;  // spec_k: 0 is off, kDraftersCount the drafter's own
     std::string model_id;  // empty = the model directory name
     bool vision = true;    // load the vision encoder when the checkpoint has one
+    int64_t image_max_pixels = 0;  // LoadOptions::image_max_pixels
     std::string spec;               // the kind of drafter asked for: "mtp", "dflash", "dspine" (empty: any)
     std::filesystem::path drafter;  // a drafter checkpoint for speculative decoding (an assistant, a block drafter)
     int64_t draft_shortlist = 64;   // LoadOptions::draft_shortlist

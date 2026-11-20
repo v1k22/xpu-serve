@@ -76,6 +76,9 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
     const auto config = cfg::read_json(dir / "config.json");
     const std::string type = cfg::get_string(config, "model_type", "config.json");
     cfg::check_quantization(config);
+    if (options.image_max_pixels > 0 && type != "qwen3_omni_moe") {
+        fail("--image-max-pixels: ", type, "'s images are not sized by a pixel budget (Qwen3-VL's processor is)");
+    }
     if (type == "gemma4" || type == "gemma4_text") return gemma4::load(dir, config, options);
     if (type == "qwen3_5" || type == "qwen3_5_text" || type == "qwen3_5_moe" || type == "qwen3_5_moe_text" ||
         type == "sensenova_loop") {

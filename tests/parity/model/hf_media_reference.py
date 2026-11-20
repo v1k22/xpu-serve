@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Reference outputs for models that hear from Hugging Face transformers (test-only): Qwen3-ASR, and Qwen3-Omni's
-thinker (text and audio in).
+"""Reference outputs for models that read audio and images from Hugging Face transformers (test-only): Qwen3-ASR, and
+Qwen3-Omni's thinker (text, audio and images in).
 
-    python -I tests/parity/model/hf_audio_reference.py --model-dir <checkpoint> --out <dir> [--audio a.wav ...]
-        [--gen 32] [--converted-out <dir>]
+    python -I tests/parity/model/hf_media_reference.py --model-dir <checkpoint> --out <dir> [--audio a.wav ...]
+        [--image a.png ...] [--gen 32] [--converted-out <dir>]
 
 Runs transformers' Qwen3ASRForConditionalGeneration or Qwen3OmniMoeThinkerForConditionalGeneration in float32 on
 the CPU. A checkpoint in the released layout (weights under thinker.*, a thinker_config; Qwen3-Omni's experts one
@@ -19,6 +19,10 @@ clip as its own turn; Qwen3-Omni is asked about it. The clips are the --audio fi
   * the encoder's rows after the projector (float32 [rows, hidden], <name>.audio_rows.bin),
   * the messages and the prompt token ids (the chat template's turn, <|audio_pad|> once per row),
   * the full-vocabulary logits of the last prompt position (<name>.last_logits.bin) and the greedy continuation.
+For Qwen3-Omni, image cases too (the --image files, or synthetic ones of sizes the processor resizes in each of its
+ways): the image as PNG, the processor's patches (float32 [patches, values], <name>.pixels.bin, in its merge-block
+order), the vision tower's rows (float32 [tokens, (1 + deepstack) * hidden]: the merged row, then each deepstack
+row, <name>.image_rows.bin), the prompt with <|image_pad|> once per token, the last logits and the greedy text.
 A text-only case checks the decoder alone.
 """
 
@@ -153,6 +157,22 @@ def synthetic_clips():
             ("cd_44k", 44100, clip(3.1, 44100))]
 
 
+def synthetic_images():
+    """(name, PIL image): colour gradients with noise; one whose sides are a multiple of 32, one the processor resizes,
+    one whose height rounds half to even (48 / 32), one below min_pixels (scaled up)."""
+    from PIL import Image
+
+    rng = np.random.default_rng(11)
+
+    def image(w, h):
+        y, x = np.mgrid[0:h, 0:w]
+        a = np.stack([x * 255 // max(w - 1, 1), y * 255 // max(h - 1, 1), (x + y) * 127 // max(w + h - 2, 1)], -1)
+        return Image.fromarray((a + rng.integers(0, 40, a.shape)).clip(0, 255).astype(np.uint8))
+
+    return [("grid_64x96", image(96, 64)), ("odd_75x100", image(100, 75)), ("half_48x200", image(200, 48)),
+            ("small_30x30", image(30, 30))]
+
+
 def read_wav(path):
     import soundfile
 
@@ -175,6 +195,7 @@ def main():
     ap.add_argument("--model-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--audio", nargs="*", default=[])
+    ap.add_argument("--image", nargs="*", default=[])
     ap.add_argument("--gen", type=int, default=32)
     ap.add_argument("--converted-out")
     ap.add_argument("--threads", type=int, default=min(32, os.cpu_count() or 1))
@@ -216,10 +237,37 @@ def main():
 
     manifest = {"model_dir": os.path.abspath(args.model_dir), "dtype": "float32", "mel_min_length": min_length,
                 "cases": []}
-    for name, rate, samples in [("text_only", 0, None)] + clips:
+    images = []
+    if omni:
+        from PIL import Image
+        from transformers import AutoImageProcessor
+
+        processor = AutoImageProcessor.from_pretrained(args.model_dir)
+        images = [(os.path.splitext(os.path.basename(p))[0], Image.open(p).convert("RGB")) for p in args.image] \
+            or synthetic_images()
+        image_pad = tok.convert_tokens_to_ids("<|image_pad|>")
+    for name, rate, samples in [("text_only", 0, None)] + clips + [(n, -1, im) for n, im in images]:
         case = {"name": name}
         with torch.no_grad():
-            if samples is None:
+            if rate == -1:  # an image
+                samples.save(os.path.join(args.out, f"{name}.png"))
+                feats = processor(images=samples, return_tensors="pt")
+                pixels, grid = feats["pixel_values"], feats["image_grid_thw"]
+                pixels.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.pixels.bin"))
+                vision = model.model.visual(pixels, grid_thw=grid)
+                rows = torch.cat([vision.pooler_output] + list(vision.deepstack_features), dim=1)
+                rows.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.image_rows.bin"))
+                messages = [{"role": "user", "content": [{"type": "image"},
+                                                         {"type": "text", "text": "Describe the image in one line."}]}]
+                ids = tok(template(messages), add_special_tokens=False)["input_ids"]
+                at = ids.index(image_pad)
+                ids = ids[:at] + [image_pad] * rows.shape[0] + ids[at + 1:]
+                inputs = {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
+                          "pixel_values": pixels, "image_grid_thw": grid}
+                case.update({"image": f"{name}.png", "pixels": f"{name}.pixels.bin",
+                             "image_rows": f"{name}.image_rows.bin", "rows": int(rows.shape[0]),
+                             "grid": grid[0].tolist()})
+            elif samples is None:
                 messages = [{"role": "user", "content": "Say hello in one word."}]
                 ids = tok(template(messages), add_special_tokens=False)["input_ids"]
                 inputs = {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids), dtype=torch.long)}

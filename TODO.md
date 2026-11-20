@@ -540,8 +540,11 @@ Every model below is enabled the same way (CLAUDE.md 8.1); a model is done when 
 - [x] Qwen3-Omni's thinker, text and audio in: the audio encoder shared with Qwen3-ASR (`models/qwen3_audio`), the
       Qwen3 decoder with mixture-of-experts layers, the `qwen3` dialect (JSON tool calls); parity with transformers on
       tiny checkpoints, a q4 pack on one Arc Pro B60 — docs/decisions/0025
-- [ ] Qwen3-Omni images and video: Qwen3-VL's vision tower and deepstack inputs, and rotary positions apart from
-      cache positions (positions on three axes; proposed in 0025)
+- [x] Qwen3-Omni images: Qwen3-VL's vision tower (`models/qwen3_vision`) and its deepstack rows, rotary positions
+      apart from cache positions (each token's position on three axes, the Rope op's axis per frequency),
+      `--image-max-pixels`; parity with transformers on tiny checkpoints, the q4 pack on one Arc Pro B60 — 0025
+- [ ] Qwen3-Omni video: frames from a container (MP4 / H.264 needs a decoder this repository does not have yet: to
+      be decided), time-scaled t positions, audio interleaved with frames by time
 - [ ] Qwen3-Omni speech out: talker, code predictor, Code2Wav (`/v1/audio/speech`, chat `modalities`)
 - [ ] Image generation: BAGEL, Qwen-Image-2.1 (`/v1/images/generations`, `/v1/images/edits`)
 - [ ] Whisper-style encoder-decoders (cross-attention)

@@ -188,6 +188,9 @@ public:
 
 struct LoadOptions {
     bool vision = true;        // load the vision encoder when the checkpoint has one
+    // The most pixels an image is resized to, below the checkpoint's own bound (0: the checkpoint's), for an image
+    // processor that sizes by pixel count (Qwen3-VL's); a model whose processor does not is refused it by name.
+    int64_t image_max_pixels = 0;
     bool speculation = false;  // build the speculative decoding programs when the model has a drafter
     // A drafter checkpoint beside the model, for speculation: a Gemma 4 assistant, a block drafter (DFlash, DSpine).
     std::filesystem::path drafter;

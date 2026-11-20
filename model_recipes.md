@@ -1438,18 +1438,18 @@ decode 167 tok/s. At f16 it is about as fast as the 1.7B's q4, with a lower word
 
 ### Qwen3-Omni-30B-A3B-Instruct
 
-`Qwen/Qwen3-Omni-30B-A3B-Instruct` (`qwen3_omni_moe`): its thinker, Qwen's audio encoder and a Qwen3
-mixture-of-experts decoder (48 layers, 128 experts, 8 a token, 3B active). Text and audio in (`input_audio` parts:
-WAV, MP3 or FLAC), text out, tool calls (JSON, the `qwen3` dialect). Images, video and speech out are not supported
-yet: image parts are refused, and the talker the checkpoint holds is not read ([decision
+`Qwen/Qwen3-Omni-30B-A3B-Instruct` (`qwen3_omni_moe`): its thinker, Qwen's audio encoder, Qwen3-VL's vision tower
+and a Qwen3 mixture-of-experts decoder (48 layers, 128 experts, 8 a token, 3B active). Text, audio (`input_audio`
+parts: WAV, MP3 or FLAC) and images (`image_url` data URLs) in, text out, tool calls (JSON, the `qwen3` dialect).
+Video and speech out are not supported yet: the talker the checkpoint holds is not read ([decision
 0025](docs/decisions/0025-qwen3-omni.md)). The other releases of the thinker (`-Thinking`, `-Captioner`) are the same
 model type.
 
-The checkpoint is 70.5 GB in bf16: on a 24 GB card it runs as a q4 pack.
+The checkpoint is 70.5 GB in bf16: on a 24 GB card it runs as a q4 pack, its encoders at q8 (`--scope all`):
 
 ```bash
-xpu-serve convert -hf Qwen/Qwen3-Omni-30B-A3B-Instruct --out ~/models/Qwen3-Omni-30B-A3B-q4 --quant q4
-xpu-serve serve ~/models/Qwen3-Omni-30B-A3B-q4 --device GPU --ctx 16384
+xpu-serve convert -hf Qwen/Qwen3-Omni-30B-A3B-Instruct --out ~/models/Qwen3-Omni-30B-A3B-q4 --quant q4 --scope all
+xpu-serve serve ~/models/Qwen3-Omni-30B-A3B-q4 --device GPU --image-max-pixels 1048576
 ```
 
 ```bash
@@ -1458,11 +1458,23 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
     {"type": "input_audio", "input_audio": {"data": "'"$(base64 -w0 speech.flac)"'", "format": "flac"}},
     {"type": "text", "text": "Describe the speaker and summarize what they say."}]}]
 }'
+curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$(base64 -w0 photo.jpg)"'"}},
+    {"type": "text", "text": "What is in this picture?"}]}]
+}'
 ```
 
-- The pack is 27 GB on disk, of which the device reads 19.5 GB: the thinker (18.3 GB) and the audio encoder (1.2 GB,
-  f16). The rest is the talker, Code2Wav and the vision tower, kept for when they are read.
-- `--ctx 16384` is about what one Arc Pro B60 holds beside the weights (23.6 GB at a 16,000-token prompt).
+- The device holds 19.6 GB of weights: the thinker (18.3 GB), the vision tower (0.67 GB) and the audio encoder
+  (0.66 GB), the encoders at q8. The pack (26 GB) also keeps the talker and Code2Wav, for when they are read.
+- `--image-max-pixels 1048576` resizes an image to at most a megapixel, about 1,000 tokens: the checkpoint's own
+  bound is 12.8 megapixels (12,544 tokens), which a 24 GB card does not hold beside the weights and whose vision tower
+  takes seconds (its attention spans every patch of the image). At the default `--ctx 8192` and that bound, a
+  2048 x 2048 photo peaked at 23.3 GB. Without the encoders' q8 (the default `--scope`, encoders in f16) a megapixel
+  image peaked at 24.1 GB and the same photo at its full size ran the card out of memory. The f16 tower is the more
+  faithful one: its rows against transformers' at cosine 0.99999, the q8 tower's at 0.991 to 0.997 (the answers
+  below were right with both).
+- Text and audio alone: `--no-vision` frees the vision tower, and up to `--ctx 16384` fits.
 - Sampling defaults: greedy (its generation_config.json sets only the talker's).
 
 Measured on an Arc Pro B60 (q4):
@@ -1472,6 +1484,13 @@ Measured on an Arc Pro B60 (q4):
 | Prefill | 1,028 tok/s | 1,546 tok/s | 1,473 tok/s | 1,282 tok/s | 1,003 tok/s |
 | Decode | 64 tok/s | 65 tok/s | 58 tok/s | 50 tok/s | 41 tok/s |
 
+| Image | Tokens | Vision tower | The whole answer |
+|---|---|---|---|
+| a 640 x 360 invoice: "Read the invoice number and the total." | 239 | 70 ms | 0.95 s, both read right |
+| the Hugging Face docs' cat photo | 648 | 0.30 s | 1.4 s: "a Pallas's cat, also known as a manul" |
+| the same at 2048 x 2048, resized to a megapixel | 1,043 | 0.73 s | 3.0 s |
+| the same at 2048 x 2048, not resized (no `--image-max-pixels`) | 4,114 | 9.1 s | 13.5 s |
+
 A short chat decodes at about 70 tok/s. Asked about LibriSpeech's first clip ("What is said in this audio?") it
 quoted it word for word in 1.6 s; asked to describe a 12 s clip's speaker and summarize it, it wrote 85 tokens in
 2.0 s. A prompt of a few hundred tokens takes 0.5 to 0.75 s to prefill, about what 512 tokens do: a mixture of
@@ -1480,9 +1499,10 @@ experts reads nearly every expert for any step of more than a few tokens.
 Checked against transformers' thinker on the original weights, asked about two LibriSpeech clips and a text prompt:
 on cpu-ref in f32, the log-mel features, the encoder's rows (cosine 1, within 8.6e-7) and every greedy token equal;
 last logits within 1.5e-5 but for the 12 s clip's, cosine 0.99939, the amount transformers' own float32 differs from
-its float64 on that prompt (a router's top-8 decided within float32 rounding). The q4 pack on the GPU: the encoder's
-rows cosine 1, last logits cosine 0.984 to 0.986 with the same top token; its answers are worded otherwise from the
-first tokens on (both correct).
+its float64 on that prompt (a router's top-8 decided within float32 rounding). Asked to describe the cat photo and the
+invoice: the processor's patches within 6e-8, the vision tower's rows and the last logits at cosine 1, every greedy
+token equal. The q4 pack on the GPU: the audio encoder's rows cosine 1, last logits cosine 0.967 to 0.986 with the same
+top token; its answers are worded otherwise from the first tokens on (both correct).
 
 ## Embedding models
 

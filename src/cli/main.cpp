@@ -117,6 +117,8 @@ void add_engine_options(Args& a) {
                "alone (default: the checkpoint's)")
         .value("log-level", "debug | info | warn | error", "info")
         .flag("no-vision", "do not load the model's vision encoder (text only)")
+        .value("image-max-pixels", "resize images to at most this many pixels (Qwen3-VL's processor; default: the "
+                                   "checkpoint's bound)")
         .flag("help", "show this help")
         .alias("-hf", "hf")
         .alias("-hfd", "hf-drafter");
@@ -142,6 +144,7 @@ ServiceOptions service_options(const Args& a) {
     }
     o.session.kv = quant::parse_kv_formats(a.get("kv-dtype"));
     o.vision = !a.has("no-vision");
+    if (a.has("image-max-pixels")) o.image_max_pixels = a.get_int("image-max-pixels");
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");
     const std::string& spec = a.get("spec");
