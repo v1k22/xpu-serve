@@ -59,7 +59,8 @@ enum class OpKind : uint8_t {
     Reshape,    // same element count; target may use kT / kL
     Slice,      // python-style [begin, end) on one axis; a symbolic axis only supports "last n" (begin < 0, end = kSliceEnd)
     Transpose,  // out.shape[i] = x.shape[perm[i]]; any dtype
-    Rope,       // (x [T, H, D], positions [T] or [T, S] int, inv_freq [R/(2S)] f32) -> [T, H, D]; T may be static; see below
+    Rope,       // (x [T, H, D], positions [T] or [T, S] int, inv_freq [R/(2S)] f32 [, pair_axes [R/2] int])
+                // -> [T, H, D]; T may be static; see below
     KvCache,    // (k [T, Hkv, D], v [T, Hkv, D]) -> (k_all [L, Hkv, D], v_all [L, Hkv, D]); appends to the slot's state
     Attention,  // (q [T, Hq, D], k [N, Hkv, D], v [N, Hkv, D] [, key_bias [N] f32]) -> [T, Hq, D]; see AttentionAttrs; GQA
     CausalConv, // (x [T, C], w [C, K]) -> [T, C]; depthwise causal conv over the slot's last K-1 inputs, see below
@@ -112,6 +113,10 @@ enum class OpKind : uint8_t {
 // With positions [T] the rotated channels are one section. With positions [T, S] (axial RoPE, e.g. 2-D image patches)
 // they split into S contiguous sections of R/S channels; section s rotates by positions[:, s]. Within a section of
 // width W, channel c < W/2 pairs with c + W/2 and both rotate by the angle position * inv_freq[c].
+// x may be [T, L, H, D] (L rows a token, rotated as T * L rows of [H, D]) with positions [T, L] or [T, L, S].
+// With pair_axes (multimodal RoPE: positions [T, S] on S axes, e.g. time, height, width), the R channels are one
+// section whose frequencies each read an axis: channel c < R/2 pairs with c + R/2 and both rotate by
+// positions[:, pair_axes[c]] * inv_freq[c], inv_freq [R/2]; every pair_axes value in [0, S).
 
 std::string_view op_name(OpKind kind);
 
@@ -186,6 +191,8 @@ struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op'
 // (T <= sliding_window); an encoder's local attention sees the keys within sliding_window - 1 of it (ModernBERT).
 // Not causal with a block (an encoder over several images at once): q, k and v have one static length, a multiple of
 // `block`, and key j is visible to query i iff both fall in the same run of `block` tokens.
+// Not causal over rows of several a token (q [T, R, Hq, D], k / v [N, R, Hkv, D]: a vision tower's patches, R of each
+// merged token): one sequence of T * R queries over N * R keys, every key visible; no window, block or groups.
 // Not causal in groups (`grouped`; questions packed after the state they ask about): q, k and v are the step's own
 // [T, ...] and a fourth input, groups [T] i32, gives each token's group; key j is visible to query i iff
 // groups[i] == 0, groups[j] == 0 or groups[i] == groups[j]. Group 0 sees every token and every token sees it; any
@@ -277,7 +284,7 @@ public:
     Value reshape(Value x, Dims shape);
     Value slice(Value x, int axis, int64_t begin, int64_t end = kSliceEnd);
     Value transpose(Value x, std::vector<int> perm);
-    Value rope(Value x, Value positions, Value inv_freq, int64_t rotary_dim = 0);
+    Value rope(Value x, Value positions, Value inv_freq, int64_t rotary_dim = 0, Value pair_axes = {});
     int add_kv_slot(int64_t num_kv_heads, int64_t head_dim, int64_t sliding_window, std::string label);
     std::pair<Value, Value> kv_cache(int slot, Value k, Value v);
     std::pair<Value, Value> kv_read(int slot);

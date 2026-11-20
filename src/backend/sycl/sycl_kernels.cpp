@@ -1666,8 +1666,8 @@ template void gather_bits(sycl::queue&, const uint32_t*, const int64_t*, uint32_
 // handful of 64-bit divisions: at a prefill's or a policy's sizes that cost more than reading and writing x.)
 template <typename I, typename Y>
 void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_freq, Y* y, int64_t tokens,
-          int64_t heads, int64_t dim, int64_t rotary, int64_t sections) {
-    const auto width = static_cast<int>(rotary / sections);
+          int64_t heads, int64_t dim, int64_t rotary, int64_t sections, const int32_t* pair_axes) {
+    const auto width = static_cast<int>(pair_axes != nullptr ? rotary : rotary / sections);
     const int half_w = width / 2;
     const auto pairs = static_cast<int>(rotary / 2);
     const auto rotated = static_cast<int>(rotary);
@@ -1684,10 +1684,11 @@ void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_f
             for (int h = 0; h < h_n; ++h) yt[h * d_n + d] = static_cast<Y>(xt[h * d_n + d]);
             return;
         }
-        const int sec = j / half_w;
+        const int sec = pair_axes != nullptr ? 0 : j / half_w;
         const int c0 = j % half_w;
+        const int64_t axis = pair_axes != nullptr ? pair_axes[j] : sec;
         // f32 angle as Hugging Face computes it (inv_freq @ positions in float32)
-        const float angle = static_cast<float>(positions[t * sections + sec]) * inv_freq[c0];
+        const float angle = static_cast<float>(positions[t * sections + axis]) * inv_freq[c0];
         const float cs = sycl::cos(angle);
         const float sn = sycl::sin(angle);
         const int lo = sec * width + c0;
@@ -2119,7 +2120,7 @@ template void gather<float, int32_t>(sycl::queue&, const float*, const int32_t*,
 template void gather<float, int64_t>(sycl::queue&, const float*, const int64_t*, float*, int64_t, int64_t);
 #define XS_INSTANTIATE_ROPE(I, Y)                                                                                     \
     template void rope<I, Y>(sycl::queue&, const float*, const I*, const float*, Y*, int64_t, int64_t, int64_t, int64_t, \
-                             int64_t);
+                             int64_t, const int32_t*);
 XS_INSTANTIATE_ROPE(int32_t, float)
 XS_INSTANTIATE_ROPE(int64_t, float)
 XS_INSTANTIATE_ROPE(int32_t, half)

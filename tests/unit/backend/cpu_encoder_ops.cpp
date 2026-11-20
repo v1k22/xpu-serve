@@ -6,6 +6,8 @@
 
 #include "backend/cpu_ref/cpu_backend.h"
 #include "backend_test_util.h"
+#include "mrope_cases.h"
+#include "rows_cases.h"
 #include "reference_ops.h"
 #include "util/error.h"
 
@@ -89,6 +91,58 @@ TEST_SUITE("cpu-ref encoder ops") {
                 std::swap(p[0], p[1]);
             CHECK_FALSE(test::all_close(out, test::ref::axial_rope(to_f64(x), swapped, freq64), kAtol, kRtol));
         }
+    }
+
+    TEST_CASE("multimodal rope: each frequency rotates by the position of its axis") {
+        test::TensorRng rng(15);
+        for (const test::mrope::Case& c : test::mrope::cases()) {
+            CAPTURE(c.name);
+            const HostTensor x = rng.uniform(DType::F32, {9, c.heads, c.dim});
+            const HostTensor pos = test::mrope::positions(rng, c, 9);
+            const HostTensor out = run_out(test::mrope::graph_of(c), {{"x", x}, {"pos", pos}});
+            const std::vector<double> freq64(c.inv_freq.begin(), c.inv_freq.end());
+            const auto rows = test::mrope::rows(pos);
+            CHECK(test::all_close(out, test::ref::multimodal_rope(to_f64(x), rows, freq64, c.axes), kAtol, kRtol));
+            if (c.equal_positions) {  // the three axes agree: 1-D RoPE over the whole head
+                std::vector<int64_t> first;
+                for (const auto& r : rows) first.push_back(r[0]);
+                CHECK(test::all_close(out, test::ref::rope(to_f64(x), first, freq64), kAtol, kRtol));
+            } else {  // planted bug: every frequency on the first axis
+                const std::vector<int> first_axis(c.axes.size(), 0);
+                CHECK_FALSE(test::all_close(out, test::ref::multimodal_rope(to_f64(x), rows, freq64, first_axis), kAtol,
+                                            kRtol));
+            }
+        }
+        graph::Graph g;
+        const Value x = g.input("x", DType::F32, {kT, 2, 8});
+        const Value pos = g.input("pos", DType::I32, {kT, 2});
+        const Value freq = g.constant(test::make_tensor(DType::F32, {4}, std::vector<float>{1, 1, 1, 1}));
+        const Value bad = g.constant(test::make_tensor(DType::I32, {4}, std::vector<int32_t>{0, 1, 2, 0}));
+        CHECK_THROWS_WITH_AS(g.rope(x, pos, freq, 0, bad), doctest::Contains("pair_axes[2]"), Error);
+    }
+
+    TEST_CASE("rows of several a token: attention and rope over [T, R, H, D] are over the T * R rows") {
+        using namespace test::token_rows;
+        test::TensorRng rng(16);
+        const HostTensor q = rng.uniform(DType::F32, {kTokens, kRows, kHeads, kDim});
+        const HostTensor k = rng.uniform(DType::F32, {kTokens, kRows, kKvHeads, kDim});
+        const HostTensor v = rng.uniform(DType::F32, {kTokens, kRows, kKvHeads, kDim});
+        const HostTensor out = run_out(attention_graph(0.6f), {{"q", q}, {"k", k}, {"v", v}});
+        CHECK(out.shape() == q.shape());
+        test::ref::AttentionSpec spec;
+        spec.scale = 0.6;
+        spec.causal = false;
+        const Tensor64 expected = test::ref::attention(flat(to_f64(q)), flat(to_f64(k)), flat(to_f64(v)), spec);
+        CHECK(test::all_close(out.reshaped({kTokens * kRows, kHeads, kDim}), expected, kAtol, kRtol));
+        CHECK_FALSE(test::all_close(out, per_token(to_f64(q), to_f64(k), to_f64(v), spec), kAtol, kRtol));
+
+        const std::vector<float> freq{1.0f, 0.3f, 0.1f, 0.03f, 0.01f, 0.003f, 0.001f, 0.0003f};
+        const HostTensor x = rng.uniform(DType::F32, {kTokens, kRows, kHeads, kDim});
+        const HostTensor pos = rng.ints(DType::I32, {kTokens, kRows}, 0, 50);
+        const HostTensor rotated = run_out(rope_graph(freq, false), {{"x", x}, {"pos", pos}});
+        const std::vector<double> freq64(freq.begin(), freq.end());
+        CHECK(test::all_close(rotated.reshaped({kTokens * kRows, kHeads, kDim}),
+                              test::ref::rope(flat(to_f64(x)), test::to_ints(pos), freq64), kAtol, kRtol));
     }
 
     TEST_CASE("non-causal attention over the step's own tokens sees every key, with GQA") {

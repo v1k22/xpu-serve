@@ -332,7 +332,8 @@ HostTensor transpose(const HostTensor& x, const std::vector<int>& perm) {
     return out;
 }
 
-HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTensor& inv_freq, int64_t rotary_dim) {
+HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTensor& inv_freq, int64_t rotary_dim,
+                const HostTensor* pair_axes) {
     check_f32(x, "rope x");
     check_f32(inv_freq, "rope inv_freq");
     const int64_t tokens = x.dim(0);
@@ -340,6 +341,29 @@ HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTens
     const int64_t dim = x.dim(2);
     const int64_t rotated = rotary_dim == 0 ? dim : rotary_dim;
     const int64_t sections = positions.rank() == 2 ? positions.dim(1) : 1;
+    if (pair_axes != nullptr) {  // one section; pair i reads axis pair_axes[i]
+        const int64_t half = rotated / 2;
+        XS_CHECK(pair_axes->numel() == half && inv_freq.numel() == half, "rope pair_axes and inv_freq hold ",
+                 pair_axes->numel(), " and ", inv_freq.numel(), " entries for ", half, " pairs");
+        HostTensor out = x.clone();
+        for (int64_t t = 0; t < tokens; ++t) {
+            for (int64_t i = 0; i < half; ++i) {
+                const int64_t axis = int_at(*pair_axes, i);
+                XS_CHECK(axis >= 0 && axis < sections, "rope pair_axes[", i, "] = ", axis, " of ", sections, " axes");
+                const double pos = static_cast<double>(int_at(positions, t * sections + axis));
+                const double angle = pos * inv_freq.data<float>()[i];
+                const double c = std::cos(angle), sn = std::sin(angle);
+                for (int64_t h = 0; h < heads; ++h) {
+                    const int64_t base = (t * heads + h) * dim;
+                    const double x1 = x.data<float>()[base + i];
+                    const double x2 = x.data<float>()[base + half + i];
+                    out.data<float>()[base + i] = static_cast<float>(x1 * c - x2 * sn);
+                    out.data<float>()[base + half + i] = static_cast<float>(x2 * c + x1 * sn);
+                }
+            }
+        }
+        return out;
+    }
     const int64_t width = rotated / sections;
     const int64_t half = width / 2;
     XS_CHECK(positions.numel() == tokens * sections, "rope has ", positions.numel(), " positions for ", tokens,

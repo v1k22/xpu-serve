@@ -196,6 +196,37 @@ inline Tensor64 axial_rope(const Tensor64& x, const std::vector<std::vector<int6
     return out;
 }
 
+// Multimodal RoPE as transformers' Qwen3-Omni and Qwen3-VL compute it: cos and sin of [D/2] angles, angle i =
+// positions[t][axes[i]] * inv_freq[i], laid out cat(angles, angles) over the head (rotate-half).
+inline Tensor64 multimodal_rope(const Tensor64& x, const std::vector<std::vector<int64_t>>& positions,
+                                const std::vector<double>& inv_freq, const std::vector<int>& axes) {
+    const int64_t heads = x.shape[1], dim = x.shape[2], half = dim / 2;
+    Tensor64 out(x.shape);
+    for (size_t t = 0; t < positions.size(); ++t) {
+        for (int64_t h = 0; h < heads; ++h) {
+            const int64_t base = (static_cast<int64_t>(t) * heads + h) * dim;
+            for (int64_t d = 0; d < dim; ++d) {
+                const auto i = static_cast<size_t>(d % half);
+                const double angle = static_cast<double>(positions[t][static_cast<size_t>(axes[i])]) * inv_freq[i];
+                const double rotated = d < half ? -x[base + d + half] : x[base + d - half];
+                out[base + d] = x[base + d] * std::cos(angle) + rotated * std::sin(angle);
+            }
+        }
+    }
+    return out;
+}
+
+// Qwen3-Omni's interleaved axes for `pairs` frequencies and sections {t, h, w}: frequency i reads h when i % 3 == 1
+// and i < 3 * h, w when i % 3 == 2 and i < 3 * w, else t (Qwen3OmniMoeThinkerTextRotaryEmbedding).
+inline std::vector<int> interleaved_mrope_axes(int64_t pairs, int64_t h, int64_t w) {
+    std::vector<int> axes(static_cast<size_t>(pairs), 0);
+    for (int64_t i = 0; i < pairs; ++i) {
+        if (i % 3 == 1 && i < 3 * h) axes[static_cast<size_t>(i)] = 1;
+        if (i % 3 == 2 && i < 3 * w) axes[static_cast<size_t>(i)] = 2;
+    }
+    return axes;
+}
+
 // Partial rotary (Qwen): rotate-half rope over the first `rotary_dim` channels, the rest unchanged.
 inline Tensor64 partial_rope(const Tensor64& x, const std::vector<int64_t>& positions,
                              const std::vector<double>& inv_freq, int64_t rotary_dim) {

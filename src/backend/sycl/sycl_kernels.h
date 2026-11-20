@@ -109,10 +109,11 @@ void gather(sycl::queue& q, const T* table, const I* ids, float* out, int64_t n,
 template <typename I>
 void gather_bits(sycl::queue& q, const uint32_t* table, const I* ids, uint32_t* out, int64_t n, int64_t width);
 
-// x [T, H, D]; positions [T] or [T, sections]; inv_freq [rotary / (2 sections)].
+// x [T, H, D]; positions [T] or [T, sections]; inv_freq [rotary / (2 sections)]. With pair_axes [rotary / 2] (i32,
+// device): one section, pair i rotated by positions[:, pair_axes[i]] and inv_freq [rotary / 2].
 template <typename I, typename Y>
 void rope(sycl::queue& q, const float* x, const I* positions, const float* inv_freq, Y* y, int64_t tokens,
-          int64_t heads, int64_t dim, int64_t rotary, int64_t sections);
+          int64_t heads, int64_t dim, int64_t rotary, int64_t sections, const int32_t* pair_axes = nullptr);
 
 // For each of `outer` blocks: rows [begin, begin + len) of `dim` rows of `inner` elements of `elem` bytes.
 void slice(sycl::queue& q, const void* x, void* y, size_t elem, int64_t outer, int64_t dim, int64_t begin, int64_t len,

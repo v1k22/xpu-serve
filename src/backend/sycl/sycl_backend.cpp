@@ -894,6 +894,7 @@ private:
                     need(0, is_f32(0), "f32");
                     need(1, is_int(1), "i32 or i64");
                     need(2, is_f32(2), "f32");
+                    if (n.inputs.size() == 4) need(3, dt(n.inputs[3]) == DType::I32, "i32");
                     break;
                 case OpKind::Attention: {
                     need(0, is_f32(0), "f32");
@@ -1125,8 +1126,8 @@ private:
             const int64_t first = graph_.type(nodes[kc].inputs[0]).shape[0];
             if (q.size() != 3 || q[0] == kT || first == kT || first != graph_.type(nodes[vc].inputs[0]).shape[0]) continue;
             sycl_be::AttentionShape sh;
-            sh.tokens = q[0];
-            sh.head_dim = q[2];
+            sh.tokens = q.size() == 4 ? q[0] * q[1] : q[0];
+            sh.head_dim = q.back();
             if (sh.head_dim <= 128 || !sycl_be::attention_matrix_path(sh, attention_.path)) continue;
             fused_[kc] = Fused::Skip;
             fused_[vc] = Fused::Skip;
@@ -2131,18 +2132,21 @@ private:
                 return;
             }
             case OpKind::Rope: {
-                const Dims& x = in_shape(0);
+                const Dims& x = in_shape(0);  // [T, H, D] or [T, L, H, D]: T * L rows
                 const Dims& pos = in_shape(1);
-                const int64_t sections = pos.size() == 2 ? pos[1] : 1;
+                const int64_t rows = x.size() == 4 ? x[0] * x[1] : x[0];
+                const int64_t heads = x[x.size() - 2], dim = x.back();
+                const int64_t sections = pos.size() == x.size() - 1 ? pos.back() : 1;
                 const int64_t rotary_attr = std::get<graph::RopeAttrs>(n.attrs).rotary_dim;
-                const int64_t rotary = rotary_attr == 0 ? x[2] : rotary_attr;
+                const int64_t rotary = rotary_attr == 0 ? dim : rotary_attr;
+                const auto* axes = n.inputs.size() == 4 ? reinterpret_cast<const int32_t*>(in_ptr(3)) : nullptr;
                 with_out([&](auto* y) {
                     if (in_dt(1) == DType::I32) {
-                        sycl_be::rope(q_, in_f32(0), reinterpret_cast<const int32_t*>(in_ptr(1)), in_f32(2), y, x[0],
-                                      x[1], x[2], rotary, sections);
+                        sycl_be::rope(q_, in_f32(0), reinterpret_cast<const int32_t*>(in_ptr(1)), in_f32(2), y, rows,
+                                      heads, dim, rotary, sections, axes);
                     } else {
-                        sycl_be::rope(q_, in_f32(0), reinterpret_cast<const int64_t*>(in_ptr(1)), in_f32(2), y, x[0],
-                                      x[1], x[2], rotary, sections);
+                        sycl_be::rope(q_, in_f32(0), reinterpret_cast<const int64_t*>(in_ptr(1)), in_f32(2), y, rows,
+                                      heads, dim, rotary, sections, axes);
                     }
                 });
                 return;
@@ -2178,12 +2182,13 @@ private:
                 const auto& a = std::get<graph::AttentionAttrs>(n.attrs);
                 const Dims& qs = in_shape(0);
                 const Dims& ks = in_shape(1);
+                const bool rows = qs.size() == 4;  // [T, R, H, D]: T * R queries over N * R keys
                 sycl_be::AttentionShape s;
-                s.tokens = qs[0];
-                s.q_heads = qs[1];
-                s.head_dim = qs[2];
-                s.kv_len = ks[0] == kL ? step.kv_len : ks[0];
-                s.kv_heads = ks[1];
+                s.tokens = rows ? qs[0] * qs[1] : qs[0];
+                s.q_heads = qs[qs.size() - 2];
+                s.head_dim = qs.back();
+                s.kv_len = rows ? ks[0] * ks[1] : ks[0] == kL ? step.kv_len : ks[0];
+                s.kv_heads = ks[ks.size() - 2];
                 s.scale = a.scale;
                 s.softcap = a.softcap;
                 s.window = a.sliding_window;
@@ -2439,7 +2444,7 @@ private:
             key += str_cat(" ", shape(1)[0], "x", shape(1)[1]);
         } else if (n.kind == OpKind::Attention) {
             key += str_cat(" T=", shape(0)[0] == kT ? step.tokens : shape(0)[0], " N=",
-                           shape(1)[0] == kL ? step.kv_len : shape(1)[0], " D=", shape(0)[2]);
+                           shape(1)[0] == kL ? step.kv_len : shape(1)[0], " D=", shape(0).back());
         } else {  // elementwise passes: by output shape, dtype and fusion
             const Dims& o = p.shapes[i][0];
             key += " [";

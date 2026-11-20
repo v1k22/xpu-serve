@@ -486,26 +486,49 @@ Value Graph::transpose(Value x, std::vector<int> perm) {
                     "transpose");
 }
 
-Value Graph::rope(Value x, Value positions, Value inv_freq, int64_t rotary_dim) {
+Value Graph::rope(Value x, Value positions, Value inv_freq, int64_t rotary_dim, Value pair_axes) {
     const Dims& xs = type(x).shape;
     const TensorType& pt = type(positions);
     const TensorType& ft = type(inv_freq);
-    XS_CHECK(xs.size() == 3 && (xs[0] == kT || xs[0] > 0), "rope input must be [T, heads, head_dim], got ",
-             shape_to_string(xs));
-    const int64_t rotated = rotary_dim == 0 ? xs[2] : rotary_dim;
-    XS_CHECK(rotated > 0 && rotated <= xs[2], "rope rotary_dim ", rotary_dim, " out of range for head_dim ", xs[2]);
-    const bool axial = pt.shape.size() == 2;
-    XS_CHECK(is_int(pt.dtype) && !pt.shape.empty() && pt.shape[0] == xs[0] &&
-                 (pt.shape.size() == 1 || (axial && pt.shape[1] > 0)),
-             "rope positions must be [T] or [T, sections] int with the input's T, got ", dtype_name(pt.dtype),
-             shape_to_string(pt.shape), " for ", shape_to_string(xs));
-    const int64_t sections = axial ? pt.shape[1] : 1;
+    // x [T, H, D], or [T, L, H, D] (L rows a token: a merged token's patches) with positions led by [T, L].
+    XS_CHECK((xs.size() == 3 || (xs.size() == 4 && xs[1] > 0)) && (xs[0] == kT || xs[0] > 0),
+             "rope input must be [T, heads, head_dim] or [T, rows, heads, head_dim], got ", shape_to_string(xs));
+    const size_t lead = xs.size() - 2;
+    const int64_t head_dim = xs.back();
+    const int64_t rotated = rotary_dim == 0 ? head_dim : rotary_dim;
+    XS_CHECK(rotated > 0 && rotated <= head_dim, "rope rotary_dim ", rotary_dim, " out of range for head_dim ",
+             head_dim);
+    const bool axial = pt.shape.size() == lead + 1;
+    XS_CHECK(is_int(pt.dtype) && (pt.shape.size() == lead || (axial && pt.shape.back() > 0)) &&
+                 std::equal(xs.begin(), xs.begin() + static_cast<std::ptrdiff_t>(lead), pt.shape.begin()),
+             "rope positions must be the input's leading dims, [T] or [T, rows], and a sections axis or none, int; "
+             "got ", dtype_name(pt.dtype), shape_to_string(pt.shape), " for ", shape_to_string(xs));
+    const int64_t sections = axial ? pt.shape.back() : 1;
+    if (pair_axes.valid()) {
+        const TensorType& at = type(pair_axes);
+        XS_CHECK(axial && rotated % 2 == 0 && is_int(at.dtype) && at.shape == Dims{rotated / 2} &&
+                     ft.shape == Dims{rotated / 2} && ft.dtype == DType::F32,
+                 "multimodal rope takes positions [T, axes], inv_freq [R/2] f32 and pair_axes [R/2] int for ",
+                 rotated, " rotated channels; got positions ", shape_to_string(pt.shape), ", inv_freq ",
+                 shape_to_string(ft.shape), ", pair_axes ", dtype_name(at.dtype), shape_to_string(at.shape));
+        const Node& source = nodes_[static_cast<size_t>(pair_axes.node)];
+        if (source.kind == OpKind::Constant) {
+            const HostTensor& table = std::get<ConstantAttrs>(source.attrs).value;
+            for (int64_t j = 0; j < table.numel(); ++j) {
+                const int64_t a = table.dtype() == DType::I32 ? table.data<int32_t>()[j] : table.data<int64_t>()[j];
+                XS_CHECK(a >= 0 && a < sections, "rope pair_axes[", j, "] = ", a, " is not one of the ", sections,
+                         " position axes");
+            }
+        }
+        return add_node(OpKind::Rope, {x, positions, inv_freq, pair_axes},
+                        RopeAttrs{rotary_dim == head_dim ? 0 : rotary_dim}, {TensorType{DType::F32, xs}}, "rope");
+    }
     XS_CHECK(rotated % (2 * sections) == 0, "rope rotary dim ", rotated, " does not split into ", sections,
              " sections of even width");
     const int64_t pairs = rotated / (2 * sections);
     XS_CHECK(ft.shape == Dims{pairs} && ft.dtype == DType::F32, "rope inv_freq must be [", pairs, "] f32, got ",
              dtype_name(ft.dtype), shape_to_string(ft.shape));
-    return add_node(OpKind::Rope, {x, positions, inv_freq}, RopeAttrs{rotary_dim == xs[2] ? 0 : rotary_dim},
+    return add_node(OpKind::Rope, {x, positions, inv_freq}, RopeAttrs{rotary_dim == head_dim ? 0 : rotary_dim},
                     {TensorType{DType::F32, xs}}, "rope");
 }
 
@@ -536,6 +559,17 @@ std::pair<Value, Value> Graph::kv_read(int slot) {
 }
 
 Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& attrs) {
+    if (type(q).shape.size() == 4) {  // rows of several a token: one sequence of T * L queries over N * L keys
+        const Dims& qs = type(q).shape;
+        const Dims& ks = type(k_all).shape;
+        XS_CHECK(!attrs.causal && attrs.sliding_window == 0 && attrs.block == 0 && !attrs.grouped && qs[1] > 0 &&
+                     ks.size() == 4 && ks == type(v_all).shape && ks[1] == qs[1] && ks[3] == qs[3] &&
+                     qs[2] % ks[2] == 0,
+                 "attention over q [T, rows, heads, head_dim] is non-causal, without a window, block or groups, "
+                 "over k / v [N, rows, kv_heads, head_dim] of as many rows; got ", shape_to_string(qs), " and ",
+                 shape_to_string(ks));
+        return add_node(OpKind::Attention, {q, k_all, v_all}, attrs, {TensorType{DType::F32, qs}}, "attention");
+    }
     const Dims& qs = type(q).shape;
     const Dims& ks = type(k_all).shape;
     const Dims& vs = type(v_all).shape;

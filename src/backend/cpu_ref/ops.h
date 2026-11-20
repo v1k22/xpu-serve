@@ -35,7 +35,8 @@ HostTensor slice(const HostTensor& x, int axis, int64_t begin, int64_t end);
 // Any dtype.
 HostTensor transpose(const HostTensor& x, const std::vector<int>& perm);
 // positions [T] or [T, S] (axial sections); rotary_dim 0 = the whole head dim.
-HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTensor& inv_freq, int64_t rotary_dim = 0);
+HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTensor& inv_freq, int64_t rotary_dim = 0,
+                const HostTensor* pair_axes = nullptr);
 // x [T, C], w [C, K], state [(K-1) * C] row-major (updated in place to the last K-1 inputs).
 HostTensor causal_conv(const HostTensor& x, const HostTensor& w, std::vector<float>& state);
 // q, k [T, Hk, Dk], v [T, Hv, Dv], g, beta [T, Hv], state [Hv * Dk * Dv] (updated in place).

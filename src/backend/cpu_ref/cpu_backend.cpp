@@ -405,8 +405,20 @@ class CpuProgram {
             }
             case OpKind::Transpose:
                 return {cpu_ref::transpose(in(0), std::get<graph::TransposeAttrs>(n.attrs).perm)};
-            case OpKind::Rope:
-                return {cpu_ref::rope(f32(0), in(1), f32(2), std::get<graph::RopeAttrs>(n.attrs).rotary_dim)};
+            case OpKind::Rope: {
+                // [T, L, H, D] with positions [T, L(, S)]: T * L rows of [H, D].
+                const HostTensor x = f32(0);
+                const Dims shape = x.shape();
+                const int64_t rows = shape.size() == 4 ? shape[0] * shape[1] : shape[0];
+                const HostTensor& pos = in(1);
+                const bool axial = pos.rank() + 1 == shape.size();
+                const HostTensor flat_pos = pos.reshaped(axial ? Dims{rows, pos.shape().back()} : Dims{rows});
+                const HostTensor flat_x = x.reshaped({rows, shape[shape.size() - 2], shape.back()});
+                const int64_t rotary = std::get<graph::RopeAttrs>(n.attrs).rotary_dim;
+                const HostTensor out =
+                    cpu_ref::rope(flat_x, flat_pos, f32(2), rotary, n.inputs.size() == 4 ? &in(3) : nullptr);
+                return {out.reshaped(shape)};
+            }
             case OpKind::CausalConv: {
                 const auto slot = static_cast<size_t>(std::get<graph::StateAttrs>(n.attrs).slot);
                 if (conv_inputs != nullptr) (*conv_inputs)[slot] = {f32(0), f32(1)};
@@ -433,6 +445,13 @@ class CpuProgram {
             }
             case OpKind::Attention: {
                 const auto& a = std::get<graph::AttentionAttrs>(n.attrs);
+                if (in(0).rank() == 4) {  // T * R queries over N * R keys
+                    const Dims qs = in(0).shape(), ks = in(1).shape();
+                    const auto rows = [](const Dims& d) { return Dims{d[0] * d[1], d[2], d[3]}; };
+                    const HostTensor out = cpu_ref::attention(*pool_, f32(0).reshaped(rows(qs)),
+                                                              f32(1).reshaped(rows(ks)), f32(2).reshaped(rows(ks)), a);
+                    return {out.reshaped(qs)};
+                }
                 if (a.grouped) return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, nullptr, &in(3))};
                 if (n.inputs.size() == 4) {
                     const HostTensor bias = f32(3);

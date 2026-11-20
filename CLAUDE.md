@@ -297,11 +297,12 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 - MatMul weights use the Hugging Face layout `[out, in]`: `matmul(x, w) = x @ w^T`.
 - Ops: Input, Weight, Constant, Gather, MatMul, Add, Mul, Div, Scale, Tanh, GeluTanh, Gelu, Softcap, Sigmoid, Silu, Softplus,
   Clamp, RmsNorm, Softmax, TopK, ReduceSum, Reshape, Slice, Transpose, PrevRow (each row of a step replaced by the row
-  before it), Rope (1-D or axial, optionally partial), KvCache, KvRead (another program's KV slot, read only),
-  Attention (causal with optional window, or non-causal: every key, the keys of the query's own block of tokens, or
-  a window as wide after each query as before it: a drafter's block over a cache, an encoder's local attention; or
-  the step's tokens in groups, group 0 seeing and seen by all, any other group itself and group 0: questions packed
-  after their state),
+  before it), Rope (1-D, axial, or multimodal: each frequency reads one of a token's position axes, Qwen's time /
+  height / width; optionally partial; over rows of several a token too), KvCache, KvRead (another program's KV slot,
+  read only), Attention (causal with optional window, or non-causal: every key, the keys of the query's own block of
+  tokens, or a window as wide after each query as before it: a drafter's block over a cache, an encoder's local
+  attention; or the step's tokens in groups, group 0 seeing and seen by all, any other group itself and group 0:
+  questions packed after their state; or rows of several a token as one sequence, a vision tower's patches),
   CausalConv and GatedDelta (stateful, for linear attention),
   ExpertMatMul (each token's chosen experts from a stacked `[E, N, K]` bank, for mixture of experts), SignMatMul (a
   matmul by a one-bit weight: the cheap score of every row that a shortlist starts from), MhcRoute and StreamMix
@@ -340,7 +341,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/test_graph.cpp`, `test_half.cpp`, `test_base64.cpp` | IR shape inference and validation; f16/bf16 conversions; base64 | hand-written expectations, RFC 4648 vectors |
 | `tests/unit/image/` | decoding, resize, hashing | Pillow-written images; torchvision resize outputs in `tests/fixtures/image/` (bit-exact) |
 | `tests/unit/audio/` | WAV decoding of every sample format, channel count and fmt layout (files the test writes), RF64 and streamed WAVs, chunks skipped; MP3 and FLAC; refusals by name (truncated and malformed files, other containers); the WAV writer; hashing; resampling (44.1, 48, 8 and 22.05 kHz to 16 kHz, edge lengths); the FFT; log-mel features (a chirp, noise, silence, a clip below min_length, a length off the hop, full scale; frames computed in parts on threads, a clip of period 1 s giving equal frames 1 s apart); the VAD (`test_vad.cpp`: where turns start and stop with their prefix and closing silence, clicks, short pauses, the threshold, a loud room, the same events however the stream is cut); planted: another rolloff, zero padding in place of reflect, the symmetric window | libsndfile's decodes (soundfile) of files soundfile and ffmpeg wrote; torchaudio's resample; transformers' Qwen3ASRFeatureExtractor, and its math in float64; in `tests/fixtures/audio/` (`tests/parity/audio/gen_audio_cases.py`); the DFT in long double |
-| `tests/unit/backend/cpu_*.cpp` | each op on cpu-ref (`cpu_encoder_ops.cpp`: the encoder ops and stateless sessions, attention in groups), KV sessions (a quantized cache holds the values its formats store), attention masks | fp64 references in `reference_ops.h`, with planted-bug controls |
+| `tests/unit/backend/cpu_*.cpp` | each op on cpu-ref (`cpu_encoder_ops.cpp`: the encoder ops and stateless sessions, attention in groups, multimodal RoPE (`mrope_cases.h`), attention and RoPE over rows of several a token (`rows_cases.h`)), KV sessions (a quantized cache holds the values its formats store), attention masks | fp64 references in `reference_ops.h`, with planted-bug controls |
 | `tests/unit/backend/device_*.cpp` | each op on the GPU backend (`device_encoder_ops.cpp` likewise), sessions, agreement with cpu-ref (also with an int8 or a TurboQuant KV cache on both; a query that sees one key reads the value the host stores for it), decode timing and quantized matmul timing by rows, format and path (`XS_DEVICE_BENCH=1`, `device_quant_timing.cpp`) | the same references; skip unless `XS_DEVICE_TEST_DEVICE` is set |
 | `tests/unit/backend/*_conv_ops.cpp` | Conv2d: Qwen3-ASR's 3 x 3 stride-2 layers over one channel and many, a causal dilated 1-D convolution, depthwise and grouped ones, padding on two sides only, a symbolic batch; on cpu-ref and the GPU | fp64 references (`conv_ops_cases.h`); planted: the kernel flipped |
 | `tests/unit/test_media.cpp` | media placeholder expansion: each item's token run in order, images and audio in one prompt, items out of order or of a modality the model does not take refused | fake encoders |
