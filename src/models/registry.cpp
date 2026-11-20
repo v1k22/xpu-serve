@@ -32,6 +32,18 @@ bool is_embedding_type(const std::string& type) {
 
 }  // namespace
 
+void Model::prepare_positioned_inputs(std::span<const int32_t> tokens, std::span<const RotaryPosition> positions,
+                                      std::span<const float* const> embeddings, TensorMap& inputs) const {
+    XS_CHECK(positions.size() == tokens.size(), positions.size(), " positions for ", tokens.size(), " tokens");
+    const int64_t start = positions.empty() ? 0 : positions.front()[0];
+    for (size_t i = 0; i < positions.size(); ++i) {
+        const int32_t p = static_cast<int32_t>(start + static_cast<int64_t>(i));
+        XS_CHECK(positions[i] == (RotaryPosition{p, p, p}), info().id, " reads one position a token, but token ", i,
+                 " of the step is at (", positions[i][0], ", ", positions[i][1], ", ", positions[i][2], ")");
+    }
+    prepare_inputs(tokens, start, embeddings, inputs);
+}
+
 MediaInput VisionEncoder::warm_up_item() const {
     image::Image gray;
     gray.width = gray.height = 768;

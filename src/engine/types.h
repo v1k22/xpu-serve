@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -28,6 +29,11 @@ enum class Modality : uint8_t { Image, Audio };
 inline constexpr size_t kModalities = 2;
 const char* modality_name(Modality m);  // "image", "audio"
 
+// A token's rotary position on three axes (time, height, width): what a model with multimodal RoPE reads (Qwen's).
+// Text, and media without positions of their own, take one position each, the same on all three: the token's index
+// in the sequence, for every model whose media leave positions empty.
+using RotaryPosition = std::array<int32_t, 3>;
+
 // One run of an encoder program over (a part of) a media item: its inputs, and how many leading rows of its
 // "embeddings" output are the item's (the rest pads the program's static shape).
 struct EncoderRun {
@@ -42,6 +48,9 @@ struct MediaInput {
     uint64_t key = 0;               // content hash of the decoded item; tells items apart in the prefix cache
     std::vector<EncoderRun> runs;   // in order: the item's rows are each run's leading `rows`, one after another
     int64_t num_tokens = 0;         // the rows of all runs = soft tokens the prompt holds for this item
+    // Each soft token's position from the item's first (an image's (0, row, column)); empty: 0, 1, 2, ... on all
+    // three axes. The token after the item takes one past the item's largest position on any axis.
+    std::vector<RotaryPosition> positions;
 };
 
 struct GenerateRequest {

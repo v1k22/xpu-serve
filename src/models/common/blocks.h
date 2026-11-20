@@ -115,6 +115,8 @@ struct AttentionSpec {
     int64_t kv_window = 0;        // the slot's sliding-window hint
     std::string kv_label;
     graph::Value groups;          // [T] i32: attention in groups (attrs.grouped, no KV cache); invalid: none
+    graph::Value rope_axes;       // [rotary / 2] i32: multimodal RoPE, the axis of pos each frequency reads (Rope's
+                                  // pair_axes); invalid: none
 };
 
 struct AttentionParts {

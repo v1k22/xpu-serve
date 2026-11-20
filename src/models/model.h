@@ -29,6 +29,9 @@ struct ModelInfo {
     std::string id;       // display name, the model directory name by default
     int64_t vocab_size = 0;
     int64_t hidden_size = 0;      // width of a token embedding (and of an image soft token's row)
+    // Width of a media item's rows when it is not hidden_size: an encoder fills the first columns of each and leaves
+    // the rest 0 (Qwen3-Omni's: the image's merged features, then its features for the decoder's first layers).
+    int64_t media_width = 0;
     int64_t max_position = 0;     // longest context the model supports
     std::string dialect;          // chat::make_output_parser dialect
     std::vector<int32_t> stop_token_ids;
@@ -163,6 +166,11 @@ public:
     // token's embedding (an image's soft token), or nullptr for an ordinary token.
     virtual void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos,
                                 std::span<const float* const> embeddings, TensorMap& inputs) const = 0;
+    // The engine's call: each fed token's rotary position too (MediaInput::positions). A model whose RoPE reads them
+    // on three axes overrides it; the default is for one position a token, positions[i] = start_pos + i on every
+    // axis, which is all such a model is ever given.
+    virtual void prepare_positioned_inputs(std::span<const int32_t> tokens, std::span<const RotaryPosition> positions,
+                                           std::span<const float* const> embeddings, TensorMap& inputs) const;
     // Null for a text-only model, or when vision was not loaded.
     virtual const VisionEncoder* vision() const { return nullptr; }
     // Null for a model that takes no audio.

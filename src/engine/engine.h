@@ -51,10 +51,14 @@ private:
     // Runs a target program over `tokens` (appended after the cached ones); the outputs the round reads are in
     // outputs_: each row's logits, or with argmax_only_ its argmax alone, and the hidden rows a drafter takes.
     void run_target(size_t program, std::span<const int32_t> tokens, std::span<const PositionKey> keys,
-                    std::span<const float* const> embeddings);
+                    std::span<const RotaryPosition> positions, std::span<const float* const> embeddings);
     // Feeds `tokens` (appended after the cached ones); target_token(sampler, 0, ...) is then the token after them.
     void forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
-                 std::span<const float* const> embeddings);
+                 std::span<const RotaryPosition> positions, std::span<const float* const> embeddings);
+    // The rotary positions of `count` text tokens from cached position `index` on, past the prompt.
+    std::vector<RotaryPosition> text_positions(int64_t index, size_t count) const;
+    // Width of the rows a media item's encoder runs give (ModelInfo::media_width, or the hidden size).
+    int64_t media_width() const;
     // The target's token after row `row` of the last run: sampled from the row's logits (checked against `draft`
     // when there is one, Sampler::verify), or the row's argmax when that is all the sampler reads (argmax_only_).
     int32_t target_token(Sampler& sampler, int64_t row, std::span<const int32_t> prompt,
@@ -84,6 +88,7 @@ private:
     TensorMap outputs_;
     bool has_argmax_ = false;   // every target program outputs "argmax" beside "logits"
     bool argmax_only_ = false;  // this request's sampler reads no more than a row's argmax, and the programs give it
+    int64_t rotary_delta_ = 0;  // a token past the prompt at cached position i has rotary position i + delta
 };
 
 }  // namespace xs

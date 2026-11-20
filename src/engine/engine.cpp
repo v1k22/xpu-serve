@@ -68,13 +68,14 @@ void Engine::set_prefill_chunk(int64_t tokens) {
 }
 
 void Engine::run_target(size_t program, std::span<const int32_t> tokens, std::span<const PositionKey> keys,
-                        std::span<const float* const> embeddings) {
-    XS_CHECK(!tokens.empty() && keys.size() == tokens.size(), "forward without tokens");
+                        std::span<const RotaryPosition> positions, std::span<const float* const> embeddings) {
+    XS_CHECK(!tokens.empty() && keys.size() == tokens.size() && positions.size() == tokens.size(),
+             "forward without tokens");
     const auto start = static_cast<int64_t>(cached_.size());
     XS_CHECK(start + static_cast<int64_t>(tokens.size()) <= options_.max_context, "sequence of ",
              start + static_cast<int64_t>(tokens.size()), " tokens exceeds the context limit of ", options_.max_context);
     inputs_.clear();
-    model_->prepare_inputs(tokens, start, embeddings, inputs_);
+    model_->prepare_positioned_inputs(tokens, positions, embeddings, inputs_);
     std::vector<std::string> wanted{argmax_only_ ? "argmax" : "logits"};
     if (drafter_) wanted.insert(wanted.end(), drafter_->target_outputs().begin(), drafter_->target_outputs().end());
     outputs_.clear();
@@ -85,9 +86,9 @@ void Engine::run_target(size_t program, std::span<const int32_t> tokens, std::sp
 }
 
 void Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
-                     std::span<const float* const> embeddings) {
+                     std::span<const RotaryPosition> positions, std::span<const float* const> embeddings) {
     const auto start = static_cast<int64_t>(cached_.size());
-    run_target(drafter_ ? spec::kPrefill : spec::kStep, tokens, keys, embeddings);
+    run_target(drafter_ ? spec::kPrefill : spec::kStep, tokens, keys, positions, embeddings);
     if (drafter_) {
         drafter_->add(outputs_, static_cast<int64_t>(tokens.size()), start, tokens);
         drafter_->flush();
@@ -124,7 +125,7 @@ std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, 
     std::vector<PositionKey> keys(fed.size());
     std::transform(fed.begin(), fed.end(), keys.begin(), text_key);
     const auto start = static_cast<int64_t>(cached_.size());
-    run_target(spec::kVerify, fed, keys, {});
+    run_target(spec::kVerify, fed, keys, text_positions(start, fed.size()), {});
     stats.spec_draft_ms += draft_ms;
     stats.spec_verify_ms += timer.elapsed_ms() - draft_ms;
 
@@ -173,6 +174,19 @@ int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
     return keep;
 }
 
+std::vector<RotaryPosition> Engine::text_positions(int64_t index, size_t count) const {
+    std::vector<RotaryPosition> out(count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto p = static_cast<int32_t>(index + static_cast<int64_t>(i) + rotary_delta_);
+        out[i] = {p, p, p};
+    }
+    return out;
+}
+
+int64_t Engine::media_width() const {
+    return model_->info().media_width > 0 ? model_->info().media_width : model_->info().hidden_size;
+}
+
 std::shared_ptr<const HostTensor> Engine::encode(const MediaInput& media, GenerateStats& stats) {
     for (auto it = encoded_.begin(); it != encoded_.end(); ++it) {
         if (it->first != media.key) continue;
@@ -180,18 +194,21 @@ std::shared_ptr<const HostTensor> Engine::encode(const MediaInput& media, Genera
         return encoded_.front().second;
     }
     Timer timer;
-    const int64_t width = model_->info().hidden_size;
-    auto rows = std::make_shared<HostTensor>(DType::F32, Dims{media.num_tokens, width});
+    const int64_t width = media_width();
+    auto rows = std::make_shared<HostTensor>(DType::F32, Dims{media.num_tokens, width});  // zeros past an encoder's
     int64_t at = 0;
     for (const EncoderRun& run : media.runs) {
         TensorMap out;
         encoders_[static_cast<size_t>(media.modality)]->run(run.program, run.inputs, out);
         const HostTensor& e = out.at("embeddings");
-        XS_CHECK(e.dtype() == DType::F32 && e.rank() == 2 && e.dim(1) == width && e.dim(0) >= run.rows &&
+        XS_CHECK(e.dtype() == DType::F32 && e.rank() == 2 && e.dim(1) <= width && e.dim(0) >= run.rows &&
                      at + run.rows <= media.num_tokens,
                  modality_name(media.modality), " encoder output is ", dtype_name(e.dtype()), dims_to_string(e.shape()),
-                 "; expected ", run.rows, " rows of ", width, " (", at, " of ", media.num_tokens, " so far)");
-        std::copy_n(e.data<float>(), run.rows * width, rows->data<float>() + at * width);
+                 "; expected ", run.rows, " rows of up to ", width, " (", at, " of ", media.num_tokens, " so far)");
+        const int64_t cols = e.dim(1);
+        for (int64_t r = 0; r < run.rows; ++r) {
+            std::copy_n(e.data<float>() + r * cols, cols, rows->data<float>() + (at + r) * width);
+        }
         at += run.rows;
     }
     XS_CHECK(at == media.num_tokens, "a ", modality_name(media.modality), " item's runs give ", at, " rows for ",
@@ -263,6 +280,40 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
             keys[i] = media_key(request.media[item].key, row++);
         }
 
+        // Rotary positions: text one past what came before; a media item's tokens at their offsets from the item's
+        // first position, the token after it one past its largest (transformers' get_rope_index).
+        std::vector<RotaryPosition> positions(n);
+        int64_t next = 0, base = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t m = media_item[i];
+            if (m < 0) {
+                const auto p = static_cast<int32_t>(next++);
+                positions[i] = {p, p, p};
+                continue;
+            }
+            const MediaInput& media = request.media[static_cast<size_t>(m)];
+            const int64_t r = media_row[i];
+            XS_CHECK(media.positions.empty() || static_cast<int64_t>(media.positions.size()) == media.num_tokens,
+                     "a ", modality_name(media.modality), " item with ", media.positions.size(), " positions for ",
+                     media.num_tokens, " tokens");
+            if (r == 0) base = next;
+            const auto r32 = static_cast<int32_t>(r);
+            const RotaryPosition offset =
+                media.positions.empty() ? RotaryPosition{r32, r32, r32} : media.positions[static_cast<size_t>(r)];
+            for (size_t a = 0; a < 3; ++a) positions[i][a] = static_cast<int32_t>(base + offset[a]);
+            if (r + 1 == media.num_tokens) {
+                int64_t largest = media.num_tokens - 1;
+                if (!media.positions.empty()) {
+                    largest = 0;
+                    for (const RotaryPosition& p : media.positions) {
+                        largest = std::max<int64_t>({largest, p[0], p[1], p[2]});
+                    }
+                }
+                next = base + largest + 1;
+            }
+        }
+        rotary_delta_ = next - static_cast<int64_t>(n);
+
         Sampler sampler(request.sampling);
         argmax_only_ = has_argmax_ && !sampler.needs_logits();
         Timer prefill_timer;
@@ -270,7 +321,7 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
         result.stats.cached_tokens = static_cast<int>(cached);
         std::vector<std::shared_ptr<const HostTensor>> encoded(request.media.size());
         std::vector<const float*> rows;
-        const int64_t width = model_->info().hidden_size;
+        const int64_t width = media_width();
         for (auto pos = static_cast<size_t>(cached); pos < n;) {
             const size_t len = std::min(n - pos, static_cast<size_t>(options_.prefill_chunk));
             rows.assign(len, nullptr);
@@ -285,6 +336,7 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
             }
             forward(std::span<const int32_t>(prompt).subspan(pos, len),
                     std::span<const PositionKey>(keys).subspan(pos, len),
+                    std::span<const RotaryPosition>(positions).subspan(pos, len),
                     any_rows ? std::span<const float* const>(rows) : std::span<const float* const>());
             pos += len;
         }
@@ -319,9 +371,9 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
                 const std::vector<int32_t> round = spec_round(token, k, sampler, prompt, result.tokens, result.stats);
                 ready.assign(round.begin(), round.end());
             } else if (ready.empty()) {
-                const int32_t next[] = {token};
-                const PositionKey next_key[] = {text_key(token)};
-                forward(next, next_key, {});
+                const int32_t fed[] = {token};
+                const PositionKey fed_key[] = {text_key(token)};
+                forward(fed, fed_key, text_positions(static_cast<int64_t>(cached_.size()), 1), {});
                 ready.push_back(target_token(sampler, 0, prompt, result.tokens, nullptr));
             }
             token = ready.front();

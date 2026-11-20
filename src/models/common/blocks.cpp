@@ -124,7 +124,9 @@ AttentionOut attention(Graph& g, const AttentionSpec& s, const AttentionParts& p
                        const std::pair<Value, Value>* shared_kv) {
     const int64_t hd = s.head_dim;
     const auto heads = [&](Value v, int64_t n) { return g.reshape(v, {kT, n, hd}); };
-    const auto position = [&](Value v) { return inv_freq.valid() ? g.rope(v, pos, inv_freq, s.rotary_dim) : v; };
+    const auto position = [&](Value v) {
+        return inv_freq.valid() ? g.rope(v, pos, inv_freq, s.rotary_dim, s.rope_axes) : v;
+    };
 
     Value q = p.q(x);
     Value gate;
