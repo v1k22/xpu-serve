@@ -1,6 +1,9 @@
 #include "backend/sycl/sycl_conv.h"
 
+#include <cstdint>
 #include <type_traits>
+
+#include "util/error.h"
 
 namespace xs::sycl_be {
 
@@ -11,23 +14,25 @@ namespace syclex = sycl::ext::oneapi::experimental;
 size_t align_up(size_t n) { return (n + 255) & ~size_t{255}; }
 
 // col [N * HO * WO, CG * KH * KW]: row (n, i, j) holds group g's patch under output (i, j), zeros where the kernel
-// reaches into the padding.
+// reaches into the padding. Indices within a row and a patch are 32-bit (64-bit division is emulated on the device).
 template <typename T>
 void unfold(sycl::queue& q, const float* x, T* col, const Conv2dShape& s, int64_t g) {
     const graph::Conv2dAttrs a = s.attrs;
-    const int64_t cg = s.c / a.groups, k = cg * s.kh * s.kw, positions = s.ho * s.wo;
-    const int64_t c = s.c, h = s.h, w = s.w, kh = s.kh, kw = s.kw, wo = s.wo;
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(s.n * positions * k)), [=](sycl::id<1> id) {
-        const auto idx = static_cast<int64_t>(id[0]);
-        const int64_t col_k = idx % k, row = idx / k;
-        const int64_t b = row / positions, p = row % positions;
-        const int64_t i = p / wo, j = p % wo;
-        const int64_t ci = col_k / (kh * kw), u = (col_k / kw) % kh, v = col_k % kw;
-        const int64_t y = i * a.stride_h + u * a.dilation_h - a.pad_top;
-        const int64_t z = j * a.stride_w + v * a.dilation_w - a.pad_left;
+    const auto i32 = [](int64_t v) { return static_cast<int32_t>(v); };
+    const int32_t cg = i32(s.c / a.groups), khw = i32(s.kh * s.kw), kw = i32(s.kw), wo = i32(s.wo);
+    const int32_t positions = i32(s.ho * s.wo), h = i32(s.h), w = i32(s.w);
+    const int32_t sh = i32(a.stride_h), sw = i32(a.stride_w), dh = i32(a.dilation_h), dw = i32(a.dilation_w);
+    const int32_t pt = i32(a.pad_top), pl = i32(a.pad_left);
+    const int64_t c = s.c, k = int64_t{cg} * khw, channel0 = g * cg;
+    const sycl::range<2> range(static_cast<size_t>(s.n * positions), static_cast<size_t>(k));
+    syclex::parallel_for(q, range, [=](sycl::id<2> id) {
+        const auto row = static_cast<int32_t>(id[0]), col_k = static_cast<int32_t>(id[1]);
+        const int32_t b = row / positions, p = row - b * positions, i = p / wo, j = p - i * wo;
+        const int32_t ci = col_k / khw, uv = col_k - ci * khw, u = uv / kw, v = uv - u * kw;
+        const int32_t y = i * sh + u * dh - pt, z = j * sw + v * dw - pl;
         const bool inside = y >= 0 && y < h && z >= 0 && z < w;
-        const float value = inside ? x[((b * c + g * cg + ci) * h + y) * w + z] : 0.0f;
-        col[idx] = static_cast<T>(value);
+        const float value = inside ? x[((b * c + channel0 + ci) * h + y) * w + z] : 0.0f;
+        col[static_cast<int64_t>(row) * k + col_k] = static_cast<T>(value);
     });
 }
 
@@ -39,6 +44,8 @@ void conv2d(sycl::queue& q, Scratch& scratch, const float* x, const W* w, const 
     using T = std::conditional_t<std::is_same_v<W, half>, half, float>;
     const int64_t groups = s.attrs.groups, cg = s.c / groups, og = s.o / groups;
     const int64_t k = cg * s.kh * s.kw, positions = s.ho * s.wo, rows = s.n * positions;
+    XS_CHECK(rows < INT32_MAX && k < INT32_MAX, "sycl conv2d: ", rows, " output positions of ", k,
+             " values each is past the 32-bit indices it computes with");
     const size_t col_bytes = align_up(static_cast<size_t>(rows * k) * sizeof(T));
     char* base = static_cast<char*>(scratch.get(col_bytes + static_cast<size_t>(rows * og) * sizeof(float)));
     T* col = reinterpret_cast<T*>(base);
@@ -51,11 +58,13 @@ void conv2d(sycl::queue& q, Scratch& scratch, const float* x, const W* w, const 
             matmul(q, scratch, col, w + g * og * k, gemm, rows, og, k);
         }
         const int64_t o = s.o;
-        syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(rows * og)), [=](sycl::id<1> id) {
-            const auto idx = static_cast<int64_t>(id[0]);
-            const int64_t row = idx / og, oc = idx % og;
-            const int64_t b = row / positions, p = row % positions, channel = g * og + oc;
-            out[(b * o + channel) * positions + p] = gemm[idx] + (bias != nullptr ? bias[channel] : 0.0f);
+        const sycl::range<3> range(static_cast<size_t>(s.n), static_cast<size_t>(og), static_cast<size_t>(positions));
+        syclex::parallel_for(q, range, [=](sycl::id<3> id) {
+            const auto b = static_cast<int64_t>(id[0]), oc = static_cast<int64_t>(id[1]);
+            const auto p = static_cast<int64_t>(id[2]);
+            const int64_t channel = g * og + oc;
+            out[(b * o + channel) * positions + p] =
+                gemm[(b * positions + p) * og + oc] + (bias != nullptr ? bias[channel] : 0.0f);
         });
     }
 }
