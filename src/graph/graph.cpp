@@ -66,6 +66,8 @@ std::string_view op_name(OpKind kind) {
         case OpKind::MhcRoute: return "MhcRoute";
         case OpKind::Conv2d: return "Conv2d";
         case OpKind::StreamMix: return "StreamMix";
+        case OpKind::L2Clip: return "L2Clip";
+        case OpKind::DynamicConv: return "DynamicConv";
     }
     return "?";
 }
@@ -311,6 +313,13 @@ Value Graph::rms_norm(Value x, Value weight, float eps) {
     XS_CHECK(!xs.empty() && ws.size() == 1 && ws[0] == xs.back(), "rms_norm weight ", shape_to_string(ws),
              " does not match the last dim of ", shape_to_string(xs), " (", where(weight), ")");
     return add_node(OpKind::RmsNorm, {x, weight}, NormAttrs{eps}, {TensorType{DType::F32, xs}}, "rms_norm");
+}
+
+Value Graph::l2_clip(Value x, float threshold, float eps) {
+    XS_CHECK(!type(x).shape.empty() && type(x).shape.back() > 0 && threshold > 0.0f && eps >= 0.0f,
+             "l2_clip takes x [..., D] and a positive threshold, got ", shape_to_string(type(x).shape), " and ",
+             threshold);
+    return elementwise_unary(OpKind::L2Clip, x, L2ClipAttrs{threshold, eps});
 }
 
 Value Graph::layer_norm(Value x, Value weight, Value bias, float eps) {
@@ -590,6 +599,7 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     XS_CHECK(qs[1] % ks[1] == 0, "attention heads ", qs[1], " not a multiple of kv heads ", ks[1]);
     XS_CHECK(attrs.sliding_window >= 0 && attrs.softcap >= 0.0f && attrs.block >= 0, "invalid attention attributes");
     XS_CHECK(!attrs.grouped, "attention in groups takes the tokens' groups (attention_in_groups)");
+    XS_CHECK(attrs.rel_extent == 0, "attention with a relative bias takes it and its sink (attention_relative)");
     if (attrs.block > 0) {
         XS_CHECK(!attrs.causal && attrs.sliding_window == 0 && qs[0] > 0 && ks[0] == qs[0] && qs[0] % attrs.block == 0,
                  "attention within blocks of ", attrs.block, " takes non-causal q, k and v of one static length, a "
@@ -605,6 +615,25 @@ Value Graph::attention(Value q, Value k, Value v, Value key_bias, const Attentio
     XS_CHECK(bt.dtype == DType::F32 && bt.shape == (Dims{type(k).shape[0]}), "attention key_bias must be f32 [",
              dim_to_string(type(k).shape[0]), "], got ", shape_to_string(bt.shape), " (", where(key_bias), ")");
     nodes_[static_cast<size_t>(out.node)].inputs.push_back(key_bias);
+    return out;
+}
+
+Value Graph::attention_relative(Value q, Value k_all, Value v_all, Value rel, Value sink, const AttentionAttrs& attrs) {
+    XS_CHECK(attrs.rel_extent > 0 && attrs.causal && attrs.softcap == 0.0f && attrs.block == 0 && !attrs.grouped,
+             "attention with a relative bias is causal, without a softcap, block or groups, and has an extent");
+    AttentionAttrs plain = attrs;
+    plain.rel_extent = 0;
+    const Value out = attention(q, k_all, v_all, plain);
+    const Dims& qs = type(q).shape;
+    XS_CHECK(type(rel).dtype == DType::F32 && type(rel).shape == (Dims{kT, qs[1], attrs.rel_extent}),
+             "attention rel must be f32 [T, ", qs[1], ", ", attrs.rel_extent, "], got ",
+             shape_to_string(type(rel).shape), " (", where(rel), ")");
+    XS_CHECK(type(sink).dtype == DType::F32 && type(sink).shape == (Dims{kT, qs[1]}), "attention sink must be f32 [T, ",
+             qs[1], "], got ", shape_to_string(type(sink).shape), " (", where(sink), ")");
+    Node& n = nodes_[static_cast<size_t>(out.node)];
+    n.attrs = attrs;
+    n.inputs.push_back(rel);
+    n.inputs.push_back(sink);
     return out;
 }
 
@@ -640,6 +669,20 @@ Value Graph::causal_conv(int slot, Value x, Value w) {
              s.kernel, "], got ", shape_to_string(type(w).shape));
     return add_node(OpKind::CausalConv, {x, w}, StateAttrs{slot, 0.0f}, {TensorType{DType::F32, {kT, s.channels}}},
                     "causal_conv");
+}
+
+Value Graph::dynamic_conv(int slot, Value x, Value w, Value taps) {
+    XS_CHECK(slot >= 0 && static_cast<size_t>(slot) < conv_slots_.size(), "unknown conv slot ", slot);
+    const ConvSlot& s = conv_slots_[static_cast<size_t>(slot)];
+    const Dims& ts = type(taps).shape;
+    XS_CHECK(type(x).shape == (Dims{kT, s.channels}) && type(w).shape == (Dims{s.kernel, s.channels}),
+             "dynamic_conv slot ", slot, " (", s.label, ") expects x [T, ", s.channels, "] and w [", s.kernel, ", ",
+             s.channels, "], got ", shape_to_string(type(x).shape), " and ", shape_to_string(type(w).shape));
+    XS_CHECK(ts.size() == 3 && ts[0] == kT && ts[1] > 0 && s.channels % ts[1] == 0 && ts[2] == s.kernel,
+             "dynamic_conv slot ", slot, " expects taps [T, groups, ", s.kernel, "] with groups dividing ", s.channels,
+             ", got ", shape_to_string(ts));
+    return add_node(OpKind::DynamicConv, {x, w, taps}, StateAttrs{slot, 0.0f},
+                    {TensorType{DType::F32, {kT, s.channels}}}, "dynamic_conv");
 }
 
 int Graph::add_recurrent_slot(int64_t heads, int64_t key_dim, int64_t value_dim, std::string label) {
@@ -690,7 +733,9 @@ void Graph::validate() const {
             ++appended[static_cast<size_t>(std::get<KvCacheAttrs>(n.attrs).slot)];
         }
         reads += n.kind == OpKind::KvRead ? 1 : 0;
-        if (n.kind == OpKind::CausalConv) ++convs[static_cast<size_t>(std::get<StateAttrs>(n.attrs).slot)];
+        if (n.kind == OpKind::CausalConv || n.kind == OpKind::DynamicConv) {
+            ++convs[static_cast<size_t>(std::get<StateAttrs>(n.attrs).slot)];
+        }
         if (n.kind == OpKind::GatedDelta) ++recurrents[static_cast<size_t>(std::get<StateAttrs>(n.attrs).slot)];
     }
     for (size_t s = 0; s < appended.size(); ++s) {
@@ -758,6 +803,9 @@ std::string attrs_to_string(const Attrs& a) {
             } else if constexpr (std::is_same_v<T, AttentionAttrs>) {
                 os << "scale=" << v.scale << " window=" << v.sliding_window << " softcap=" << v.softcap
                    << " causal=" << v.causal;
+                if (v.rel_extent > 0) os << " rel_extent=" << v.rel_extent;
+            } else if constexpr (std::is_same_v<T, L2ClipAttrs>) {
+                os << "threshold=" << v.threshold << " eps=" << v.eps;
             }
         },
         a);

@@ -138,6 +138,13 @@ struct CopyPart {
 };
 void copy_parts(sycl::queue& q, const CopyPart* parts, int count);
 
+// y = x * min(1, threshold / (|x| + eps)), |x| the L2 norm of each row of `width` values (graph.h L2Clip).
+void l2_clip(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width, float threshold, float eps);
+
+// graph.h DynamicConv: x [T, C], w [K, C], taps [T, G, K]; the state as causal_conv's.
+void dynamic_conv(sycl::queue& q, const float* x, const float* w, const float* taps, const float* state_in,
+                  float* state_out, float* y, int64_t tokens, int64_t channels, int64_t kernel, int64_t groups);
+
 // x [T, C], w [C, K]; reads the previous K-1 inputs from state_in [K-1, C] and writes the new ones to state_out.
 // `silu` applies SiLU to the output (a fused Silu op).
 void causal_conv(sycl::queue& q, const float* x, const float* w, const float* state_in, float* state_out, float* y,
@@ -162,6 +169,11 @@ struct AttentionShape {
     int64_t block = 0;                // > 0: queries see the keys of their own run of `block` tokens (T == N)
     // [T] (T == N, not causal): token i sees token j iff either is in group 0 or both share a group; null: none
     const int32_t* groups = nullptr;
+    // Causal with a relative bias and a sink (graph.h, AttentionAttrs::rel_extent): rel [T, Hq, rel_extent] by how
+    // far back a key sits, and sink [T, Hq], one more logit of the softmax without a value; null: none
+    const float* rel = nullptr;
+    int64_t rel_extent = 0;
+    const float* sink = nullptr;
 };
 // Whether query i sees key j under the tokens' groups (graph.h, AttentionAttrs::grouped).
 inline bool group_sees(const int32_t* groups, int64_t i, int64_t j) {

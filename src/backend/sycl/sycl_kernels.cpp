@@ -436,6 +436,9 @@ struct AttentionRowsKernel {
     bool causal;
     const float* key_bias;
     const int32_t* groups;
+    const float* rel;
+    int64_t rel_extent;
+    const float* sink;
 
     auto get(syclex::properties_tag) const {
         if constexpr (kLargeRegisterFile) {
@@ -499,6 +502,7 @@ struct AttentionRowsKernel {
                 float sc = sycl::reduce_over_group(sg, dot, sycl::plus<float>()) * k_factor;
                 if (softcap > 0.0f) sc = softcap * sycl::tanh(sc / softcap);
                 if (key_bias != nullptr) sc += key_bias[j];
+                if (rel != nullptr && pos - j < rel_extent) sc += rel[(t * hq_n + h0 + g) * rel_extent + (pos - j)];
                 const float m_new = sycl::fmax(m[g], sc);
                 corr[g] = sycl::exp(m[g] - m_new);
                 p[g] = sycl::exp(sc - m_new);
@@ -531,9 +535,15 @@ struct AttentionRowsKernel {
             for (int sgi = 0; sgi < kSubGroups; ++sgi)
                 m_all = sycl::fmax(m_all, slm[(sgi * G + g) * kSlot + D]);
             const int64_t head_row = t * hq_n + h0 + g;
+            // The sink is a logit without a value: it only adds to the denominator, in the first split's share.
+            float sunk = 0.0f;
+            if (sink != nullptr && sp == 0) {
+                m_all = sycl::fmax(m_all, sink[head_row]);
+                sunk = sycl::exp(sink[head_row] - m_all);
+            }
             for (int64_t d = static_cast<int64_t>(it.get_local_linear_id()); d < D; d += kWg) {
                 float acc = 0.0f;
-                float denom = 0.0f;
+                float denom = sunk;
                 for (int sgi = 0; sgi < kSubGroups; ++sgi) {
                     const int64_t base = static_cast<int64_t>(sgi * G + g) * kSlot;
                     const float ms = slm[base + D];
@@ -569,7 +579,7 @@ void attention_rows_launch(sycl::queue& q, const float* qp, const K& k, const V&
         sycl::local_accessor<float, 1> slm(sycl::range<1>(Kernel::kSubGroups * G * Kernel::kSlot), h);
         syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(units * split * Kernel::kWg), Kernel::kWg),
                           Kernel{qp, k, v, out, part, slm, s.q_heads, s.kv_heads, s.kv_len, s.tokens, s.window, split,
-                                 s.scale, s.softcap, s.causal, s.key_bias, s.groups});
+                                 s.scale, s.softcap, s.causal, s.key_bias, s.groups, s.rel, s.rel_extent, s.sink});
     });
 }
 
@@ -1751,6 +1761,45 @@ void to_half(sycl::queue& q, const float* x, half* y, int64_t n) {
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) { y[i] = static_cast<half>(x[i]); });
 }
 
+void l2_clip(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width, float threshold, float eps) {
+    const size_t wg = width >= 1024 ? 512 : (width >= 256 ? 256 : (width >= 128 ? 128 : (width >= 32 ? 32 : 16)));
+    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * wg, wg), [=](sycl::nd_item<1> it) {
+        const int64_t r = static_cast<int64_t>(it.get_group(0));
+        const float* xr = x + r * width;
+        float* yr = y + r * width;
+        float sum = 0.0f;
+        for (int64_t i = static_cast<int64_t>(it.get_local_id(0)); i < width; i += static_cast<int64_t>(wg))
+            sum += xr[i] * xr[i];
+        sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+        const float factor = sycl::fmin(1.0f, threshold / (sycl::sqrt(sum) + eps));
+        for (int64_t i = static_cast<int64_t>(it.get_local_id(0)); i < width; i += static_cast<int64_t>(wg))
+            yr[i] = xr[i] * factor;
+    });
+}
+
+void dynamic_conv(sycl::queue& q, const float* x, const float* w, const float* taps, const float* state_in,
+                  float* state_out, float* y, int64_t tokens, int64_t channels, int64_t kernel, int64_t groups) {
+    const int64_t past = kernel - 1;
+    const int64_t per_group = channels / groups;
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(tokens + past), static_cast<size_t>(channels)),
+                   [=](sycl::item<2> it) {
+        const int64_t t = static_cast<int64_t>(it[0]);
+        const int64_t c = static_cast<int64_t>(it[1]);
+        // x' = [state_in; x]: the input j tokens back from t is row past + t - j
+        auto ext = [&](int64_t r) { return r < past ? state_in[r * channels + c] : x[(r - past) * channels + c]; };
+        if (t < tokens) {
+            const float* tap = taps + (t * groups + c / per_group) * kernel;
+            float acc = 0.0f;
+            for (int64_t j = 0; j < kernel; ++j)
+                acc += (w[j * channels + c] + tap[j]) * ext(past + t - j);
+            y[t * channels + c] = acc;
+        } else {
+            const int64_t r = t - tokens;
+            state_out[r * channels + c] = ext(tokens + r);
+        }
+    });
+}
+
 void causal_conv(sycl::queue& q, const float* x, const float* w, const float* state_in, float* state_out, float* y,
                  int64_t tokens, int64_t channels, int64_t kernel, bool silu) {
     const int64_t past = kernel - 1;
@@ -1967,11 +2016,17 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
     const bool causal = s.causal;
     const float* key_bias = s.key_bias;
     const int32_t* groups = s.groups;
+    const float* rel = s.rel;
+    const int64_t rel_extent = s.rel_extent;
+    const float* sink = s.sink;
+    const int64_t hq = s.q_heads;
     constexpr size_t kWg = 256;
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * kWg, kWg), [=](sycl::nd_item<1> it) {
         const int64_t r = static_cast<int64_t>(it.get_group(0));
         const int64_t tl = (r / group) % tc;
         const int64_t pos = past + t0 + tl;
+        // the row's query head: rows run KV head, token, head of the KV head's group
+        const int64_t head_row = (t0 + tl) * hq + r / (tc * group) * group + r % group;
         // visible keys, relative to k_lo: [lo, hi]
         int64_t lo = 0;
         int64_t hi = keys - 1;
@@ -1988,17 +2043,20 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
                 return -std::numeric_limits<float>::infinity();
             }
             const float v = sr[j];
-            const float c = softcap > 0.0f ? softcap * sycl::tanh(v / softcap) : v;
+            float c = softcap > 0.0f ? softcap * sycl::tanh(v / softcap) : v;
+            if (rel != nullptr && pos - (k_lo + j) < rel_extent) c += rel[head_row * rel_extent + pos - (k_lo + j)];
             return key_bias != nullptr ? c + key_bias[k_lo + j] : c;
         };
         float mx = -std::numeric_limits<float>::infinity();
         for (int64_t j = lo + lid; j <= hi; j += static_cast<int64_t>(kWg))
             mx = sycl::fmax(mx, score(j));
         mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+        if (sink != nullptr) mx = sycl::fmax(mx, sink[head_row]);
         float sum = 0.0f;
         for (int64_t j = lo + lid; j <= hi; j += static_cast<int64_t>(kWg))
             sum += sycl::exp(score(j) - mx);
         sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+        if (sink != nullptr) sum += sycl::exp(sink[head_row] - mx);  // a logit without a value
         const float inv = 1.0f / sum;
         for (int64_t j = lid; j < keys; j += static_cast<int64_t>(kWg))
             pr[j] = static_cast<CT>(j >= lo && j <= hi ? sycl::exp(score(j) - mx) * inv : 0.0f);

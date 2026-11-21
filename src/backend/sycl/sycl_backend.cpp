@@ -526,7 +526,10 @@ public:
         }
         for (size_t i = 0; i < nodes.size(); ++i) {
             const OpKind kind = nodes[i].kind;
-            if (kind == OpKind::KvCache || kind == OpKind::CausalConv || kind == OpKind::GatedDelta) need(i);
+            if (kind == OpKind::KvCache || kind == OpKind::CausalConv || kind == OpKind::DynamicConv ||
+                kind == OpKind::GatedDelta) {
+                need(i);
+            }
         }
         while (!stack.empty()) {
             const size_t i = stack.back();
@@ -905,8 +908,9 @@ private:
                              " is not supported (a multiple of 8, at most 512)");
                     if (std::get<graph::AttentionAttrs>(n.attrs).grouped) {
                         need(3, dt(n.inputs[3]) == DType::I32, "i32");
-                    } else if (n.inputs.size() == 4) {
-                        need(3, is_f32(3), "f32");
+                    } else {  // a key bias, or a relative bias and a sink
+                        for (size_t k = 3; k < n.inputs.size(); ++k)
+                            need(k, is_f32(k), "f32");
                     }
                     break;
                 }
@@ -2093,6 +2097,12 @@ private:
                 const auto& a = std::get<graph::ClampAttrs>(n.attrs);
                 return unary(UnaryOp::Clamp, a.lo, a.hi);
             }
+            case OpKind::L2Clip: {
+                const auto& a = std::get<graph::L2ClipAttrs>(n.attrs);
+                const int64_t width = out_shape.back();
+                sycl_be::l2_clip(q_, in_f32(0), out, out_n / width, width, a.threshold, a.eps);
+                return;
+            }
             case OpKind::RmsNorm: {
                 const int64_t width = out_shape.back();
                 const float* w = n.inputs.size() == 2 ? in_f32(1) : nullptr;
@@ -2197,6 +2207,10 @@ private:
                 s.block = a.block < s.tokens ? a.block : 0;  // one block: every key
                 if (a.grouped) {
                     s.groups = reinterpret_cast<const int32_t*>(in_ptr(3));
+                } else if (a.rel_extent > 0) {
+                    s.rel = in_f32(3);
+                    s.rel_extent = a.rel_extent;
+                    s.sink = in_f32(4);
                 } else if (n.inputs.size() == 4) {
                     s.key_bias = in_f32(3);
                 }
@@ -2402,6 +2416,23 @@ private:
                 if (rewinding_) {
                     f.channels = x[1];
                     f.kernel = in_shape(1)[1];
+                    keep_inputs(f, {{in_f32(0), x[1]}}, x[0]);
+                }
+                return;
+            }
+            case OpKind::DynamicConv: {
+                const auto slot = static_cast<size_t>(std::get<graph::StateAttrs>(n.attrs).slot);
+                SharedFixed& f = shared_.fixed[fixed_slot_[slot]];
+                StateBuffers& st = f.state;
+                const Dims& x = in_shape(0);
+                const Dims& taps = in_shape(2);
+                sycl_be::dynamic_conv(q_, in_f32(0), in_f32(1), in_f32(2),
+                                      reinterpret_cast<const float*>(st.buf[st.cur].get()),
+                                      reinterpret_cast<float*>(st.buf[1 - st.cur].get()), out, x[0], x[1], taps[2],
+                                      taps[1]);
+                if (rewinding_) {  // the window a cut leaves depends on x alone
+                    f.channels = x[1];
+                    f.kernel = taps[2];
                     keep_inputs(f, {{in_f32(0), x[1]}}, x[0]);
                 }
                 return;

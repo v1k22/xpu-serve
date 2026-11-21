@@ -206,3 +206,50 @@ TEST_CASE("sign matmul: one word of signs per 32 columns, a scale per row") {
     CHECK_THROWS_AS(g.sign_matmul(x, signs, g.constant(xs::HostTensor(DType::F32, {9}))), xs::Error);       // 9 scales
     CHECK_THROWS_AS(g.sign_matmul(x, g.constant(xs::HostTensor(DType::F32, {10, 2})), scales), xs::Error);  // float signs
 }
+
+TEST_CASE("causal attention with a relative bias takes a bias per head by distance and a sink per head") {
+    Graph g;
+    const int slot = g.add_kv_slot(2, 32, 0, "kv");
+    const Value k = g.input("k", DType::F32, {kT, 2, 32});
+    const auto [ka, va] = g.kv_cache(slot, k, k);
+    const Value q = g.input("q", DType::F32, {kT, 4, 32});
+    const Value rel = g.input("rel", DType::F32, {kT, 4, 16});
+    const Value sink = g.input("sink", DType::F32, {kT, 4});
+    graph::AttentionAttrs attrs;
+    attrs.rel_extent = 16;
+    const Value out = g.attention_relative(q, ka, va, rel, sink, attrs);
+    CHECK(g.type(out).shape == (Dims{kT, 4, 32}));
+    CHECK(g.node(out).inputs.size() == 5);
+    CHECK(std::get<graph::AttentionAttrs>(g.node(out).attrs).rel_extent == 16);
+    CHECK_THROWS_AS(g.attention(q, ka, va, attrs), xs::Error);  // the bias only through attention_relative
+    CHECK_THROWS_AS(g.attention_relative(q, ka, va, g.input("r2", DType::F32, {kT, 4, 8}), sink, attrs), xs::Error);
+    CHECK_THROWS_AS(g.attention_relative(q, ka, va, rel, g.input("s2", DType::F32, {kT, 2}), attrs), xs::Error);
+    graph::AttentionAttrs other = attrs;
+    other.causal = false;
+    CHECK_THROWS_AS(g.attention_relative(q, ka, va, rel, sink, other), xs::Error);
+    other = attrs;
+    other.softcap = 30.0f;
+    CHECK_THROWS_AS(g.attention_relative(q, ka, va, rel, sink, other), xs::Error);
+    other = attrs;
+    other.rel_extent = 0;
+    CHECK_THROWS_AS(g.attention_relative(q, ka, va, rel, sink, other), xs::Error);
+}
+
+TEST_CASE("l2_clip keeps the shape; dynamic_conv takes taps per token and group over a conv slot") {
+    Graph g;
+    const Value x = g.input("x", DType::F32, {kT, 3, 16});
+    CHECK(g.type(g.l2_clip(x, 2.0f)).shape == (Dims{kT, 3, 16}));
+    CHECK_THROWS_AS(g.l2_clip(x, 0.0f), xs::Error);
+
+    const int slot = g.add_conv_slot(48, 4, "conv");
+    const Value c = g.input("c", DType::F32, {kT, 48});
+    const Value w = g.input("w", DType::F32, {4, 48});
+    const Value taps = g.input("taps", DType::F32, {kT, 6, 4});
+    CHECK(g.type(g.dynamic_conv(slot, c, w, taps)).shape == (Dims{kT, 48}));
+    g.output("out", g.dynamic_conv(slot, c, w, taps));
+    CHECK_THROWS_AS(g.validate(), xs::Error);  // the slot is used twice
+    const int other = g.add_conv_slot(48, 4, "other");
+    CHECK_THROWS_AS(g.dynamic_conv(other, c, g.input("w2", DType::F32, {48, 4}), taps), xs::Error);  // w is [K, C]
+    CHECK_THROWS_AS(g.dynamic_conv(other, c, w, g.input("t2", DType::F32, {kT, 5, 4})), xs::Error);  // 5 groups of 48
+    CHECK_THROWS_AS(g.dynamic_conv(other, c, w, g.input("t3", DType::F32, {kT, 6, 3})), xs::Error);
+}

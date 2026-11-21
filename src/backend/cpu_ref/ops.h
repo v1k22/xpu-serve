@@ -28,6 +28,7 @@ HostTensor softplus(const HostTensor& x);
 HostTensor clamp(const HostTensor& x, float lo, float hi);
 // `weight` may be null (no scaling).
 HostTensor rms_norm(const HostTensor& x, const HostTensor* weight, float eps);
+HostTensor l2_clip(const HostTensor& x, float threshold, float eps);
 // Any dtype; `shape` is concrete.
 HostTensor reshape(const HostTensor& x, const Dims& shape);
 // Any dtype; begin/end as in graph::SliceAttrs, resolved against the runtime dim.
@@ -39,13 +40,17 @@ HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTens
                 const HostTensor* pair_axes = nullptr);
 // x [T, C], w [C, K], state [(K-1) * C] row-major (updated in place to the last K-1 inputs).
 HostTensor causal_conv(const HostTensor& x, const HostTensor& w, std::vector<float>& state);
+// x [T, C], w [K, C], taps [T, G, K], state as causal_conv's.
+HostTensor dynamic_conv(const HostTensor& x, const HostTensor& w, const HostTensor& taps, std::vector<float>& state);
 // q, k [T, Hk, Dk], v [T, Hv, Dv], g, beta [T, Hv], state [Hv * Dk * Dv] (updated in place).
 HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& k, const HostTensor& v,
                        const HostTensor& g, const HostTensor& beta, float qk_l2norm_eps, std::vector<float>& state);
-// `groups` [T] i32: the tokens' groups of attention in groups (AttentionAttrs::grouped), else null.
+// `groups` [T] i32: the tokens' groups of attention in groups (AttentionAttrs::grouped), else null. `rel` [T, Hq, E]
+// and `sink` [T, Hq]: the relative bias and the sink of AttentionAttrs::rel_extent, else null.
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
                      const graph::AttentionAttrs& attrs, const HostTensor* key_bias = nullptr,
-                     const HostTensor* groups = nullptr);
+                     const HostTensor* groups = nullptr, const HostTensor* rel = nullptr,
+                     const HostTensor* sink = nullptr);
 HostTensor div(const HostTensor& a, const HostTensor& b);
 HostTensor softmax(const HostTensor& x);
 // (values f32, indices i32) of the k largest along the last axis, largest first; ties keep the lower index first.

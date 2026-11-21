@@ -108,9 +108,12 @@ double dot(const float* a, const float* b, int64_t n) {
 }
 
 // Softmax-weighted sum of v rows for one query head over keys [first, last]: those `visible` keeps (empty: all).
+// `rel` [rel_extent]: this query head's bias by how far back a key sits from `pos`, and `sink`, its extra logit; or
+// both null.
 void attend_one(const float* q, const HostTensor& k_all, const HostTensor& v_all, int64_t kv_head, int64_t first,
                 int64_t last, const graph::AttentionAttrs& attrs, const float* key_bias,
-                const std::function<bool(int64_t)>& visible, float* out) {
+                const std::function<bool(int64_t)>& visible, const float* rel, const float* sink, int64_t pos,
+                float* out) {
     const int64_t kv_heads = k_all.dim(1);
     const int64_t head_dim = k_all.dim(2);
     const float* k = k_all.data<float>();
@@ -125,10 +128,15 @@ void attend_one(const float* q, const HostTensor& k_all, const HostTensor& v_all
         double s = attrs.scale * dot(q, k + (j * kv_heads + kv_head) * head_dim, head_dim);
         if (attrs.softcap > 0.0f) s = attrs.softcap * std::tanh(s / attrs.softcap);
         if (key_bias != nullptr) s += key_bias[j];
+        if (rel != nullptr && pos - j < attrs.rel_extent) s += rel[pos - j];
         scores[static_cast<size_t>(j - first)] = s;
         max_score = std::max(max_score, s);
     }
     double denom = 0;
+    if (sink != nullptr) {
+        max_score = std::max(max_score, static_cast<double>(*sink));
+        denom = std::exp(*sink - max_score);
+    }
     for (double& s : scores) {
         s = std::exp(s - max_score);
         denom += s;
@@ -390,6 +398,52 @@ HostTensor rope(const HostTensor& x, const HostTensor& positions, const HostTens
     return out;
 }
 
+HostTensor l2_clip(const HostTensor& x, float threshold, float eps) {
+    check_f32(x, "l2_clip x");
+    const int64_t d = x.shape().back();
+    HostTensor out(DType::F32, x.shape());
+    for (int64_t r = 0; r < x.numel() / d; ++r) {
+        const float* in = x.data<float>() + r * d;
+        const double factor = std::min(1.0, threshold / (std::sqrt(dot(in, in, d)) + eps));
+        for (int64_t i = 0; i < d; ++i)
+            out.data<float>()[r * d + i] = static_cast<float>(in[i] * factor);
+    }
+    return out;
+}
+
+HostTensor dynamic_conv(const HostTensor& x, const HostTensor& w, const HostTensor& taps, std::vector<float>& state) {
+    check_f32(x, "dynamic_conv x");
+    check_f32(w, "dynamic_conv w");
+    check_f32(taps, "dynamic_conv taps");
+    const int64_t tokens = x.dim(0);
+    const int64_t channels = x.dim(1);
+    const int64_t kernel = w.dim(0);
+    const int64_t groups = taps.dim(1);
+    const int64_t past = kernel - 1;
+    XS_CHECK(w.dim(1) == channels && taps.dim(0) == tokens && taps.dim(2) == kernel && channels % groups == 0 &&
+                 static_cast<int64_t>(state.size()) == past * channels,
+             "dynamic_conv shapes do not fit");
+    const int64_t per_group = channels / groups;
+    // x' = [state; x], [past + T, C]: the input j tokens back from t is row past + t - j
+    std::vector<float> ext(static_cast<size_t>((past + tokens) * channels));
+    std::copy(state.begin(), state.end(), ext.begin());
+    std::copy(x.data<float>(), x.data<float>() + x.numel(), ext.begin() + past * channels);
+    HostTensor out(DType::F32, {tokens, channels});
+    for (int64_t t = 0; t < tokens; ++t) {
+        for (int64_t c = 0; c < channels; ++c) {
+            const float* tap = taps.data<float>() + (t * groups + c / per_group) * kernel;
+            double acc = 0;
+            for (int64_t j = 0; j < kernel; ++j) {
+                acc += (static_cast<double>(w.data<float>()[j * channels + c]) + tap[j]) *
+                       ext[static_cast<size_t>((past + t - j) * channels + c)];
+            }
+            out.data<float>()[t * channels + c] = static_cast<float>(acc);
+        }
+    }
+    std::copy(ext.end() - past * channels, ext.end(), state.begin());
+    return out;
+}
+
 HostTensor causal_conv(const HostTensor& x, const HostTensor& w, std::vector<float>& state) {
     check_f32(x, "causal_conv x");
     check_f32(w, "causal_conv w");
@@ -479,7 +533,8 @@ HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& 
 }
 
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
-                     const graph::AttentionAttrs& attrs, const HostTensor* key_bias, const HostTensor* groups) {
+                     const graph::AttentionAttrs& attrs, const HostTensor* key_bias, const HostTensor* groups,
+                     const HostTensor* rel, const HostTensor* sink) {
     check_f32(q, "attention q");
     check_f32(k_all, "attention k");
     check_f32(v_all, "attention v");
@@ -502,6 +557,12 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
              "attention groups of ", groups == nullptr ? 0 : groups->numel(), " for ", tokens, " queries and ", kv_len,
              " keys");
     const int32_t* group = groups != nullptr ? groups->data<int32_t>() : nullptr;
+    const bool relative = attrs.rel_extent > 0;
+    XS_CHECK(relative == (rel != nullptr) && relative == (sink != nullptr) && (!relative || attrs.causal),
+             "attention with a relative bias is causal and needs the bias and the sink, and only it");
+    XS_CHECK(!relative ||
+                 (rel->shape() == Dims{tokens, q_heads, attrs.rel_extent} && sink->shape() == Dims{tokens, q_heads}),
+             "attention relative bias and sink do not fit ", tokens, " queries of ", q_heads, " heads");
     HostTensor out(DType::F32, q.shape());
     pool.parallel_for(tokens * q_heads, [&](int64_t item) {
         const int64_t t = item / q_heads;
@@ -519,8 +580,10 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
             visible = [group, t](int64_t j) { return group[t] == 0 || group[j] == 0 || group[t] == group[j]; };
         }
         const int64_t offset = (t * q_heads + h) * head_dim;
+        const int64_t row = t * q_heads + h;
         attend_one(q.data<float>() + offset, k_all, v_all, h / heads_per_kv, first, last, attrs, bias, visible,
-                   out.data<float>() + offset);
+                   relative ? rel->data<float>() + row * attrs.rel_extent : nullptr,
+                   relative ? sink->data<float>() + row : nullptr, pos, out.data<float>() + offset);
     });
     return out;
 }

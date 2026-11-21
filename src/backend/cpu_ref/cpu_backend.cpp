@@ -278,7 +278,9 @@ class CpuProgram {
                 const bool per_token = !(f.conv && i == 1);  // a conv's w is not per token
                 head.push_back(per_token ? cpu_ref::slice(f.inputs[i], 0, 0, m) : f.inputs[i]);
             }
-            if (f.conv) {
+            if (f.conv && head.size() == 3) {
+                cpu_ref::dynamic_conv(head[0], head[1], head[2], f.state);
+            } else if (f.conv) {
                 cpu_ref::causal_conv(head[0], head[1], f.state);
             } else {
                 cpu_ref::gated_delta(*pool_, head[0], head[1], head[2], head[3], head[4], f.eps, f.state);
@@ -392,6 +394,10 @@ class CpuProgram {
                 const auto& a = std::get<graph::ClampAttrs>(n.attrs);
                 return {cpu_ref::clamp(f32(0), a.lo, a.hi)};
             }
+            case OpKind::L2Clip: {
+                const auto& a = std::get<graph::L2ClipAttrs>(n.attrs);
+                return {cpu_ref::l2_clip(f32(0), a.threshold, a.eps)};
+            }
             case OpKind::RmsNorm: {
                 const float eps = std::get<graph::NormAttrs>(n.attrs).eps;
                 if (n.inputs.size() == 1) return {cpu_ref::rms_norm(f32(0), nullptr, eps)};
@@ -425,6 +431,11 @@ class CpuProgram {
                 if (conv_inputs != nullptr) (*conv_inputs)[slot] = {f32(0), f32(1)};
                 return {cpu_ref::causal_conv(f32(0), f32(1), conv_state[slot])};
             }
+            case OpKind::DynamicConv: {
+                const auto slot = static_cast<size_t>(std::get<graph::StateAttrs>(n.attrs).slot);
+                if (conv_inputs != nullptr) (*conv_inputs)[slot] = {f32(0), f32(1), f32(2)};
+                return {cpu_ref::dynamic_conv(f32(0), f32(1), f32(2), conv_state[slot])};
+            }
             case OpKind::GatedDelta: {
                 const auto& a = std::get<graph::StateAttrs>(n.attrs);
                 const auto slot = static_cast<size_t>(a.slot);
@@ -454,6 +465,10 @@ class CpuProgram {
                     return {out.reshaped(qs)};
                 }
                 if (a.grouped) return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, nullptr, &in(3))};
+                if (a.rel_extent > 0) {
+                    const HostTensor rel = f32(3), sink = f32(4);
+                    return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, nullptr, nullptr, &rel, &sink)};
+                }
                 if (n.inputs.size() == 4) {
                     const HostTensor bias = f32(3);
                     return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, &bias)};

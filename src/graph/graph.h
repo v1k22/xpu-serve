@@ -86,6 +86,10 @@ enum class OpKind : uint8_t {
                 // sum_s m[..., p, s] x[..., s, :] (+ a[..., p] y[..., :]); leading dims equal. Mixes the residual
                 // streams of hyper-connections (S streams of width D), and reads a weighted sum of them (P = 1)
     Conv2d,     // (x [N, C, H, W], w [O, C / groups, KH, KW] [, b [O]]) -> [N, O, HO, WO]; see below
+    L2Clip,     // (x [..., D]) -> x * min(1, threshold / (|x| + eps)), |x| the L2 norm over the last dim, f32: a
+                // vector longer than the threshold is scaled down to it, a shorter one passes
+    DynamicConv, // (x [T, C], w [K, C], taps [T, G, K]) -> [T, C]; a depthwise causal conv with taps per token, see
+                 // below
 };
 
 // Conv2d (torch.nn.functional.conv2d: cross-correlation, NCHW): with x zero-padded by Conv2dAttrs::pad,
@@ -102,6 +106,10 @@ enum class OpKind : uint8_t {
 
 // CausalConv: with x' = [the slot's K-1 previous inputs (zeros at the start), x], out[t, c] = sum_j w[c, j] x'[t + j, c];
 // the slot then keeps the last K-1 rows of x'.
+//
+// DynamicConv: with x[t - j] the input j tokens back (before the step, the slot's K - 1 previous inputs; zeros at the
+// start), out[t, c] = sum_j (w[j, c] + taps[t, c / (C / G), j]) x[t - j, c]: tap j weights the token j back, and the
+// channels of one of G equal groups share a token's taps. The slot then keeps the last K - 1 inputs, as CausalConv's.
 //
 // GatedDelta (gated delta rule, the recurrence of Gated DeltaNet linear attention): v head h reads key head
 // h / (Hv / Hk) and owns a state S_h [Dk, Dv] (zeros at the start), kept in the slot across runs. Per token t:
@@ -175,7 +183,11 @@ struct MhcRouteAttrs {
     int64_t streams = 2;
     int iterations = 1;
 };
-struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op's state across runs
+struct L2ClipAttrs {
+    float threshold = 0.0f;
+    float eps = 1e-6f;
+};
+struct StateAttrs {  // CausalConv, DynamicConv and GatedDelta: the slot that carries the op's state across runs
     int slot = -1;
     float qk_l2norm_eps = 0.0f;  // GatedDelta only; 0 = no l2norm of q and k
 };
@@ -197,6 +209,10 @@ struct StateAttrs {  // CausalConv and GatedDelta: the slot that carries the op'
 // [T, ...] and a fourth input, groups [T] i32, gives each token's group; key j is visible to query i iff
 // groups[i] == 0, groups[j] == 0 or groups[i] == groups[j]. Group 0 sees every token and every token sees it; any
 // other group sees group 0 and itself. No window, block or key bias.
+// Causal with a relative bias and a sink (`rel_extent` > 0): a fourth input, rel [T, Hq, rel_extent] f32, and a fifth,
+// sink [T, Hq] f32. Head h of query i adds rel[i, h, p_i - j] to its score of key j when p_i - j < rel_extent (a bias
+// by how far back the key sits), and its softmax runs over the visible keys and one more logit, sink[i, h], which has
+// no value: the keys' weights then sum to less than 1. No softcap.
 // scores = scale * q.k (f32); if softcap > 0: scores = softcap * tanh(scores / softcap); softmax in f32.
 struct AttentionAttrs {
     float scale = 1.0f;
@@ -205,11 +221,13 @@ struct AttentionAttrs {
     bool causal = true;
     int64_t block = 0;
     bool grouped = false;
+    int64_t rel_extent = 0;
 };
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
                            ClampAttrs, NormAttrs, ReshapeAttrs, SliceAttrs, TransposeAttrs, KvCacheAttrs,
-                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, AxisAttrs, MhcRouteAttrs, Conv2dAttrs>;
+                           RopeAttrs, StateAttrs, AttentionAttrs, TopKAttrs, AxisAttrs, MhcRouteAttrs, Conv2dAttrs,
+                           L2ClipAttrs>;
 
 struct TensorType {
     DType dtype = DType::F32;
@@ -234,7 +252,7 @@ struct KvSlot {
     int64_t sliding_window = 0;  // hint: keys older than this are never read (0 = all are)
     std::string label;
 };
-struct ConvSlot {  // the last kernel - 1 inputs of a CausalConv: [kernel - 1, channels]
+struct ConvSlot {  // the last kernel - 1 inputs of a CausalConv or a DynamicConv: [kernel - 1, channels]
     int64_t channels = 0;
     int64_t kernel = 0;
     std::string label;
@@ -280,6 +298,7 @@ public:
     Value clamp(Value x, float lo, float hi);
     Value rms_norm(Value x, float eps);
     Value rms_norm(Value x, Value weight, float eps);
+    Value l2_clip(Value x, float threshold, float eps = 1e-6f);
     Value layer_norm(Value x, Value weight, Value bias, float eps);
     Value reshape(Value x, Dims shape);
     Value slice(Value x, int axis, int64_t begin, int64_t end = kSliceEnd);
@@ -291,10 +310,14 @@ public:
     Value attention(Value q, Value k_all, Value v_all, const AttentionAttrs& attrs);
     // Non-causal attention whose key j's scores get key_bias[j] added (AttentionAttrs::causal must be false).
     Value attention(Value q, Value k, Value v, Value key_bias, const AttentionAttrs& attrs);
+    // Causal attention with a relative bias rel [T, Hq, rel_extent] and a sink [T, Hq] (AttentionAttrs::rel_extent).
+    Value attention_relative(Value q, Value k_all, Value v_all, Value rel, Value sink, const AttentionAttrs& attrs);
     // Attention of the step's tokens in groups, groups [T] i32 (AttentionAttrs::grouped, not causal).
     Value attention_in_groups(Value q, Value k, Value v, Value groups, const AttentionAttrs& attrs);
     int add_conv_slot(int64_t channels, int64_t kernel, std::string label);
     Value causal_conv(int slot, Value x, Value w);
+    // The slot is a conv slot of x's channels and w's taps (add_conv_slot).
+    Value dynamic_conv(int slot, Value x, Value w, Value taps);
     int add_recurrent_slot(int64_t heads, int64_t key_dim, int64_t value_dim, std::string label);
     Value gated_delta(int slot, Value q, Value k, Value v, Value g, Value beta, float qk_l2norm_eps);
     Value div(Value a, Value b);

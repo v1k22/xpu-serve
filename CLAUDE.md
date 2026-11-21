@@ -298,14 +298,16 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 - Values are logically f32; weights keep their stored dtype and backends choose the compute precision.
 - MatMul weights use the Hugging Face layout `[out, in]`: `matmul(x, w) = x @ w^T`.
 - Ops: Input, Weight, Constant, Gather, MatMul, Add, Mul, Div, Scale, Tanh, GeluTanh, Gelu, Softcap, Sigmoid, Silu, Softplus,
-  Clamp, RmsNorm, Softmax, TopK, ReduceSum, Reshape, Slice, Transpose, PrevRow (each row of a step replaced by the row
+  Clamp, RmsNorm, L2Clip (a vector longer than a threshold scaled down to it), Softmax, TopK, ReduceSum, Reshape, Slice, Transpose, PrevRow (each row of a step replaced by the row
   before it), Rope (1-D, axial, or multimodal: each frequency reads one of a token's position axes, Qwen's time /
   height / width; optionally partial; over rows of several a token too), KvCache, KvRead (another program's KV slot,
   read only), Attention (causal with optional window, or non-causal: every key, the keys of the query's own block of
   tokens, or a window as wide after each query as before it: a drafter's block over a cache, an encoder's local
   attention; or the step's tokens in groups, group 0 seeing and seen by all, any other group itself and group 0:
-  questions packed after their state; or rows of several a token as one sequence, a vision tower's patches),
-  CausalConv and GatedDelta (stateful, for linear attention),
+  questions packed after their state; or rows of several a token as one sequence, a vision tower's patches; causal
+  with a bias by how far back a key sits and a sink, one more logit without a value: Inkling 2),
+  CausalConv and GatedDelta (stateful, for linear attention), DynamicConv (a causal convolution whose taps are per
+  token, over a conv slot),
   ExpertMatMul (each token's chosen experts from a stacked `[E, N, K]` bank, for mixture of experts), SignMatMul (a
   matmul by a one-bit weight: the cheap score of every row that a shortlist starts from), MhcRoute and StreamMix
   (manifold-constrained hyper-connections: a router's read and write weights and its Sinkhorn stream mix; residual
@@ -316,7 +318,7 @@ sequence. Model code builds it once at load time; a backend compiles it once.
 - Graph inputs are filled per step by `Model::prepare_inputs` (token ids, positions, and model-specific host inputs
   such as Gemma 4's per-layer embedding rows, and the image rows that replace soft-token embeddings).
 - Conv and recurrent slots (`add_conv_slot`, `add_recurrent_slot`) hold fixed-size per-sequence state for
-  `causal_conv` and `gated_delta`. They summarize the whole sequence, so a session cannot cut them back to a prefix,
+  `causal_conv`, `dynamic_conv` and `gated_delta`. They summarize the whole sequence, so a session cannot cut them back to a prefix,
   with two exceptions: the last step can be undone whole (the state before it is the buffer the step did not write:
   how a decision model reads one question after another on one state), and inside a last step of up to
   `SessionOptions::rewind_tokens` tokens any count can be kept (a speculative verify; the backend keeps that step's
@@ -351,6 +353,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/model/media_parity.cpp` | a model that reads audio or images (`XS_TEST_MODEL_DIR`: Qwen3-ASR, Qwen3-Omni's thinker): per clip the log-mel features and the audio encoder's rows run by run, per image the processor's patches and the vision tower's rows (merged and deepstack); the prompt (the case's messages through the template and tokenizer, a media token per row), last-token logits at the engine's positions (`rotary_positions`), greedy text through the engine; Qwen3-ASR's two checkpoint layouts | transformers' Qwen3-ASR and Qwen3OmniMoeThinkerForConditionalGeneration in fp32, from `tests/parity/model/hf_media_reference.py` (`make_tiny.py --arch qwen3_asr` or `--arch qwen3_omni` writes a tiny one in the released layout; `--converted-out` writes transformers' layout of Qwen3-ASR's; synthetic images of sizes the processor resizes each of its ways) |
 | `tests/unit/backend/*_hc_ops.cpp` | MhcRoute (2 and 4 streams, a bias or none, 1, 3 and 20 Sinkhorn iterations, logits large enough to need the peak subtracted) and StreamMix (a read, a mix, a mix with the branch's update; one token and several) on cpu-ref and the GPU | fp64 references (`hc_ops_cases.h`); planted: too few iterations, the bias dropped, the mix transposed |
 | `tests/unit/backend/*_moe_ops.cpp` | Div, Softmax, TopK (ties to the lower index), ReduceSum, ExpertMatMul and the `moe` block (softmax and sigmoid routers, shared expert), on cpu-ref and the GPU | fp64 references and an fp64 composition of the block (`moe_ops_cases.h`) |
+| `tests/unit/backend/*_relative_ops.cpp` | L2Clip (rows on both sides of the threshold, a row of zeros), DynamicConv over several steps (state carried, taps per token and group) and causal attention with a relative bias and a sink over a cache fed in steps (the per-row and matrix paths, an extent shorter and longer than the cache, a window), on cpu-ref and the GPU | fp64 references (`relative_ops_cases.h`); planted: a norm in place of the clip, taps in time order, the sink left out, the bias read toward the future |
 | `tests/unit/backend/*_shortlist_ops.cpp` | SignMatMul (words loaded whole and one by one, rows that fill no sub-group) and the shortlist head: the best rows by sketch, their exact logits, the head's pick, on cpu-ref and the GPU | fp64 references (`shortlist_cases.h`) |
 | `tests/unit/backend/*_programs.cpp` | sessions of several programs: KV slots shared by label, KvRead, truncate inside a short step (conv, gated delta, KV) equals never running the dropped tokens, the last step undone whole equals never running it; a run asked for some outputs returns those and advances the state all the same | the same session without them (`session_cases.h`) |
 | `tests/unit/engine/` | rotary positions (`rotary_positions.cpp`: an image's tokens at their offsets, the text after it one past its largest, generated tokens after that, prefix reuse, a one-position model refusing media with positions); speculative decoding emits exactly the greedy tokens (a stateful tiny model, a partly wrong drafter that drafts a token a run or a block a run, prefix reuse, stops); the same tokens when greedy decoding reads each row's `argmax` output instead of the logits; rejection sampling draws the target's distribution | plain greedy decoding; exact distributions |

@@ -373,6 +373,7 @@ bool xmx_device(const sycl::device& d) {
 bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v) {
     const FlashConfig c = flash_config(s.head_dim);
     if (c.dp == 0 || s.head_dim % 8 != 0) return false;
+    if (s.rel != nullptr || s.sink != nullptr) return false;  // a relative bias or a sink: the GEMM path's softmax
     if (s.block % (int64_t{kTm} * c.mt) != 0) return false;  // a sub-group's rows in one block
     // 2D block loads: 64-byte aligned bases, rows of at least 64 bytes, extents below 2^24
     const auto aligned = [](const void* p) { return reinterpret_cast<uintptr_t>(p) % 64 == 0; };

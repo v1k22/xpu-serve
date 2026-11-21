@@ -244,6 +244,37 @@ inline Tensor64 partial_rope(const Tensor64& x, const std::vector<int64_t>& posi
 
 // Depthwise causal conv over a whole sequence x [N, C] with w [C, K] (zeros before the first input), as
 // torch.nn.functional.conv1d(padding=K-1)[..., :N].
+// x * min(1, threshold / (|x| + eps)) over the last dim.
+inline Tensor64 l2_clip(const Tensor64& x, double threshold, double eps) {
+    const int64_t d = x.shape.back();
+    Tensor64 out(x.shape);
+    for (int64_t r = 0; r < x.numel() / d; ++r) {
+        double sum = 0;
+        for (int64_t i = 0; i < d; ++i) sum += x[r * d + i] * x[r * d + i];
+        const double factor = std::min(1.0, threshold / (std::sqrt(sum) + eps));
+        for (int64_t i = 0; i < d; ++i) out[r * d + i] = x[r * d + i] * factor;
+    }
+    return out;
+}
+
+// The whole sequence x [N, C] through a depthwise causal conv whose tap j weights the token j back: w [K, C] plus
+// each token's taps [N, G, K], shared by the channels of a group. `newest_first` false plants the taps in time order.
+inline Tensor64 dynamic_conv(const Tensor64& x, const Tensor64& w, const Tensor64& taps, bool newest_first = true) {
+    const int64_t n = x.shape[0], c = x.shape[1], k = w.shape[0], groups = taps.shape[1];
+    Tensor64 out(x.shape);
+    for (int64_t t = 0; t < n; ++t) {
+        for (int64_t ch = 0; ch < c; ++ch) {
+            double acc = 0;
+            for (int64_t j = 0; j < k; ++j) {
+                const int64_t src = newest_first ? t - j : t - (k - 1) + j;
+                if (src >= 0) acc += (w[j * c + ch] + taps[(t * groups + ch / (c / groups)) * k + j]) * x[src * c + ch];
+            }
+            out[t * c + ch] = acc;
+        }
+    }
+    return out;
+}
+
 inline Tensor64 causal_conv(const Tensor64& x, const Tensor64& w) {
     const int64_t n = x.shape[0], c = x.shape[1], k = w.shape[1];
     Tensor64 out(x.shape);
@@ -319,6 +350,10 @@ struct AttentionSpec {
     // other than 0 does not see group 0 (questions without their state).
     bool state_sees_itself_only = false;
     bool questions_without_state = false;
+    // A relative bias and a sink (graph::AttentionAttrs::rel_extent): rel [T, Hq, E] by how far back a key sits, and
+    // sink [T, Hq], one more logit without a value. Empty: none. `rel_sign` -1 plants the bias on the wrong side.
+    Tensor64 rel, sink;
+    int rel_sign = 1;
 };
 
 // The groups of a state of lengths[0] tokens (group 0) and questions of lengths[1], lengths[2], ... after it (groups
@@ -362,10 +397,18 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
                 s *= spec.scale;
                 if (spec.softcap > 0) s = spec.softcap * std::tanh(s / spec.softcap);
                 if (!spec.key_bias.empty()) s += spec.key_bias[static_cast<size_t>(j)];
+                const int64_t back = spec.rel_sign * (p - j);
+                if (!spec.rel.data.empty() && back >= 0 && back < spec.rel.shape[2]) {
+                    s += spec.rel[(i * hq + h) * spec.rel.shape[2] + back];
+                }
                 scores[static_cast<size_t>(j)] = s;
             }
-            const double mx = *std::max_element(scores.begin(), scores.end());
+            double mx = *std::max_element(scores.begin(), scores.end());
             double sum = 0;
+            if (!spec.sink.data.empty()) {
+                mx = std::max(mx, spec.sink[i * hq + h]);
+                sum = std::exp(spec.sink[i * hq + h] - mx);
+            }
             for (double& s : scores)
                 sum += (s = std::exp(s - mx));
             for (int64_t d = 0; d < dim; ++d) {
