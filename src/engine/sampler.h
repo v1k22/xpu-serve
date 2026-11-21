@@ -34,8 +34,10 @@ private:
     void apply_penalties(std::span<float> logits, std::span<const int32_t> prompt,
                          std::span<const int32_t> generated) const;
     bool greedy() const { return params_.temperature <= 0.0f || params_.top_k == 1; }
-    // The candidates sample() draws from: order_[i] with weight weights_[i] (unnormalized).
-    void distribution(std::span<const float> logits);
+    // The candidates sample() draws from: order_[i] with weight weights_[i] (unnormalized). Returns their sum.
+    double distribution(std::span<const float> logits);
+    // A candidate drawn by weight, the weights summing to `total`.
+    int32_t draw(double total);
 
     SamplingParams params_;
     std::mt19937_64 rng_;
