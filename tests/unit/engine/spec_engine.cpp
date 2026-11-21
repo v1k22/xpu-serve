@@ -326,4 +326,101 @@ TEST_CASE("programs that offer each row's argmax: greedy decoding reads it, samp
     }
 }
 
+namespace {
+
+// A block drafter that asks for a row of the target's last token (BlockDrafting::target_rows), over a session that
+// only records what the draft program is given.
+struct RowDrafting final : BlockDrafting, Speculation {
+    std::vector<std::string> rows{"context"};
+    Graph none;
+    int64_t block_drafts() const override { return 3; }
+    void prepare_block(int32_t token, int64_t, TensorMap& inputs) const override {
+        inputs["token_ids"] = HostTensor::from_vector(DType::I32, {1}, std::vector<int32_t>{token});
+    }
+    std::span<const std::string> target_rows() const override { return rows; }
+    const Graph& prefill_graph() const override { return none; }
+    const Graph& verify_graph() const override { return none; }
+    const Graph& draft_graph() const override { return none; }
+    const BlockDrafting* block() const override { return this; }
+    std::string_view drafter_name() const override { return "rows"; }
+};
+
+struct RecordingSession final : Session {
+    int64_t cached = 0;
+    TensorMap given;  // the draft program's inputs, last run
+    void run(size_t program, const TensorMap& inputs, TensorMap& outputs, std::span<const std::string>) override {
+        REQUIRE(program == spec::kDraft);
+        given.clear();
+        for (const auto& [name, t] : inputs) given[name] = t.clone();
+        outputs["drafts"] = HostTensor::from_vector(DType::I32, {3}, std::vector<int32_t>{4, 5, 6});
+        cached += 4;  // the block's rows, which the runner cuts back
+    }
+    int64_t num_cached(size_t) const override { return cached; }
+    void reset() override { cached = 0; }
+    void truncate(size_t, int64_t n) override { cached = n; }
+};
+
+// What a target's run of `rows` tokens gives the drafter: row r holds r + `first` in every column.
+TensorMap target_rows(int64_t rows, float first) {
+    HostTensor t(DType::F32, {rows, 2});
+    for (int64_t r = 0; r < rows; ++r) t.data<float>()[2 * r] = t.data<float>()[2 * r + 1] = first + static_cast<float>(r);
+    TensorMap out;
+    out["context"] = std::move(t);
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("a block drafter that reads the target's last token: the row of the last token kept, after every step") {
+    const RowDrafting drafting;
+    RecordingSession session;
+    const auto drafter = spec::make_drafter(drafting, session);
+    CHECK(drafter->target_outputs().size() == 1);
+    const auto context = [&] { return session.given.at("context").data<float>()[0]; };
+    const std::vector<int32_t> five(5, 1), four(4, 1);
+
+    // A prefill of 5 tokens that gives a row per token, then one that gives its last token's alone.
+    drafter->add(target_rows(5, 10.0f), 5, 0, five);
+    session.cached = 5;
+    CHECK(drafter->propose(7, 3) == std::vector<int32_t>{4, 5, 6});
+    CHECK(session.given.at("context").shape() == Dims{1, 2});
+    CHECK(context() == 14.0f);
+    CHECK(session.cached == 5);  // the block's rows are cut back
+    drafter->add(target_rows(1, 30.0f), 5, 5, five);
+    session.cached = 10;
+    drafter->propose(7, 2);
+    CHECK(context() == 30.0f);
+
+    // A verify of the pending token and 3 drafts that keeps 2 rows: the second row's, not the last's.
+    drafter->add(target_rows(4, 40.0f), 2, 10, four);
+    session.cached = 12;
+    drafter->propose(7, 3);
+    CHECK(context() == 41.0f);
+    // One that keeps them all, and one that keeps the pending token alone.
+    drafter->add(target_rows(4, 50.0f), 4, 12, four);
+    session.cached = 16;
+    drafter->propose(7, 3);
+    CHECK(context() == 53.0f);
+    drafter->add(target_rows(4, 60.0f), 1, 16, four);
+    session.cached = 17;
+    drafter->propose(7, 3);
+    CHECK(context() == 60.0f);
+
+    // The sequence cut back to another token: its row is gone, and a draft before the target runs again is refused.
+    drafter->truncate(17);  // where it already is: the row still holds
+    drafter->propose(7, 3);
+    drafter->truncate(9);
+    session.cached = 9;
+    CHECK_THROWS_AS(drafter->propose(7, 3), xs::Error);
+    drafter->add(target_rows(1, 70.0f), 3, 9, std::vector<int32_t>(3, 1));
+    session.cached = 12;
+    drafter->propose(7, 3);
+    CHECK(context() == 70.0f);
+    // A run without the row, or one that gives a row per token of another count, is refused by name.
+    CHECK_THROWS_WITH_AS(drafter->add(TensorMap{}, 4, 12, four), doctest::Contains("'context'"), xs::Error);
+    CHECK_THROWS_WITH_AS(drafter->add(target_rows(3, 0.0f), 2, 12, four), doctest::Contains("'context'"), xs::Error);
+    // A last row alone cannot serve a step cut inside: which token it belongs to is not the kept one.
+    CHECK_THROWS_WITH_AS(drafter->add(target_rows(1, 0.0f), 2, 12, four), doctest::Contains("'context'"), xs::Error);
+}
+
 }  // namespace xs
