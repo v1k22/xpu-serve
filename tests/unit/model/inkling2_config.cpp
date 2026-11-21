@@ -1,8 +1,10 @@
-// Inkling 2 config parsing (inkling2_loop): the Inkling-2-Mini layout, and what it refuses by name.
+// Inkling 2 config parsing (inkling2_loop): the Inkling-2-Mini layout and its drafter's settings (mtp_config), and
+// what each refuses by name.
 #include <doctest/doctest.h>
 
 #include <nlohmann/json.hpp>
 
+#include "models/drafters/dspark.h"
 #include "models/inkling2/inkling2.h"
 #include "util/error.h"
 
@@ -138,4 +140,57 @@ TEST_CASE("inkling2 config: a GGUF import's expert banks hold the gate rows, the
     CHECK(xs::inkling2::parse_config(config).gate_up_alternates);
     config["text_config"]["gate_up_rows"] = "pairs";
     CHECK(refuses(config, "gate_up_rows 'pairs'"));
+}
+
+namespace {
+
+// thinkingmachines/Inkling-2-Mini's mtp_config: its drafter's settings.
+json drafter_config() {
+    return {{"hidden_size", 2304},        {"num_hidden_layers", 3},        {"num_attention_heads", 24},
+            {"num_key_value_heads", 8},   {"head_dim", 128},               {"intermediate_size", 9216},
+            {"max_position_embeddings", 1048576}, {"torch_dtype", "bfloat16"}, {"q_bias", false},
+            {"o_bias", false},            {"rms_norm_eps", 1e-6},          {"rope_theta", 1000000.0},
+            {"local_layer_ids", {0, 2}},  {"sliding_window_size", 1024},   {"block_size", 8},
+            {"markov_rank", 256},         {"markov_head_type", "rnn_hidden"}, {"target_layer_ids", {5, 23, 41, 48}}};
+}
+
+bool drafter_refuses(const json& config, const std::string& part, int64_t hidden = 2304, int64_t visits = 48) {
+    try {
+        xs::dspark::parse_config(config, hidden, visits);
+    } catch (const xs::Error& e) {
+        return std::string(e.what()).find(part) != std::string::npos;
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST_CASE("inkling2 drafter config: the released mtp_config, and what it refuses by name") {
+    const xs::dspark::Config c = xs::dspark::parse_config(drafter_config(), 2304, 48);
+    CHECK(c.num_layers == 3);
+    CHECK(c.num_heads == 24);
+    CHECK(c.num_kv_heads == 8);
+    CHECK(c.head_dim == 128);
+    CHECK(c.intermediate_size == 9216);
+    CHECK(c.block_size == 8);
+    CHECK(c.markov_rank == 256);
+    CHECK(c.windows == std::vector<int64_t>{1024, 0, 1024});  // the middle layer sees the whole context
+    CHECK(c.target_ids == std::vector<int64_t>{5, 23, 41, 48});
+    CHECK(c.rope_theta == 1e6);
+
+    const auto with = [](const char* key, const json& value) {
+        json config = drafter_config();
+        config[key] = value;
+        return config;
+    };
+    CHECK(drafter_refuses(with("markov_head_type", "bilinear"), "markov_head_type 'bilinear'"));
+    CHECK(drafter_refuses(with("q_bias", true), "q_bias"));
+    CHECK(drafter_refuses(with("o_bias", true), "o_bias"));
+    CHECK(drafter_refuses(with("hidden_size", 1024), "hidden_size 1024 is not the target's 2304"));
+    CHECK(drafter_refuses(with("local_layer_ids", {0, 3}), "local_layer_ids names layer 3"));
+    // The states it reads: rising, the last one the target's count of layer visits (its final state).
+    CHECK(drafter_refuses(with("target_layer_ids", {5, 23, 41, 47}), "target_layer_ids"));
+    CHECK(drafter_refuses(with("target_layer_ids", {23, 5, 41, 48}), "target_layer_ids"));
+    CHECK(drafter_refuses(drafter_config(), "target_layer_ids", 2304, 24));  // a target that runs each layer once
+    CHECK(drafter_refuses(with("block_size", 1), "sizes do not fit"));
 }

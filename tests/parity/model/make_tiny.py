@@ -273,8 +273,53 @@ def released_inkling2_layout(out, released):
     with open(os.path.join(out, "model.safetensors.index.json"), "w") as f:
         json.dump({"metadata": {}, "weight_map": {name: shard for name in sorted(tensors)}}, f, indent=2)
     released["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    released["mtp_config"] = inkling2_drafter(out, released["text_config"])
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(released, f, indent=2)
+
+
+def inkling2_drafter(out, text):
+    """The checkpoint's block drafter (DSpark) as the release ships one: mtp.safetensors beside the model and an
+    mtp_config, which is returned. Three layers, the first and the last seeing a window of context shorter than a
+    prompt; states read at the input of the last layer of a block before the loop, in its second pass and in its
+    third, and after the final norm, as the release's are; every tensor random, norms away from 1."""
+    hidden, heads, kv_heads, head_dim, width, rank, layers = text["hidden_size"], 4, 2, 32, 128, 16, 3
+    block, loop = text["n_layers_per_attn_res_block"], text["loop_config"]
+    core = loop["core_end"] - loop["core_start"]
+    visits = text["num_hidden_layers"] + (loop["num_passes"] - 1) * core
+    taps = [block - 1, loop["core_start"] + core + block - 1, loop["core_start"] + 3 * core - 1, visits]
+    config = dict(hidden_size=hidden, num_hidden_layers=layers, num_attention_heads=heads, num_key_value_heads=kv_heads,
+                  head_dim=head_dim, intermediate_size=width, max_position_embeddings=text["model_max_length"],
+                  torch_dtype="bfloat16", q_bias=False, o_bias=False, rms_norm_eps=1e-6, rope_theta=1000000.0,
+                  local_layer_ids=[0, 2], sliding_window_size=6, block_size=8, markov_rank=rank,
+                  markov_head_type="rnn_hidden", target_layer_ids=taps)
+    g = torch.Generator().manual_seed(7)
+    normal = lambda *shape, std=0.05: torch.randn(*shape, generator=g) * std
+    norm = lambda n: torch.rand(n, generator=g) + 0.5
+    t = {"fuse_weight": normal(layers + 1, len(taps), std=1.0), "mask_embed": normal(hidden, std=1.0),
+         "norm.weight": norm(hidden), "markov_head.dflare_norm.weight": norm(hidden),
+         "markov_head.markov_w1.weight": normal(text["vocab_size"], rank, std=1.0),
+         "markov_head.rnn_proj.weight": normal(3 * rank, 2 * rank + 2 * hidden, std=0.1),
+         "markov_head.rnn_proj.bias": normal(3 * rank, std=0.5),
+         "markov_head.hidden_out.weight": normal(hidden, rank, std=0.5),
+         "markov_head.hidden_out.bias": normal(hidden, std=0.2)}
+    for l in range(layers):
+        a = f"layers.{l}.self_attn."
+        t.update({
+            f"layers.{l}.input_layernorm.weight": norm(hidden), f"layers.{l}.post_attention_layernorm.weight": norm(hidden),
+            f"layers.{l}.dflare_norm.weight": norm(hidden),
+            a + "q_proj.weight": normal(heads * head_dim, hidden, std=0.25),
+            a + "k_proj.weight": normal(kv_heads * head_dim, hidden, std=0.25),
+            a + "v_proj.weight": normal(kv_heads * head_dim, hidden),
+            a + "o_proj.weight": normal(hidden, heads * head_dim),
+            a + "k_proj_ctx.weight": normal(kv_heads * head_dim, hidden, std=0.25),
+            a + "v_proj_ctx.weight": normal(kv_heads * head_dim, hidden),
+            a + "q_norm.weight": norm(head_dim), a + "k_norm.weight": norm(head_dim), a + "k_norm_ctx.weight": norm(head_dim),
+            f"layers.{l}.mlp.gate_proj.weight": normal(width, hidden), f"layers.{l}.mlp.up_proj.weight": normal(width, hidden),
+            f"layers.{l}.mlp.down_proj.weight": normal(hidden, width)})
+    save_file({k: v.to(torch.bfloat16) for k, v in t.items()}, os.path.join(out, "mtp.safetensors"),
+              metadata={"format": "pt"})
+    return config
 
 
 def qwen3_asr(vocab_size, source):

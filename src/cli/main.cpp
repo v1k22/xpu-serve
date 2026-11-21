@@ -91,9 +91,9 @@ void add_engine_options(Args& a) {
         .value("backend-opt", "backend options as key=value[,key=value]")
         .value("spec",
                "speculative decoding: off | mtp (the model's MTP head, or a Gemma 4 assistant with --drafter) | "
-               "dflash | dspine (a block drafter checkpoint with --drafter)",
+               "dflash | dspine (a block drafter checkpoint with --drafter) | dspark (Inkling 2's own drafter)",
                "off")
-        .value("spec-k", "speculative decoding: drafts per round (default: 3, or 7 of a block drafter's block)")
+        .value("spec-k", "speculative decoding: drafts per round (default: 3, 7 of a block drafter's block, 2 of DSpark's)")
         .value("drafter",
                "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, a DFlash or DSpine drafter)")
         .value("hf",
@@ -148,12 +148,12 @@ ServiceOptions service_options(const Args& a) {
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");
     const std::string& spec = a.get("spec");
-    if (spec == "mtp" || spec == "dflash" || spec == "dspine") {
+    if (spec == "mtp" || spec == "dflash" || spec == "dspine" || spec == "dspark") {
         o.spec = spec;
         o.engine.spec_k = a.get("spec-k").empty() ? kDraftersCount : a.get_int("spec-k");
         if (o.engine.spec_k != kDraftersCount && o.engine.spec_k < 1) fail("--spec-k must be at least 1, got ", o.engine.spec_k);
     } else if (spec != "off") {
-        fail("--spec must be off, mtp, dflash or dspine, got '", spec, "'");
+        fail("--spec must be off, mtp, dflash, dspine or dspark, got '", spec, "'");
     }
     o.drafter = a.get("drafter");
     if (a.has("hf-drafter")) {

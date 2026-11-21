@@ -21,7 +21,7 @@ struct HubSpec {
 };
 HubSpec parse_hub_spec(std::string_view text);
 
-// A model, or a drafter for one (a GGUF repository's drafter files are its `mtp-*.gguf`).
+// A model, or a drafter for one (a GGUF repository's drafter files are its `mtp-*.gguf` and `dspark-*.gguf`).
 enum class FileRole { Model, Drafter };
 
 struct Selection {
@@ -36,8 +36,9 @@ struct Selection {
 // file of the quantization (the error lists the ones there are), several, a file split into parts.
 Selection select_files(const RepoListing& listing, const HubSpec& spec, FileRole role);
 
-// For a GGUF file of a model whose MTP head is published apart (llama.cpp's draft model, `mtp-*.gguf`): the head's
-// file named after the model's file, else the only one, else its Q8_0; empty when the repository has none.
+// For a GGUF file of a model whose drafter is published apart (llama.cpp's draft model: an MTP head, `mtp-*.gguf`,
+// or a DSpark drafter, `dspark-*.gguf`): the drafter's file named after the model's file, else the only one, else
+// its Q8_0; empty when the repository has none.
 std::string select_mtp_head(const RepoListing& listing, const std::string& model_file);
 
 }  // namespace xs::hub

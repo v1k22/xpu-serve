@@ -74,6 +74,15 @@ struct Candidate {
     bool split = false;
 };
 
+// The length of the prefix that marks a GGUF repository's drafter files (llama.cpp's draft models: `mtp-*.gguf`, and
+// `dspark-*.gguf` for a DSpark drafter); 0 for any other file. `base`: a file's name in lower case.
+size_t drafter_prefix(std::string_view base) {
+    for (const std::string_view prefix : {"mtp-", "dspark-"}) {
+        if (base.substr(0, prefix.size()) == prefix) return prefix.size();
+    }
+    return 0;
+}
+
 std::string list_of(const std::vector<Candidate>& cs) {
     std::string s;
     for (const Candidate& c : cs)
@@ -86,7 +95,7 @@ Selection select_gguf(const RepoListing& l, const HubSpec& spec, FileRole role) 
     for (const RepoFile& f : l.files) {
         if (extension(f.path) != ".gguf") continue;
         const std::string base = lower(basename(f.path));
-        const bool drafter = base.rfind("mtp-", 0) == 0;
+        const bool drafter = drafter_prefix(base) > 0;
         if (base.rfind("mmproj", 0) == 0 || base.rfind("imatrix", 0) == 0) continue;
         if (drafter != (role == FileRole::Drafter)) continue;
         Candidate c;
@@ -94,7 +103,7 @@ Selection select_gguf(const RepoListing& l, const HubSpec& spec, FileRole role) 
         c.stem = gguf_stem(f.path, &c.split);
         cs.push_back(std::move(c));
     }
-    const char* what = role == FileRole::Drafter ? "drafter (mtp-*.gguf) " : "";
+    const char* what = role == FileRole::Drafter ? "drafter (mtp-*.gguf, dspark-*.gguf) " : "";
     if (cs.empty()) fail(l.repo, " has no ", what, "GGUF file");
     std::string quant = spec.quant;
     std::vector<Candidate> match;
@@ -198,14 +207,14 @@ std::string select_mtp_head(const RepoListing& l, const std::string& model_file)
     const std::string model_stem = upper(gguf_stem(model_file, &split));
     std::vector<Candidate> heads;
     for (const RepoFile& f : l.files) {
-        if (extension(f.path) != ".gguf" || lower(basename(f.path)).rfind("mtp-", 0) != 0) continue;
+        if (extension(f.path) != ".gguf" || drafter_prefix(lower(basename(f.path))) == 0) continue;
         Candidate c;
         c.path = f.path;
         c.stem = gguf_stem(f.path, &c.split);
         if (!c.split) heads.push_back(std::move(c));
     }
-    for (const Candidate& h : heads) {
-        if (upper(h.stem.substr(4)) == model_stem) return h.path;  // "mtp-<the model file's name>"
+    for (const Candidate& h : heads) {  // "mtp-<the model file's name>"
+        if (upper(h.stem.substr(drafter_prefix(lower(h.stem)))) == model_stem) return h.path;
     }
     if (heads.size() == 1) return heads.front().path;
     for (const Candidate& h : heads) {

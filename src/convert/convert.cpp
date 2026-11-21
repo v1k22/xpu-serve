@@ -151,14 +151,16 @@ void plan_graph(const graph::Graph& g, const WeightStore& weights, DType matmul_
     }
 }
 
-// A language model: the text decoder's graph and its drafter's (speculative decoding) at the requested format, its
+// A language model: the text decoder's graph and its drafter's programs (speculative decoding) at the requested format, its
 // media encoders' (vision, audio) at q8 (they run once per item and are compute-bound: only with scope All; their
 // quality is not measured at q4 yet), and the tables the model reads on the host at q8.
 std::map<std::string, DType> plan_formats(const Model& model, const ConvertOptions& o) {
     std::map<std::string, DType> plan;
     plan_graph(model.graph(), model.weights(), o.format, o.scope, o, plan);
     if (const Speculation* spec = model.speculation()) {
+        // the verify program too: what a block drafter reads of its target is computed there, with weights of its own
         plan_graph(spec->draft_graph(), model.weights(), o.format, o.scope, o, plan);
+        plan_graph(spec->verify_graph(), model.weights(), o.format, o.scope, o, plan);
     }
     for (size_t k = 0; k < kModalities; ++k) {
         if (const MediaEncoder* e = model.encoder(static_cast<Modality>(k))) {

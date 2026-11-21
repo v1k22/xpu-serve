@@ -16,10 +16,12 @@ namespace xs {
 
 // EngineOptions::spec_k as given to the service: the count that suits the kind of drafter asked for. A chain drafter
 // drafts 3 a round; a block drafter 7 (its drafts come in one run, and a verify of up to 8 tokens costs little more
-// than one of 4: docs/design-spec-decode.md), or its whole block where that is shorter.
+// than one of 4: docs/design-spec-decode.md), or its whole block where that is shorter. DSpark drafts 2: its target
+// is a mixture of experts whose every verify row reads experts of its own, so a row costs what its token would.
 inline constexpr int kDraftersCount = -1;
 inline constexpr int kChainDrafts = 3;
 inline constexpr int kBlockDrafts = 7;
+inline constexpr int kDsparkDrafts = 2;
 
 struct ServiceOptions {
     std::string backend = "sycl";

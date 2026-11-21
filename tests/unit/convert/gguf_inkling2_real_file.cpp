@@ -2,11 +2,13 @@
 // Hugging Face checkpoint it was converted from (XS_INKLING2_DIR: its config.json and tokenizer.json; the weights are
 // not read). The tokenizer written from the file passes the Inkling 2 parity cases and matches the checkpoint's token
 // by token; config.json gives the model code what the checkpoint's does, but for the order of the expert banks' rows.
-// Each case skips unless both variables are set.
+// With the drafter's file (XS_GGUF_DRAFTER_FILE, dspark-Inkling-2-Mini-Q8_0.gguf), the two files plan a pack with the
+// checkpoint's mtp_config and every tensor of its mtp.safetensors. Each case skips unless its variables are set.
 // The weights are checked by the model parity test on the imported pack (model_parity.cpp), the lossless file's
 // against Hugging Face fp32.
 #include <doctest/doctest.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -18,6 +20,7 @@
 #include "convert/real_gguf.h"
 #include "io/gguf.h"
 #include "model/tiny_checkpoints.h"
+#include "models/drafters/dspark.h"
 #include "models/inkling2/inkling2.h"
 #include "tokenizer/parity_cases.h"
 #include "tokenizer/tokenizer.h"
@@ -107,5 +110,46 @@ TEST_SUITE("gguf real file") {
         // The converter stores the gate rows of a fused bank, then its up rows; the checkpoint alternates them.
         CHECK(b.gate_up_alternates);
         CHECK_FALSE(a.gate_up_alternates);
+    }
+
+    TEST_CASE("a real inkling2 GGUF and its drafter's file plan the checkpoint's drafter") {
+        const auto real = real_file();
+        const char* d = std::getenv("XS_GGUF_DRAFTER_FILE");
+        if (!real || d == nullptr || *d == '\0') return;
+        const gguf::File file(real->gguf), drafter(d);
+        const gguf_import::ImportPlan plan = gguf_import::find_architecture("inkling2").plan_with_mtp(file, drafter);
+        const nlohmann::json hf = checkpoint_config(real->hf);
+        const inkling2::Config target = inkling2::parse_config(hf);
+        const auto parse = [&](const nlohmann::json& c) {
+            return dspark::parse_config(c, target.hidden_size, target.applications());
+        };
+        const dspark::Config a = parse(nlohmann::json::parse(plan.config.at("mtp_config").dump()));
+        const dspark::Config b = parse(hf.at("mtp_config"));
+        CHECK(a.hidden_size == b.hidden_size);
+        CHECK(a.intermediate_size == b.intermediate_size);
+        CHECK(a.num_layers == b.num_layers);
+        CHECK(a.num_heads == b.num_heads);
+        CHECK(a.num_kv_heads == b.num_kv_heads);
+        CHECK(a.head_dim == b.head_dim);
+        CHECK(a.block_size == b.block_size);
+        CHECK(a.markov_rank == b.markov_rank);
+        CHECK(a.windows == b.windows);
+        CHECK(a.target_ids == b.target_ids);
+        CHECK(a.rms_norm_eps == b.rms_norm_eps);
+        CHECK(a.rope_theta == b.rope_theta);
+        // The 15 tensors of each drafter layer and the 9 beside them, under the pack's prefix.
+        std::set<std::string> names;
+        for (const gguf_import::PackTensor& t : plan.tensors) {
+            if (t.name.rfind("mtp.", 0) == 0) names.insert(t.name);
+        }
+        CHECK(static_cast<int64_t>(names.size()) == 15 * a.num_layers + 9);
+        for (const char* name : {"mtp.fuse_weight", "mtp.mask_embed", "mtp.markov_head.rnn_proj.weight",
+                                 "mtp.layers.0.self_attn.k_proj_ctx.weight", "mtp.layers.2.dflare_norm.weight"}) {
+            CAPTURE(name);
+            CHECK(names.count(name) == 1);
+        }
+        // A model file is not a drafter's.
+        CHECK_THROWS_WITH_AS(gguf_import::find_architecture("inkling2").plan_with_mtp(file, file),
+                             doctest::Contains("is not Inkling 2's drafter"), xs::Error);
     }
 }

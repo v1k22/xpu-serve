@@ -1,8 +1,11 @@
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
+#include "io/joined_weights.h"
 #include "models/common/blocks.h"
 #include "models/config_util.h"
+#include "models/drafters/dspark.h"
 #include "models/inkling2/inkling2.h"
 #include "util/error.h"
 #include "util/log.h"
@@ -16,6 +19,10 @@ using graph::Value;
 
 // The released checkpoint's names: everything of the decoder sits under model.llm.
 constexpr const char* kPrefix = "model.llm.";
+// The checkpoint's drafter: its file beside the model's, and where its tensors sit among the model's (a pack keeps
+// them there).
+constexpr const char* kDrafterFile = "mtp.safetensors";
+constexpr const char* kDrafterPrefix = "mtp.";
 // transformers' Inkling2LoopUnweightedRMSNorm as the block residuals build it (its default, not rms_norm_eps).
 constexpr float kUnitEps = 1e-6f;
 
@@ -61,16 +68,24 @@ public:
         return mix(s.blocks, s.h, query("attn_res.output_query", 1), 1);
     }
 
-    // rows [n, hidden] -> logits [n, output_size].
-    Value head(Value rows) {
+    // The decoder's rows as the output layer reads them.
+    Value final_norm(Value rows) { return g_.rms_norm(rows, weight("norm.weight"), eps()); }
+    // normed rows [n, hidden] -> logits [n, output_size].
+    Value logits(Value normed) {
         Graph::Scope scope(g_, "head");
-        const Value logits = g_.matmul(g_.rms_norm(rows, weight("norm.weight"), eps()), weight("unembed.weight"));
-        return g_.softcap(g_.slice(logits, 1, 0, c_.output_size), static_cast<float>(c_.logit_softcap));
+        const Value all = g_.matmul(normed, weight("unembed.weight"));
+        return g_.softcap(g_.slice(all, 1, 0, c_.output_size), static_cast<float>(c_.logit_softcap));
     }
+
+    // The residual stream as it entered layer visit `visit` of decoder() (a looped layer has a visit per pass, in
+    // the order they run): what a drafter reads of the target.
+    Value entered(int64_t visit) const { return entered_.at(static_cast<size_t>(visit)); }
+    // Each token's position: an input only a drafter's context reads (the decoder has no rotary positions).
+    Value positions() { return g_.input("positions", DType::I32, {kT}); }
+    Value weight(const std::string& name) { return g_.weight(weights_, kPrefix + name); }
 
 private:
     float eps() const { return static_cast<float>(c_.norm_eps); }
-    Value weight(const std::string& name) { return g_.weight(weights_, kPrefix + name); }
     Value norm(Value x, const std::string& name) { return g_.rms_norm(x, weight(name), eps()); }
     Value unit(Value x) { return g_.reshape(g_.rms_norm(x, kUnitEps), {kT, 1, c_.hidden_size}); }
 
@@ -255,6 +270,7 @@ private:
         const bool sliding = c_.sliding[static_cast<size_t>(i)];
         const std::string ctl = l + "controllers.";
         const Value h = s.h;
+        entered_.push_back(h);
 
         Value xq, xk, xv;
         if (sliding) {
@@ -308,6 +324,7 @@ private:
     const Config& c_;
     const WeightStore& weights_;
     Value ids_, log_scale_;
+    std::vector<Value> entered_;
 };
 
 // The experts of a released checkpoint are NVFP4 (U8 codes) or MXFP8 (F8 codes) beside their scales; a pack's, or a
@@ -323,23 +340,36 @@ void pair_experts(SafetensorsWeights& weights, const Config& cfg) {
     }
 }
 
-class Inkling2Model final : public Model {
+// The programs of an Inkling 2 checkpoint: the step graph, and with its drafter (DSpark, models/drafters/dspark.h) the
+// prefill and verify programs, the same decoder appending the drafter's context, and the drafter's block program.
+class Inkling2Model final : public Model, public Speculation {
 public:
-    Inkling2Model(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights)
+    // `drafter`: the checkpoint's drafter, its weights in `weights` under kDrafterPrefix.
+    Inkling2Model(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights, const LoadOptions& options,
+                  std::optional<dspark::Config> drafter)
         : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)) {
-        Builder b(step_, cfg_, *weights_);
-        const Value h = b.decoder();
-        const Value logits = b.head(step_.slice(h, 0, -1));
-        step_.output("logits", logits);
-        step_.output("argmax", blocks::argmax_rows(step_, logits));
-        step_.validate();
+        if (drafter) {
+            block_ = std::make_unique<dspark::Drafter>(std::move(*drafter), *weights_, kDrafterPrefix, options.drafts);
+        }
+        build_target(step_, Head::LastLogits);
         log::debug("inkling2: graph has ", step_.nodes().size(), " nodes, ", step_.kv_slots().size(), " kv and ",
                    step_.conv_slots().size(), " conv slots over ", cfg_.applications(), " layer applications");
+        if (block_ == nullptr) return;
+        build_target(prefill_, Head::LastLogitsContext);
+        build_target(verify_, Head::AllLogitsContext);
+        build_draft();
     }
 
     const ModelInfo& info() const override { return info_; }
     const graph::Graph& graph() const override { return step_; }
     const WeightStore& weights() const override { return *weights_; }
+    const Speculation* speculation() const override { return block_ ? this : nullptr; }
+
+    const graph::Graph& prefill_graph() const override { return prefill_; }
+    const graph::Graph& verify_graph() const override { return verify_; }
+    const graph::Graph& draft_graph() const override { return draft_; }
+    const BlockDrafting* block() const override { return block_.get(); }
+    std::string_view drafter_name() const override { return "dspark"; }
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
                         TensorMap& inputs) const override {
@@ -348,6 +378,7 @@ public:
         XS_CHECK(n > 0, "inkling2: a step needs at least one token");
         HostTensor ids(DType::I32, {n});
         HostTensor scale(DType::F32, {n, 1, 1});
+        HostTensor positions(DType::I32, {n});
         for (int64_t i = 0; i < n; ++i) {
             const int32_t t = tokens[static_cast<size_t>(i)];
             if (t < 0 || t >= cfg_.vocab_size) {
@@ -356,22 +387,67 @@ public:
             ids.data<int32_t>()[i] = t;
             const double past_floor = std::max(static_cast<double>(start_pos + i + 1) / cfg_.log_scale_floor, 1.0);
             scale.data<float>()[i] = static_cast<float>(1.0 + cfg_.log_scale_alpha * std::log(past_floor));
+            positions.data<int32_t>()[i] = static_cast<int32_t>(start_pos + i);
         }
         inputs["token_ids"] = std::move(ids);
         inputs["log_scale"] = std::move(scale);
+        if (block_ != nullptr) inputs["positions"] = std::move(positions);
     }
 
 private:
+    enum class Head {
+        LastLogits,         // the step graph
+        LastLogitsContext,  // prefill with the drafter
+        AllLogitsContext,   // verify
+    };
+
+    void build_target(Graph& g, Head head) const {
+        Builder b(g, cfg_, *weights_);
+        const Value h = b.decoder();
+        // With a drafter every program takes the positions prepare_inputs gives, the step graph without reading them.
+        const Value positions = block_ != nullptr ? b.positions() : Value{};
+        Value logits;
+        if (head == Head::LastLogits) {
+            logits = b.logits(b.final_norm(g.slice(h, 0, -1)));
+        } else {
+            const bool all = head == Head::AllLogitsContext;
+            const Value normed = b.final_norm(h);
+            // The drafter reads the stream entering the layer visits it names; the last id, the count of visits,
+            // stands for the state the output layer reads.
+            std::vector<Value> taps;
+            for (const int64_t id : block_->config().target_ids) {
+                taps.push_back(id < cfg_.applications() ? b.entered(id) : normed);
+            }
+            const Value context = block_->append_context(g, taps, positions);
+            logits = b.logits(all ? normed : g.slice(normed, 0, -1));
+            g.output(dspark::kContextRow, all ? context : g.slice(context, 0, -1));
+        }
+        g.output("logits", logits);
+        g.output("argmax", blocks::argmax_rows(g, logits));
+        g.validate();
+    }
+
+    void build_draft() {
+        Builder b(draft_, cfg_, *weights_);
+        dspark::Target target;
+        target.embed = b.weight("embed.weight");
+        target.embed_norm = b.weight("embed_norm.weight");
+        target.head = b.weight("unembed.weight");
+        target.tokens = cfg_.output_size;
+        block_->build_block(draft_, target);
+    }
+
     Config cfg_;
     ModelInfo info_;
     std::unique_ptr<WeightStore> weights_;
-    graph::Graph step_;
+    graph::Graph step_, prefill_, verify_, draft_;
+    std::unique_ptr<dspark::Drafter> block_;
 };
 
 }  // namespace
 
 std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
-                            const LoadOptions& /*options*/) {
+                            const LoadOptions& options) {
     Config cfg = parse_config(config_json);
 
     ModelInfo info;
@@ -392,9 +468,27 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     XS_CHECK(!stops.empty(), "inkling2: no end-of-sequence token in config.json or generation_config.json");
     info.stop_token_ids = std::move(stops);
 
-    auto weights = SafetensorsWeights::open_dir(dir, SafetensorsWeights::Fp8::AsStored);
-    pair_experts(*weights, cfg);
-    return std::make_unique<Inkling2Model>(std::move(cfg), std::move(info), std::move(weights));
+    auto checkpoint = SafetensorsWeights::open_dir(dir, SafetensorsWeights::Fp8::AsStored);
+    pair_experts(*checkpoint, cfg);
+    std::unique_ptr<WeightStore> weights = std::move(checkpoint);
+
+    // The drafter: a released checkpoint keeps it in a file of its own, a pack among the model's tensors.
+    std::optional<dspark::Config> drafter;
+    if (options.speculation) {
+        if (std::filesystem::exists(dir / kDrafterFile)) {
+            weights = std::make_unique<JoinedWeights>(std::move(weights), SafetensorsWeights::open_file(dir / kDrafterFile),
+                                                      kDrafterPrefix);
+        }
+        const bool has_config = config_json.contains("mtp_config") && !config_json.at("mtp_config").is_null();
+        if (has_config && weights->contains(std::string(kDrafterPrefix) + "fuse_weight")) {
+            drafter = dspark::parse_config(config_json.at("mtp_config"), cfg.hidden_size, cfg.applications());
+        } else {
+            log::warn("inkling2: the checkpoint has no drafter (", kDrafterFile, " and config.json's mtp_config); ",
+                      "speculative decoding is unavailable");
+        }
+    }
+    return std::make_unique<Inkling2Model>(std::move(cfg), std::move(info), std::move(weights), options,
+                                           std::move(drafter));
 }
 
 }  // namespace xs::inkling2

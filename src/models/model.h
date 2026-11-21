@@ -93,10 +93,11 @@ public:
     virtual bool drafter_keeps_state() const = 0;
 };
 
-// A drafter that proposes a block in one run (DFlash, DSpine): block_drafts() tokens after a pending one. Nothing is
-// handed over: the target's prefill and verify programs append what the drafter reads of them to state slots of its
-// own (they count the same tokens as the target's), and Speculation::draft_graph, fed the pending token at its
-// position, appends its block to those slots; the engine cuts them back after the run. It gives "drafts" [n] i32, or
+// A drafter that proposes a block in one run (DFlash, DSpine, DSpark): block_drafts() tokens after a pending one. The
+// target's prefill and verify programs append what the drafter reads of them to state slots of its own (they count
+// the same tokens as the target's), and Speculation::draft_graph, fed the pending token at its position, appends its
+// block to those slots; the engine cuts them back after the run. What a drafter reads of the last token alone goes
+// through the host instead (target_rows). It gives "drafts" [n] i32, or
 // "candidates" [n, K] i32 with "scores" [n, K, K] f32: scores[i][j][k] ranks candidate k of draft i given that draft
 // i - 1 was its candidate j (row j = 0 for the first draft), and the drafts follow the best of each row in turn.
 class BlockDrafting {
@@ -105,6 +106,10 @@ public:
     virtual int64_t block_drafts() const = 0;
     // Inputs of the draft graph for the block after `token`, which sits at `position`.
     virtual void prepare_block(int32_t token, int64_t position, TensorMap& inputs) const = 0;
+    // Outputs of the target's prefill and verify programs that the draft graph takes as inputs of the same names,
+    // [1, width] each: the row of the last token the target kept. A verify gives a row per token; a prefill may give
+    // its last token's alone.
+    virtual std::span<const std::string> target_rows() const { return {}; }
 };
 
 // Speculative decoding with a model's drafter (an MTP head in the checkpoint, an assistant or a block drafter beside
@@ -122,7 +127,7 @@ public:
     virtual const graph::Graph& draft_graph() const = 0;
     virtual const ChainDrafting* chain() const { return nullptr; }
     virtual const BlockDrafting* block() const { return nullptr; }
-    // What drafts: "mtp", "assistant", "dflash", "dflash2", "dspine".
+    // What drafts: "mtp", "assistant", "dflash", "dflash2", "dspine", "dspark".
     virtual std::string_view drafter_name() const = 0;
     // The prefix a drafter checkpoint beside the model (LoadOptions::drafter) has its weights under in
     // Model::weights(); empty when the drafter is the checkpoint's own.

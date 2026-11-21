@@ -166,6 +166,30 @@ TEST_SUITE("hub select") {
             doctest::Contains("no drafter"), Error);
     }
 
+    // unsloth/Inkling-2-Mini-GGUF: the model's files, their copies in another layout under a name that is not
+    // .gguf, the DSpark drafter's two files and the vision projectors.
+    TEST_CASE("a DSpark drafter's files (dspark-*.gguf) are drafters: never the model, fetched for a model file") {
+        const RepoListing inkling = listing(
+            "unsloth/Inkling-2-Mini-GGUF",
+            {".gitattributes", "Inkling-2-Mini-UD-IQ1_S.gguf", "Inkling-2-Mini-UD-Q4_K_M.gguf",
+             "Inkling-2-Mini-UD-Q4_K_XL.gguf", "Inkling-2-Mini-UD-Q8_K_XL.gguf", "Mainline_Support/HOW_TO_RUN.md",
+             "Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file", "Mainline_Support/README.md", "README.md",
+             "assets/size_vs_kld.png", "dspark-Inkling-2-Mini-Q8_0.gguf", "dspark/README.md",
+             "dspark/dspark-Inkling-2-Mini-BF16.gguf", "mmproj-BF16.gguf", "mmproj-F16.gguf", "mmproj-F32.gguf"});
+        const auto pick = [&](const char* spec, FileRole role) {
+            return select_files(inkling, parse_hub_spec(spec), role).gguf;
+        };
+        CHECK(pick("unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_XL", FileRole::Model) == "Inkling-2-Mini-UD-Q4_K_XL.gguf");
+        CHECK(pick("unsloth/Inkling-2-Mini-GGUF", FileRole::Model) == "Inkling-2-Mini-UD-Q4_K_M.gguf");
+        // the only Q8_0 and BF16 files are the drafter's
+        CHECK_THROWS_AS(pick("unsloth/Inkling-2-Mini-GGUF:Q8_0", FileRole::Model), Error);
+        CHECK_THROWS_AS(pick("unsloth/Inkling-2-Mini-GGUF:BF16", FileRole::Model), Error);
+        CHECK(pick("unsloth/Inkling-2-Mini-GGUF", FileRole::Drafter) == "dspark-Inkling-2-Mini-Q8_0.gguf");
+        CHECK(pick("unsloth/Inkling-2-Mini-GGUF:BF16", FileRole::Drafter) == "dspark/dspark-Inkling-2-Mini-BF16.gguf");
+        CHECK(select_mtp_head(inkling, "Inkling-2-Mini-UD-Q4_K_XL.gguf") == "dspark-Inkling-2-Mini-Q8_0.gguf");
+        CHECK(select_mtp_head(inkling, "Inkling-2-Mini-UD-IQ1_S.gguf") == "dspark-Inkling-2-Mini-Q8_0.gguf");
+    }
+
     TEST_CASE("the MTP head of a model file published apart: named after it, else the only one, else none") {
         const RepoListing qwen = listing("unsloth/Qwen3.8-27B-GGUF", kQwen38Gguf);
         CHECK(select_mtp_head(qwen, "Qwen3.8-27B-Q4_0.gguf") == "MTP/mtp-Qwen3.8-27B-Q4_0.gguf");

@@ -23,11 +23,13 @@ std::string env(const char* name) {
     return v != nullptr ? std::string(v) : std::string();
 }
 
-// A file of the Qwen3.5 family (qwen35, qwen35moe) whose MTP head is not in it (nextn_predict_layers 0): unsloth's
-// smallest Qwen3.8-27B files.
+// A model file whose drafter is not in it: one of the Qwen3.5 family (qwen35, qwen35moe) without its MTP head
+// (nextn_predict_layers 0: unsloth's smallest Qwen3.8-27B files), or Inkling 2's, whose drafter is always a file of
+// its own.
 bool lacks_mtp_head(const fs::path& file) {
     const gguf::File f(file);
     const gguf::Value* arch = f.find("general.architecture");
+    if (arch != nullptr && arch->as_string() == "inkling2") return true;
     if (arch == nullptr || (arch->as_string() != "qwen35" && arch->as_string() != "qwen35moe")) return false;
     const gguf::Value* n = f.find(std::string(arch->as_string()) + ".nextn_predict_layers");
     return n == nullptr || n->as_int() == 0;
@@ -92,11 +94,11 @@ SourceFiles fetch_source(const std::string& text, FileRole role, const SourceOpt
     if (role == FileRole::Model && lacks_mtp_head(s.gguf)) {
         const std::string head = select_mtp_head(listing, sel.gguf);
         if (head.empty()) {
-            log::info(sel.gguf, " has no MTP head and ", spec.repo, " publishes none: --spec mtp is not available");
+            log::info(sel.gguf, " has no drafter and ", spec.repo, " publishes none: --spec is not available");
         } else {
             fetch_files(listing, {head}, o.hub);
             s.mtp = s.snapshot / head;
-            log::info(sel.gguf, " has no MTP head: importing the one of ", head);
+            log::info(sel.gguf, " has no drafter: importing the one of ", head);
         }
     }
     return s;

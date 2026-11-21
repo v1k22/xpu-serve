@@ -1,7 +1,8 @@
 #pragma once
 
-// A block drafter's runner (BlockDrafting: DFlash, DSpine): one run of the draft program proposes the whole block.
-// The drafter reads the target through state the target's own programs write, so nothing waits here.
+// A block drafter's runner (BlockDrafting: DFlash, DSpine, DSpark): one run of the draft program proposes the whole
+// block. The drafter reads the target through state the target's own programs write; what it reads of the last token
+// alone (BlockDrafting::target_rows) waits here between the target's run and the draft's.
 
 #include <cstdint>
 #include <span>
@@ -15,18 +16,20 @@ class BlockDrafter final : public Drafter {
 public:
     BlockDrafter(const Speculation& spec, Session& session);
 
-    std::span<const std::string> target_outputs() const override { return {}; }
+    std::span<const std::string> target_outputs() const override { return block_.target_rows(); }
     int max_drafts() const override;
-    void add(const TensorMap&, int64_t, int64_t, std::span<const int32_t>) override {}
+    void add(const TensorMap& outputs, int64_t keep, int64_t start, std::span<const int32_t> tokens) override;
     void flush() override {}
     std::vector<int32_t> propose(int32_t pending, int k) override;
-    void truncate(int64_t) override {}
-    void reset() override {}
+    void truncate(int64_t n) override;
+    void reset() override;
 
 private:
     const BlockDrafting& block_;
     Session& session_;
     TensorMap inputs_;
+    TensorMap rows_;    // target_rows() of the token at position at_ - 1
+    int64_t at_ = -1;   // -1: none held
 };
 
 // The drafts of a block program's outputs (BlockDrafting): "drafts" as they are, or the path through "candidates"

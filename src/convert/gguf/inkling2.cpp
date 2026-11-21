@@ -335,6 +335,146 @@ Layout layout(const Dimensions& d) {
     return l;
 }
 
+// ---- The drafter (DSpark), a file of its own: general.architecture "dflash" with dflash.dspark.markov_rank
+
+constexpr std::string_view kDrafter = "dflash";
+// Where a pack keeps the drafter's tensors, under the names of the checkpoint's mtp.safetensors.
+const std::string kDrafterPrefix = "mtp.";
+
+const std::set<std::string_view> kDrafterKeys = {
+    "block_count", "context_length", "embedding_length", "feed_forward_length", "attention.head_count",
+    "attention.head_count_kv", "attention.key_length", "attention.value_length", "attention.layer_norm_rms_epsilon",
+    "attention.causal", "attention.sliding_window", "attention.sliding_window_pattern", "rope.freq_base",
+    "rope.dimension_count", "vocab_size", "vocab_size_unpadded", "block_size", "target_layers", "dspark.markov_rank",
+    "sample_from_anchor", "has_confidence_head", "final_logit_softcapping",
+};
+
+std::string drafter_key(std::string_view rest) {
+    return str_cat(kDrafter, ".", rest);
+}
+
+struct DrafterDimensions {
+    int64_t layers = 0, hidden = 0, width = 0, heads = 0, kv_heads = 0, head_dim = 0, rank = 0, taps = 0;
+};
+
+// The drafter file `f` against the model's: mtp_config as the released config.json has it. Refuses a drafter of
+// another kind or another model by name.
+nlohmann::ordered_json drafter_config(const gguf::File& f, const gguf::File& model, const Dimensions& d,
+                                      DrafterDimensions& out) {
+    const std::string_view arch = f.get_string("general.architecture");
+    if (arch != kDrafter || f.find(drafter_key("dspark.markov_rank")) == nullptr) {
+        fail(kName, ": --mtp: the file is not Inkling 2's drafter (general.architecture '", arch, "'; expected '",
+             kDrafter, "' with ", drafter_key("dspark.markov_rank"), ")");
+    }
+    refuse_unknown_keys(f, kDrafter, kDrafterKeys);
+    const auto positive_of = [&](std::string_view rest) { return positive(f, kDrafter, drafter_key(rest)); };
+    const auto refuse_true = [&](std::string_view rest) {
+        if (const gguf::Value* v = f.find(drafter_key(rest)); v != nullptr && v->as_bool()) {
+            fail(kName, ": --mtp: ", drafter_key(rest), " true is not supported");
+        }
+    };
+    refuse_true("attention.causal");
+    refuse_true("sample_from_anchor");
+    refuse_true("has_confidence_head");
+
+    out.layers = positive_of("block_count");
+    out.hidden = positive_of("embedding_length");
+    out.width = positive_of("feed_forward_length");
+    out.heads = positive_of("attention.head_count");
+    out.kv_heads = positive_of("attention.head_count_kv");
+    out.head_dim = positive_of("attention.key_length");
+    out.rank = positive_of("dspark.markov_rank");
+    const std::vector<int64_t> taps = f.get(drafter_key("target_layers")).ints();
+    out.taps = static_cast<int64_t>(taps.size());
+    // The model the drafter was made for: the same width, vocabulary and softcap, and as many layer visits as the
+    // last state it reads names.
+    const int64_t visits = positive(model, kName, key("block_count"));
+    const auto same = [&](std::string_view what, double mine, double models) {
+        if (mine != models) {
+            fail(kName, ": --mtp: the drafter's ", what, " is ", mine, ", the model's ", models,
+                 ": it drafts for another model");
+        }
+    };
+    same("embedding_length", static_cast<double>(out.hidden), static_cast<double>(d.hidden));
+    same("vocab_size", static_cast<double>(positive_of("vocab_size")), static_cast<double>(d.vocab));
+    same("vocab_size_unpadded", static_cast<double>(positive_of("vocab_size_unpadded")), static_cast<double>(d.tokens));
+    same("final_logit_softcapping", f.get_float(drafter_key("final_logit_softcapping")),
+         model.get_float(key("final_logit_softcapping")));
+    same("last target layer", static_cast<double>(taps.empty() ? -1 : taps.back()), static_cast<double>(visits));
+    if (f.get_int(drafter_key("attention.value_length")) != out.head_dim ||
+        f.get_int(drafter_key("rope.dimension_count")) != out.head_dim) {
+        fail(kName, ": --mtp: attention.value_length and rope.dimension_count must equal attention.key_length ",
+             out.head_dim);
+    }
+    const std::vector<gguf::Value> pattern = f.get(drafter_key("attention.sliding_window_pattern")).elements();
+    if (static_cast<int64_t>(pattern.size()) != out.layers) {
+        fail(kName, ": --mtp: attention.sliding_window_pattern has ", pattern.size(), " entries for ", out.layers,
+             " layers");
+    }
+    std::vector<int64_t> local;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if (pattern[i].as_bool()) local.push_back(static_cast<int64_t>(i));
+    }
+
+    nlohmann::ordered_json c;
+    c["hidden_size"] = out.hidden;
+    c["num_hidden_layers"] = out.layers;
+    c["num_attention_heads"] = out.heads;
+    c["num_key_value_heads"] = out.kv_heads;
+    c["head_dim"] = out.head_dim;
+    c["intermediate_size"] = out.width;
+    c["max_position_embeddings"] = positive_of("context_length");
+    c["q_bias"] = false;
+    c["o_bias"] = false;
+    c["rms_norm_eps"] = config_number(f.get(drafter_key("attention.layer_norm_rms_epsilon")));
+    c["rope_theta"] = config_number(f.get(drafter_key("rope.freq_base")));
+    c["local_layer_ids"] = local;
+    c["sliding_window_size"] = positive_of("attention.sliding_window");
+    c["block_size"] = positive_of("block_size");
+    c["markov_rank"] = out.rank;
+    c["markov_head_type"] = "rnn_hidden";  // the one head the converter writes (joint_proj, dspark_hidden_out)
+    c["target_layer_ids"] = taps;
+    return c;
+}
+
+Layout drafter_layout(const DrafterDimensions& d, int64_t vocab) {
+    const std::string P = kDrafterPrefix;
+    const int64_t h = d.hidden, q = d.heads * d.head_dim, kv = d.kv_heads * d.head_dim;
+    Layout l;
+    l.top["dspark_fuse.weight"] = one({d.layers + 1, d.taps}, P + "fuse_weight");
+    l.top["mask_embd.weight"] = one({h}, P + "mask_embed");
+    l.top["output_norm.weight"] = one({h}, P + "norm.weight");
+    l.top["dspark_norm.weight"] = one({h}, P + "markov_head.dflare_norm.weight");
+    l.top["markov_w1.weight"] = one({vocab, d.rank}, P + "markov_head.markov_w1.weight");
+    l.top["joint_proj.weight"] = one({3 * d.rank, 2 * d.rank + 2 * h}, P + "markov_head.rnn_proj.weight");
+    l.top["joint_proj.bias"] = one({3 * d.rank}, P + "markov_head.rnn_proj.bias");
+    l.top["dspark_hidden_out.weight"] = one({h, d.rank}, P + "markov_head.hidden_out.weight");
+    l.top["dspark_hidden_out.bias"] = one({h}, P + "markov_head.hidden_out.bias");
+    for (int64_t i = 0; i < d.layers; ++i) {
+        const std::string L = P + "layers." + std::to_string(i) + ".";
+        const std::string A = L + "self_attn.";
+        Entries e;
+        e["attn_norm.weight"] = one({h}, L + "input_layernorm.weight");
+        e["attn_q.weight"] = one({q, h}, A + "q_proj.weight");
+        e["attn_k.weight"] = one({kv, h}, A + "k_proj.weight");
+        e["attn_v.weight"] = one({kv, h}, A + "v_proj.weight");
+        e["attn_output.weight"] = one({h, q}, A + "o_proj.weight");
+        e["attn_q_norm.weight"] = one({d.head_dim}, A + "q_norm.weight");
+        e["attn_k_norm.weight"] = one({d.head_dim}, A + "k_norm.weight");
+        e["attn_k_ctx.weight"] = one({kv, h}, A + "k_proj_ctx.weight");
+        e["attn_v_ctx.weight"] = one({kv, h}, A + "v_proj_ctx.weight");
+        e["attn_k_ctx_norm.weight"] = one({d.head_dim}, A + "k_norm_ctx.weight");
+        e["dflare_norm.weight"] = one({h}, L + "dflare_norm.weight");
+        e["ffn_norm.weight"] = one({h}, L + "post_attention_layernorm.weight");
+        e["ffn_gate.weight"] = one({d.width, h}, L + "mlp.gate_proj.weight");
+        e["ffn_up.weight"] = one({d.width, h}, L + "mlp.up_proj.weight");
+        e["ffn_down.weight"] = one({h, d.width}, L + "mlp.down_proj.weight");
+        l.blocks.push_back(std::move(e));
+    }
+    l.block_kind = [](int64_t) { return std::string("a drafter layer"); };
+    return l;
+}
+
 class Inkling2 final : public Architecture {
 public:
     std::string_view name() const override { return kName; }
@@ -348,6 +488,18 @@ public:
         plan.config["text_config"] = text_config(f, d);
         map_tensors(f, kName, layout(d), plan);
         return plan;
+    }
+
+    // The drafter is always a file of its own (its blocks are named as the model's are): its tensors go into the
+    // pack beside the model's, under the names a pack of the released checkpoint gives them, and its settings into
+    // config.json's mtp_config.
+    ImportPlan plan_with_mtp(const gguf::File& f, const gguf::File& mtp) const override {
+        ImportPlan p = plan(f);
+        DrafterDimensions dd;
+        const Dimensions d = dimensions(f);
+        p.config["mtp_config"] = drafter_config(mtp, f, d, dd);
+        map_tensors(mtp, kDrafter, drafter_layout(dd, d.vocab), p);
+        return p;
     }
 };
 

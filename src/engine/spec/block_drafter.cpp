@@ -21,12 +21,46 @@ int BlockDrafter::max_drafts() const {
     return static_cast<int>(block_.block_drafts());
 }
 
+void BlockDrafter::add(const TensorMap& outputs, int64_t keep, int64_t start, std::span<const int32_t> tokens) {
+    if (block_.target_rows().empty()) return;
+    const auto fed = static_cast<int64_t>(tokens.size());
+    XS_CHECK(keep >= 1 && keep <= fed, "spec: ", keep, " rows kept of a step of ", fed);
+    rows_.clear();
+    for (const std::string& name : block_.target_rows()) {
+        const auto it = outputs.find(name);
+        XS_CHECK(it != outputs.end(), "spec: the target's run gave no '", name, "' for its block drafter");
+        const HostTensor& t = it->second;
+        XS_CHECK(t.dtype() == DType::F32 && t.rank() == 2 && (t.dim(0) == fed || (t.dim(0) == 1 && keep == fed)),
+                 "spec: '", name, "' is ", dtype_name(t.dtype()), " ", dims_to_string(t.shape()), " after a step of ",
+                 fed, " tokens of which ", keep, " are kept");
+        const int64_t row = t.dim(0) == fed ? keep - 1 : 0;
+        HostTensor last(DType::F32, {1, t.dim(1)});
+        std::copy_n(t.data<float>() + row * t.dim(1), t.dim(1), last.data<float>());
+        rows_[name] = std::move(last);
+    }
+    at_ = start + keep;
+}
+
+void BlockDrafter::truncate(int64_t n) {
+    if (n != at_) reset();  // the rows held are another token's: the target runs again before the next draft
+}
+
+void BlockDrafter::reset() {
+    rows_.clear();
+    at_ = -1;
+}
+
 std::vector<int32_t> BlockDrafter::propose(int32_t pending, int k) {
     XS_CHECK(k >= 1 && k <= max_drafts(), "spec: ", k, " drafts of a block of ", max_drafts());
     // The draft program's slots hold what the target's programs appended: the positions before the pending token.
     const int64_t position = session_.num_cached(kDraft);
     inputs_.clear();
     block_.prepare_block(pending, position, inputs_);
+    if (!block_.target_rows().empty()) {
+        XS_CHECK(at_ == position, "spec: the block drafter holds the target's rows of position ", at_ - 1,
+                 ", the draft follows position ", position - 1);
+        for (const auto& [name, row] : rows_) inputs_[name] = row.clone();
+    }
     TensorMap out;
     session_.run(kDraft, inputs_, out);
     session_.truncate(kDraft, position);  // the block's rows were drafts, not the sequence
