@@ -50,12 +50,19 @@ struct MoeSpec {
     Act act = Act::Silu;
 };
 
+// An expert's hidden state from its gate and up projections' outputs.
+using Combine = std::function<Value(Value gate, Value up)>;
+
 struct MoeParts {
     Value router;                     // [E, hidden]
     Value router_x;                   // the router's input when it is not x (invalid: x)
+    Value select_bias;                // [E]: added to the probabilities to choose the experts, not to their weights; or
+                                      // invalid
     Value expert_scale;               // [E]: each expert's routing weight times its entry, after normalizing; or invalid
     Value gate, up, down;             // [E, I, hidden], [E, I, hidden], [E, hidden, I]
     Value gate_up;                    // instead of gate and up: [E, 2 I, hidden], gate rows first (one expert matmul)
+    bool interleaved = false;         // gate_up's rows alternate instead: gate 0, up 0, gate 1, up 1, ...
+    Combine hidden;                   // empty: act(gate) * up
     Linear shared_gate, shared_up, shared_down;  // a shared expert every token uses; empty: none
     Value shared_expert_gate;         // [1, hidden]: the shared output times sigmoid(x . w); invalid: no gate
 };

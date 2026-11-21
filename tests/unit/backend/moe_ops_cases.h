@@ -331,4 +331,119 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
     CHECK_FALSE(all_close(out, unnormalized, env.mm_atol, env.mm_rtol));
 }
 
+// The block as Inkling 2 routes: a bias that chooses the experts without weighing them, a fused bank whose rows
+// alternate gate and up, a hidden state the model computes itself (softcapped SwiGLU).
+inline void moe_selection_bias(const Env& env) {
+    TensorRng rng(36);
+    const int64_t experts = 8, top_k = 2, hidden = 64, inter = 48, tokens = 9;
+    const float s_in = 1.0f / std::sqrt(static_cast<float>(hidden));
+    MemoryWeights w;
+    w.add("router", rng.uniform(DType::F32, {experts, hidden}, 6.0f * s_in));
+    w.add("bias", rng.uniform(DType::F32, {experts}, 0.6f));
+    w.add("gate_up", rng.uniform(DType::BF16, {experts, 2 * inter, hidden}, 4.0f * s_in));
+    w.add("down", rng.uniform(DType::BF16, {experts, hidden, inter}, 1.0f / std::sqrt(static_cast<float>(inter))));
+    const Tensor64 router_w = to_f64(w.tensor("router")), bias = to_f64(w.tensor("bias"));
+    const auto sigmoid = [](double v) { return 1.0 / (1.0 + std::exp(-v)); };
+    // The biased probabilities each token ranks its experts by; tokens with a near tie at the cut are drawn again.
+    HostTensor x = rng.uniform(DType::F32, {tokens, hidden});
+    const auto ranked = [&](int64_t t) {
+        std::vector<std::pair<double, int64_t>> row;
+        for (int64_t e = 0; e < experts; ++e) {
+            double logit = 0;
+            for (int64_t c = 0; c < hidden; ++c) logit += router_w[e * hidden + c] * x.data<float>()[t * hidden + c];
+            row.emplace_back(sigmoid(logit) + bias[e], e);
+        }
+        std::sort(row.rbegin(), row.rend());
+        return row;
+    };
+    int64_t moved_by_bias = 0;
+    for (int64_t t = 0; t < tokens; ++t) {
+        for (int attempt = 0;; ++attempt) {
+            REQUIRE(attempt < 100);
+            const auto row = ranked(t);
+            if (row[static_cast<size_t>(top_k - 1)].first - row[static_cast<size_t>(top_k)].first > 0.02) break;
+            const HostTensor redraw = rng.uniform(DType::F32, {1, hidden});
+            std::copy(redraw.data<float>(), redraw.data<float>() + hidden, x.data<float>() + t * hidden);
+        }
+    }
+
+    const float gate_cap = 1.5f, up_cap = 2.0f;
+    Graph g;
+    blocks::MoeSpec spec;
+    spec.experts = experts;
+    spec.top_k = top_k;
+    spec.router = blocks::Router::Sigmoid;
+    spec.routed_scale = 8.0f;
+    blocks::MoeParts parts;
+    parts.router = g.weight(w, "router");
+    parts.select_bias = g.weight(w, "bias");
+    parts.gate_up = g.weight(w, "gate_up");
+    parts.interleaved = true;
+    parts.down = g.weight(w, "down");
+    parts.hidden = [&](Value gate, Value up) {
+        return g.mul(g.mul(g.softcap(gate, gate_cap), g.sigmoid(gate)), g.softcap(up, up_cap));
+    };
+    g.output("out", blocks::moe(g, g.input("x", DType::F32, {kT, hidden}), spec, parts));
+    const HostTensor out = run(env, g, w, {{"x", x}}).at("out");
+
+    // fp64, with the bank's rows read as the model stores them (`interleaved`) or gate rows first, and the bias
+    // choosing only (`weigh` false) or weighing too.
+    const Tensor64 x64 = to_f64(x), bank = to_f64(w.tensor("gate_up")), down = to_f64(w.tensor("down"));
+    const auto softcap = [](double v, double cap) { return cap * std::tanh(v / cap); };
+    const auto expected = [&](bool use_bias, bool interleaved, bool weigh) {
+        Tensor64 result({tokens, hidden});
+        for (int64_t t = 0; t < tokens; ++t) {
+            std::vector<std::pair<double, int64_t>> row;
+            for (int64_t e = 0; e < experts; ++e) {
+                double logit = 0;
+                for (int64_t c = 0; c < hidden; ++c) logit += router_w[e * hidden + c] * x64[t * hidden + c];
+                row.emplace_back(sigmoid(logit) + (use_bias ? bias[e] : 0.0), e);
+            }
+            std::sort(row.rbegin(), row.rend());
+            double sum = 0;
+            for (int64_t j = 0; j < top_k; ++j) {
+                auto& [score, e] = row[static_cast<size_t>(j)];
+                if (use_bias && !weigh) score -= bias[e];
+                sum += score;
+            }
+            for (int64_t j = 0; j < top_k; ++j) {
+                const auto [score, e] = row[static_cast<size_t>(j)];
+                std::vector<double> h(static_cast<size_t>(inter));
+                for (int64_t n = 0; n < inter; ++n) {
+                    double gate = 0, up = 0;
+                    const int64_t gate_row = interleaved ? 2 * n : n, up_row = interleaved ? 2 * n + 1 : inter + n;
+                    for (int64_t c = 0; c < hidden; ++c) {
+                        gate += bank[(e * 2 * inter + gate_row) * hidden + c] * x64[t * hidden + c];
+                        up += bank[(e * 2 * inter + up_row) * hidden + c] * x64[t * hidden + c];
+                    }
+                    h[static_cast<size_t>(n)] = softcap(gate, gate_cap) * sigmoid(gate) * softcap(up, up_cap);
+                }
+                for (int64_t c = 0; c < hidden; ++c) {
+                    double y = 0;
+                    for (int64_t n = 0; n < inter; ++n) {
+                        y += down[(e * hidden + c) * inter + n] * h[static_cast<size_t>(n)];
+                    }
+                    result[t * hidden + c] += score / sum * spec.routed_scale * y;
+                }
+            }
+        }
+        return result;
+    };
+    for (int64_t t = 0; t < tokens; ++t) {  // the case must hold tokens whose experts the bias changes
+        std::vector<std::pair<double, int64_t>> plain;
+        for (const auto& [score, e] : ranked(t)) plain.emplace_back(score - bias[e], e);
+        std::sort(plain.rbegin(), plain.rend());
+        const auto biased = ranked(t);
+        for (int64_t j = 0; j < top_k; ++j) {
+            moved_by_bias += plain[static_cast<size_t>(j)].second != biased[static_cast<size_t>(j)].second ? 1 : 0;
+        }
+    }
+    CHECK(moved_by_bias >= 3);
+    CHECK(all_close(out, expected(true, true, false), env.mm_atol, env.mm_rtol));
+    // Planted bugs: no bias; the bias weighing the experts it chose; the bank read gate rows first.
+    CHECK_FALSE(all_close(out, expected(false, true, false), env.mm_atol, env.mm_rtol));
+    CHECK_FALSE(all_close(out, expected(true, true, true), env.mm_atol, env.mm_rtol));
+    CHECK_FALSE(all_close(out, expected(true, false, false), env.mm_atol, env.mm_rtol));
+}
+
 }  // namespace xs::test::moe

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <tuple>
 
 #include "util/error.h"
 #include "util/half.h"
@@ -41,21 +42,37 @@ Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p) {
     XS_CHECK(s.top_k >= 1 && s.top_k <= s.experts, "moe: top_k ", s.top_k, " of ", s.experts, " experts");
     const Value logits = g.matmul(p.router_x.valid() ? p.router_x : x, p.router);  // [T, E]
     const Value probs = s.router == Router::Softmax ? g.softmax(logits) : g.sigmoid(logits);
-    auto [weights, idx] = g.topk(probs, s.top_k);  // [T, k]
+    Value weights, idx;  // [T, k]
+    if (p.select_bias.valid()) {
+        std::tie(weights, idx) = g.topk(g.add(probs, p.select_bias), s.top_k);
+        const Value bias = g.gather(g.reshape(p.select_bias, {s.experts, 1}), idx);  // [T, k, 1]
+        weights = g.add(weights, g.scale(g.reshape(bias, {kT, s.top_k}), -1.0f));
+    } else {
+        std::tie(weights, idx) = g.topk(probs, s.top_k);
+    }
     if (s.normalize) weights = g.div(weights, g.reshape(g.reduce_sum(weights, 1), {kT, 1}));
     if (s.routed_scale != 1.0f) weights = g.scale(weights, s.routed_scale);
     if (p.expert_scale.valid()) {
         const Value per = g.gather(g.reshape(p.expert_scale, {s.experts, 1}), idx);  // [T, k, 1]
         weights = g.mul(weights, g.reshape(per, {kT, s.top_k}));
     }
-    Value h;
+    Value gate, up;  // [T, k, I]
     if (p.gate_up.valid()) {
         const int64_t inter = g.type(p.gate_up).shape[1] / 2;
         const Value both = g.expert_matmul(x, p.gate_up, idx);  // [T, k, 2 I]
-        h = g.mul(activation(g, s.act, g.slice(both, 2, 0, inter)), g.slice(both, 2, inter, 2 * inter));
+        if (p.interleaved) {
+            const Value pairs = g.reshape(both, {kT, s.top_k, inter, 2});
+            gate = g.reshape(g.slice(pairs, 3, 0, 1), {kT, s.top_k, inter});
+            up = g.reshape(g.slice(pairs, 3, 1, 2), {kT, s.top_k, inter});
+        } else {
+            gate = g.slice(both, 2, 0, inter);
+            up = g.slice(both, 2, inter, 2 * inter);
+        }
     } else {
-        h = g.mul(activation(g, s.act, g.expert_matmul(x, p.gate, idx)), g.expert_matmul(x, p.up, idx));
+        gate = g.expert_matmul(x, p.gate, idx);
+        up = g.expert_matmul(x, p.up, idx);
     }
+    const Value h = p.hidden ? p.hidden(gate, up) : g.mul(activation(g, s.act, gate), up);
     const Value y = g.expert_matmul(h, p.down, idx);  // [T, k, hidden]
     Value out = g.reduce_sum(g.mul(y, g.reshape(weights, {kT, s.top_k, 1})), 1);
     if (p.shared_gate) {

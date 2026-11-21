@@ -39,4 +39,7 @@ TEST_SUITE("cpu-ref moe ops") {
         xs::test::moe::moe_block(cpu_env(), xs::blocks::Router::Softmax, false, false, 7, true);
         xs::test::moe::moe_block(cpu_env(), xs::blocks::Router::Softmax, false, true, 40, true);
     }
+    TEST_CASE("moe block: a selection bias, interleaved gate and up rows, a softcapped hidden state") {
+        xs::test::moe::moe_selection_bias(cpu_env());
+    }
 }
