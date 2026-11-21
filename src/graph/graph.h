@@ -201,6 +201,9 @@ struct StateAttrs {  // CausalConv, DynamicConv and GatedDelta: the slot that ca
 // positions are the causal ones, and key j is visible to query i iff |p_i - j| < sliding_window: the window reaches as
 // far after a query as before it. A block drafter's block sees itself whole and the window of the cache before it
 // (T <= sliding_window); an encoder's local attention sees the keys within sliding_window - 1 of it (ModernBERT).
+// Not causal with a sliding_window, `anchored` (a block drafter whose window is measured from its block's start): q is
+// [T, ...], k and v a cache [L, ...], and every query sees the same keys, those of the step and the sliding_window
+// before it: key j is visible iff j >= L - T - sliding_window.
 // Not causal with a block (an encoder over several images at once): q, k and v have one static length, a multiple of
 // `block`, and key j is visible to query i iff both fall in the same run of `block` tokens.
 // Not causal over rows of several a token (q [T, R, Hq, D], k / v [N, R, Hkv, D]: a vision tower's patches, R of each
@@ -222,6 +225,7 @@ struct AttentionAttrs {
     int64_t block = 0;
     bool grouped = false;
     int64_t rel_extent = 0;
+    bool anchored = false;
 };
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,

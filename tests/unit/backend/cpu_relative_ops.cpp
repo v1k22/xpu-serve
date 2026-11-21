@@ -23,4 +23,7 @@ TEST_SUITE("cpu-ref relative ops") {
     TEST_CASE("causal attention with a relative bias and a sink") {
         xs::test::relative::relative_attention(cpu_env());
     }
+    TEST_CASE("attention over a window anchored at the step: a drafter's block over its context") {
+        xs::test::relative::anchored_window_attention(cpu_env());
+    }
 }

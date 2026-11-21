@@ -368,7 +368,9 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
         int64_t k_lo = 0;
         int64_t k_hi = s.kv_len;
         if (s.causal) k_hi = past + t0 + cur;
-        if (s.window > 0) {
+        if (s.anchored) {
+            k_lo = std::max<int64_t>(0, past - s.window);
+        } else if (s.window > 0) {
             k_lo = std::max<int64_t>(0, past + t0 - s.window + 1);
             k_hi = std::min<int64_t>(k_hi, past + t0 + cur - 1 + s.window);
         }
@@ -421,7 +423,7 @@ void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, 
     }
     // Keys before `first` are outside every query's window: drop them, which shifts all positions alike.
     const int64_t past = s.kv_len - s.tokens;
-    const int64_t first = s.window > 0 ? std::max<int64_t>(0, past - s.window + 1) : 0;
+    const int64_t first = s.window > 0 ? std::max<int64_t>(0, past - s.window + (s.anchored ? 0 : 1)) : 0;
     const int64_t rows = (s.kv_len - first) * s.kv_heads;
     const int64_t queries = s.tokens * s.q_heads;
     const bool rotated_keys = quant::turbo_bits(kv.k.format) != 0;

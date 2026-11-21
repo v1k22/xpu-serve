@@ -2247,6 +2247,7 @@ private:
                 s.softcap = a.softcap;
                 s.window = a.sliding_window;
                 s.causal = a.causal;
+                s.anchored = a.anchored;
                 s.block = a.block < s.tokens ? a.block : 0;  // one block: every key
                 if (a.grouped) {
                     s.groups = reinterpret_cast<const int32_t*>(in_ptr(3));

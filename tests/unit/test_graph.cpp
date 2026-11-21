@@ -253,3 +253,23 @@ TEST_CASE("l2_clip keeps the shape; dynamic_conv takes taps per token and group 
     CHECK_THROWS_AS(g.dynamic_conv(other, c, w, g.input("t2", DType::F32, {kT, 5, 4})), xs::Error);  // 5 groups of 48
     CHECK_THROWS_AS(g.dynamic_conv(other, c, w, g.input("t3", DType::F32, {kT, 6, 3})), xs::Error);
 }
+
+TEST_CASE("an anchored window is for attention that is not causal, over a cache") {
+    Graph g;
+    const int slot = g.add_kv_slot(2, 32, 0, "kv");
+    const Value k = g.input("k", DType::F32, {kT, 2, 32});
+    const auto [ka, va] = g.kv_cache(slot, k, k);
+    const Value q = g.input("q", DType::F32, {kT, 4, 32});
+    graph::AttentionAttrs attrs;
+    attrs.causal = false;
+    attrs.sliding_window = 8;
+    attrs.anchored = true;
+    CHECK(g.type(g.attention(q, ka, va, attrs)).shape == (Dims{kT, 4, 32}));
+    graph::AttentionAttrs other = attrs;
+    other.causal = true;
+    CHECK_THROWS_AS(g.attention(q, ka, va, other), xs::Error);
+    other = attrs;
+    other.sliding_window = 0;
+    CHECK_THROWS_AS(g.attention(q, ka, va, other), xs::Error);
+    CHECK_THROWS_AS(g.attention(q, k, k, attrs), xs::Error);  // the step's own keys: no cache to anchor in
+}

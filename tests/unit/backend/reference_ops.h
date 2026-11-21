@@ -354,6 +354,8 @@ struct AttentionSpec {
     // sink [T, Hq], one more logit without a value. Empty: none. `rel_sign` -1 plants the bias on the wrong side.
     Tensor64 rel, sink;
     int rel_sign = 1;
+    // Not causal: every query sees the step's keys and the sliding_window before the step (AttentionAttrs::anchored).
+    bool anchored = false;
 };
 
 // The groups of a state of lengths[0] tokens (group 0) and questions of lengths[1], lengths[2], ... after it (groups
@@ -387,6 +389,7 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
             for (int64_t j = 0; j < l_len; ++j) {
                 const int64_t reach = spec.sliding_window + spec.window_slack;
                 const bool visible =
+                    spec.anchored ? j >= l_len - t_len - spec.sliding_window :
                     (!spec.causal || j <= p) &&
                     (spec.sliding_window == 0 || (p - j < reach && (spec.causal || spec.one_sided || j - p < reach))) &&
                     group_visible(spec, i, j);

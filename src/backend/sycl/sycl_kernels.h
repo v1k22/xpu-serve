@@ -174,6 +174,9 @@ struct AttentionShape {
     const float* rel = nullptr;
     int64_t rel_extent = 0;
     const float* sink = nullptr;
+    // Not causal with a window: every query sees the step's keys and the `window` before the step (graph.h,
+    // AttentionAttrs::anchored)
+    bool anchored = false;
 };
 // Whether query i sees key j under the tokens' groups (graph.h, AttentionAttrs::grouped).
 inline bool group_sees(const int32_t* groups, int64_t i, int64_t j) {
@@ -184,6 +187,7 @@ inline bool group_sees(const int32_t* groups, int64_t i, int64_t j) {
 inline int64_t attention_visible_keys(const AttentionShape& s) {
     if (s.block > 0) return s.block;
     if (s.window <= 0) return s.kv_len;
+    if (s.anchored) return std::min(s.window + s.tokens, s.kv_len);
     return std::min(s.causal ? s.window : 2 * s.window - 1, s.kv_len);
 }
 // The per-row kernels cover these head dims; others take the GEMM path.

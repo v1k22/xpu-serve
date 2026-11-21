@@ -595,6 +595,9 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
                  "non-causal attention with a sliding window takes q [T, ...] and k/v [L, ...] or [T, ...], got ",
                  shape_to_string(qs), " and ", shape_to_string(ks));
     }
+    XS_CHECK(!attrs.anchored || (!attrs.causal && attrs.sliding_window > 0 && qs[0] == kT && ks[0] == kL),
+             "attention with an anchored window is not causal and takes q [T, ...] and k/v [L, ...], got ",
+             shape_to_string(qs), " and ", shape_to_string(ks));
     XS_CHECK(ks[2] == qs[2], "attention head_dim differs: q ", qs[2], ", k ", ks[2]);
     XS_CHECK(qs[1] % ks[1] == 0, "attention heads ", qs[1], " not a multiple of kv heads ", ks[1]);
     XS_CHECK(attrs.sliding_window >= 0 && attrs.softcap >= 0.0f && attrs.block >= 0, "invalid attention attributes");
@@ -804,6 +807,7 @@ std::string attrs_to_string(const Attrs& a) {
                 os << "scale=" << v.scale << " window=" << v.sliding_window << " softcap=" << v.softcap
                    << " causal=" << v.causal;
                 if (v.rel_extent > 0) os << " rel_extent=" << v.rel_extent;
+                if (v.anchored) os << " anchored";
             } else if constexpr (std::is_same_v<T, L2ClipAttrs>) {
                 os << "threshold=" << v.threshold << " eps=" << v.eps;
             }

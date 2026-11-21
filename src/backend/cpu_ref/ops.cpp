@@ -571,6 +571,10 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
         int64_t first = attrs.sliding_window > 0 ? std::max<int64_t>(0, pos - attrs.sliding_window + 1) : 0;
         int64_t last = attrs.causal ? pos : kv_len - 1;
         if (attrs.sliding_window > 0) last = std::min(last, pos + attrs.sliding_window - 1);
+        if (attrs.anchored) {  // the step and the window before it, whichever the query
+            first = std::max<int64_t>(0, kv_len - tokens - attrs.sliding_window);
+            last = kv_len - 1;
+        }
         if (attrs.block > 0) {  // the keys of the query's own block
             first = t / attrs.block * attrs.block;
             last = first + attrs.block - 1;

@@ -152,4 +152,57 @@ inline void relative_attention(const Env& env) {
     }
 }
 
+// Attention that is not causal over a window anchored at the step: every query of a step sees the step's keys and
+// the window before the step, whichever its row (a block drafter's block over its context).
+inline void anchored_window_attention(const Env& env) {
+    TensorRng rng(44);
+    struct Shape {
+        int64_t heads, kv_heads, dim, window;
+        std::vector<int64_t> steps;
+    };
+    for (const Shape& s : {Shape{4, 2, 32, 6, {5, 8, 8, 3}}, Shape{24, 8, 128, 16, {40, 8, 8}},
+                           Shape{3, 1, 64, 100, {7, 8, 20}}}) {
+        CAPTURE(s.heads);
+        CAPTURE(s.window);
+        graph::AttentionAttrs attrs;
+        attrs.scale = 1.0f / std::sqrt(static_cast<float>(s.dim));
+        attrs.causal = false;
+        attrs.sliding_window = s.window;
+        attrs.anchored = true;
+        Graph g;
+        const int slot = g.add_kv_slot(s.kv_heads, s.dim, 0, "kv");
+        const auto [k_all, v_all] = g.kv_cache(slot, g.input("k", DType::F32, {kT, s.kv_heads, s.dim}),
+                                               g.input("v", DType::F32, {kT, s.kv_heads, s.dim}));
+        g.output("out", g.attention(g.input("q", DType::F32, {kT, s.heads, s.dim}), k_all, v_all, attrs));
+        const auto session = env.compile(g, MemoryWeights{});
+        std::vector<HostTensor> ks, vs;
+        int64_t differ = 0;
+        for (const int64_t t : s.steps) {
+            CAPTURE(t);
+            const HostTensor q = rng.uniform(DType::F32, {t, s.heads, s.dim}, 2.0f);
+            ks.push_back(rng.uniform(DType::F32, {t, s.kv_heads, s.dim}, 2.0f));
+            vs.push_back(rng.uniform(DType::F32, {t, s.kv_heads, s.dim}));
+            TensorMap out;
+            session->run({{"q", q}, {"k", ks.back()}, {"v", vs.back()}}, out);
+            ref::AttentionSpec spec;
+            spec.scale = attrs.scale;
+            spec.causal = false;
+            spec.sliding_window = s.window;
+            spec.anchored = true;
+            const Tensor64 k = concat_rows(ks), v = concat_rows(vs);
+            CHECK(all_close(out.at("out"), ref::attention(to_f64(q), k, v, spec), env.atol, env.rtol));
+            // Planted bug: a window around each row (the rule without the anchor) sees other keys once the cache is
+            // longer than the window.
+            ref::AttentionSpec per_row = spec;
+            per_row.anchored = false;
+            per_row.sliding_window = s.window + 1;
+            differ += all_close(out.at("out"), ref::attention(to_f64(q), k, v, per_row), env.atol, env.rtol) ? 0 : 1;
+        }
+        // (where the cache outgrows the window: the last shape's never does, and both rules see every key)
+        int64_t total = 0;
+        for (const int64_t t : s.steps) total += t;
+        if (total > s.window + 8) CHECK(differ >= 1);
+    }
+}
+
 }  // namespace xs::test::relative

@@ -28,4 +28,7 @@ TEST_SUITE("device relative ops" * doctest::skip(!dev::enabled())) {
     TEST_CASE("causal attention with a relative bias and a sink") {
         xs::test::relative::relative_attention(device_env());
     }
+    TEST_CASE("attention over a window anchored at the step: a drafter's block over its context") {
+        xs::test::relative::anchored_window_attention(device_env());
+    }
 }
