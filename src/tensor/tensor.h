@@ -35,6 +35,7 @@ struct QuantParams {
 // `block_rows` rows and `block_cols` columns, [ceil(rows / block_rows), ceil(cols / block_cols)] row-major:
 // w = e4m3(code) * scale. A scale per row is a block of one row and all its columns.
 inline constexpr int64_t kFp8Block = 128;
+inline constexpr int64_t kMxfp8Block = 32;  // columns of a row that share a scale in MXFP8
 struct Fp8Run {
     const uint8_t* codes = nullptr;
     const float* scales = nullptr;
@@ -43,12 +44,24 @@ struct Fp8Run {
     int64_t block_cols = kFp8Block;
 };
 
+// A run of rows of an NVFP4 weight (dtype F4): E2M1 codes [rows, cols], two a byte (the low nibble is the even
+// column), an E4M3 code per kFp4Block columns of a row as their scale, [rows, cols / kFp4Block], and one factor for the
+// run: w = e2m1(code) * e4m3(scale) * factor.
+inline constexpr int64_t kFp4Block = 16;
+struct Fp4Run {
+    const uint8_t* codes = nullptr;
+    const uint8_t* scales = nullptr;
+    float factor = 1.0f;
+    int64_t rows = 0;
+};
+
 struct TensorView {
     DType dtype = DType::F32;
     Dims shape;
-    const void* data = nullptr;   // dense values or codes; null for an F8 weight
+    const void* data = nullptr;   // dense values or codes; null for an F8 or F4 weight
     QuantParams quant;            // dtype Q8 / Q4 only
     std::span<const Fp8Run> fp8;  // an F8 weight: the rows of its matrix [numel / cols, cols], run after run
+    std::span<const Fp4Run> fp4;  // an F4 weight: likewise
     BlockFormat block = BlockFormat::Q4_0;  // dtype Block only: `data` is the matrix's rows as blocks of this format
 
     int64_t numel() const { return xs::numel(shape); }

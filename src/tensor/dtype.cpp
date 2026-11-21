@@ -17,13 +17,14 @@ size_t dtype_size(DType t) {
         case DType::Q8: return 1;
         case DType::F8: return 1;
         case DType::Q4: fail("q4 packs two values per byte; use storage_bytes");
+        case DType::F4: fail("f4 packs two values per byte; use storage_bytes");
         case DType::Block: fail("a block format decides its own size; use block_storage_bytes");
     }
     fail("unknown dtype");
 }
 
 size_t storage_bytes(DType t, int64_t numel) {
-    if (t == DType::Q4) return static_cast<size_t>((numel + 1) / 2);
+    if (t == DType::Q4 || t == DType::F4) return static_cast<size_t>((numel + 1) / 2);
     return static_cast<size_t>(numel) * dtype_size(t);
 }
 
@@ -40,6 +41,7 @@ std::string_view dtype_name(DType t) {
         case DType::Q8: return "q8";
         case DType::Q4: return "q4";
         case DType::F8: return "f8";
+        case DType::F4: return "f4";
         case DType::Block: return "block";
     }
     return "?";
@@ -61,5 +63,7 @@ DType dtype_from_safetensors(std::string_view s) {
 bool is_float(DType t) { return t == DType::F32 || t == DType::F16 || t == DType::BF16; }
 
 bool is_quantized(DType t) { return t == DType::Q8 || t == DType::Q4; }
+
+bool is_float_codes(DType t) { return t == DType::F8 || t == DType::F4; }
 
 }  // namespace xs

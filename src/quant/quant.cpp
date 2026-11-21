@@ -304,6 +304,7 @@ void dequantize_rows(const TensorView& v, int64_t first, int64_t count, float* o
 void read_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
     if (is_quantized(v.dtype)) return dequantize_rows(v, first, count, out);
     if (v.dtype == DType::F8) return fp8_rows(v, first, count, out);
+    if (v.dtype == DType::F4) return fp4_rows(v, first, count, out);
     if (v.dtype == DType::Block) return decode_block_rows(v, first, count, out);
     XS_CHECK(!v.shape.empty(), "a weight's rows need at least one dim");
     const int64_t cols = v.shape.back();

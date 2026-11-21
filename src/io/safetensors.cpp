@@ -1,5 +1,6 @@
 #include "io/safetensors.h"
 
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -58,7 +59,7 @@ SafetensorsFile::SafetensorsFile(const std::filesystem::path& path) : file_(path
     }
 }
 
-std::unique_ptr<SafetensorsWeights> SafetensorsWeights::open_dir(const std::filesystem::path& dir) {
+std::unique_ptr<SafetensorsWeights> SafetensorsWeights::open_dir(const std::filesystem::path& dir, Fp8 fp8) {
     namespace fs = std::filesystem;
     std::vector<fs::path> paths;
     const fs::path index_path = dir / "model.safetensors.index.json";
@@ -79,7 +80,7 @@ std::unique_ptr<SafetensorsWeights> SafetensorsWeights::open_dir(const std::file
     auto weights = std::unique_ptr<SafetensorsWeights>(new SafetensorsWeights());
     for (const auto& p : paths)
         weights->add_file(p);
-    weights->pair_fp8();
+    if (fp8 == Fp8::Paired) weights->pair_fp8();
     if (fs::exists(dir / kPackManifest)) weights->apply_pack_manifest(dir / kPackManifest);
     return weights;
 }
@@ -152,6 +153,65 @@ void SafetensorsWeights::pair_fp8() {
         index_.erase(it);
         index_[name] = &(fp8_views_[name] = v);
     }
+}
+
+void SafetensorsWeights::pair_mxfp8(const std::string& name) {
+    const TensorView codes = get(name);
+    const std::string scale_name = name + "_scale";
+    const TensorView exponents = get(scale_name);
+    Dims blocks = codes.shape;
+    if (!blocks.empty()) blocks.back() = (blocks.back() + kMxfp8Block - 1) / kMxfp8Block;
+    XS_CHECK(codes.dtype == DType::F8 && codes.fp8.empty() && codes.shape.size() >= 2 &&
+                 exponents.dtype == DType::U8 && exponents.shape == blocks,
+             "mxfp8 tensor '", name, "' ", dtype_name(codes.dtype), " ", dims_to_string(codes.shape), " beside '",
+             scale_name, "' ", dtype_name(exponents.dtype), " ", dims_to_string(exponents.shape),
+             ": expected f8 codes and one u8 exponent per ", kMxfp8Block, " columns of a row, ",
+             dims_to_string(blocks));
+    const auto count = static_cast<size_t>(exponents.numel());
+    fp8_scales_.push_back(std::make_unique<float[]>(count));
+    const auto* stored = static_cast<const uint8_t*>(exponents.data);
+    for (size_t i = 0; i < count; ++i) fp8_scales_.back()[i] = std::ldexp(1.0f, static_cast<int>(stored[i]) - 127);
+    Fp8Run run{static_cast<const uint8_t*>(codes.data), fp8_scales_.back().get(), codes.numel() / codes.shape.back()};
+    run.block_rows = 1;
+    run.block_cols = kMxfp8Block;
+    TensorView v;
+    v.dtype = DType::F8;
+    v.shape = codes.shape;
+    v.fp8 = fp8_runs_[name] = {run};
+    index_.erase(scale_name);
+    index_[name] = &(fp8_views_[name] = v);
+}
+
+void SafetensorsWeights::pair_nvfp4(const std::string& name) {
+    const TensorView codes = get(name);
+    const std::string scale_name = name + "_scale", amax_name = name + "_amax";
+    const std::string denominator_name = name + "_outer_scale_denominator";
+    XS_CHECK(codes.dtype == DType::U8 && codes.shape.size() == 3, "nvfp4 tensor '", name, "' is ",
+             dtype_name(codes.dtype), " ", dims_to_string(codes.shape), ", expected u8 [runs, rows, cols / 2]");
+    const TensorView scales = get(scale_name), amax = get(amax_name), denominator = get(denominator_name);
+    const int64_t runs = codes.shape[0], rows = codes.shape[1], cols = 2 * codes.shape[2];
+    XS_CHECK(cols % kFp4Block == 0 && scales.dtype == DType::F8 && scales.fp8.empty() &&
+                 scales.shape == (Dims{runs, rows, cols / kFp4Block}),
+             "nvfp4 tensor '", name, "' ", dims_to_string(codes.shape), ": its scales '", scale_name, "' are ",
+             dtype_name(scales.dtype), " ", dims_to_string(scales.shape), ", expected f8 ",
+             dims_to_string(Dims{runs, rows, cols / kFp4Block}));
+    XS_CHECK(amax.dtype == DType::F32 && amax.shape == Dims{runs} && denominator.dtype == DType::F32 &&
+                 denominator.numel() == 1,
+             "nvfp4 tensor '", name, "': '", amax_name, "' ", dims_to_string(amax.shape), " and '", denominator_name,
+             "' ", dims_to_string(denominator.shape), " must be f32 [", runs, "] and one f32");
+    const float divisor = *static_cast<const float*>(denominator.data);
+    std::vector<Fp4Run> parts;
+    for (int64_t r = 0; r < runs; ++r) {
+        parts.push_back(Fp4Run{static_cast<const uint8_t*>(codes.data) + r * rows * (cols / 2),
+                               static_cast<const uint8_t*>(scales.data) + r * rows * (cols / kFp4Block),
+                               static_cast<const float*>(amax.data)[r] / divisor, rows});
+    }
+    TensorView v;
+    v.dtype = DType::F4;
+    v.shape = {runs, rows, cols};
+    v.fp4 = fp4_runs_[name] = std::move(parts);
+    for (const std::string& gone : {scale_name, amax_name, denominator_name}) index_.erase(gone);
+    index_[name] = &(fp4_views_[name] = v);
 }
 
 void SafetensorsWeights::join_rows(const std::string& name, const std::vector<std::string>& parts, Dims shape) {

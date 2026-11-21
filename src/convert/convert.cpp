@@ -36,7 +36,7 @@ constexpr uint64_t kShardBytes = uint64_t{4} << 30;
 // Q8 / Q4 when `format` fits the tensor (a float tensor, as stored or as an FP8 checkpoint's f8, of at least 2 dims
 // and min_elements, quant.h's matrix view); explains a refusal in the log.
 std::optional<DType> fitting(const std::string& name, const TensorView& v, DType format, const ConvertOptions& o) {
-    if (!(is_float(v.dtype) || v.dtype == DType::F8) || v.shape.size() < 2 || v.numel() < o.min_elements) {
+    if (!(is_float(v.dtype) || is_float_codes(v.dtype)) || v.shape.size() < 2 || v.numel() < o.min_elements) {
         return std::nullopt;
     }
     if (const std::string why = quant::unsupported_reason(format, quant::matrix_rows(v.shape), v.shape.back(), o.group);
@@ -212,7 +212,7 @@ OutUnit copy_unit(const std::string& name, const TensorView& v) {
     XS_CHECK(v.dtype != DType::Block, "convert: '", name, "' is in GGUF's ", block_format_name(v.block),
              " format; convert reads float checkpoints");
     OutUnit u;
-    if (v.dtype == DType::F8) {
+    if (is_float_codes(v.dtype)) {
         u.tensors.push_back(OutTensor{name, DType::F32, v.shape});
         u.write = [v](std::ostream& out) {
             const int64_t rows = quant::matrix_rows(v.shape);

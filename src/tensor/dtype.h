@@ -10,11 +10,14 @@ namespace xs {
 // codes plus per-group f16 scales (and, for Q4, f16 biases) that a TensorView's `quant` points at.
 // F8 is a weight of an FP8 checkpoint: logically a float matrix, stored as E4M3 codes (a byte each) times one scale
 // per block of rows and columns; a TensorView's `fp8` holds its rows, and quant::read_rows reads them.
+// F4 is a weight of an NVFP4 checkpoint: logically a float matrix, stored as E2M1 codes (two a byte) times an E4M3
+// scale per block of columns and a factor per run of rows; a TensorView's `fp4` holds its rows.
 // Block is a weight in one of GGUF's block formats (tensor/block_format.h), kept as the file stores it: logically a
 // float matrix, a TensorView's `block` names the format and `data` points at its blocks.
-enum class DType : uint8_t { F32, F16, BF16, I64, I32, I8, U8, Bool, Q8, Q4, F8, Block };
+enum class DType : uint8_t { F32, F16, BF16, I64, I32, I8, U8, Bool, Q8, Q4, F8, Block, F4 };
 
-// Bytes per element; refused for Q4 (two codes per byte): use storage_bytes. Refused for Block (the format decides).
+// Bytes per element; refused for Q4 and F4 (two codes per byte): use storage_bytes. Refused for Block (the format
+// decides).
 size_t dtype_size(DType t);
 // Bytes that `numel` elements of `t` occupy. Refused for Block: block_storage_bytes.
 size_t storage_bytes(DType t, int64_t numel);
@@ -24,5 +27,6 @@ std::string_view dtype_name(DType t);  // "f32", "f16", "bf16", ...
 DType dtype_from_safetensors(std::string_view s);
 bool is_float(DType t);      // f32, f16, bf16: float values, element by element
 bool is_quantized(DType t);  // q8, q4: a pack's formats
+bool is_float_codes(DType t);  // f8, f4: a float checkpoint's weight stored as codes and scales (FP8, NVFP4)
 
 }  // namespace xs

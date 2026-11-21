@@ -95,6 +95,14 @@ float code_value(uint8_t code) {
     return (code & 0x80) != 0 ? -magnitude : magnitude;
 }
 
+// The value of an E2M1 code (4 bits), from its fields: a sign, two exponent bits, one mantissa bit.
+float e2m1_value(int code) {
+    const int e = (code >> 1) & 3, m = code & 1;
+    const float half_m = 0.5f * static_cast<float>(m);
+    const float magnitude = e == 0 ? half_m : std::ldexp(1.0f + half_m, e - 1);
+    return (code & 8) != 0 ? -magnitude : magnitude;
+}
+
 // The values the pair stands for, written without the code under test: the code's fields through ldexp, the block's
 // scale by its index.
 std::vector<float> expected_values(const Raw& codes, float first_scale = 0.5f) {
@@ -280,6 +288,127 @@ TEST_SUITE("fp8") {
         REQUIRE(bank.data != nullptr);
         CHECK(rows_of(bank, 0, 5) == dense);
         CHECK(rows_of(bank, 2, 2) == slice_rows(dense, 8, 2, 2));  // across the two parts
+    }
+
+    TEST_CASE("E2M1 codes: every code against its fields") {
+        for (int code = 0; code < 16; ++code) {
+            const float expected = e2m1_value(code);
+            CHECK(quant::e2m1_to_f32(static_cast<uint8_t>(code)) == expected);
+            CHECK(std::signbit(quant::e2m1_to_f32(static_cast<uint8_t>(code))) == ((code & 8) != 0));
+        }
+        CHECK(quant::e2m1_to_f32(7) == 6.0f);
+        CHECK(quant::e2m1_to_f32(0xF) == -6.0f);
+    }
+
+    // A released Inkling 2 checkpoint's expert banks: the store leaves them as stored when asked, and the model's
+    // loader pairs each with its companions.
+    TEST_CASE("an MXFP8 weight: codes beside an exponent per 32 columns of a row are one f8 weight") {
+        const Dir dir("xs_mxfp8_store_test");
+        const int64_t experts = 3, rows = 5, cols = 96;
+        Raw codes = random_codes("bank.w", experts * rows, cols, 11);
+        codes.shape = {experts, rows, cols};
+        Raw exponents{"bank.w_scale", DType::U8, {experts, rows, cols / 32}, {}};
+        for (int64_t i = 0; i < experts * rows * (cols / 32); ++i) {
+            exponents.bytes.push_back(static_cast<uint8_t>(120 + i % 13));  // 2^-7 to 2^5
+        }
+        write_file(dir.path / "model.safetensors", {codes, exponents});
+        CHECK_THROWS_AS(SafetensorsWeights::open_dir(dir.path), Error);  // an FP8 checkpoint it is not
+        const auto store = SafetensorsWeights::open_dir(dir.path, SafetensorsWeights::Fp8::AsStored);
+        CHECK(store->get("bank.w").fp8.empty());
+        store->pair_mxfp8("bank.w");
+        CHECK(store->names() == std::vector<std::string>{"bank.w"});
+        const TensorView& w = store->get("bank.w");
+        CHECK(w.dtype == DType::F8);
+        CHECK(w.shape == Dims{experts, rows, cols});
+        std::vector<float> expected;
+        for (int64_t r = 0; r < experts * rows; ++r) {
+            for (int64_t c = 0; c < cols; ++c) {
+                const int exponent = exponents.bytes[static_cast<size_t>(r * (cols / 32) + c / 32)] - 127;
+                expected.push_back(std::ldexp(code_value(codes.bytes[static_cast<size_t>(r * cols + c)]), exponent));
+            }
+        }
+        CHECK(rows_of(w, 0, experts * rows) == expected);
+        CHECK(rows_of(w, 4, 3) == slice_rows(expected, cols, 4, 3));  // across two experts
+        // Planted bug: the exponent read as the scale itself.
+        std::vector<float> linear = expected;
+        for (int64_t r = 0; r < experts * rows; ++r) {
+            for (int64_t c = 0; c < cols; ++c) {
+                const int stored = exponents.bytes[static_cast<size_t>(r * (cols / 32) + c / 32)];
+                linear[static_cast<size_t>(r * cols + c)] =
+                    code_value(codes.bytes[static_cast<size_t>(r * cols + c)]) * static_cast<float>(stored);
+            }
+        }
+        CHECK(rows_of(w, 0, experts * rows) != linear);
+    }
+
+    TEST_CASE("an NVFP4 weight: two codes a byte, a scale per 16 columns of a row, a factor per expert") {
+        const Dir dir("xs_nvfp4_store_test");
+        const int64_t experts = 3, rows = 4, cols = 64;
+        std::mt19937 rng(12);
+        Raw codes{"bank.w", DType::U8, {experts, rows, cols / 2}, {}};
+        for (int64_t i = 0; i < experts * rows * cols / 2; ++i) {
+            codes.bytes.push_back(static_cast<uint8_t>(rng() & 0xFF));
+        }
+        Raw scales = random_codes("bank.w_scale", experts * rows, cols / 16, 13);
+        scales.shape = {experts, rows, cols / 16};
+        const std::vector<float> amax{0.75f, 2.0f, 5.5f};
+        const float denominator = 2688.0f;
+        const auto f32_bytes = [](const std::vector<float>& values) {
+            const auto* p = reinterpret_cast<const uint8_t*>(values.data());
+            return std::vector<uint8_t>(p, p + values.size() * sizeof(float));
+        };
+        write_file(dir.path / "model.safetensors",
+                   {codes, scales, Raw{"bank.w_amax", DType::F32, {experts}, f32_bytes(amax)},
+                    Raw{"bank.w_outer_scale_denominator", DType::F32, {1}, f32_bytes({denominator})}});
+        const auto store = SafetensorsWeights::open_dir(dir.path, SafetensorsWeights::Fp8::AsStored);
+        store->pair_nvfp4("bank.w");
+        CHECK(store->names() == std::vector<std::string>{"bank.w"});
+        const TensorView& w = store->get("bank.w");
+        CHECK(w.dtype == DType::F4);
+        CHECK(w.shape == Dims{experts, rows, cols});
+        CHECK(w.nbytes() == static_cast<size_t>(experts * rows * cols / 2));
+        // The values from the fields: the even column in a byte's low nibble.
+        const auto value = [&](int64_t r, int64_t c, bool low_is_even) {
+            const uint8_t byte = codes.bytes[static_cast<size_t>(r * (cols / 2) + c / 2)];
+            const int code = (c % 2 == 0) == low_is_even ? byte & 0xF : byte >> 4;
+            const float scale = code_value(scales.bytes[static_cast<size_t>(r * (cols / 16) + c / 16)]);
+            return e2m1_value(code) * scale * (amax[static_cast<size_t>(r / rows)] / denominator);
+        };
+        std::vector<float> expected, swapped;
+        for (int64_t r = 0; r < experts * rows; ++r) {
+            for (int64_t c = 0; c < cols; ++c) {
+                expected.push_back(value(r, c, true));
+                swapped.push_back(value(r, c, false));
+            }
+        }
+        CHECK(rows_of(w, 0, experts * rows) == expected);
+        CHECK(rows_of(w, 3, 2) == slice_rows(expected, cols, 3, 2));  // one expert's last row, the next one's first
+        CHECK(rows_of(w, 0, experts * rows) != swapped);  // planted: the even column in the high nibble
+    }
+
+    TEST_CASE("refusals by name: an MXFP8 or NVFP4 weight without its companions, or with ones of another shape") {
+        const auto refuses = [](const auto& fn, const std::string& part) {
+            try {
+                fn();
+            } catch (const Error& e) {
+                return std::string(e.what()).find(part) != std::string::npos;
+            }
+            return false;
+        };
+        const Dir dir("xs_fp4_refuse");
+        Raw codes = random_codes("a.w", 4, 64, 3);
+        Raw nibbles{"b.w", DType::U8, {2, 2, 32}, std::vector<uint8_t>(128, 0x21)};
+        Raw short_scales = random_codes("b.w_scale", 4, 2, 4);  // one per 32 columns: not NVFP4's 16
+        short_scales.shape = {2, 2, 2};
+        write_file(dir.path / "model.safetensors",
+                   {codes, Raw{"a.w_scale", DType::U8, {4, 4}, std::vector<uint8_t>(16, 127)}, nibbles, short_scales,
+                    Raw{"b.w_amax", DType::F32, {2}, std::vector<uint8_t>(8, 0)},
+                    Raw{"b.w_outer_scale_denominator", DType::F32, {1}, std::vector<uint8_t>(4, 0)}});
+        const auto store = SafetensorsWeights::open_dir(dir.path, SafetensorsWeights::Fp8::AsStored);
+        CHECK(refuses([&] { store->pair_mxfp8("a.w"); }, "one u8 exponent per 32 columns"));
+        CHECK(refuses([&] { store->pair_nvfp4("b.w"); }, "[2, 2, 4]"));
+        CHECK(refuses([&] { store->pair_nvfp4("a.w"); }, "expected u8"));
+        CHECK(refuses([&] { store->pair_mxfp8("c.w"); }, "'c.w' not found"));
     }
 
     TEST_CASE("refusals by name: codes without scales, a wrong grid, other ranks, dense or mismatched parts") {

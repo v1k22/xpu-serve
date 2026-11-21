@@ -32,6 +32,8 @@ constexpr std::array<float, 256> e4m3_table() {
 }
 
 constexpr std::array<float, 256> kE4m3 = e4m3_table();
+constexpr std::array<float, 16> kE2m1 = {0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+                                         -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
 }  // namespace
 
@@ -56,6 +58,32 @@ void fp8_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
                 const float scale = scales[c0 / run.block_cols];
                 const int64_t c1 = std::min(cols, c0 + run.block_cols);
                 for (int64_t c = c0; c < c1; ++c) o[c] = kE4m3[codes[c]] * scale;
+            }
+        }
+        begin += run.rows;
+    }
+}
+
+float e2m1_to_f32(uint8_t code) { return kE2m1[code & 0xF]; }
+
+void fp4_rows(const TensorView& v, int64_t first, int64_t count, float* out) {
+    XS_CHECK(v.dtype == DType::F4 && v.shape.size() >= 2 && !v.fp4.empty(),
+             "an fp4 weight needs its codes paired with their scales (the model's loader does that), got ",
+             dtype_name(v.dtype), " ", dims_to_string(v.shape));
+    const int64_t cols = v.shape.back();
+    XS_CHECK(first >= 0 && count >= 0 && first + count <= matrix_rows(v.shape), "fp4: rows ", first, " to ",
+             first + count, " of a ", dims_to_string(v.shape), " weight");
+    const int64_t row_bytes = (cols + 1) / 2, row_scales = (cols + kFp4Block - 1) / kFp4Block;
+    int64_t begin = 0;  // the first row of `run`
+    for (const Fp4Run& run : v.fp4) {
+        const int64_t end = std::min(first + count, begin + run.rows);
+        for (int64_t r = std::max(first, begin); r < end; ++r) {
+            const uint8_t* codes = run.codes + (r - begin) * row_bytes;
+            const uint8_t* scales = run.scales + (r - begin) * row_scales;
+            float* o = out + (r - first) * cols;
+            for (int64_t c = 0; c < cols; ++c) {
+                const uint8_t code = c % 2 == 0 ? codes[c / 2] & 0xF : codes[c / 2] >> 4;
+                o[c] = kE2m1[code] * kE4m3[scales[c / kFp4Block]] * run.factor;
             }
         }
         begin += run.rows;

@@ -742,7 +742,7 @@ private:
         const auto device_type = [&](size_t i, DType t) {
             if (t == DType::Block && quant_.block_float) return DType::F32;  // decoded as it is uploaded
             if (device_quantized(t)) return t;  // check_ops makes sure only matmuls and gathers read it
-            if (is_float(t) || t == DType::F8) return DType::F32;  // an fp8 weight is decoded as it is uploaded
+            if (is_float(t) || is_float_codes(t)) return DType::F32;  // float codes are decoded as they are uploaded
             XS_CHECK(t == DType::I32 || t == DType::I64, where(i), ": dtype ", dtype_name(t), " is not supported");
             return t;
         };
@@ -1443,8 +1443,9 @@ private:
         return buf;
     }
 
-    // An FP8 checkpoint's weight, decoded on the way up: its values in `dst` (f16 or f32), a piece of rows at a time.
-    DeviceBuffer upload_fp8(const TensorView& view, DType dst) {
+    // An FP8 or NVFP4 checkpoint's weight, decoded on the way up: its values in `dst` (f16 or f32), a piece of rows
+    // at a time.
+    DeviceBuffer upload_decoded(const TensorView& view, DType dst) {
         const int64_t rows = quant::matrix_rows(view.shape);
         const int64_t cols = view.shape.back();
         const size_t width = static_cast<size_t>(cols) * dtype_size(dst);
@@ -1497,7 +1498,7 @@ private:
                     leaf_ptr_[i] = shared_.weight_buffers.back().get();
                 } else {
                     shared_.weight_buffers.push_back(
-                        view.dtype == DType::F8 ? upload_fp8(view, dtype_[i][0])
+                        is_float_codes(view.dtype) ? upload_decoded(view, dtype_[i][0])
                                                 : upload(name, view.data, view.dtype, view.shape, dtype_[i][0]));
                     leaf_ptr_[i] = shared_.weight_buffers.back().get();
                 }
