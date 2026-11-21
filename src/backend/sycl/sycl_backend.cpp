@@ -233,10 +233,15 @@ sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::Attent
 // What the programs of one session share (backend.h): the queue, the weights uploaded so far (by name and device
 // dtype), the state slots (by label) with their token counts, and the step memory (programs run one at a time).
 struct SharedKv {
-    graph::KvSlot spec;
+    graph::KvSlot spec;  // its sliding window: what every program that declares the slot never reads past (0: all)
     KvBuffers buf;
     int64_t len = 0;
+    // The first token the buffers hold. 0 unless the slot keeps only its sliding window (SyclProgram::keeps_window):
+    // its rows are then the tokens from `base` on, and the kernels, which measure a window back from the newest
+    // key, read them as a cache of len - base tokens.
+    int64_t base = 0;
     bool typed = false;  // a writing program has set buf.dtype
+    bool attention_only = true;  // every program reads the slot as attention's keys and values and nothing else
 };
 struct SharedFixed {  // a conv or recurrent slot
     bool conv = false;
@@ -303,7 +308,7 @@ public:
     }
 
     void reset() {
-        for (SharedKv& k : kv) k.len = 0;
+        for (SharedKv& k : kv) k.len = k.base = 0;
         for (SharedFixed& f : fixed) {
             q.memset(f.state.buf[f.state.cur].get(), 0, f.state.bytes);
             f.tokens = 0;
@@ -558,7 +563,16 @@ public:
                      "last step can be undone whole; a count inside it only when it had up to rewind_tokens tokens)");
         }
         if (!reads_kv_) {
-            for (size_t k : kv_slot_) shared_.kv[k].len = n;
+            for (size_t k : kv_slot_) {
+                const SharedKv& s = shared_.kv[k];
+                XS_CHECK(n == 0 || s.base == 0 || n - s.spec.sliding_window >= s.base, "cannot truncate to ", n,
+                         " tokens: kv slot '", s.spec.label, "' keeps the ", s.spec.sliding_window,
+                         " tokens before its last step and holds none before token ", s.base);
+            }
+            for (size_t k : kv_slot_) {
+                shared_.kv[k].len = n;
+                if (n == 0) shared_.kv[k].base = 0;
+            }
         }
         for (size_t f : fixed_slot_) rewind(shared_.fixed[f], n);
         q_.wait_and_throw();
@@ -621,10 +635,13 @@ private:
 
     size_t shared_kv(const graph::KvSlot& spec) {
         for (size_t i = 0; i < shared_.kv.size(); ++i) {
-            const graph::KvSlot& s = shared_.kv[i].spec;
+            graph::KvSlot& s = shared_.kv[i].spec;
             if (s.label != spec.label) continue;
             XS_CHECK(s.num_kv_heads == spec.num_kv_heads && s.head_dim == spec.head_dim, "sycl: kv slot '",
                      spec.label, "' is declared with two shapes");
+            // the widest window of the programs that share it; all of it when one of them reads all
+            s.sliding_window =
+                s.sliding_window == 0 || spec.sliding_window == 0 ? 0 : std::max(s.sliding_window, spec.sliding_window);
             return i;
         }
         SharedKv k;
@@ -654,6 +671,18 @@ private:
     }
 
     KvBuffers& kv_buffers(int64_t slot) const { return shared_.kv[kv_slot_[static_cast<size_t>(slot)]].buf; }
+    // The first token the buffers of the slot behind `v` hold (0 for a value that is not a KV slot's).
+    int64_t kv_base(Value v) const {
+        const Node& n = graph_.node(v);
+        if (n.kind != OpKind::KvCache && n.kind != OpKind::KvRead) return 0;
+        return shared_.kv[kv_slot_[static_cast<size_t>(std::get<graph::KvCacheAttrs>(n.attrs).slot)]].base;
+    }
+    // Whether a slot keeps only its sliding window: one that attention alone reads, in a session whose conv or
+    // recurrent state already rules out cutting the sequence back before its last step (truncate), so no later step
+    // reads the keys before that window.
+    bool keeps_window(const SharedKv& s) const {
+        return s.spec.sliding_window > 0 && s.attention_only && !shared_.fixed.empty();
+    }
 
     // Bytes a token takes in each buffer of a slot.
     struct KvTokenBytes {
@@ -776,8 +805,9 @@ private:
                                         std::none_of(graph_.outputs().begin(), graph_.outputs().end(), [&](const auto& o) {
                                             return static_cast<size_t>(o.value.node) == i;
                                         });
-                    const SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(
+                    SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(
                         std::get<graph::KvCacheAttrs>(n.attrs).slot)]];
+                    slot.attention_only = slot.attention_only && (unread || attention_reads_only(i, consumers));
                     if (unread && slot.typed) {
                         dtype_[i][0] = dtype_[i][1] = slot.buf.dtype;
                     } else if (kv_format_.k != quant::KvFormat::Float && (unread || attention_reads_only(i, consumers))) {
@@ -795,8 +825,9 @@ private:
                     break;
                 }
                 case OpKind::KvRead: {  // in the dtype its writer stores (a program compiled before this one)
-                    const SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(
+                    SharedKv& slot = shared_.kv[kv_slot_[static_cast<size_t>(
                         std::get<graph::KvCacheAttrs>(n.attrs).slot)]];
+                    slot.attention_only = slot.attention_only && attention_reads_only(i, consumers);
                     XS_CHECK(slot.typed, "sycl: kv slot '", slot.spec.label, "' is read before a program writes it; ",
                              "compile the writer first");
                     dtype_[i][0] = dtype_[i][1] = slot.buf.dtype;
@@ -1528,16 +1559,26 @@ private:
         return s;
     }
 
+    // Room for a step that brings the slots to `tokens` tokens. A slot grows by doubling; one that keeps only its
+    // sliding window (keeps_window) instead moves the window before the step to the front of buffers a window
+    // larger than the step needs, so it moves again only a window of tokens later.
     void ensure_kv_capacity(int64_t tokens) {
         for (size_t slot : kv_slot_) {
-            KvBuffers& b = shared_.kv[slot].buf;
-            const int64_t len = shared_.kv[slot].len;
-            if (tokens <= b.capacity) continue;
+            SharedKv& s = shared_.kv[slot];
+            KvBuffers& b = s.buf;
+            if (tokens - s.base <= b.capacity) continue;
+            const int64_t window = keeps_window(s) ? s.spec.sliding_window : 0;
+            const int64_t base = window > 0 ? std::max(s.base, s.len - window) : 0;
+            const int64_t cap = std::min(max_context_, window > 0 ? tokens - base + window
+                                                                  : std::max({tokens, 2 * b.capacity, int64_t{1024}}));
             const KvTokenBytes bytes = kv_token_bytes(b);
-            const int64_t cap = std::min(max_context_, std::max({tokens, 2 * b.capacity, int64_t{1024}}));
+            const int64_t len = s.len - base;  // tokens kept
             const auto grow = [&](DeviceBuffer& buf, int64_t per_token) {
                 DeviceBuffer bigger(q_, static_cast<size_t>(cap * per_token));
-                if (len > 0 && per_token > 0) q_.memcpy(bigger.get(), buf.get(), static_cast<size_t>(len * per_token));
+                if (len > 0 && per_token > 0) {
+                    q_.memcpy(bigger.get(), static_cast<const char*>(buf.get()) + (base - s.base) * per_token,
+                              static_cast<size_t>(len * per_token));
+                }
                 return bigger;
             };
             DeviceBuffer k = grow(b.k, bytes.k);
@@ -1550,6 +1591,7 @@ private:
             b.k_scale = std::move(ks);
             b.v_scale = std::move(vs);
             b.capacity = cap;
+            s.base = base;
         }
     }
 
@@ -2166,11 +2208,12 @@ private:
                 const int slot = std::get<graph::KvCacheAttrs>(n.attrs).slot;
                 KvBuffers& b = kv_buffers(slot);
                 const int64_t count = step.tokens * b.row;
-                const size_t offset = static_cast<size_t>((step.kv_len - step.tokens) * b.row);
+                const int64_t held = step.kv_len - step.tokens - kv_base(Value{static_cast<int32_t>(i), 0});
+                const size_t offset = static_cast<size_t>(held * b.row);
                 if (b.dtype == kKvCodes) {
                     const int64_t rows = step.tokens * b.heads;
                     const int64_t width = b.row / b.heads;
-                    const int64_t first = (step.kv_len - step.tokens) * b.heads;
+                    const int64_t first = held * b.heads;
                     const auto append = [&](quant::KvFormat f, const float* x, DeviceBuffer& codes, DeviceBuffer& scales) {
                         const quant::KvRowBytes bytes = quant::kv_row_bytes(f, width);
                         sycl_be::quantize_kv(q_, f, x, reinterpret_cast<uint8_t*>(codes.get()) + first * bytes.codes,
@@ -2198,7 +2241,7 @@ private:
                 s.tokens = rows ? qs[0] * qs[1] : qs[0];
                 s.q_heads = qs[qs.size() - 2];
                 s.head_dim = qs.back();
-                s.kv_len = rows ? ks[0] * ks[1] : ks[0] == kL ? step.kv_len : ks[0];
+                s.kv_len = rows ? ks[0] * ks[1] : ks[0] == kL ? step.kv_len - kv_base(n.inputs[1]) : ks[0];
                 s.kv_heads = ks[ks.size() - 2];
                 s.scale = a.scale;
                 s.softcap = a.softcap;

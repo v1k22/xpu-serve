@@ -25,6 +25,9 @@ TEST_SUITE("cpu-ref programs") {
     TEST_CASE("the last step undone whole equals never running it") {
         xs::test::session::undo_last_step(cpu_env());
     }
+    TEST_CASE("a windowed KV slot beside conv state: every output as over all the tokens kept") {
+        xs::test::session::windowed_slot(cpu_env());
+    }
     TEST_CASE("a run asked for some outputs: just those, the state advanced all the same") {
         xs::test::session::requested_outputs(cpu_env());
     }

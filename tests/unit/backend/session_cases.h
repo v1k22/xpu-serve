@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "backend_test_util.h"
+#include "recurrent_ops_cases.h"
 #include "reference_ops.h"
 #include "util/error.h"
 
@@ -29,14 +30,14 @@ struct Env {
     double rtol = 1e-5;
 };
 
-// One layer of each kind of state: a causal conv, a gated delta rule and attention over a KV cache, each fed from its
-// own inputs.
+// One layer of each kind of state: a causal conv, a gated delta rule and attention over a KV cache (within a sliding
+// window, when given one), each fed from its own inputs.
 struct HybridLayer {
     static constexpr int64_t kChannels = 24, kKernel = 4, kHk = 2, kHv = 4, kDk = 32, kDv = 16, kHkv = 2, kD = 32;
     MemoryWeights weights;
     Graph graph;
 
-    HybridLayer() {
+    explicit HybridLayer(int64_t window = 0) {
         TensorRng rng(41);
         weights.add("conv_w", rng.uniform(DType::BF16, {kChannels, kKernel}));
         const int conv = graph.add_conv_slot(kChannels, kKernel, "conv");
@@ -48,11 +49,12 @@ struct HybridLayer {
                                               graph.input("v", DType::F32, {kT, kHv, kDv}),
                                               graph.input("g", DType::F32, {kT, kHv}),
                                               graph.input("beta", DType::F32, {kT, kHv}), 1e-6f));
-        const int kv = graph.add_kv_slot(kHkv, kD, 0, "attn");
+        const int kv = graph.add_kv_slot(kHkv, kD, window, "attn");
         const auto [k_all, v_all] =
             graph.kv_cache(kv, graph.input("ak", DType::F32, {kT, kHkv, kD}), graph.input("av", DType::F32, {kT, kHkv, kD}));
-        graph.output("attn", graph.attention(graph.input("aq", DType::F32, {kT, 2 * kHkv, kD}), k_all, v_all,
-                                             graph::AttentionAttrs{0.2f}));
+        graph::AttentionAttrs attrs{0.2f};
+        attrs.sliding_window = window;
+        graph.output("attn", graph.attention(graph.input("aq", DType::F32, {kT, 2 * kHkv, kD}), k_all, v_all, attrs));
     }
 
     // `tokens` rows of every input.
@@ -226,6 +228,59 @@ inline void undo_last_step(const Env& env) {
     plain->run(first, want);
     plain->run(third, want);
     outputs_close(out, want, env);
+}
+
+// A KV slot with a sliding window beside conv and recurrent state, which rule out cutting the sequence back before
+// its last step: a backend may then keep only the window's keys. Over many steps, far past a few windows, with
+// steps undone whole and cut inside, attention gives what it gives over every token kept.
+inline void windowed_slot(const Env& env) {
+    const int64_t window = 6;
+    const HybridLayer layer(window);
+    const Graph* programs[] = {&layer.graph};
+    TensorRng rng(45);
+    const auto session = env.compile(programs, layer.weights, 4);
+    ref::AttentionSpec spec;
+    spec.scale = 0.2;
+    spec.sliding_window = window;
+    std::vector<HostTensor> ks, vs;
+    struct Step {
+        int64_t tokens;
+        int64_t keep;  // of the step, after it ran: all, none (undone whole) or a count inside it
+    };
+    int64_t cached = 0;
+    for (const Step& s : {Step{5, 5}, Step{1, 1},  Step{1, 1},  Step{9, 9}, Step{3, 0}, Step{3, 3}, Step{1, 1},
+                          Step{4, 2}, Step{1, 1},  Step{20, 20}, Step{1, 1}, Step{2, 1}, Step{7, 7}, Step{1, 0},
+                          Step{1, 1}, Step{30, 30}, Step{4, 3},  Step{1, 1}, Step{1, 1}, Step{12, 0}, Step{2, 2}}) {
+        CAPTURE(cached);
+        CAPTURE(s.tokens);
+        const TensorMap in = HybridLayer::inputs(rng, s.tokens);
+        TensorMap out;
+        session->run(in, out);
+        ks.push_back(in.at("ak").clone());
+        vs.push_back(in.at("av").clone());
+        CHECK(all_close(out.at("attn"),
+                        ref::attention(to_f64(in.at("aq")), recurrent::concat_rows(ks), recurrent::concat_rows(vs), spec),
+                        env.atol, env.rtol));
+        if (s.keep < s.tokens) {
+            session->truncate(cached + s.keep);
+            ks.pop_back();
+            vs.pop_back();
+            if (s.keep > 0) {
+                const TensorMap kept = HybridLayer::head(in, s.keep);
+                ks.push_back(kept.at("ak").clone());
+                vs.push_back(kept.at("av").clone());
+            }
+        }
+        cached += s.keep;
+        CHECK(session->num_cached() == cached);
+    }
+    CHECK_THROWS_AS(session->truncate(cached - 3), xs::Error);  // before the last step
+    session->truncate(0);
+    const TensorMap in = HybridLayer::inputs(rng, 9);
+    TensorMap out;
+    session->run(in, out);
+    CHECK(all_close(out.at("attn"), ref::attention(to_f64(in.at("aq")), to_f64(in.at("ak")), to_f64(in.at("av")), spec),
+                    env.atol, env.rtol));
 }
 
 // Programs that name the same KV slot share it: two writers extend one sequence, a KvRead reader attends to all of it
