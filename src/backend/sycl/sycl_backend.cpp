@@ -2688,8 +2688,15 @@ public:
                 }
                 continue;
             }
+            if (key == "kv_chunk") {  // keys a chunk of a quantized cache on the fused kernel (0: whole)
+                const bool digits = !value.empty() && value.find_first_not_of("0123456789") == std::string::npos;
+                XS_CHECK(digits && value.size() <= 9, "sycl backend option kv_chunk=", value, " is not a key count");
+                attention.kv_chunk = std::stoll(value);
+                continue;
+            }
             if (key != "attention") {
-                fail("sycl does not know backend option '", key, "' (known: attention, block, few_rows, gemv)");
+                fail("sycl does not know backend option '", key,
+                     "' (known: attention, block, few_rows, gemv, kv_chunk)");
             }
             if (value == "rows") {
                 attention.path = sycl_be::AttentionPath::Rows;

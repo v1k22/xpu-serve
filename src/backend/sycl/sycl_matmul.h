@@ -90,6 +90,7 @@ void expert_matmul_gemm(sycl::queue& q, Scratch& scratch, const float* x, bool p
 // it, GEMMs otherwise. Rows, Gemm and Flash force one (tests); Flash takes GEMMs where it does not fit.
 enum class AttentionPath : uint8_t { Auto, Rows, Gemm, Flash };
 inline constexpr int64_t kAttentionRowsMax = 8;
+inline constexpr int64_t kKvChunkKeys = 65536;
 
 struct AttentionPlan {
     AttentionPath path = AttentionPath::Auto;
@@ -98,6 +99,9 @@ struct AttentionPlan {
     // GEMM path: bytes of scores and probabilities that stay in the device's cache between the GEMMs and the softmax
     // of a chunk of queries; 0 where streaming them through memory costs less than the smaller GEMMs (set per device).
     int64_t score_cache = 0;
+    // A quantized cache of more visible keys than this goes to the fused kernel a chunk of them at a time
+    // (attention_quantized); 0: always whole.
+    int64_t kv_chunk = kKvChunkKeys;
 };
 
 // Keys and values in two parts, k / v holding the first `first_len` (an Attention over Concat(k1, k2) with the
@@ -116,8 +120,10 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
 bool attention_matrix_path(const AttentionShape& s, AttentionPath path);
 
 // attention() over a quantized KV cache. The rows path reads the codes; the matrix paths first decode the keys and
-// values the queries can see to CT in `kv_scratch` (a second scratch: they use `scratch` for their own buffers). A
-// TurboQuant format's rows decode rotated: the queries are rotated to meet the keys, the output rotated back.
+// values the queries can see to CT in `kv_scratch` (a second scratch: they use `scratch` for their own buffers), on
+// the fused kernel a chunk of plan.kv_chunk keys at a time past that many, each chunk's partial softmax merged into
+// the rows' (the scratch stays a chunk's whatever the context). A TurboQuant format's rows decode rotated: the queries
+// are rotated to meet the keys, the output rotated back.
 template <typename CT>
 void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvQuantized& kv,
                          float* out, const AttentionShape& s, const AttentionPlan& plan);

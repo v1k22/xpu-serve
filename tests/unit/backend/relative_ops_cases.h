@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "backend_test_util.h"
+#include "quant/kv_format.h"
 #include "recurrent_ops_cases.h"
 #include "reference_ops.h"
 #include "util/error.h"
@@ -29,6 +30,7 @@ struct Env {
     // `attention`: the attention path a session takes (a backend option; "auto" leaves it to the backend).
     std::function<std::unique_ptr<Session>(const Graph&, const WeightStore&, const std::string& attention)> compile;
     std::vector<std::string> attention_impls{"auto"};
+    quant::KvFormats kv;  // the cache's formats, which `compile` sets: the reference reads the values they store
     double atol = 1e-5;
     double rtol = 1e-5;
 };
@@ -133,15 +135,19 @@ inline void relative_attention(const Env& env) {
         // read toward the future, no bias.
         std::vector<TensorMap> inputs;
         std::vector<std::array<Tensor64, 4>> expected;
-        std::vector<HostTensor> ks, vs;
+        std::vector<HostTensor> ks, vs;  // as the cache stores them
         for (const int64_t t : s.steps) {
             const HostTensor q = rng.uniform(DType::F32, {t, s.heads, s.dim}, 2.0f);
             const HostTensor rel = rng.uniform(DType::F32, {t, s.heads, s.extent}, 3.0f);
             HostTensor sink = rng.uniform(DType::F32, {t, s.heads}, 3.0f);
             for (int64_t i = 0; i < t * s.heads; ++i) sink.data<float>()[i] += s.sink_shift;
-            ks.push_back(rng.uniform(DType::F32, {t, s.kv_heads, s.dim}, 2.0f));
-            vs.push_back(rng.uniform(DType::F32, {t, s.kv_heads, s.dim}));
-            inputs.push_back({{"q", q}, {"k", ks.back()}, {"v", vs.back()}, {"rel", rel}, {"sink", sink}});
+            const HostTensor k_in = rng.uniform(DType::F32, {t, s.kv_heads, s.dim}, 2.0f);
+            const HostTensor v_in = rng.uniform(DType::F32, {t, s.kv_heads, s.dim});
+            inputs.push_back({{"q", q}, {"k", k_in}, {"v", v_in}, {"rel", rel}, {"sink", sink}});
+            ks.push_back(k_in.clone());
+            vs.push_back(v_in.clone());
+            quant::round_trip_kv(env.kv.k, ks.back().data<float>(), t * s.kv_heads, s.dim);
+            quant::round_trip_kv(env.kv.v, vs.back().data<float>(), t * s.kv_heads, s.dim);
             ref::AttentionSpec spec;
             spec.scale = attrs.scale;
             spec.sliding_window = s.window;

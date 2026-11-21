@@ -101,6 +101,9 @@ struct FlashArgs {
     const float* rel = nullptr;  // [T, Hq, rel_extent]
     int64_t rel_extent = 0;
     const float* sink = nullptr;  // [T, Hq]
+    int64_t key_begin = 0;  // k and v hold keys [key_begin, key_stop) (FlashKeys)
+    int64_t key_stop = 0;
+    bool partial = false;  // partial rows to `part`, not `out`
 };
 
 template <int DP, int BC, int MT, int SGS, typename QT>
@@ -179,7 +182,9 @@ struct FlashKernel {
             lo = t0 / a.block * a.block;
             hi = lo + a.block;
         }
-        const int key_end = static_cast<int>(a.block > 0 ? hi : a.kv_len);
+        lo = std::max(lo, a.key_begin);
+        hi = std::max(lo, std::min(hi, a.key_stop));
+        const int key_end = static_cast<int>(std::min<int64_t>(a.block > 0 ? hi : a.kv_len, a.key_stop));
         const int pos0 = static_cast<int>(past + t0);
         const int rows_valid = static_cast<int>(last - t0 + 1);
         const int64_t blocks = ceil_div(hi - lo, BC);
@@ -207,7 +212,7 @@ struct FlashKernel {
         const auto kg = global_ptr(kp);
         const auto vg = global_ptr(vp);
         const size_t width = static_cast<size_t>(a.kv_heads * d_n);  // K and V as [kv_len, Hkv * D] matrices
-        const size_t height = static_cast<size_t>(a.kv_len);
+        const size_t height = static_cast<size_t>(a.key_stop - a.key_begin);  // rows of k and v
         const size_t col0 = static_cast<size_t>(hk * d_n);
         const float qk_scale = a.softcap > 0.0f ? a.scale / a.softcap : a.scale * kLog2e;
         const float cap2 = a.softcap * kLog2e;
@@ -221,8 +226,8 @@ struct FlashKernel {
             for (int kk = 0; kk < kDt; ++kk) {
                 for (int nt = 0; nt < kKt; ++nt) {
                     TileKt kt;
-                    mxi::joint_matrix_load_checked(sg, kt, kg, width, height, width, static_cast<size_t>(kb + nt * kTn),
-                                                   col0 + kk * kTk);
+                    mxi::joint_matrix_load_checked(sg, kt, kg, width, height, width,
+                                                   static_cast<size_t>(kb - a.key_begin + nt * kTn), col0 + kk * kTk);
                     for (int mt = 0; mt < MT; ++mt) mx::joint_matrix_mad(sg, sc[mt][nt], qa[mt][kk], kt, sc[mt][nt]);
                 }
             }
@@ -279,15 +284,17 @@ struct FlashKernel {
             }
             // V: plain loads inside the cache, bounds-checked ones for the last block only. Checked VNNI loads of
             // V gave wrong tiles on Xe2 (Arc B60) in the one-row-tile kernels; plain ones are right on Xe2 and Xe3.
-            const bool interior = kb + BC <= a.kv_len;
+            const bool interior = kb + BC <= a.key_stop;
+            const int64_t vr = kb - a.key_begin;  // the block's first row of v
             for (int kt = 0; kt < kKt; ++kt) {
                 for (int dt = 0; dt < kDt; ++dt) {
                     TileV vt;
                     if (interior) {
-                        mx::joint_matrix_load(sg, vt, global_ptr(vp + (kb + kt * kTk) * width + col0 + dt * kTn), width);
+                        const half* row = vp + (vr + kt * kTk) * width + col0 + dt * kTn;
+                        mx::joint_matrix_load(sg, vt, global_ptr(row), width);
                     } else {
                         mxi::joint_matrix_load_checked(sg, vt, vg, width, height, width,
-                                                       static_cast<size_t>(kb + kt * kTk), col0 + dt * kTn);
+                                                       static_cast<size_t>(vr + kt * kTk), col0 + dt * kTn);
                     }
                     for (int mt = 0; mt < MT; ++mt) mx::joint_matrix_mad(sg, o[mt][dt], pa[mt][kt], vt, o[mt][dt]);
                 }
@@ -301,7 +308,7 @@ struct FlashKernel {
                 const float r = sycl::reduce_over_group(sg, ls[mt][i], sycl::plus<float>());
                 l[mt] = lane == i ? r : l[mt];
             }
-            if (a.split == 1) {
+            if (!a.partial) {
                 for (int dt = 0; dt < kDt; ++dt) {
                     for_rows(sg, o[mt][dt], [&](float& x, int i) {
                         const float li = sycl::select_from_group(sg, l[mt], i);
@@ -322,7 +329,7 @@ struct FlashKernel {
             if (r >= rows_valid) break;
             const int64_t row_out = (t0 + r) * a.q_heads + h;
             const float* src = sg_slm + r * DP;
-            if (a.split == 1) {
+            if (!a.partial) {
                 for (int64_t d = lane; d < d_n; d += kSg) out[row_out * d_n + d] = src[d];
             } else {
                 float* dst = part + (row_out * a.split + sp) * (d_n + 2);
@@ -340,7 +347,7 @@ struct FlashKernel {
 
 template <int DP, int BC, int MT, int SGS, typename QT>
 void flash_t(sycl::queue& q, const QT* qp, const half* k, const half* v, float* out, float* part,
-             const AttentionShape& s, int64_t split) {
+             const AttentionShape& s, int64_t split, const FlashKeys& keys) {
     using K = FlashKernel<DP, BC, MT, SGS, QT>;
     FlashArgs a;
     a.group = s.q_heads / s.kv_heads;
@@ -363,6 +370,9 @@ void flash_t(sycl::queue& q, const QT* qp, const half* k, const half* v, float* 
     a.rel = s.rel;
     a.rel_extent = s.rel_extent;
     a.sink = s.sink;
+    a.key_begin = keys.begin;
+    a.key_stop = keys.end < 0 ? s.kv_len : keys.end;
+    a.partial = split > 1 || keys.partial;
     const auto wgs = static_cast<size_t>(s.kv_heads * a.row_blocks * split);
     syclex::submit(q, [&](sycl::handler& h) {
         K kernel{qp, k, v, out, part, a, sycl::local_accessor<float, 1>(sycl::range<1>(K::kSlmFloats), h)};
@@ -411,18 +421,18 @@ int64_t flash_attention_split(const AttentionShape& s, int64_t compute_units) {
 
 template <typename QT>
 void flash_attention(sycl::queue& q, const QT* qp, const half* k, const half* v, float* out,
-                     const AttentionShape& s, int64_t split, float* part) {
+                     const AttentionShape& s, int64_t split, float* part, const FlashKeys& keys) {
     switch (flash_config(s.head_dim).dp) {  // the configurations of flash_config
-        case 64: return flash_t<64, 32, 2, 4, QT>(q, qp, k, v, out, part, s, split);
-        case 80: return flash_t<80, 32, 2, 4, QT>(q, qp, k, v, out, part, s, split);
-        case 128: return flash_t<128, 32, 1, 4, QT>(q, qp, k, v, out, part, s, split);
+        case 64: return flash_t<64, 32, 2, 4, QT>(q, qp, k, v, out, part, s, split, keys);
+        case 80: return flash_t<80, 32, 2, 4, QT>(q, qp, k, v, out, part, s, split, keys);
+        case 128: return flash_t<128, 32, 1, 4, QT>(q, qp, k, v, out, part, s, split, keys);
         default: fail("flash_attention: head_dim ", s.head_dim, " is not covered (flash_attention_fits)");
     }
 }
 
 template void flash_attention<float>(sycl::queue&, const float*, const half*, const half*, float*,
-                                     const AttentionShape&, int64_t, float*);
+                                     const AttentionShape&, int64_t, float*, const FlashKeys&);
 template void flash_attention<half>(sycl::queue&, const half*, const half*, const half*, float*,
-                                    const AttentionShape&, int64_t, float*);
+                                    const AttentionShape&, int64_t, float*, const FlashKeys&);
 
 }  // namespace xs::sycl_be

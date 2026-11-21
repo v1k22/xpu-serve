@@ -70,8 +70,9 @@ build/src/xpu-serve run   <embedding-model-dir> --device GPU --prompt "text"    
   (`XS_WITH_SYCL`); `-DXS_SYCL_TARGETS=intel_gpu_bmg_g21` compiles its kernels ahead
   of time for the Arc Pro B60. Any other C++20 compiler builds only the CPU reference backend (the test oracle).
 - Useful flags: `--backend sycl|cpu-ref` (default: sycl when built), `--device GPU|GPU.0|GPU.1`, `--precision f16|f32`,
-  `--kv-dtype auto|i8|turbo4|turbo3|turbo2` (or `<keys>:<values>`, e.g. `i8:turbo4`), `--ctx N`, `--prefill-chunk N`, `--backend-opt attention=auto|rows|gemm`,
-  `--backend-opt gemv=auto|vector|xmx`, `--backend-opt few_rows=N`, `--backend-opt block=auto|f16`,
+  `--kv-dtype auto|i8|turbo4|turbo3|turbo2` (or `<keys>:<values>`, e.g. `i8:turbo4`), `--ctx N`, `--prefill-chunk N`,
+  `--backend-opt attention=auto|rows|gemm|flash`, `--backend-opt gemv=auto|vector|xmx`, `--backend-opt few_rows=N`,
+  `--backend-opt block=auto|f16`, `--backend-opt kv_chunk=N`,
   `--spec mtp|dflash|dspine|dspark --spec-k N`,
   `--readout letters|openjev` (a language model served as a decision model), `--set-size N` (d1: questions packed
   after one state, 1 for each alone),
@@ -682,8 +683,10 @@ Hugging Face safetensors (8.1 first, if it does not).
   model's own; no rerank or score API; no packs (`convert` refuses them).
 - A quantized KV cache (`--kv-dtype`): the TurboQuant formats need a head_dim that is a multiple of 128 (a model
   with another is refused by name); keys and values take one format, or `i8` keys with TurboQuant values, other
-  pairs are refused. Prefill decodes the keys and values in view of one layer to f16 at a time, so its scratch is
-  one layer's f16 cache. Lossy and opt-in (docs/decisions/0010, 0020).
+  pairs are refused. Prefill decodes the keys and values in view of one layer to f16 for the matrix paths: on the
+  fused kernel past 65,536 of them a chunk of that many at a time (`--backend-opt kv_chunk=N`, 0 for whole), so
+  the scratch stays a chunk's; on the GEMM path (a head_dim past 128) the layer's whole cache. Lossy and opt-in
+  (docs/decisions/0010, 0020).
 - `-hf` reads the Hugging Face Hub's API and resolve URLs: a GGUF file is imported into a pack, so it takes its size
   twice on disk; a file split into parts is refused, as the import refuses it; no Xet chunk deduplication. The MTP
   head a repository publishes apart is fetched for a `qwen35` or `qwen35moe` file without one.

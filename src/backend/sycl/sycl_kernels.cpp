@@ -1994,6 +1994,41 @@ void attention_combine(sycl::queue& q, const float* part, float* out, int64_t ro
     });
 }
 
+void attention_merge(sycl::queue& q, const float* part, float* acc, int64_t rows, int64_t split, int64_t head_dim,
+                     bool first) {
+    const int64_t d_n = head_dim;
+    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(rows)), [=](sycl::item<1> it) {
+        constexpr float kNegInf = -std::numeric_limits<float>::infinity();
+        const int64_t r = static_cast<int64_t>(it[0]);
+        const float* pr = part + r * split * (d_n + 2);
+        float* ar = acc + r * (d_n + 2);
+        const float m_acc = first ? kNegInf : ar[d_n];
+        float m_all = m_acc;
+        for (int64_t sp = 0; sp < split; ++sp)
+            m_all = sycl::fmax(m_all, pr[sp * (d_n + 2) + d_n]);
+        if (m_all == kNegInf) {  // nothing seen yet
+            if (first) {
+                for (int64_t d = 0; d < d_n; ++d) ar[d] = 0.0f;
+                ar[d_n] = kNegInf;
+                ar[d_n + 1] = 0.0f;
+            }
+            return;
+        }
+        const float w_acc = m_acc == kNegInf ? 0.0f : sycl::exp(m_acc - m_all);
+        float denom = m_acc == kNegInf ? 0.0f : ar[d_n + 1] * w_acc;
+        for (int64_t d = 0; d < d_n; ++d) ar[d] = m_acc == kNegInf ? 0.0f : ar[d] * w_acc;
+        for (int64_t sp = 0; sp < split; ++sp) {
+            const float* ps = pr + sp * (d_n + 2);
+            if (ps[d_n] == kNegInf) continue;
+            const float w = sycl::exp(ps[d_n] - m_all);
+            for (int64_t d = 0; d < d_n; ++d) ar[d] += ps[d] * w;
+            denom += ps[d_n + 1] * w;
+        }
+        ar[d_n] = m_all;
+        ar[d_n + 1] = denom;
+    });
+}
+
 template <typename CT, typename QT>
 void attention_pack_q(sycl::queue& q, const QT* qp, CT* packed, const AttentionShape& s, int64_t t0, int64_t tc) {
     const int64_t d_n = s.head_dim;

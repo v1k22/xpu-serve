@@ -412,6 +412,59 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
     }
 }
 
+namespace {
+
+// A quantized stream from key `key` (every head's row) on.
+KvStream stream_from(const KvStream& stream, int64_t key, const AttentionShape& s) {
+    const quant::KvRowBytes bytes = quant::kv_row_bytes(stream.format, s.head_dim);
+    const int64_t skip = key * s.kv_heads;
+    return KvStream{stream.format, stream.codes + skip * bytes.codes, stream.scales + skip * bytes.scales};
+}
+
+// attention_quantized's chunks: keys [first, kv_len) a chunk at a time, decoded to f16 and read by the fused kernel,
+// which writes partial rows that attention_merge folds into each row's; the sink goes with the first chunk alone.
+// False, having run nothing, where the fused kernel does not take the shape.
+bool attention_quantized_chunks(sycl::queue& q, Scratch& kv_scratch, const float* qp, const KvQuantized& kv,
+                                float* out, const AttentionShape& s, const AttentionPlan& plan, int64_t first) {
+    const int64_t chunk = plan.kv_chunk;
+    const int64_t d = s.head_dim;
+    const int64_t queries = s.tokens * s.q_heads;
+    AttentionShape one_chunk = s;  // what a launch's keys number, for its split
+    one_chunk.kv_len = chunk;
+    one_chunk.window = 0;
+    const int64_t split = flash_attention_split(one_chunk, plan.compute_units);
+    const bool rotated_keys = quant::turbo_bits(kv.k.format) != 0;
+    const size_t kv_bytes = align_up(static_cast<size_t>(chunk * s.kv_heads * d) * sizeof(half));
+    const size_t q_bytes = rotated_keys ? align_up(static_cast<size_t>(queries * d) * sizeof(float)) : 0;
+    const size_t acc_bytes = align_up(static_cast<size_t>(queries * (d + 2)) * sizeof(float));
+    const size_t part_bytes = align_up(static_cast<size_t>(queries * split * (d + 2)) * sizeof(float));
+    auto* base = static_cast<char*>(kv_scratch.get(2 * kv_bytes + q_bytes + acc_bytes + part_bytes));
+    auto* k = reinterpret_cast<half*>(base);
+    auto* v = reinterpret_cast<half*>(base + kv_bytes);
+    if (!flash_attention_fits(s, k, v)) return false;
+    auto* acc = reinterpret_cast<float*>(base + 2 * kv_bytes + q_bytes);
+    auto* part = reinterpret_cast<float*>(base + 2 * kv_bytes + q_bytes + acc_bytes);
+    if (rotated_keys) {
+        auto* rotated = reinterpret_cast<float*>(base + 2 * kv_bytes);
+        kv_rotate(q, qp, rotated, queries, d, false);
+        qp = rotated;
+    }
+    for (int64_t c0 = first; c0 < s.kv_len; c0 += chunk) {
+        const int64_t c1 = std::min(s.kv_len, c0 + chunk);
+        dequantize_kv(q, stream_from(kv.k, c0, s), k, (c1 - c0) * s.kv_heads, d);
+        dequantize_kv(q, stream_from(kv.v, c0, s), v, (c1 - c0) * s.kv_heads, d);
+        AttentionShape keys = s;
+        if (c0 > first) keys.sink = nullptr;
+        flash_attention(q, qp, k, v, out, keys, split, part, FlashKeys{c0, c1, true});
+        attention_merge(q, part, acc, queries, split, d, c0 == first);
+    }
+    attention_combine(q, acc, out, queries, 1, d);
+    if (quant::turbo_bits(kv.v.format) != 0) kv_rotate(q, out, out, queries, d, true);
+    return true;
+}
+
+}  // namespace
+
 template <typename CT>
 void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvQuantized& kv,
                          float* out, const AttentionShape& s, const AttentionPlan& plan) {
@@ -424,6 +477,13 @@ void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, 
     // Keys before `first` are outside every query's window: drop them, which shifts all positions alike.
     const int64_t past = s.kv_len - s.tokens;
     const int64_t first = s.window > 0 ? std::max<int64_t>(0, past - s.window + (s.anchored ? 0 : 1)) : 0;
+    if constexpr (std::is_same_v<CT, half>) {
+        const bool fused = (plan.path == AttentionPath::Auto || plan.path == AttentionPath::Flash) && plan.xmx;
+        if (fused && plan.kv_chunk > 0 && s.kv_len - first > plan.kv_chunk && s.block == 0 &&
+            attention_quantized_chunks(q, kv_scratch, qp, kv, out, s, plan, first)) {
+            return;
+        }
+    }
     const int64_t rows = (s.kv_len - first) * s.kv_heads;
     const int64_t queries = s.tokens * s.q_heads;
     const bool rotated_keys = quant::turbo_bits(kv.k.format) != 0;
@@ -432,13 +492,8 @@ void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, 
     auto* base = static_cast<char*>(kv_scratch.get(2 * kv_bytes + q_bytes));
     auto* k = reinterpret_cast<CT*>(base);
     auto* v = reinterpret_cast<CT*>(base + kv_bytes);
-    const auto from = [&](const KvStream& stream) {  // the stream from row `first` of every head on
-        const quant::KvRowBytes bytes = quant::kv_row_bytes(stream.format, s.head_dim);
-        const int64_t skip = first * s.kv_heads;
-        return KvStream{stream.format, stream.codes + skip * bytes.codes, stream.scales + skip * bytes.scales};
-    };
-    dequantize_kv(q, from(kv.k), k, rows, s.head_dim);
-    dequantize_kv(q, from(kv.v), v, rows, s.head_dim);
+    dequantize_kv(q, stream_from(kv.k, first, s), k, rows, s.head_dim);
+    dequantize_kv(q, stream_from(kv.v, first, s), v, rows, s.head_dim);
     if (rotated_keys) {
         auto* rotated = reinterpret_cast<float*>(base + 2 * kv_bytes);
         kv_rotate(q, qp, rotated, queries, s.head_dim, false);

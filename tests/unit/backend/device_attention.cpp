@@ -44,6 +44,7 @@ struct AttentionCase {
     std::string impl = "auto";
     std::vector<int64_t> steps{5, 1, 3};
     quant::KvFormats kv;  // --kv-dtype
+    std::string kv_chunk;  // the backend's kv_chunk option ("": its default)
     bool causal = true;
     bool quantized() const { return kv.k != KvFormat::Float; }
 };
@@ -87,6 +88,7 @@ bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& r
     test::TensorRng rng(seed);
     SessionOptions options = dev::options();
     options.extra["attention"] = c.impl;
+    if (!c.kv_chunk.empty()) options.extra["kv_chunk"] = c.kv_chunk;
     options.kv = c.kv;
     const quant::KvFormats stored = rounded_reference ? c.kv : quant::KvFormats{};
     const auto session = dev::backend().compile(attention_graph(c), test::MemoryWeights{}, options);
@@ -317,6 +319,30 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
                 c.steps = {2100, 1, 2};
                 CAPTURE(describe(c));
                 CHECK(attention_matches(c, static_cast<uint32_t>(1700 + window)));
+            }
+        }
+    }
+
+    TEST_CASE("a quantized KV cache longer than a chunk of keys: the fused kernel over its chunks, merged") {
+        // f32 (no chunks: they are f16's): over 300 keys an int8 code the device rounds the other way at a tie moves
+        // the output by up to 4e-4.
+        const dev::Tolerance tol = dev::tolerance({1e-3, 1e-3}, {4e-3, 4e-3});
+        for (const std::string& impl : dev::attention_impls()) {
+            for (const quant::KvFormats& kv : {kI8, kTurboFormats[0], kTurboFormats[3]}) {
+                for (const int64_t window : {0, 40}) {
+                    AttentionCase c;
+                    c.head_dim = 128;
+                    c.heads = 8;
+                    c.kv_heads = 2;
+                    c.window = window;
+                    c.impl = impl;
+                    c.kv = kv;
+                    c.kv_chunk = "64";
+                    c.steps = {300, 20, 1, 9};
+                    CAPTURE(describe(c));
+                    const uint32_t seed = static_cast<uint32_t>(2000 + window);
+                    CHECK(attention_matches(c, {scale_of(c), c.window, 0.0, 0}, tol, seed));
+                }
             }
         }
     }

@@ -238,6 +238,10 @@ void attention_rows(sycl::queue& q, const float* qp, const KV* k, const KV* v, f
 void attention_rows_quantized(sycl::queue& q, const float* qp, const KvQuantized& kv, float* out,
                               const AttentionShape& s, int64_t split, float* part);
 void attention_combine(sycl::queue& q, const float* part, float* out, int64_t rows, int64_t split, int64_t head_dim);
+// acc [rows, D + 2]: partial rows as attention_combine reads them, merged with the `split` partial rows each row has in
+// `part`; `first`: acc starts as their merge. attention_combine(acc, split 1) then gives the output.
+void attention_merge(sycl::queue& q, const float* part, float* acc, int64_t rows, int64_t split, int64_t head_dim,
+                     bool first);
 
 // Fused attention on the matrix engines (sycl_flash_attention.cpp): an online softmax over blocks of keys, the
 // scores never leaving registers. head_dim up to 128, k and v f16, q f32 or f16. split > 1 shares each
@@ -250,9 +254,16 @@ bool xmx_device(const sycl::device& d);
 bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v);
 // Work-groups per row's keys: enough to fill `compute_units`, at least two key blocks each.
 int64_t flash_attention_split(const AttentionShape& s, int64_t compute_units);
+// The keys of a launch over part of the cache: k and v hold keys [begin, end) of its kv_len (positions, masks and the
+// relative bias stay the whole cache's), and with `partial` the launch writes partial rows to `part` even at split 1.
+struct FlashKeys {
+    int64_t begin = 0;
+    int64_t end = -1;  // -1: kv_len
+    bool partial = false;
+};
 template <typename QT>
 void flash_attention(sycl::queue& q, const QT* qp, const half* k, const half* v, float* out, const AttentionShape& s,
-                     int64_t split, float* part);
+                     int64_t split, float* part, const FlashKeys& keys = {});
 
 // Prefill attention for queries [t0, t0 + tc) through GEMMs, steps of attention_gemm (sycl_matmul.cpp):
 // q -> [Hkv, tc, G, D] packed in CT
