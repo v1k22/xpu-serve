@@ -50,4 +50,7 @@ TEST_SUITE("device moe ops" * doctest::skip(!dev::enabled())) {
     TEST_CASE("moe block: a selection bias, interleaved gate and up rows, a softcapped hidden state") {
         xs::test::moe::moe_selection_bias(device_env());
     }
+    TEST_CASE("moe block: banks stored without a factor of each expert's, gate rows then up rows") {
+        xs::test::moe::moe_selection_bias(device_env(), true);
+    }
 }

@@ -56,6 +56,12 @@ void check_coverage(const std::vector<const gguf::File*>& files, const ImportPla
             runs[t].emplace_back(0, t->rows());
     }
     for (const PackTensor& p : plan.tensors) {
+        if (p.reorder != nullptr) {  // the whole tensor, in another order
+            XS_CHECK(p.first_row == 0 && numel(p.shape) == p.source->numel(), "gguf import: '", p.name, "' ",
+                     dims_to_string(p.shape), " is not '", p.source->name, "' whole, reordered");
+            runs[p.source].emplace_back(0, p.source->rows());
+            continue;
+        }
         XS_CHECK(!p.shape.empty() && p.shape.back() == p.source->cols(), "gguf import: '", p.name, "' ",
                  dims_to_string(p.shape), " does not keep the ", p.source->cols(), " columns of '", p.source->name,
                  "'");
@@ -96,6 +102,22 @@ OutUnit write_bytes(OutTensor tensor, const std::byte* begin, size_t bytes) {
 // written).
 OutUnit unit(const PackTensor& p) {
     const gguf::TensorInfo& s = *p.source;
+    if (p.reorder != nullptr) {
+        if (s.dtype == DType::Block) {
+            fail("gguf import: '", s.name, "' is stored as ", s.type_name(), ", but ", p.reorder->what,
+                 " needs a float tensor");
+        }
+        auto values = std::make_shared<std::vector<float>>(p.reorder->apply(float_rows(s, 0, s.rows()), s.shape()));
+        XS_CHECK(static_cast<int64_t>(values->size()) == numel(p.shape), "gguf import: '", s.name, "' through ",
+                 p.reorder->what, " has ", values->size(), " values for ", dims_to_string(p.shape));
+        OutUnit u;
+        u.tensors = {OutTensor{p.name, DType::F32, p.shape}};
+        u.write = [values](std::ostream& out) {
+            out.write(reinterpret_cast<const char*>(values->data()),
+                      static_cast<std::streamsize>(values->size() * sizeof(float)));
+        };
+        return u;
+    }
     const int64_t rows = numel(p.shape) / p.shape.back();
     const size_t row_bytes = s.nbytes / static_cast<size_t>(s.rows());
     const std::byte* begin = s.data + static_cast<size_t>(p.first_row) * row_bytes;
@@ -208,8 +230,8 @@ ImportPlan Architecture::plan_with_mtp(const gguf::File&, const gguf::File&) con
 }
 
 const Architecture& find_architecture(std::string_view name) {
-    const std::vector<const Architecture*> all{&qwen35(),           &qwen35moe(), &gemma4(),
-                                               &gemma4_assistant(), &clef(),      &modern_bert()};
+    const std::vector<const Architecture*> all{&qwen35(), &qwen35moe(),   &gemma4(),  &gemma4_assistant(),
+                                               &clef(),   &modern_bert(), &inkling2()};
     std::string list;
     for (const Architecture* a : all) {
         if (a->name() == name) return *a;

@@ -56,6 +56,9 @@ struct Config {
     int64_t experts = 0;
     int64_t experts_per_token = 0;
     int64_t expert_width = 0;
+    // The fused gate and up bank's rows: gate 0, up 0, gate 1, ... as released, or the gate rows then the up rows
+    // (a GGUF import: gate_up_rows "halves").
+    bool gate_up_alternates = true;
     double route_scale = 1.0;
     double gate_softcap = 0.0;
     double up_softcap = 0.0;

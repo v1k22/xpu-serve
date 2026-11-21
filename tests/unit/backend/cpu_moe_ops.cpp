@@ -42,4 +42,7 @@ TEST_SUITE("cpu-ref moe ops") {
     TEST_CASE("moe block: a selection bias, interleaved gate and up rows, a softcapped hidden state") {
         xs::test::moe::moe_selection_bias(cpu_env());
     }
+    TEST_CASE("moe block: banks stored without a factor of each expert's, gate rows then up rows") {
+        xs::test::moe::moe_selection_bias(cpu_env(), true);
+    }
 }

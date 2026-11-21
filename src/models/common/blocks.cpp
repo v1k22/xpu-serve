@@ -59,7 +59,10 @@ Value moe(Graph& g, Value x, const MoeSpec& s, const MoeParts& p) {
     Value gate, up;  // [T, k, I]
     if (p.gate_up.valid()) {
         const int64_t inter = g.type(p.gate_up).shape[1] / 2;
-        const Value both = g.expert_matmul(x, p.gate_up, idx);  // [T, k, 2 I]
+        Value both = g.expert_matmul(x, p.gate_up, idx);  // [T, k, 2 I]
+        if (p.gate_up_scale.valid()) {
+            both = g.mul(both, g.gather(g.reshape(p.gate_up_scale, {s.experts, 1}), idx));  // by [T, k, 1]
+        }
         if (p.interleaved) {
             const Value pairs = g.reshape(both, {kT, s.top_k, inter, 2});
             gate = g.reshape(g.slice(pairs, 3, 0, 1), {kT, s.top_k, inter});

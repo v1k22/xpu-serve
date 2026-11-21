@@ -333,7 +333,9 @@ inline void moe_block(const Env& env, blocks::Router router, bool shared, bool q
 
 // The block as Inkling 2 routes: a bias that chooses the experts without weighing them, a fused bank whose rows
 // alternate gate and up, a hidden state the model computes itself (softcapped SwiGLU).
-inline void moe_selection_bias(const Env& env) {
+// `scaled`: the banks as a GGUF import of Inkling 2 holds them, gate rows then up rows and each stored without a factor
+// of its expert's, which multiplies its output (MoeParts::gate_up_scale, expert_scale).
+inline void moe_selection_bias(const Env& env, bool scaled = false) {
     TensorRng rng(36);
     const int64_t experts = 8, top_k = 2, hidden = 64, inter = 48, tokens = 9;
     const float s_in = 1.0f / std::sqrt(static_cast<float>(hidden));
@@ -342,6 +344,11 @@ inline void moe_selection_bias(const Env& env) {
     w.add("bias", rng.uniform(DType::F32, {experts}, 0.6f));
     w.add("gate_up", rng.uniform(DType::BF16, {experts, 2 * inter, hidden}, 4.0f * s_in));
     w.add("down", rng.uniform(DType::BF16, {experts, hidden, inter}, 1.0f / std::sqrt(static_cast<float>(inter))));
+    for (const char* name : {"gate_up_scale", "down_scale"}) {  // factors in [0.75, 1.75]
+        HostTensor t = rng.uniform(DType::F32, {experts}, 0.5f);
+        for (int64_t e = 0; e < experts; ++e) t.data<float>()[e] += 1.25f;
+        w.add(name, std::move(t));
+    }
     const Tensor64 router_w = to_f64(w.tensor("router")), bias = to_f64(w.tensor("bias"));
     const auto sigmoid = [](double v) { return 1.0 / (1.0 + std::exp(-v)); };
     // The biased probabilities each token ranks its experts by; tokens with a near tie at the cut are drawn again.
@@ -378,8 +385,12 @@ inline void moe_selection_bias(const Env& env) {
     parts.router = g.weight(w, "router");
     parts.select_bias = g.weight(w, "bias");
     parts.gate_up = g.weight(w, "gate_up");
-    parts.interleaved = true;
+    parts.interleaved = !scaled;
     parts.down = g.weight(w, "down");
+    if (scaled) {
+        parts.gate_up_scale = g.weight(w, "gate_up_scale");
+        parts.expert_scale = g.weight(w, "down_scale");
+    }
     parts.hidden = [&](Value gate, Value up) {
         return g.mul(g.mul(g.softcap(gate, gate_cap), g.sigmoid(gate)), g.softcap(up, up_cap));
     };
@@ -389,8 +400,13 @@ inline void moe_selection_bias(const Env& env) {
     // fp64, with the bank's rows read as the model stores them (`interleaved`) or gate rows first, and the bias
     // choosing only (`weigh` false) or weighing too.
     const Tensor64 x64 = to_f64(x), bank = to_f64(w.tensor("gate_up")), down = to_f64(w.tensor("down"));
+    const Tensor64 ones({experts}, std::vector<double>(static_cast<size_t>(experts), 1.0));
+    const Tensor64 bank_scale = scaled ? to_f64(w.tensor("gate_up_scale")) : ones;
+    const Tensor64 out_scale = scaled ? to_f64(w.tensor("down_scale")) : ones;
     const auto softcap = [](double v, double cap) { return cap * std::tanh(v / cap); };
-    const auto expected = [&](bool use_bias, bool interleaved, bool weigh) {
+    // `inner` and `outer`: each expert's factor on its gate and up outputs, and on its output.
+    const auto expected_with = [&](bool use_bias, bool interleaved, bool weigh, const Tensor64& inner,
+                                   const Tensor64& outer) {
         Tensor64 result({tokens, hidden});
         for (int64_t t = 0; t < tokens; ++t) {
             std::vector<std::pair<double, int64_t>> row;
@@ -416,6 +432,8 @@ inline void moe_selection_bias(const Env& env) {
                         gate += bank[(e * 2 * inter + gate_row) * hidden + c] * x64[t * hidden + c];
                         up += bank[(e * 2 * inter + up_row) * hidden + c] * x64[t * hidden + c];
                     }
+                    gate *= inner[e];
+                    up *= inner[e];
                     h[static_cast<size_t>(n)] = softcap(gate, gate_cap) * sigmoid(gate) * softcap(up, up_cap);
                 }
                 for (int64_t c = 0; c < hidden; ++c) {
@@ -423,11 +441,14 @@ inline void moe_selection_bias(const Env& env) {
                     for (int64_t n = 0; n < inter; ++n) {
                         y += down[(e * hidden + c) * inter + n] * h[static_cast<size_t>(n)];
                     }
-                    result[t * hidden + c] += score / sum * spec.routed_scale * y;
+                    result[t * hidden + c] += score / sum * spec.routed_scale * outer[e] * y;
                 }
             }
         }
         return result;
+    };
+    const auto expected = [&](bool use_bias, bool interleaved, bool weigh) {
+        return expected_with(use_bias, interleaved, weigh, bank_scale, out_scale);
     };
     for (int64_t t = 0; t < tokens; ++t) {  // the case must hold tokens whose experts the bias changes
         std::vector<std::pair<double, int64_t>> plain;
@@ -439,11 +460,15 @@ inline void moe_selection_bias(const Env& env) {
         }
     }
     CHECK(moved_by_bias >= 3);
-    CHECK(all_close(out, expected(true, true, false), env.mm_atol, env.mm_rtol));
-    // Planted bugs: no bias; the bias weighing the experts it chose; the bank read gate rows first.
-    CHECK_FALSE(all_close(out, expected(false, true, false), env.mm_atol, env.mm_rtol));
-    CHECK_FALSE(all_close(out, expected(true, true, true), env.mm_atol, env.mm_rtol));
-    CHECK_FALSE(all_close(out, expected(true, false, false), env.mm_atol, env.mm_rtol));
+    CHECK(all_close(out, expected(true, !scaled, false), env.mm_atol, env.mm_rtol));
+    // Planted bugs: no bias; the bias weighing the experts it chose; the bank's rows read in the other layout.
+    CHECK_FALSE(all_close(out, expected(false, !scaled, false), env.mm_atol, env.mm_rtol));
+    CHECK_FALSE(all_close(out, expected(true, !scaled, true), env.mm_atol, env.mm_rtol));
+    CHECK_FALSE(all_close(out, expected(true, scaled, false), env.mm_atol, env.mm_rtol));
+    if (scaled) {  // and: the bank's factor left out; the two factors exchanged
+        CHECK_FALSE(all_close(out, expected_with(true, false, false, ones, out_scale), env.mm_atol, env.mm_rtol));
+        CHECK_FALSE(all_close(out, expected_with(true, false, false, out_scale, bank_scale), env.mm_atol, env.mm_rtol));
+    }
 }
 
 }  // namespace xs::test::moe

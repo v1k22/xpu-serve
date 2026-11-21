@@ -95,6 +95,15 @@ bool metaspace_run(std::string_view text) {
     return true;
 }
 
+// Inkling 2's: bytes split by o200k_base's regex, no normalizer, and a piece that is in the vocabulary whole taken
+// before any merge (ignore_merges, which the file does not say).
+tok::TokenizerPipeline o200k_pipeline() {
+    tok::TokenizerPipeline p = tok::qwen_byte_level_pipeline(tok::split_regex::kO200k);
+    p.normalizer = nullptr;
+    p.model["ignore_merges"] = true;
+    return p;
+}
+
 const std::vector<TokenizerKind>& tokenizer_kinds() {
     static const std::vector<TokenizerKind> table = {
         // Qwen3.5, Qwen3.6, Qwen3.8: Qwen/Qwen3.5-4B's tokenizer.json, Qwen's byte-level BPE over its own regex. The
@@ -108,6 +117,9 @@ const std::vector<TokenizerKind>& tokenizer_kinds() {
          {},
          {},
          {}},
+        // Inkling 2: thinkingmachines/Inkling-2-Mini's tokenizer.json. Its sixty added tokens are all special, and the
+        // converter types them control.
+        {.model = "gpt2", .pre = "inkling2", .pipeline = o200k_pipeline(), .nfc = false, .added_in_vocab = false},
         // Gemma 4: google/gemma-4-E2B-it's tokenizer.json (BPE over the text with spaces as U+2581, byte fallback;
         // every id in model.vocab, the added tokens included). The converter (Gemma4Model.set_vocab) types the
         // markers a chat parser reads user-defined so that llama.cpp prints them, and types control only the tokens

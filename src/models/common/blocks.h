@@ -62,6 +62,8 @@ struct MoeParts {
     Value gate, up, down;             // [E, I, hidden], [E, I, hidden], [E, hidden, I]
     Value gate_up;                    // instead of gate and up: [E, 2 I, hidden], gate rows first (one expert matmul)
     bool interleaved = false;         // gate_up's rows alternate instead: gate 0, up 0, gate 1, up 1, ...
+    Value gate_up_scale;              // [E]: gate_up's outputs of each expert times its entry (a bank stored without a
+                                      // factor of its expert's; the down bank's goes in expert_scale); or invalid
     Combine hidden;                   // empty: act(gate) * up
     Linear shared_gate, shared_up, shared_down;  // a shared expert every token uses; empty: none
     Value shared_expert_gate;         // [1, hidden]: the shared output times sigmoid(x . w); invalid: no gate

@@ -21,6 +21,7 @@ struct Piece {
     std::string name;
     Dims shape;
     const FloatMap* map = nullptr;
+    const FloatReorder* reorder = nullptr;  // the whole tensor, reordered into `shape`
 };
 
 // What one tensor of the file becomes: its stored shape (row-major) and the pack tensors it holds, in row order. An
@@ -35,6 +36,8 @@ struct Entry {
 
 // A tensor of the file that is one pack tensor of the same shape.
 Entry one(Dims stored, std::string name, const FloatMap* map = nullptr);
+// A float tensor of the file that is one pack tensor of `shape`, its values moved by `reorder`.
+Entry reordered(Dims stored, std::string name, Dims shape, const FloatReorder* reorder);
 
 using Entries = std::map<std::string, Entry, std::less<>>;
 

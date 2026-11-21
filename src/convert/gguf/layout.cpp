@@ -11,6 +11,12 @@ Entry one(Dims stored, std::string name, const FloatMap* map) {
     return Entry{std::move(stored), {Piece{std::move(name), std::move(shape), map}}};
 }
 
+Entry reordered(Dims stored, std::string name, Dims shape, const FloatReorder* reorder) {
+    XS_CHECK(reorder != nullptr && numel(shape) == numel(stored), "gguf layout: '", name, "' ", dims_to_string(shape),
+             " is not a reordering of a tensor stored as ", dims_to_string(stored));
+    return Entry{std::move(stored), {Piece{std::move(name), std::move(shape), nullptr, reorder}}};
+}
+
 bool same_shape(const Dims& shape, const Dims& stored) {
     const auto rest = [](const Dims& d) { return std::find_if(d.begin(), d.end(), [](int64_t n) { return n != 1; }); };
     return std::equal(rest(shape), shape.end(), rest(stored), stored.end());
@@ -75,8 +81,8 @@ void map_tensors(const std::vector<const gguf::TensorInfo*>& tensors, std::strin
         if (e->pieces.empty()) plan.derived.push_back(&t);
         int64_t row = 0;
         for (const Piece& p : e->pieces) {
-            plan.tensors.push_back(PackTensor{p.name, p.shape, &t, row, p.map});
-            row += numel(p.shape) / p.shape.back();
+            plan.tensors.push_back(PackTensor{p.name, p.shape, &t, row, p.map, p.reorder});
+            row += p.reorder != nullptr ? t.rows() : numel(p.shape) / p.shape.back();
             ++made[p.name];
         }
     }

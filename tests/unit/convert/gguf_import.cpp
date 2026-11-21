@@ -369,7 +369,7 @@ TEST_SUITE("gguf import") {
             });
         };
         CHECK(architecture("llama").find("GGUF architecture 'llama' is not supported (supported: qwen35, qwen35moe, "
-                                         "gemma4, gemma4-assistant, clef, modern-bert)") != std::string::npos);
+                                         "gemma4, gemma4-assistant, clef, modern-bert, inkling2)") != std::string::npos);
         CHECK(
             refusal(work.path,
                     [](GgufWriter& w) { w.f32_tensor("blk.0.ssm_extra.weight", {128}, std::vector<float>(128, 0.0f)); })
@@ -399,7 +399,7 @@ TEST_SUITE("gguf import") {
               }).find("tokenizer.ggml.model 'llama' is not supported (supported: gpt2, gemma4)") != std::string::npos);
         CHECK(refusal(work.path, [](GgufWriter& w) {
                   w.drop_value("tokenizer.ggml.pre").string("tokenizer.ggml.pre", "llama-bpe");
-              }).find("tokenizer.ggml.pre 'llama-bpe' is not supported (supported: qwen35, modern-bert, mmbert)") !=
+              }).find("tokenizer.ggml.pre 'llama-bpe' is not supported (supported: qwen35, inkling2, modern-bert, mmbert)") !=
               std::string::npos);
         CHECK(refusal(work.path, [](GgufWriter& w) { w.boolean("tokenizer.ggml.add_space_prefix", true); })
                   .find("tokenizer.ggml.add_space_prefix is true, which disagrees with the tokenizer 'qwen35'") !=

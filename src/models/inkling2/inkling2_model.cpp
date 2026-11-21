@@ -224,8 +224,15 @@ private:
         parts.router = weight(m + "gate.weight");
         parts.select_bias = weight(m + "gate.bias");
         parts.gate_up = weight(m + "experts.w13_weight");
-        parts.interleaved = true;
+        parts.interleaved = c_.gate_up_alternates;
         parts.down = weight(m + "experts.w2_weight");
+        // A bank kept as the release's NVFP4 codes (a GGUF import) has each expert's factor beside it.
+        if (weights_.contains(kPrefix + m + "experts.w13_weight_factor")) {
+            parts.gate_up_scale = weight(m + "experts.w13_weight_factor");
+        }
+        if (weights_.contains(kPrefix + m + "experts.w2_weight_factor")) {
+            parts.expert_scale = weight(m + "experts.w2_weight_factor");
+        }
         const Dims bank{c_.experts, 2 * c_.expert_width, c_.hidden_size};
         const Dims down{c_.experts, c_.hidden_size, c_.expert_width};
         XS_CHECK(g_.type(parts.gate_up).shape == bank && g_.type(parts.down).shape == down, "inkling2: ", kPrefix, m,

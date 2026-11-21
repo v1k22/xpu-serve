@@ -67,6 +67,13 @@ Config parse_config(const nlohmann::json& config_json) {
     c.experts_per_token = cfg::get_int(t, "num_experts_per_tok", where);
     c.expert_width = cfg::get_int(t, "intermediate_size", where);
     c.route_scale = cfg::get_float(t, "route_scale", where);
+    if (t.contains("gate_up_rows")) {
+        const std::string rows = cfg::get_string(t, "gate_up_rows", where);
+        if (rows != "halves" && rows != "alternating") {
+            fail(where, ": gate_up_rows '", rows, "' is not supported (alternating, halves)");
+        }
+        c.gate_up_alternates = rows == "alternating";
+    }
     c.gate_softcap = cfg::get_float(t, "mlp_gate_softcap", where);
     c.up_softcap = cfg::get_float(t, "mlp_up_softcap", where);
     c.logit_softcap = cfg::get_float(t, "final_logit_softcapping", where);

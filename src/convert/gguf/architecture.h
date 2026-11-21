@@ -1,11 +1,12 @@
 #pragma once
 
 // What a GGUF architecture's importer provides (one file per architecture, or per pair that shares a reader:
-// qwen35.cpp, gemma4.cpp, clef.cpp, modern_bert.cpp): from the file's metadata the config.json the model code reads
+// qwen35.cpp, gemma4.cpp, clef.cpp, modern_bert.cpp, inkling2.cpp): from the file's metadata the config.json the model code reads
 // (and any other JSON file of the pack), and for every tensor of the file the pack tensors it becomes, under the names
 // the model code reads. The import driver (gguf_import.cpp) writes them: a tensor in a block format byte for byte, a
 // float tensor as stored or through a value-by-value transform. A quantized tensor is never decoded, re-encoded or
-// reordered; it can only be cut into runs of whole rows.
+// reordered; it can only be cut into runs of whole rows. A float tensor the converter transposed or flipped is put
+// back in the checkpoint's order (FloatReorder).
 //
 // A model's MTP head can come in a file of its own (`convert --mtp`): the plan then draws its tensors from two files,
 // and is the plan of a model file that held the head.
@@ -30,13 +31,21 @@ struct FloatMap {
     float (*apply)(float);
 };
 
+// A float tensor whose values the converter moved (a transpose, a flip of an axis): `apply` gives the values in the
+// pack tensor's order from the stored ones (row-major, of shape `stored`). Only a float tensor taken whole can take
+// one; the result is written as F32.
+struct FloatReorder {
+    std::string_view what;  // for errors, e.g. "a transpose"
+    std::vector<float> (*apply)(const std::vector<float>& values, const Dims& stored);
+};
 // One tensor of the pack.
 struct PackTensor {
     std::string name;  // the name the model code reads
-    Dims shape;        // its shape there, row-major; the last dim is the source's columns
+    Dims shape;        // its shape there, row-major; the last dim is the source's columns (unless reordered)
     const gguf::TensorInfo* source = nullptr;
     int64_t first_row = 0;          // the source rows it takes: numel(shape) / shape.back() of them from this one
     const FloatMap* map = nullptr;  // null: the values as stored
+    const FloatReorder* reorder = nullptr;  // not null: the whole source, its values in another order
 };
 
 struct ImportPlan {
@@ -83,6 +92,7 @@ const Architecture& qwen35();
 const Architecture& qwen35moe();
 const Architecture& gemma4();
 const Architecture& gemma4_assistant();
+const Architecture& inkling2();
 const Architecture& clef();
 const Architecture& modern_bert();
 

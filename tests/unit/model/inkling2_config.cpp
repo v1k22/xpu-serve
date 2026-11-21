@@ -128,3 +128,14 @@ TEST_CASE("inkling2 config: refusals by name") {
     config.erase("text_config");
     CHECK(refuses(config, "text_config"));
 }
+
+TEST_CASE("inkling2 config: a GGUF import's expert banks hold the gate rows, then the up rows") {
+    json config = inkling2_config();
+    CHECK(xs::inkling2::parse_config(config).gate_up_alternates);
+    config["text_config"]["gate_up_rows"] = "halves";
+    CHECK_FALSE(xs::inkling2::parse_config(config).gate_up_alternates);
+    config["text_config"]["gate_up_rows"] = "alternating";
+    CHECK(xs::inkling2::parse_config(config).gate_up_alternates);
+    config["text_config"]["gate_up_rows"] = "pairs";
+    CHECK(refuses(config, "gate_up_rows 'pairs'"));
+}
