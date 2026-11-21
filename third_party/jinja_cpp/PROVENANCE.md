@@ -18,5 +18,6 @@
 | `value.cpp` | `map('<filter>', ...)` applies the named filter to each item (was "not implemented") | Gemma 4's template renders `items.type` lists with `map('upper')` |
 | `value.h`, `value.cpp` | Floats print as Python `repr` (`python_float_repr`: shortest round-trip, `1e-05`, `1e+20`) instead of `std::to_string` with trailing zeros trimmed | Byte parity with Hugging Face for numeric tool-call arguments (`2.5e-07` printed as `0.0`) |
 | `value.cpp` | `tojson` (and `\|string` on a float, which goes through it) writes floats with `python_float_repr` instead of `ostream <<` (6 significant digits, `3` for `3.0`) | Python's `json.dumps` and `str(float)` write `repr`; Qwen 3.5 renders tool-call arguments with `\|string` and tool schemas with `tojson` |
+| `value.cpp` | `\|float` takes a float (was: ints and strings only) | Inkling 2's template passes `reasoning_effort` through `\| float`, and its default is a float |
 | `runtime.cpp` | Runtime errors put the engine's message first, on one line, then the template line and column | The message used to start with a newline, so callers that show the first line showed nothing |
 | `CMakeLists.txt` | New: static library `xs_jinja` | Our build |
