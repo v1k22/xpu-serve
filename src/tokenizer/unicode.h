@@ -14,6 +14,11 @@ enum class Category : uint8_t { kOther, kLetter, kMark, kNumber };
 // General category class as the regex \p{L} / \p{M} / \p{N} sees it.
 Category category(char32_t c);
 
+// A letter's case as the regex classes see it: \p{Lu} or \p{Lt}, \p{Ll}, or neither (\p{Lm}, \p{Lo}; and whatever
+// is no letter).
+enum class LetterCase : uint8_t { kNone, kUpper, kLower };
+LetterCase letter_case(char32_t c);
+
 uint8_t combining_class(char32_t c);
 
 // Canonical composition (NFC). Bytes that are not valid UTF-8 pass through unchanged.

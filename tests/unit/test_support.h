@@ -21,6 +21,14 @@ inline std::optional<std::filesystem::path> lfm3_dir() {
     return std::filesystem::path(p);
 }
 
+// Directory of a thinkingmachines/Inkling-2-Mini checkpoint, or of its tokenizer.json alone (not kept in this
+// repository), for the parity of its tokenizer; nullopt when XS_INKLING2_DIR is unset.
+inline std::optional<std::filesystem::path> inkling2_dir() {
+    const char* p = std::getenv("XS_INKLING2_DIR");
+    if (p == nullptr || *p == '\0') return std::nullopt;
+    return std::filesystem::path(p);
+}
+
 // Directory of a Qwen/Qwen3-ASR-1.7B checkpoint, or of its slow tokenizer files alone (vocab.json, merges.txt,
 // tokenizer_config.json: not kept in this repository), for the parity of a tokenizer built from them; nullopt when
 // XS_QWEN3_ASR_DIR is unset.

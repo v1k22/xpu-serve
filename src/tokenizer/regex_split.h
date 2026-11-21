@@ -26,6 +26,12 @@ inline constexpr std::string_view kQwen35 =
 inline constexpr std::string_view kLlama3 =
     R"((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+)"
     R"(|\s+(?!\S)|\s+)";
+// o200k_base's (GPT-4o; Inkling 2): a word is uppercase letters then lowercase ones, with a contraction on it;
+// punctuation takes the slashes after it.
+inline constexpr std::string_view kO200k =
+    R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?)"
+    R"(|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?)"
+    R"(|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)";
 }  // namespace split_regex
 
 class RegexSplitter {

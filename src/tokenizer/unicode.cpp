@@ -130,6 +130,15 @@ Category category(char32_t c) {
     return r == nullptr ? Category::kOther : static_cast<Category>(r->value);
 }
 
+LetterCase letter_case(char32_t c) {
+    if (c < 0x80) {
+        if (c >= 'A' && c <= 'Z') return LetterCase::kUpper;
+        return c >= 'a' && c <= 'z' ? LetterCase::kLower : LetterCase::kNone;
+    }
+    const t::CategoryRange* r = find_range(t::kLetterCaseRanges, t::kLetterCaseRangeCount, c);
+    return r == nullptr ? LetterCase::kNone : static_cast<LetterCase>(r->value);
+}
+
 uint8_t combining_class(char32_t c) {
     if (c < 0x300) return 0;
     const t::CombiningRange* r = find_range(t::kCombiningRanges, t::kCombiningRangeCount, c);

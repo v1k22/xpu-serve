@@ -73,6 +73,26 @@ def category_classes() -> dict:
     return classes
 
 
+def letter_cases(classes: dict) -> dict:
+    """cp -> 1 (Lu or Lt) or 2 (Ll), per the tokenizers regex engine; the other letters (Lm, Lo) have no entry."""
+    cases = {}
+    for code, pattern in ((1, r"[\p{Lu}\p{Lt}]"), (2, r"\p{Ll}")):
+        for cp in regex_members(pattern):
+            if cp in cases or classes.get(cp) != 1:
+                sys.exit(f"U+{cp:04X} is in two letter cases, or cased and no letter")
+            cases[cp] = code
+    neither = regex_members(r"[\p{Lm}\p{Lo}]")
+    for cp, code in classes.items():
+        if code == 1 and (cp in neither) == (cp in cases):
+            sys.exit(f"U+{cp:04X}: a letter that is not exactly one of Lu / Lt, Ll and Lm / Lo")
+    expected = {"Lu": 1, "Lt": 1, "Ll": 2}
+    for cp in code_points():
+        category = unicodedata.category(chr(cp))
+        if category != "Cn" and cases.get(cp, 0) != expected.get(category, 0):
+            sys.exit(f"U+{cp:04X}: regex letter case {cases.get(cp, 0)} disagrees with unicodedata category {category}")
+    return cases
+
+
 def ranges(values: dict):
     """Collapses {cp: value} (value != 0) into (first, last, value) runs."""
     out = []
@@ -229,6 +249,7 @@ def fmt_rows(items) -> str:
 
 def main() -> None:
     classes = category_classes()
+    case_ranges = ranges(letter_cases(classes))
     ccc, decomposition, primary, unsafe, unknown_ccc, unknown_decomp = nfc_data()
     bert_classes, lowercase = bert_data()
 
@@ -265,6 +286,11 @@ const CategoryRange kCategoryRanges[] = {{
 }};
 const size_t kCategoryRangeCount = sizeof(kCategoryRanges) / sizeof(kCategoryRanges[0]);
 
+const CategoryRange kLetterCaseRanges[] = {{
+{fmt_rows([f"{{0x{a:X},0x{b:X},{v}}}," for a, b, v in case_ranges])}
+}};
+const size_t kLetterCaseRangeCount = sizeof(kLetterCaseRanges) / sizeof(kLetterCaseRanges[0]);
+
 const CombiningRange kCombiningRanges[] = {{
 {fmt_rows([f"{{0x{a:X},0x{b:X},{v}}}," for a, b, v in ccc_ranges])}
 }};
@@ -300,7 +326,8 @@ const size_t kLowercaseExpansionCount = sizeof(kLowercaseExpansions) / sizeof(kL
 """
     OUT.write_text(text, encoding="utf-8")
     print(
-        f"wrote {OUT} ({OUT.stat().st_size} bytes): {len(cat_ranges)} category ranges, {len(ccc_ranges)} combining "
+        f"wrote {OUT} ({OUT.stat().st_size} bytes): {len(cat_ranges)} category ranges, {len(case_ranges)} letter case "
+        f"ranges, {len(ccc_ranges)} combining "
         f"ranges, {len(decomp_rows)} decompositions ({len(primary)} compose), {len(unsafe_ranges)} NFC-unsafe ranges, "
         f"{len(bert_ranges)} BERT class ranges, {len(case_runs)} lowercase runs, {len(expansion_rows)} expansion(s)"
     )

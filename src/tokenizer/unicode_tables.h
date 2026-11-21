@@ -36,6 +36,9 @@ struct Decomposition {
 
 extern const CategoryRange kCategoryRanges[];
 extern const size_t kCategoryRangeCount;
+// The cased letters, value: 1 = uppercase or titlecase (Lu, Lt), 2 = lowercase (Ll); other letters have no entry.
+extern const CategoryRange kLetterCaseRanges[];
+extern const size_t kLetterCaseRangeCount;
 extern const CombiningRange kCombiningRanges[];
 extern const size_t kCombiningRangeCount;
 extern const Decomposition kDecompositions[];
