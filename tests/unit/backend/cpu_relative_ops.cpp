@@ -6,7 +6,7 @@ namespace {
 
 xs::test::relative::Env cpu_env() {
     xs::test::relative::Env env;
-    env.compile = [](const xs::graph::Graph& g, const xs::WeightStore& w) {
+    env.compile = [](const xs::graph::Graph& g, const xs::WeightStore& w, const std::string&) {
         static const auto backend = xs::make_cpu_ref_backend();
         return backend->compile(g, w, {});
     };

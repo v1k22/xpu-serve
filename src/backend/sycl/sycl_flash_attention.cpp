@@ -9,8 +9,10 @@
 // row i); P converted to A tiles; O = O * alpha + P V. Any head_dim up to 128 that is a multiple of 8 works: columns
 // of a K or V tile past head_dim belong to the next head, Q's zero padding cancels them in S, and O's columns past
 // head_dim are never written. Attention within blocks of tokens (AttentionShape::block) is the same pass over the
-// keys of the tile's own block, every block in one launch. At 256 the accumulators of 8 rows fill the registers and every tile would feed one
-// DPAS: oneMKL's GEMMs match that, so those shapes take the GEMM path.
+// keys of the tile's own block, every block in one launch. A relative bias (by how far back a key sits) is added to
+// the scores within its extent; a sink starts a row's softmax as its maximum with a denominator of 1, in the first
+// split alone (attention_combine merges it with the rest). At 256 the accumulators of 8 rows fill the registers and
+// every tile would feed one DPAS: oneMKL's GEMMs match that, so those shapes take the GEMM path.
 
 #include "backend/sycl/sycl_kernels.h"
 #include "util/error.h"
@@ -96,6 +98,9 @@ struct FlashArgs {
     bool causal = false;
     const float* key_bias = nullptr;
     const int32_t* groups = nullptr;
+    const float* rel = nullptr;  // [T, Hq, rel_extent]
+    int64_t rel_extent = 0;
+    const float* sink = nullptr;  // [T, Hq]
 };
 
 template <int DP, int BC, int MT, int SGS, typename QT>
@@ -192,6 +197,11 @@ struct FlashKernel {
             m2[mt] = kNegInf;
             for (int i = 0; i < kTm; ++i) ls[mt][i] = 0.0f;
             for (int i = 0; i < kDt; ++i) mx::joint_matrix_fill(sg, o[mt][i], 0.0f);
+            if (a.sink != nullptr && sp == 0) {  // exp2(sink - max) = 1 in the denominator, held by lane 0
+                const int64_t t = t0 + mt * kTm + lane;
+                if (lane < kTm && t < a.tokens) m2[mt] = a.sink[t * a.q_heads + h] * kLog2e;
+                for (int i = 0; i < kTm; ++i) ls[mt][i] = lane == 0 && t0 + mt * kTm + i < a.tokens ? 1.0f : 0.0f;
+            }
         }
 
         const auto kg = global_ptr(kp);
@@ -234,7 +244,11 @@ struct FlashKernel {
                         ok = ok && (!a.causal || j <= pos) &&
                              (a.window <= 0 || (j > pos - a.window && j < pos + a.window)) &&
                              (a.groups == nullptr || group_sees(a.groups, t0 + r0 + i, j));
-                        y = ok ? y + bias : kNegInf;
+                        float back_bias = 0.0f;  // the relative bias of a key pos - j back
+                        if (ok && a.rel != nullptr && j <= pos && pos - j < a.rel_extent) {
+                            back_bias = a.rel[((t0 + r0 + i) * a.q_heads + h) * a.rel_extent + (pos - j)] * kLog2e;
+                        }
+                        y = ok ? y + bias + back_bias : kNegInf;
                         x = y;
                         mb[i] = sycl::fmax(mb[i], y);
                     });
@@ -346,6 +360,9 @@ void flash_t(sycl::queue& q, const QT* qp, const half* k, const half* v, float* 
     a.causal = s.causal;
     a.key_bias = s.key_bias;
     a.groups = s.groups;
+    a.rel = s.rel;
+    a.rel_extent = s.rel_extent;
+    a.sink = s.sink;
     const auto wgs = static_cast<size_t>(s.kv_heads * a.row_blocks * split);
     syclex::submit(q, [&](sycl::handler& h) {
         K kernel{qp, k, v, out, part, a, sycl::local_accessor<float, 1>(sycl::range<1>(K::kSlmFloats), h)};
@@ -373,8 +390,7 @@ bool xmx_device(const sycl::device& d) {
 bool flash_attention_fits(const AttentionShape& s, const void* k, const void* v) {
     const FlashConfig c = flash_config(s.head_dim);
     if (c.dp == 0 || s.head_dim % 8 != 0) return false;
-    if (s.rel != nullptr || s.sink != nullptr) return false;  // a relative bias or a sink: the GEMM path's softmax
-    if (s.anchored) return false;  // a window from the step's start: likewise
+    if (s.anchored) return false;  // a window from the step's start: the GEMM path's softmax
     if (s.block % (int64_t{kTm} * c.mt) != 0) return false;  // a sub-group's rows in one block
     // 2D block loads: 64-byte aligned bases, rows of at least 64 bytes, extents below 2^24
     const auto aligned = [](const void* p) { return reinterpret_cast<uintptr_t>(p) % 64 == 0; };

@@ -2,12 +2,15 @@
 
 // Backend-agnostic cases for the ops of decoders without rotary positions (Inkling 2): L2Clip, DynamicConv over
 // several steps against one fp64 pass over the whole sequence, and causal attention with a relative bias and a sink
-// over a KV cache fed in steps. Each backend's test file runs them with its own tolerance.
+// over a KV cache fed in steps, on each attention path a backend has. Each backend's test file runs them with its own
+// tolerance.
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cmath>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "backend_test_util.h"
@@ -23,7 +26,9 @@ using graph::Value;
 using recurrent::concat_rows;
 
 struct Env {
-    std::function<std::unique_ptr<Session>(const Graph&, const WeightStore&)> compile;
+    // `attention`: the attention path a session takes (a backend option; "auto" leaves it to the backend).
+    std::function<std::unique_ptr<Session>(const Graph&, const WeightStore&, const std::string& attention)> compile;
+    std::vector<std::string> attention_impls{"auto"};
     double atol = 1e-5;
     double rtol = 1e-5;
 };
@@ -44,7 +49,7 @@ inline void l2_clip(const Env& env) {
         Graph g;
         g.output("out", g.l2_clip(g.input("x", DType::F32, {kT, 3, dim}), threshold));
         TensorMap out;
-        env.compile(g, MemoryWeights{})->run({{"x", x}}, out);
+        env.compile(g, MemoryWeights{}, "auto")->run({{"x", x}}, out);
         const Tensor64 expected = ref::l2_clip(to_f64(x), threshold, 1e-6);
         CHECK(all_close(out.at("out"), expected, env.atol, env.rtol));
         // The case holds rows of both kinds: some pass unchanged, some are scaled.
@@ -74,7 +79,7 @@ inline void dynamic_conv_steps(const Env& env) {
         const int slot = g.add_conv_slot(s.channels, s.kernel, "conv");
         g.output("out", g.dynamic_conv(slot, g.input("x", DType::F32, {kT, s.channels}), g.weight(w, "w"),
                                        g.input("taps", DType::F32, {kT, s.groups, s.kernel})));
-        const auto session = env.compile(g, w);
+        const auto session = env.compile(g, w, "auto");
         std::vector<HostTensor> xs, taps, outs;
         for (const int64_t t : {5, 1, 1, 3, 2}) {  // steps shorter than the kernel must reach back across runs
             xs.push_back(rng.uniform(DType::F32, {t, s.channels}));
@@ -97,16 +102,20 @@ inline void dynamic_conv_steps(const Env& env) {
     }
 }
 
-// Causal attention with a relative bias and a sink over a cache fed in steps: a decode step, steps on the per-row
-// and the matrix paths, an extent shorter and longer than the cache, with and without a window.
+// Causal attention with a relative bias and a sink over a cache fed in steps, on each attention path: a decode step,
+// steps on the per-row and the matrix paths, an extent shorter and longer than the cache, with and without a window
+// (one longer than the extent), and a cache long enough that a decode step splits its keys between work-groups (its
+// sink raised to hold a share of the softmax that f16 can tell from none).
 inline void relative_attention(const Env& env) {
     TensorRng rng(43);
     struct Shape {
         int64_t heads, kv_heads, dim, extent, window;
         std::vector<int64_t> steps;
+        float sink_shift = 0.0f;
     };
     for (const Shape& s : {Shape{4, 2, 32, 6, 0, {5, 1, 1, 9, 3}}, Shape{6, 2, 128, 64, 0, {40, 1, 20, 1}},
-                           Shape{3, 1, 64, 12, 12, {7, 1, 30, 1, 2}}, Shape{24, 8, 128, 16, 16, {33, 1}}}) {
+                           Shape{3, 1, 64, 12, 12, {7, 1, 30, 1, 2}}, Shape{24, 8, 128, 16, 16, {33, 1}},
+                           Shape{8, 2, 128, 128, 0, {400, 1, 9}, 6.0f}, Shape{4, 2, 64, 32, 64, {150, 1, 12}}}) {
         CAPTURE(s.heads);
         CAPTURE(s.dim);
         graph::AttentionAttrs attrs;
@@ -120,34 +129,45 @@ inline void relative_attention(const Env& env) {
         g.output("out", g.attention_relative(g.input("q", DType::F32, {kT, s.heads, s.dim}), k_all, v_all,
                                              g.input("rel", DType::F32, {kT, s.heads, s.extent}),
                                              g.input("sink", DType::F32, {kT, s.heads}), attrs));
-        const auto session = env.compile(g, MemoryWeights{});
+        // Each step's inputs, its expected output and three planted bugs: the sink left out of the softmax, the bias
+        // read toward the future, no bias.
+        std::vector<TensorMap> inputs;
+        std::vector<std::array<Tensor64, 4>> expected;
         std::vector<HostTensor> ks, vs;
         for (const int64_t t : s.steps) {
-            CAPTURE(t);
             const HostTensor q = rng.uniform(DType::F32, {t, s.heads, s.dim}, 2.0f);
             const HostTensor rel = rng.uniform(DType::F32, {t, s.heads, s.extent}, 3.0f);
-            const HostTensor sink = rng.uniform(DType::F32, {t, s.heads}, 3.0f);
+            HostTensor sink = rng.uniform(DType::F32, {t, s.heads}, 3.0f);
+            for (int64_t i = 0; i < t * s.heads; ++i) sink.data<float>()[i] += s.sink_shift;
             ks.push_back(rng.uniform(DType::F32, {t, s.kv_heads, s.dim}, 2.0f));
             vs.push_back(rng.uniform(DType::F32, {t, s.kv_heads, s.dim}));
-            TensorMap out;
-            session->run({{"q", q}, {"k", ks.back()}, {"v", vs.back()}, {"rel", rel}, {"sink", sink}}, out);
+            inputs.push_back({{"q", q}, {"k", ks.back()}, {"v", vs.back()}, {"rel", rel}, {"sink", sink}});
             ref::AttentionSpec spec;
             spec.scale = attrs.scale;
             spec.sliding_window = s.window;
             spec.rel = to_f64(rel);
             spec.sink = to_f64(sink);
             const Tensor64 k = concat_rows(ks), v = concat_rows(vs);
-            CHECK(all_close(out.at("out"), ref::attention(to_f64(q), k, v, spec), env.atol, env.rtol));
-            // Planted bugs: the sink left out of the softmax; the bias read toward the future; no bias.
             ref::AttentionSpec no_sink = spec;
             no_sink.sink = Tensor64{};
-            CHECK_FALSE(all_close(out.at("out"), ref::attention(to_f64(q), k, v, no_sink), env.atol, env.rtol));
             ref::AttentionSpec flipped = spec;
             flipped.rel_sign = -1;
-            CHECK_FALSE(all_close(out.at("out"), ref::attention(to_f64(q), k, v, flipped), env.atol, env.rtol));
             ref::AttentionSpec no_rel = spec;
             no_rel.rel = Tensor64{};
-            CHECK_FALSE(all_close(out.at("out"), ref::attention(to_f64(q), k, v, no_rel), env.atol, env.rtol));
+            expected.push_back({ref::attention(to_f64(q), k, v, spec), ref::attention(to_f64(q), k, v, no_sink),
+                                ref::attention(to_f64(q), k, v, flipped), ref::attention(to_f64(q), k, v, no_rel)});
+        }
+        for (const std::string& impl : env.attention_impls) {
+            CAPTURE(impl);
+            const auto session = env.compile(g, MemoryWeights{}, impl);
+            for (size_t i = 0; i < inputs.size(); ++i) {
+                CAPTURE(s.steps[i]);
+                TensorMap out;
+                session->run(inputs[i], out);
+                CHECK(all_close(out.at("out"), expected[i][0], env.atol, env.rtol));
+                for (size_t planted = 1; planted < 4; ++planted)
+                    CHECK_FALSE(all_close(out.at("out"), expected[i][planted], env.atol, env.rtol));
+            }
         }
     }
 }
@@ -174,7 +194,7 @@ inline void anchored_window_attention(const Env& env) {
         const auto [k_all, v_all] = g.kv_cache(slot, g.input("k", DType::F32, {kT, s.kv_heads, s.dim}),
                                                g.input("v", DType::F32, {kT, s.kv_heads, s.dim}));
         g.output("out", g.attention(g.input("q", DType::F32, {kT, s.heads, s.dim}), k_all, v_all, attrs));
-        const auto session = env.compile(g, MemoryWeights{});
+        const auto session = env.compile(g, MemoryWeights{}, "auto");
         std::vector<HostTensor> ks, vs;
         int64_t differ = 0;
         for (const int64_t t : s.steps) {
