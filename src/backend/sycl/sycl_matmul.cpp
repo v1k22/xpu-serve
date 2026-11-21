@@ -465,16 +465,40 @@ void dequantize_rows(sycl::queue& q, const QuantWeight& w, int64_t first, int64_
     dequantize(q, r, out, count, k);
 }
 
+// Where the grouped GEMM reads expert e's rows, [n, k] as CT: a quantized bank's are decoded into scratch, a run of
+// experts at a time; a bank stored as CT is read in place.
+template <typename CT>
+struct ExpertRows {
+    const QuantWeight* quant = nullptr;
+    const CT* bank = nullptr;
+    int64_t n = 0, k = 0;
+
+    int64_t expert_bytes() const { return n * k * static_cast<int64_t>(sizeof(CT)); }
+    // Experts decoded between two waits (all of them when read in place).
+    int64_t batch(int64_t experts) const {
+        return bank != nullptr ? experts
+                               : std::max<int64_t>(1, static_cast<int64_t>(kExpertDequantBytes) / expert_bytes());
+    }
+    size_t scratch_bytes(int64_t experts) const {
+        return bank != nullptr ? 0 : align_up(static_cast<size_t>(std::min(batch(experts), experts) * expert_bytes()));
+    }
+    // The rows of experts [e, end), expert e's first; `to` has room for them when they are decoded.
+    const CT* rows(sycl::queue& q, int64_t e, int64_t end, CT* to) const {
+        if (bank != nullptr) return bank + e * n * k;
+        dequantize_rows(q, *quant, e * n, (end - e) * n, k, to);
+        return to;
+    }
+};
+
 template <typename CT, typename I>
-void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const QuantWeight& w, const I* idx,
-                   float* out, int64_t pairs, int64_t slots, int64_t experts, int64_t n, int64_t k) {
-    const int64_t expert_bytes = n * k * static_cast<int64_t>(sizeof(CT));
-    const int64_t batch = std::max<int64_t>(1, static_cast<int64_t>(kExpertDequantBytes) / expert_bytes);
+void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const ExpertRows<CT>& w,
+                   const I* idx, float* out, int64_t pairs, int64_t slots, int64_t experts) {
+    const int64_t n = w.n, k = w.k;
+    const int64_t batch = w.batch(experts);
     const size_t g_bytes = align_up(expert_grouping_bytes(pairs, experts));
     const size_t x_bytes = align_up(static_cast<size_t>(pairs * k) * sizeof(CT));
     const size_t y_bytes = align_up(static_cast<size_t>(pairs * n) * sizeof(float));
-    const size_t w_bytes = align_up(static_cast<size_t>(std::min(batch, experts) * expert_bytes));
-    auto* base = static_cast<char*>(scratch.get(g_bytes + x_bytes + y_bytes + w_bytes));
+    auto* base = static_cast<char*>(scratch.get(g_bytes + x_bytes + y_bytes + w.scratch_bytes(experts)));
     auto* grouping = reinterpret_cast<int32_t*>(base);
     auto* rows = reinterpret_cast<CT*>(base + g_bytes);
     auto* y = reinterpret_cast<float*>(base + g_bytes + x_bytes);
@@ -504,7 +528,7 @@ void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_sl
 
     for (int64_t e0 = 0; e0 < experts; e0 += batch) {
         const int64_t e1 = std::min(experts, e0 + batch);
-        // Dequantize the runs of experts that have pairs; set up one group per such expert.
+        // Ready the rows of each run of experts that have pairs; set up one group per such expert.
         int64_t groups = 0;
         for (int64_t e = e0; e < e1;) {
             if (offsets[static_cast<size_t>(e + 1)] == offsets[static_cast<size_t>(e)]) {
@@ -514,8 +538,8 @@ void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_sl
             int64_t run_end = e;
             while (run_end < e1 && offsets[static_cast<size_t>(run_end + 1)] > offsets[static_cast<size_t>(run_end)])
                 ++run_end;
-            dequantize_rows(q, w, e * n, (run_end - e) * n, k, wd + (e - e0) * n * k);
-            for (; e < run_end; ++e) {
+            const CT* run = w.rows(q, e, run_end, wd + (e - e0) * n * k);
+            for (const int64_t run_start = e; e < run_end; ++e) {
                 const int64_t first = offsets[static_cast<size_t>(e)];
                 pm[groups] = offsets[static_cast<size_t>(e + 1)] - first;
                 pn[groups] = n;
@@ -525,7 +549,7 @@ void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_sl
                 pldc[groups] = n;
                 psize[groups] = 1;
                 pa[groups] = rows + first * k;
-                pb[groups] = wd + (e - e0) * n * k;
+                pb[groups] = run + (e - run_start) * n * k;
                 pc[groups] = y + first * n;
                 ++groups;
             }
@@ -535,7 +559,7 @@ void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_sl
             return blas::gemm_batch(q, ta.data(), tb.data(), pm, pn, pk, alpha.data(), pa, plda, pb, pldb, beta.data(), pc,
                                     pldc, groups, psize, deps);
         });
-        q.wait();  // the next batch rewrites the dequantized weights and the group arrays
+        q.wait();  // the next batch rewrites the decoded rows and the group arrays
     }
     expert_scatter_rows(q, y, order, pairs, n, out);
 }
@@ -547,10 +571,18 @@ void expert_matmul_quant_gemm(sycl::queue& q, Scratch& scratch, const float* x, 
                               const I* idx, float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n,
                               int64_t k, bool f32) {
     if (f32) {
-        expert_gemm_t<float>(q, scratch, x, per_slot, w, idx, out, tokens * slots, slots, experts, n, k);
+        expert_gemm_t(q, scratch, x, per_slot, ExpertRows<float>{&w, nullptr, n, k}, idx, out, tokens * slots, slots,
+                      experts);
     } else {
-        expert_gemm_t<half>(q, scratch, x, per_slot, w, idx, out, tokens * slots, slots, experts, n, k);
+        expert_gemm_t(q, scratch, x, per_slot, ExpertRows<half>{&w, nullptr, n, k}, idx, out, tokens * slots, slots,
+                      experts);
     }
+}
+
+template <typename W, typename I>
+void expert_matmul_gemm(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const W* w, const I* idx,
+                        float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k) {
+    expert_gemm_t(q, scratch, x, per_slot, ExpertRows<W>{nullptr, w, n, k}, idx, out, tokens * slots, slots, experts);
 }
 
 template void expert_matmul_quant_gemm<int32_t>(sycl::queue&, Scratch&, const float*, bool, const QuantWeight&,
@@ -559,6 +591,15 @@ template void expert_matmul_quant_gemm<int32_t>(sycl::queue&, Scratch&, const fl
 template void expert_matmul_quant_gemm<int64_t>(sycl::queue&, Scratch&, const float*, bool, const QuantWeight&,
                                                 const int64_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,
                                                 bool);
+
+template void expert_matmul_gemm<half, int32_t>(sycl::queue&, Scratch&, const float*, bool, const half*,
+                                                const int32_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);
+template void expert_matmul_gemm<half, int64_t>(sycl::queue&, Scratch&, const float*, bool, const half*,
+                                                const int64_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);
+template void expert_matmul_gemm<float, int32_t>(sycl::queue&, Scratch&, const float*, bool, const float*,
+                                                 const int32_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);
+template void expert_matmul_gemm<float, int64_t>(sycl::queue&, Scratch&, const float*, bool, const float*,
+                                                 const int64_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);
 
 template void matmul<half>(sycl::queue&, Scratch&, const float*, const half*, float*, int64_t, int64_t, int64_t);
 template void matmul<float>(sycl::queue&, Scratch&, const float*, const float*, float*, int64_t, int64_t, int64_t);

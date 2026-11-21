@@ -121,16 +121,20 @@ inline void topk_rows(const Env& env) {
     CHECK(std::vector<int64_t>(huge_idx.begin(), huge_idx.begin() + 5) == std::vector<int64_t>{5, 6, 300, 20000, 39999});
 }
 
+// A float bank: few (token, slot) pairs and, from 150 tokens, more than a grouped GEMM takes on SYCL (450 pairs); an
+// expert no pair picks between the others.
 inline void expert_matmul_shared_and_per_slot(const Env& env) {
     TensorRng rng(33);
     const int64_t experts = 6, n = 40, k = 64, slots = 3;
     MemoryWeights w;
     w.add("w", rng.uniform(DType::BF16, {experts, n, k}, 1.0f / std::sqrt(static_cast<float>(k))));
-    for (const int64_t tokens : {1, 5}) {
+    for (const int64_t tokens : {1, 5, 150}) {
         CAPTURE(tokens);
         std::vector<int32_t> idx;
-        for (int64_t i = 0; i < tokens * slots; ++i)
-            idx.push_back(static_cast<int32_t>((i * 5 + 2) % experts));  // repeats experts across tokens
+        for (int64_t i = 0; i < tokens * slots; ++i) {
+            const int32_t e = static_cast<int32_t>((i * 5 + 2 + i / 7) % (experts - 1));  // repeats across tokens
+            idx.push_back(e < 3 ? e : e + 1);                                               // expert 3 never
+        }
         const HostTensor ids = ids_i32({tokens, slots}, idx);
         const HostTensor x2 = rng.uniform(DType::F32, {tokens, k});
         const HostTensor x3 = rng.uniform(DType::F32, {tokens, slots, k});

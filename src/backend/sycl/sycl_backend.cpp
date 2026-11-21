@@ -2426,13 +2426,23 @@ private:
                     }
                     return;
                 }
+                // A bank in the GEMM's type (f16 at f16, f32 at f32) takes the grouped GEMM over many pairs.
+                const bool gemm = is[0] * is[1] >= sycl_be::kExpertPairsGemm &&
+                                  (in_dt(1) == DType::F16) == (precision_ != DType::F32);
                 const auto run = [&](const auto* w) {
+                    const auto with = [&](const auto* idx) {
+                        if (gemm) {
+                            sycl_be::expert_matmul_gemm(q_, *this, in_f32(0), per_slot, w, idx, out, is[0], is[1],
+                                                        ws[0], ws[1], ws[2]);
+                        } else {
+                            sycl_be::expert_matmul(q_, in_f32(0), per_slot, w, idx, out, is[0], is[1], ws[0], ws[1],
+                                                   ws[2]);
+                        }
+                    };
                     if (in_dt(2) == DType::I32) {
-                        sycl_be::expert_matmul(q_, in_f32(0), per_slot, w, reinterpret_cast<const int32_t*>(in_ptr(2)),
-                                               out, is[0], is[1], ws[0], ws[1], ws[2]);
+                        with(reinterpret_cast<const int32_t*>(in_ptr(2)));
                     } else {
-                        sycl_be::expert_matmul(q_, in_f32(0), per_slot, w, reinterpret_cast<const int64_t*>(in_ptr(2)),
-                                               out, is[0], is[1], ws[0], ws[1], ws[2]);
+                        with(reinterpret_cast<const int64_t*>(in_ptr(2)));
                     }
                 };
                 if (in_dt(1) == DType::F16) {

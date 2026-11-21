@@ -80,6 +80,11 @@ template <typename I>
 void expert_matmul_quant_gemm(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const QuantWeight& w,
                               const I* idx, float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n,
                               int64_t k, bool f32);
+// The same over a float bank w [E, N, K] (expert_matmul's contract) whose type is the GEMM's (f16, or f32 in f32
+// precision): its rows are read where they are.
+template <typename W, typename I>
+void expert_matmul_gemm(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const W* w, const I* idx,
+                        float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k);
 
 // Auto: attention_rows up to kAttentionRowsMax queries; beyond, flash_attention where the device and shape allow
 // it, GEMMs otherwise. Rows, Gemm and Flash force one (tests); Flash takes GEMMs where it does not fit.
