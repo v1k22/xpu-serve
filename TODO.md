@@ -299,6 +299,12 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       HF parity on cpu-ref and the B60, q8 / q4 packs (`docs/decisions/0013`)
 - [x] LFM3's layers as shared builders (`lfm3::Decoder`: a probed weight prefix, `lfm3_vl`'s `text_config`,
       full-attention layers causal or over the step's tokens in groups), for d1
+- [x] Inkling 2 Mini (`inkling2_loop`, text): the graph ops it needs (attention with a relative bias and a sink,
+      L2Clip, DynamicConv) on cpu-ref and SYCL, block residuals and loop passes from the existing ops, the released
+      experts read from NVFP4 and MXFP8, the o200k Split regex; parity with transformers on a tiny checkpoint (cpu-ref
+      and the GPU, f32 and f16) — docs/decisions/0026
+- [ ] Inkling 2 Mini: its small kernels fused (a step launches some 4,700), its block drafter (`mtp.safetensors`,
+      DSpark), its GGUF files (NVFP4 as a block format), images, its output dialect (thinking and tool calls)
 - [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`; `lfm3_vl`'s text decoder is read
       for d1 only); conv-window snapshots for prefix
       reuse after a turn with reasoning; the small ops of a q4 decode step (119 norms and 48 residual adds rank

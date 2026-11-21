@@ -10,6 +10,7 @@
 #include "models/embedding.h"
 #include "models/gemma4/gemma4.h"
 #include "models/laya/laya.h"
+#include "models/inkling2/inkling2.h"
 #include "models/lfm3/lfm3.h"
 #include "models/model.h"
 #include "models/nomic_bert/nomic_bert.h"
@@ -67,15 +68,16 @@ const MediaEncoder* Model::encoder(Modality m) const {
 }
 
 std::vector<std::string> supported_model_types() {
-    return {"gemma4",           "gemma4_text", "lfm3",           "qwen3_5",       "qwen3_5_text", "qwen3_5_moe",
-            "qwen3_5_moe_text", "qwen3_asr",   "qwen3_omni_moe", "sensenova_loop"};
+    return {"gemma4",      "gemma4_text",      "inkling2_loop", "lfm3",           "qwen3_5",       "qwen3_5_text",
+            "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_asr",     "qwen3_omni_moe", "sensenova_loop"};
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOptions& options) {
     if (!std::filesystem::is_directory(dir)) fail("model directory '", dir.string(), "' does not exist");
     const auto config = cfg::read_json(dir / "config.json");
     const std::string type = cfg::get_string(config, "model_type", "config.json");
-    cfg::check_quantization(config);
+    // Inkling 2's released checkpoints are quantized their own way, which its loader checks.
+    if (type != "inkling2_loop") cfg::check_quantization(config);
     if (options.image_max_pixels > 0 && type != "qwen3_omni_moe") {
         fail("--image-max-pixels: ", type, "'s images are not sized by a pixel budget (Qwen3-VL's processor is)");
     }
@@ -85,6 +87,7 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
         return qwen3_5::load(dir, config, options);
     }
     if (type == "lfm3") return lfm3::load(dir, config, options);
+    if (type == "inkling2_loop") return inkling2::load(dir, config, options);
     if (type == "qwen3_asr") return qwen3_asr::load(dir, config, options);
     if (type == "qwen3_omni_moe") return qwen3_omni::load(dir, config, options);
     if (is_embedding_type(type)) {

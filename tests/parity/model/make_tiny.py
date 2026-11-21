@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3|sensenova_loop|qwen3_asr
-        --tokenizer-from <dir> --out <dir>
+    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3|sensenova_loop|qwen3_asr|
+        inkling2_loop --tokenizer-from <dir> --out <dir>
     python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
         [--pooling mean|cls] [--normalize] [--max-seq-length N]
     python -I tests/parity/model/make_tiny.py --drafter dflash|dflash2|dspine --target <tiny dir> --dflash-repo <clone
@@ -177,6 +177,106 @@ def sensenova_loop(vocab_size, source):
     return model
 
 
+def inkling2_loop(vocab_size, source):
+    """Inkling 2 Mini's layout, from the released checkpoint's own config.json (the --tokenizer-from one): twelve
+    layers in blocks of three, the sixth and the twelfth attending over the whole context, layers 3 to 8 run three
+    times with messages between the passes, a tiny vision tower (the class builds one). Everything the released
+    values would hide at this size is brought into reach: clip thresholds near the typical norm of a query, key or
+    relative state, softcaps near the experts' and the logits' range, a floor of the position scaling below a
+    prompt's length, a window and a bias extent shorter than a prompt. Parameters the class starts at zero or one
+    (the residual and message queries, the stored taps of the dynamic convolutions, the clip scales) are random, as
+    are the routers' selection biases, so each shows when skipped. The scales are as large as keeps the model well
+    conditioned: at twice these an error of one part in a million in the weights moved the logits a thousand times
+    as much, and no f16 run could match."""
+    from transformers import Inkling2LoopConfig, Inkling2LoopForConditionalGeneration
+
+    with open(os.path.join(source, "config.json")) as f:
+        released = json.load(f)
+    released.pop("quantization_config", None)  # released_inkling2_layout stores the experts quantized and restores it
+    text = released["text_config"]
+    layers = 12
+    text.update(
+        vocab_size=max(vocab_size, text["vocab_size"]), hidden_size=64, num_hidden_layers=layers,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=32, swa_num_attention_heads=4,
+        swa_num_key_value_heads=2, swa_head_dim=32, d_rel=8, rel_extent=24, sliding_window_size=16,
+        log_scaling_n_floor=20, log_scaling_alpha=0.4, qk_l2_clip_threshold=2.25, rel_l2_clip_threshold=1.1,
+        local_layer_ids=[i for i in range(layers) if (i + 1) % 6], n_layers_per_attn_res_block=3, n_routed_experts=8,
+        num_experts_per_tok=2, intermediate_size=32, route_scale=2.0, mlp_gate_softcap=0.75, mlp_up_softcap=1.0,
+        final_logit_softcapping=0.75, model_max_length=4096,
+        loop_config={"core_start": 3, "core_end": 9, "num_passes": 3, "gate_rank": 8, "is_varloop": False},
+    )
+    released["vision_config"].update(text_hidden_size=64, hidden_size=32, num_hidden_layers=2, num_attention_heads=2,
+                                     projection_hidden_dim=64, posemb_grid_size=4)
+    config = Inkling2LoopConfig.from_dict(json.loads(json.dumps(released)))
+    config.text_config.initializer_range = 0.05
+    model = Inkling2LoopForConditionalGeneration(config).float()
+    model.released_config = released
+    spread = {"attention_input.query": 0.75, "mlp_input.query": 0.75, "final_input.query": 0.75,
+              "message_input.query": 0.75, "sconv.static_weight": 0.15, "sconv.weight_proj.weight": 0.025,
+              "mlp.gate.weight": 0.25, "sink_proj.weight": 0.1, "relative_position_bias.proj": 0.5,
+              "_gate_proj.weight": 0.15}
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "vision_tower" in name:
+                continue
+            scale = next((v for k, v in spread.items() if name.endswith(k)), None)
+            if scale is not None:
+                p.normal_(0.0, scale)
+            elif name.endswith("norm.scale") or (p.dim() == 1 and "norm" in name):
+                p.uniform_(0.5, 1.5)  # clip scales and norms away from 1, so a skipped one shows
+        for name, b in model.named_buffers():
+            if name.endswith("e_score_correction_bias"):
+                b.normal_(0.0, 0.2)
+    return model
+
+
+def nvfp4(w):
+    """A bank [E, rows, cols] as the release stores NVFP4: E2M1 codes two a byte (the even column in the low nibble),
+    an E4M3 scale per 16 columns of a row, each expert's largest magnitude and the denominator its scales divide by."""
+    values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+    amax = w.abs().amax(dim=(1, 2))
+    denominator = torch.tensor([6.0 * 448.0])
+    factor = (amax / denominator)[:, None, None, None]
+    blocks = w.unflatten(-1, (-1, 16))
+    scale = (blocks.abs().amax(-1, keepdim=True) / 6.0 / factor).to(torch.float8_e4m3fn)
+    scaled = blocks / (scale.float() * factor).clamp_min(1e-30)
+    codes = (scaled.abs()[..., None] - values).abs().argmin(-1) + 8 * (scaled < 0)
+    codes = codes.flatten(-2).to(torch.uint8)
+    return {"": codes[..., 0::2] | (codes[..., 1::2] << 4), "_scale": scale.squeeze(-1), "_amax": amax,
+            "_outer_scale_denominator": denominator}
+
+
+def mxfp8(w):
+    """A bank as the release stores MXFP8: E4M3 codes and, per 32 columns of a row, a power of two as its exponent
+    plus 127 in a byte."""
+    blocks = w.unflatten(-1, (-1, 32))
+    exponent = torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-30) / 448.0)).clamp(-127, 127)
+    codes = (blocks / torch.exp2(exponent)[..., None]).to(torch.float8_e4m3fn).flatten(-2)
+    return {"": codes, "_scale": (exponent + 127).to(torch.uint8)}
+
+
+def released_inkling2_layout(out, released):
+    """The saved checkpoint as Inkling 2 Mini is released: its own config.json keys, one shard under an index, and the
+    experts quantized, the last third of the layers in MXFP8 and the others in NVFP4 (the release's last four of 24).
+    transformers decodes both on load, so the reference runs on the values these bytes hold."""
+    path = os.path.join(out, "model.safetensors")
+    tensors = load_file(path)
+    layers = released["text_config"]["num_hidden_layers"]
+    for i in range(layers):
+        for bank in ("w13_weight", "w2_weight"):
+            name = f"model.llm.layers.{i}.mlp.experts.{bank}"
+            stored = (mxfp8 if i >= layers - layers // 3 else nvfp4)(tensors.pop(name).float())
+            tensors.update({name + suffix: t for suffix, t in stored.items()})
+    os.remove(path)
+    shard = "model-00001-of-00001.safetensors"
+    save_file(tensors, os.path.join(out, shard), metadata={"format": "pt"})
+    with open(os.path.join(out, "model.safetensors.index.json"), "w") as f:
+        json.dump({"metadata": {}, "weight_map": {name: shard for name in sorted(tensors)}}, f, indent=2)
+    released["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+    with open(os.path.join(out, "config.json"), "w") as f:
+        json.dump(released, f, indent=2)
+
+
 def qwen3_asr(vocab_size, source):
     """Qwen3-ASR's layout from transformers' own classes: a Whisper-style audio encoder (three stride-2 convolutions
     over chunks of 100 mel frames, attention within windows of 800 frames, a two-layer projector) and a Qwen3
@@ -338,8 +438,8 @@ def perturbed(model):
 
 
 ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3,
-         "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr, "qwen3_omni": qwen3_omni, "bert": bert,
-         "nomic_bert": nomic_bert}
+         "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr, "qwen3_omni": qwen3_omni,
+         "inkling2_loop": inkling2_loop, "bert": bert, "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}
 ENCODER_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]
 
@@ -551,6 +651,8 @@ def main():
         save_file({**load_file(weights), **mtp_head(model)}, weights, metadata={"format": "pt"})
     if args.arch == "qwen3_omni":
         released_omni_layout(args.out)  # experts stay one tensor each, as the release has them
+    elif args.arch == "inkling2_loop":
+        released_inkling2_layout(args.out, model.released_config)
     else:
         fuse_experts(weights)
     if args.arch == "qwen3_asr":

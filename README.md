@@ -34,7 +34,8 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **OpenAI-compatible server**: `/v1/chat/completions` (streaming, tool calls, thinking), `/v1/completions`,
   `/v1/models`
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
-  Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3
+  Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3, Inkling 2 Mini (a
+  looped mixture of experts without rotary positions)
 - ✅ **Image input** (Gemma 4 E2B / E4B, Qwen3-Omni), as base64 `data:` URLs
 - ✅ **Audio and images in chat**: Qwen3-Omni-30B-A3B's thinker (text, audio and images in, text and tool calls
   out), as `input_audio` and `image_url` parts

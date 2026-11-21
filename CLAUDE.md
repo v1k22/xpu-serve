@@ -29,7 +29,9 @@ Qwen3.6, Qwen3.8; text; a hybrid of Gated DeltaNet linear attention and full att
 and SenseNova Loop, a Qwen3.5 decoder that runs its middle layers twice inside hyper-connections: docs/decisions/0022)
 and LFM3 (text; a hybrid of gated short convolutions and full or sliding-window attention), Qwen3-Omni's thinker (text,
 audio and images in, text out: Qwen's audio encoder, Qwen3-VL's vision tower and a Qwen3 mixture-of-experts decoder
-with positions on three axes; docs/decisions/0025),
+with positions on three axes; docs/decisions/0025), Inkling 2 Mini (text; a decoder without rotary positions whose
+middle layers run three times: attention with a bias by distance and a sink, short convolutions, block residuals;
+docs/decisions/0026),
 and decision models behind the System One API (`POST /v1/systemone`: Clef-Flash, a Qwen3.5 decoder with a joint
 schema head; pplx-decider-flash, one whose full-attention layers see the whole prompt, with a read-out per question;
 OpenJev, a language model read at the option letters with `--readout`; docs/decisions/0015; d1, LFM3-VL's text
@@ -97,7 +99,8 @@ build/src/xpu-serve run   <embedding-model-dir> --device GPU --prompt "text"    
   `XS_EMBEDDING_TEXTS=1` (also tokenize the texts).
   `tests/parity/model/make_tiny.py` writes a tiny random checkpoint of an architecture (real layer pattern and tensor
   names; with the checkpoint's own modeling code for one transformers does not ship, like LFM3 and SenseNova Loop,
-  whose code pins transformers 5.18), or of a block
+  whose code pins transformers 5.18; Inkling 2's with its experts stored in NVFP4 and MXFP8 as the release has
+  them), or of a block
   drafter for one (`--drafter`), or an encoder in a sentence-transformers checkpoint (`--arch bert|nomic_bert`), to run
   the reference scripts and the parity tests on in seconds.
 - `XS_SYCL_PROFILE=1` logs the SYCL backend's per-op device time per step (barrier timestamps between ops, no host
@@ -166,6 +169,7 @@ area).
 | `src/models/qwen3_asr/` | Qwen3-ASR: `qwen3_asr_config.cpp` (released `thinker_config` or transformers' flat layout; the forced aligner refused by name), `qwen3_asr_model.cpp` (the Qwen3 decoder with the audio encoder's rows at `<|audio_pad|>`), `qwen3_asr_transcription.cpp` (`language <Name><asr_text>`: forcing, parsing, ISO 639-1 codes, held back while streaming) |
 | `src/models/qwen3_vision/` | Qwen3-VL's vision tower, Qwen3-Omni's: `qwen3_vision_config.cpp` (its vision_config; Qwen2VLImageProcessor's settings and `smart_resize`), `qwen3_vision_encoder.cpp` (the processor: resize, normalize, patches in merge-block order, the position table's bilinear taps, rotary (row, column), the decoder's (0, row, column); the program over T = merged tokens with each token's 4 patches as rows: patch projection, the interpolated position table, blocks with 2-D RoPE and attention over all the image's patches, deepstack mergers, the last merger; output row = merged, then deepstack rows) |
 | `src/models/qwen3_omni/` | Qwen3-Omni's thinker (`qwen3_omni_moe`): `qwen3_omni_config.cpp` (the thinker_config's text, audio and vision configs), `qwen3_omni_model.cpp` (the audio encoder at its larger size, the vision tower, and the Qwen3 MoE decoder reading positions on three axes, the encoders' rows at `<|audio_pad|>` / `<|image_pad|>`, an image's deepstack rows added after the decoder's first layers; experts joined from one tensor each; text, audio and images in, text out in the `qwen3` dialect; the talker not read) |
+| `src/models/inkling2/` | Inkling 2 Mini (`inkling2_loop`): `inkling2_config.cpp` (the released config.json's own keys; refusals by name, its quantization_config among them), `inkling2_model.cpp` (the decoder: block residuals mixed by learned queries, attention with a relative bias and a sink over clipped queries and keys and normed values, short convolutions on keys, values and each sublayer's output (taps per token in the full-attention layers), softcapped experts behind a sigmoid router; the looped layers once per pass with KV and convolution slots of their own (`layers.<i>.pass<n>`) and messages from the pass before through gates; the released experts paired from NVFP4 and MXFP8; the vision tower not read) |
 | `src/server/transcription_handlers.cpp` | `POST /v1/audio/transcriptions`: the multipart form (each refusal names its field; timestamps refused), json / text / streamed events; `/v1/audio/translations` refused |
 | `src/server/realtime_session.cpp` | `GET /v1/realtime`'s session: `session.update` (every refusal an `error` event naming its field), the audio buffer at 24 kHz, the server VAD's turns, commits, and the worker that transcribes committed turns in order (deltas, completed / failed) |
 | `src/backend/sycl/sycl_conv.cpp` | Conv2d: the input unfolded into rows of patches (any stride, padding, dilation; group by group), one GEMM, the result laid out NCHW with the bias |
@@ -381,7 +385,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/convert/gguf_clef_real_file.cpp` | a real clef GGUF (`XS_GGUF_FILE`) against its checkpoint (`XS_CLEF_DIR`): the config fields the model code reads and joint_head_config.json, the head's tensors by name, shape and value (float ones exactly, block formats within their rounding, the scales from the parameters), the tokenizer token by token, the pack loads as a decision model | the checkpoint's config.json, joint_head_config.json, joint_head.safetensors and tokenizer.json |
 | `tests/unit/test_fp8.cpp` | FP8 checkpoints: the E4M3 code table, codes paired with their scales (one per block, one per row), tensors joined row-wise (F8 runs of either layout; float tensors copied), rows read whole and in part, refusals; the E2M1 table, an MXFP8 weight (an exponent per 32 columns) and an NVFP4 one (two codes a byte, a scale per 16 columns, a factor per expert) paired by a loader | values written from the codes' fields and the blocks' or rows' indices; planted: swapped grid, row scales read as blocks, an exponent read as a scale, nibbles in the other order |
 | `tests/unit/model/fp8_checkpoint.cpp` | a tiny Qwen3.5 (dense; mixture of experts stored expert by expert) written the way an FP8 release stores it (transformers' 128 x 128 blocks, or compressed-tensors' scale per channel): weights, logits (cpu-ref and GPU) and `convert`'s packs; banks stored expert by expert as bf16; `quantization_config` refusals of both schemes | the same checkpoint with the decoded values in the usual layout (`tiny_checkpoints.h`) |
-| `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp`, `qwen3_config.cpp`, `qwen3_omni_config.cpp`, `lfm3_config.cpp`, `modern_bert_config.cpp` | config parsing and refusals (LFM3: also an `lfm3_vl` checkpoint's `text_config`; SenseNova Loop's run order and hyper-connections) | |
+| `tests/unit/model/gemma4_config.cpp`, `qwen3_5_config.cpp`, `qwen3_config.cpp`, `qwen3_omni_config.cpp`, `lfm3_config.cpp`, `inkling2_config.cpp`, `modern_bert_config.cpp` | config parsing and refusals (LFM3: also an `lfm3_vl` checkpoint's `text_config`; SenseNova Loop's run order and hyper-connections; Inkling 2's loop and its quantization_config) | |
 | `tests/unit/model/sensenova_loop.cpp` | SenseNova Loop on a tiny checkpoint the test writes (`tiny_checkpoints.h`, `TinyQwen::loop_count`): its runs and state slots, a prompt fed in pieces equal to the whole, the GPU against cpu-ref, a pack that keeps the hyper-connection routers, a block drafter refused | the same model fed differently; its unquantized checkpoint; planted: the same weights run once |
 | `tests/unit/model/qwen3_5_value_heads.cpp` | linear attention's value heads in the tiled order: the same logits over a prefill and decode steps (`step_logits.h`), no ops added for a grouped checkpoint or when the orders coincide | the tiny checkpoint in the grouped order; planted: the tiled weights read as grouped |
 | `tests/unit/model/qwen3_5_expert_banks.cpp` | a mixture of experts' gate and up banks stored apart (`experts.gate_proj`, `experts.up_proj`): the same logits over a prefill and decode steps on cpu-ref (and the GPU); a checkpoint with neither layout, both, one half or a bank of another shape refused by name | the tiny MoE checkpoint with fused banks; planted: the two halves under each other's name |
@@ -582,6 +586,11 @@ Hugging Face safetensors (8.1 first, if it does not).
 
 ## 10. Known limitations
 
+- Inkling 2 Mini (`inkling2_loop`) is text only: its vision tower is not read and an image is refused. Its released
+  checkpoint (experts in NVFP4 and MXFP8) is the float model its codes decode to, which a backend holds as floats:
+  far more than the download, so it is served from a pack `convert` makes of it. The variable-pass research
+  checkpoint (`is_varloop`) is refused by name. A step runs some 4,700 small kernels (48 layer applications), which
+  bounds decode speed until they are fused.
 - Three model families: Gemma 4 E2B/E4B (text and images) and 26B-A4B (text), Qwen3.5 dense and MoE (text; its
   vision tower is not loaded; SenseNova Loop's neither, and a block drafter beside SenseNova Loop is refused; a MoE
   checkpoint's expert banks come fused, as the released ones store them, expert by expert as an FP8 release does, or
