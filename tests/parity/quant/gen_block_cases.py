@@ -1,6 +1,6 @@
 """Writes tests/fixtures/quant/blocks: blocks of every GGUF block format and the values ggml's own code gives them.
 
-Run: python3 -I tests/parity/quant/gen_block_cases.py <llama.cpp checkout>
+Run: python3 -I tests/parity/quant/gen_block_cases.py <llama.cpp checkout>   (one whose ggml has NVFP4, MXFP4 and Q2_0)
 
 Compiles ggml_dequantize.c with the checkout's ggml/src/ggml-quants.c (cc; -ffp-contract=off, so each product is
 rounded on its own, as the C source says), then writes per format:
@@ -45,6 +45,9 @@ FORMATS = {
     "IQ3_S": (110, 256, [0], [(106, 110)]),
     "IQ4_NL": (18, 32, [0], []),
     "IQ4_XS": (136, 256, [0], [(2, 8)]),
+    "NVFP4": (36, 64, [], [(0, 4)]),
+    "MXFP4": (17, 32, [], [(0, 1)]),
+    "Q2_0": (18, 64, [0], []),
 }
 
 # The edge blocks after the random ones: (name, codes, f16 fields); codes "zero" / "max" set every code byte to 0x00 /

@@ -1,5 +1,8 @@
 #include "quant/block_decode.h"
 
+#include <cmath>
+#include <cstring>
+
 #include "quant/block_tables.h"
 #include "quant/quant.h"
 #include "util/error.h"
@@ -412,6 +415,56 @@ void iq4_xs(const uint8_t* b, float* y) {
     }
 }
 
+// The sixteen values of a 4-bit float code (E2M1: a sign, two exponent bits, one mantissa bit), doubled as ggml
+// keeps them; a block's scale is halved to match.
+constexpr int8_t kFp4Values[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+
+// Half of an unsigned E4M3 code (ggml_ue4m3_to_fp32): 4 exponent bits biased by 7, 3 mantissa bits, subnormals below
+// 2^-6; 0 and 0x7f read as 0, the top bit is not looked at.
+float ue4m3_half(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const int exponent = (x >> 3) & 0xF;
+    const int mantissa = x & 0x7;
+    const float raw = exponent == 0 ? std::ldexp(static_cast<float>(mantissa), -9)
+                                    : std::ldexp(1.0f + static_cast<float>(mantissa) / 8.0f, exponent - 7);
+    return raw * 0.5f;
+}
+
+// NVFP4: 4 scale bytes (one per 16 columns), then 32 bytes of codes: sub-block s has column j in the low nibble of
+// byte 8 s + j and column j + 8 in its high nibble. w = value * scale.
+void nvfp4(const uint8_t* b, float* y) {
+    const uint8_t* qs = b + 4;
+    for (int s = 0; s < 4; ++s) {
+        const float d = ue4m3_half(b[s]);
+        for (int j = 0; j < 8; ++j) {
+            y[16 * s + j] = static_cast<float>(kFp4Values[qs[8 * s + j] & 0x0F]) * d;
+            y[16 * s + j + 8] = static_cast<float>(kFp4Values[qs[8 * s + j] >> 4]) * d;
+        }
+    }
+}
+
+// MXFP4: one byte e, then 16 bytes of codes (column j in the low nibble of byte j, column j + 16 in its high nibble).
+// w = value * 2^(e - 128), a subnormal for e below 2.
+void mxfp4(const uint8_t* b, float* y) {
+    const uint32_t bits = b[0] < 2 ? 0x00200000u << b[0] : static_cast<uint32_t>(b[0] - 1) << 23;
+    float d;
+    std::memcpy(&d, &bits, sizeof(d));
+    const uint8_t* qs = b + 1;
+    for (int j = 0; j < 16; ++j) {
+        y[j] = static_cast<float>(kFp4Values[qs[j] & 0x0F]) * d;
+        y[j + 16] = static_cast<float>(kFp4Values[qs[j] >> 4]) * d;
+    }
+}
+
+// Q2_0: f16 d, 16 bytes of 2-bit codes (column j in bits 2 (j % 4) of byte j / 4). w = (q - 1) * d.
+void q2_0(const uint8_t* b, float* y) {
+    const float d = f16_at(b);
+    const uint8_t* qs = b + 2;
+    for (int j = 0; j < 64; ++j) {
+        y[j] = static_cast<float>(((qs[j / 4] >> (2 * (j % 4))) & 3) - 1) * d;
+    }
+}
+
 using BlockDecoder = void (*)(const uint8_t* block, float* out);
 
 BlockDecoder decoder(BlockFormat f) {
@@ -454,6 +507,12 @@ BlockDecoder decoder(BlockFormat f) {
             return iq4_nl;
         case BlockFormat::IQ4_XS:
             return iq4_xs;
+        case BlockFormat::NVFP4:
+            return nvfp4;
+        case BlockFormat::MXFP4:
+            return mxfp4;
+        case BlockFormat::Q2_0:
+            return q2_0;
     }
     fail("unknown block format ", static_cast<int>(f));
 }

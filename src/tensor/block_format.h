@@ -37,12 +37,17 @@ enum class BlockFormat : uint8_t {
     // 32 / 256 weights: 4-bit indexes into 16 unevenly spaced values
     IQ4_NL,
     IQ4_XS,
+    // 64 / 32 weights: 4-bit float codes (E2M1) under an E4M3 scale per 16 weights, or one power of two
+    NVFP4,
+    MXFP4,
+    // 64 weights: 2-bit codes (-1, 0, 1, 2) under one scale
+    Q2_0,
 };
-inline constexpr int kBlockFormats = 19;
+inline constexpr int kBlockFormats = 22;
 
 struct BlockLayout {
     int32_t bytes = 0;    // of one block
-    int32_t weights = 0;  // it holds: 32 or 256
+    int32_t weights = 0;  // it holds: 32, 64 or 256
 };
 
 constexpr BlockLayout block_layout(BlockFormat f) {
@@ -85,6 +90,12 @@ constexpr BlockLayout block_layout(BlockFormat f) {
             return {18, 32};
         case BlockFormat::IQ4_XS:
             return {136, 256};
+        case BlockFormat::NVFP4:
+            return {36, 64};
+        case BlockFormat::MXFP4:
+            return {17, 32};
+        case BlockFormat::Q2_0:
+            return {18, 64};
     }
     return {};
 }

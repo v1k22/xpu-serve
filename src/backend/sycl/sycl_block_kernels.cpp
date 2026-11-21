@@ -65,6 +65,25 @@ inline float iq4_value(uint32_t code) {
     return static_cast<float>(static_cast<int8_t>(word >> (8 * (code & 3))));
 }
 
+// The value of a 4-bit float code (E2M1), doubled: 0, 1, 2, 3, 4, 6, 8, 12 by its low three bits, a nibble each, and
+// its sign.
+inline float fp4_level(uint32_t code) {
+    return signed_float((0xC8643210u >> (4 * (code & 7u))) & 15u, code >> 3);
+}
+// Half of an unsigned E4M3 code, as ggml reads an NVFP4 scale: (1 + m / 8) 2^(e - 8), below e = 1 the subnormal
+// m 2^-10; 0 and 0x7f are 0, the top bit is not looked at.
+inline float ue4m3_half(uint32_t x) {
+    const uint32_t e = (x >> 3) & 15u;
+    const uint32_t m = x & 7u;
+    const float normal = sycl::bit_cast<float>(((e + 119u) << 23) | (m << 20));
+    const float v = e == 0 ? static_cast<float>(m) * 0x1p-10f : normal;
+    return x == 0x7Fu ? 0.0f : v;
+}
+// 2^(x - 128), ggml's power of two of an MXFP4 block (a subnormal below x = 2).
+inline float e8m0_half(uint32_t x) {
+    return sycl::bit_cast<float>(x < 2 ? 0x00200000u << x : (x - 1u) << 23);
+}
+
 // The two words of an 8-byte entry of a table of u64.
 inline void grid_pair(const uint32_t* grid, uint32_t index, uint32_t* g) {
     const auto v = load<sycl::vec<uint32_t, 2>>(reinterpret_cast<const uint8_t*>(grid) + 8 * index);
@@ -531,6 +550,72 @@ struct Fmt<BlockFormat::Q5_1> {
     static uint32_t low(const Fields& f, int t) { return f.lo[t]; }
     static uint32_t high(const Fields& f, int t) { return f.hi >> (8 * t); }
     static Affine affine(const Fields& f, int) { return {f.d, -f.m}; }  // w = d code + m
+};
+
+template <>
+struct Fmt<BlockFormat::NVFP4> {
+    static constexpr bool kTrick = false;
+    static constexpr bool kGrid = false;
+    static constexpr bool kMin = false;
+    static constexpr int kGroups = 2;
+    static constexpr std::array<int, kBlockStreams> kSuperblock = {128, 16};
+    struct Fields {
+        sycl::vec<uint32_t, 4> lo;
+        uint32_t scales;  // two bytes: each half's E4M3 code
+    };
+    static Fields fields(const RowPtr& r, int32_t u) {
+        return {load<sycl::vec<uint32_t, 4>>(r.p[0] + 16 * u), load<uint16_t>(r.p[1] + 2 * u)};
+    }
+    static void levels(const Fields& f, const uint32_t*, int t, float* lv) {
+        const uint32_t w = f.lo[t];
+        for (int i = 0; i < 8; ++i)
+            lv[i] = fp4_level((w >> (4 * i)) & 15u);
+    }
+    static Affine affine(const Fields& f, int g) { return {ue4m3_half((f.scales >> (8 * g)) & 255u), 0.0f}; }
+};
+
+template <>
+struct Fmt<BlockFormat::MXFP4> {
+    static constexpr bool kTrick = false;
+    static constexpr bool kGrid = false;
+    static constexpr bool kMin = false;
+    static constexpr int kGroups = 1;
+    static constexpr std::array<int, kBlockStreams> kSuperblock = {128, 8};
+    struct Fields {
+        sycl::vec<uint32_t, 4> lo;
+        float d;
+    };
+    static Fields fields(const RowPtr& r, int32_t u) {
+        return {load<sycl::vec<uint32_t, 4>>(r.p[0] + 16 * u), e8m0_half(r.p[1][u])};
+    }
+    static void levels(const Fields& f, const uint32_t*, int t, float* lv) {
+        const uint32_t w = f.lo[t];
+        for (int i = 0; i < 8; ++i)
+            lv[i] = fp4_level((w >> (4 * i)) & 15u);
+    }
+    static Affine affine(const Fields& f, int) { return {f.d, 0.0f}; }
+};
+
+template <>
+struct Fmt<BlockFormat::Q2_0> {
+    static constexpr bool kTrick = true;
+    static constexpr bool kGrid = false;
+    static constexpr int kLowBits = 2;
+    static constexpr int kHighBits = 0;
+    static constexpr int kOff = 1;
+    static constexpr bool kMin = false;
+    static constexpr int kGroups = 1;
+    static constexpr std::array<int, kBlockStreams> kSuperblock = {64, 8};
+    struct Fields {
+        sycl::vec<uint32_t, 2> lo;
+        float d;
+    };
+    static Fields fields(const RowPtr& r, int32_t u) {
+        return {load<sycl::vec<uint32_t, 2>>(r.p[0] + 8 * u), f16_at(r.p[1] + 2 * (u >> 1))};
+    }
+    static uint32_t low(const Fields& f, int t) { return f.lo[t >> 1] >> (16 * (t & 1)); }
+    static uint32_t high(const Fields&, int) { return 0; }
+    static Affine affine(const Fields& f, int) { return {f.d, 0.0f}; }
 };
 
 // The codes of quarter t of a kTrick format.
@@ -1076,7 +1161,8 @@ void gather_block_t(sycl::queue& q, const Streams& w, const I* ids, float* out, 
 
 Streams streams_of(const BlockWeight& w, int64_t k) {
     XS_CHECK(block_on_device(w.format), "sycl: no kernel reads the block format ", block_format_name(w.format));
-    XS_CHECK(k % 256 == 0, "sycl: a ", block_format_name(w.format), " weight needs a multiple of 256 columns, got ", k);
+    XS_CHECK(block_whole_rows(w.format, k), "sycl: a ", block_format_name(w.format), " weight needs a multiple of ",
+             block_layout(w.format).weights, " columns, got ", k);
     Streams s;
     for (int i = 0; i < kBlockStreams; ++i)
         s.s[i] = w.s[i];
@@ -1121,6 +1207,12 @@ void dispatch(BlockFormat format, Fn&& f) {
             return f.template operator()<BlockFormat::Q5_0>();
         case BlockFormat::Q5_1:
             return f.template operator()<BlockFormat::Q5_1>();
+        case BlockFormat::NVFP4:
+            return f.template operator()<BlockFormat::NVFP4>();
+        case BlockFormat::MXFP4:
+            return f.template operator()<BlockFormat::MXFP4>();
+        case BlockFormat::Q2_0:
+            return f.template operator()<BlockFormat::Q2_0>();
         default:
             fail("sycl: no kernel reads the block format ", block_format_name(format));
     }

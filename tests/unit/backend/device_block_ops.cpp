@@ -26,7 +26,8 @@ constexpr BlockFormat kFormats[] = {
     BlockFormat::Q4_0,    BlockFormat::Q4_1,  BlockFormat::Q5_0,    BlockFormat::Q5_1,   BlockFormat::Q8_0,
     BlockFormat::Q2_K,    BlockFormat::Q3_K,  BlockFormat::Q4_K,    BlockFormat::Q5_K,   BlockFormat::Q6_K,
     BlockFormat::IQ1_S,   BlockFormat::IQ1_M, BlockFormat::IQ2_XXS, BlockFormat::IQ2_XS, BlockFormat::IQ2_S,
-    BlockFormat::IQ3_XXS, BlockFormat::IQ3_S, BlockFormat::IQ4_NL,  BlockFormat::IQ4_XS,
+    BlockFormat::IQ3_XXS, BlockFormat::IQ3_S, BlockFormat::IQ4_NL,  BlockFormat::IQ4_XS, BlockFormat::NVFP4,
+    BlockFormat::MXFP4,   BlockFormat::Q2_0,
 };
 static_assert(sizeof(kFormats) / sizeof(kFormats[0]) == kBlockFormats);
 
@@ -66,9 +67,12 @@ TEST_SUITE("device ops") {
     TEST_CASE("matmul and gather on GGUF block format weights against fp64 of the decoded values" *
               doctest::skip(!dev::enabled())) {
         test::TensorRng rng(71);
-        // 768 columns: 24 units of 32, so the lanes of a sub-group take one or two; 37 rows fill no sub-group pair
-        for (const auto& [n, k] : {std::pair<int64_t, int64_t>{37, 768}, std::pair<int64_t, int64_t>{64, 2560}}) {
+        // 768 columns: 24 units of 32, so the lanes of a sub-group take one or two; 37 rows fill no sub-group pair.
+        // 1,152: no whole number of 256 columns, which only the formats of narrower blocks can hold.
+        for (const auto& [n, k] : {std::pair<int64_t, int64_t>{37, 768}, std::pair<int64_t, int64_t>{64, 2560},
+                                   std::pair<int64_t, int64_t>{19, 1152}}) {
             for (const BlockFormat f : kFormats) {
+                if (k % block_layout(f).weights != 0) continue;
                 CAPTURE(block_format_name(f));
                 CAPTURE(k);
                 test::MemoryWeights w;
@@ -148,8 +152,9 @@ TEST_SUITE("device ops") {
         test::TensorRng rng(73);
         // 18 rows an expert: no whole block of rows; expert 0 is read by ids outside the bank too.
         const int64_t experts = 5, n = 18, slots = 2;
-        for (const int64_t k : {768, 256}) {
+        for (const int64_t k : {768, 256, 1152}) {
             for (const BlockFormat f : kFormats) {
+                if (k % block_layout(f).weights != 0) continue;
                 CAPTURE(block_format_name(f));
                 CAPTURE(k);
                 test::MemoryWeights w;

@@ -13,7 +13,8 @@
 namespace xs::sycl_be {
 
 // A weight [N, K] as streams, each row-major and 64-byte aligned, a row's part a whole number of bytes. With
-// U = K / 32 units (the columns [32 u, 32 u + 32) of a row) and B = K / 256 blocks a row, stream by stream:
+// U = K / 32 units (the columns [32 u, 32 u + 32) of a row) and B = K / 256 blocks a row, stream by stream (K a
+// multiple of 256 for the formats whose blocks are that wide, of their own block for the others):
 //
 //   Q4_K     nibbles [K/2]   header [16 B]: d, dmin (f16), scales[12]
 //   Q5_K     nibbles [K/2]   bit 4 [K/8]         header [16 B]
@@ -31,6 +32,9 @@ namespace xs::sycl_be {
 //   IQ1_M    indexes [K/8]   index bits 8-10 and shifts [K/16]         scales u16[4] [8 B]
 //   Q5_0     nibbles [K/2]   bit 4 [K/8]         d f16 [2 U]
 //   Q5_1     nibbles [K/2]   bit 4 [K/8]         d, m f16 [4 U]
+//   NVFP4    nibbles [K/2]   scales [K/16]: an E4M3 code per 16 columns
+//   MXFP4    nibbles [K/2]   exponent [U]
+//   Q2_0     bits 0-1 [K/4]  d f16 [U]: one per 64 columns
 //
 // Codes are in column order: nibble, bit pair or bit c of a row's stream is column c's (the low nibble of a byte the
 // even column), where a block scatters them by halves and quarters. Scales keep the block's own encoding.
@@ -38,6 +42,8 @@ inline constexpr int kBlockStreams = 5;
 
 // Whether the block kernels read `f` (the formats listed above: all but the three a pack's kernels take).
 bool block_on_device(BlockFormat f);
+// Whether a weight of `cols` columns is whole blocks of `f`.
+bool block_whole_rows(BlockFormat f, int64_t cols);
 // Bytes a row of `cols` columns takes in each stream (0 past the format's last).
 void block_stream_rows(BlockFormat f, int64_t cols, int64_t out[kBlockStreams]);
 

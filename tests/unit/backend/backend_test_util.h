@@ -132,6 +132,8 @@ inline std::vector<size_t> block_f16_fields(BlockFormat format) {
         case BlockFormat::Q6_K:
             return {208};
         case BlockFormat::IQ1_M:
+        case BlockFormat::NVFP4:  // E4M3 scales, a byte each
+        case BlockFormat::MXFP4:  // a power of two, as its exponent
             return {};
         default:
             return {0};
@@ -163,6 +165,12 @@ inline std::vector<uint8_t> random_blocks(BlockFormat format, int64_t count, uin
             for (int k = 0; k < 4; ++k)
                 block[49 + 2 * k] = static_cast<uint8_t>((block[49 + 2 * k] & 0x0F) | (((h >> (4 * k)) & 0xF) << 4));
         }
+        // The float-4 formats' scales in the same range: an E4M3 code of exponent 0 (a subnormal) to 3, or 2^-13 to
+        // 2^-8 (a block's values are up to twelve times its scale).
+        if (format == BlockFormat::NVFP4) {
+            for (int k = 0; k < 4; ++k) block[k] = static_cast<uint8_t>(rng() & 0x1F);
+        }
+        if (format == BlockFormat::MXFP4) block[0] = static_cast<uint8_t>(115 + rng() % 6);
     }
     return bytes;
 }

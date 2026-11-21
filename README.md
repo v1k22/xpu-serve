@@ -221,8 +221,9 @@ xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
   E2B the tokenizer equals the original's token by token), and the template is the file's, which a publisher may have
   changed from the original checkpoint's. Thinking, tool calls and streaming work as with the original checkpoint.
   The quantization options do not apply.
-- Both backends read all 19 of GGUF's block formats (Q4_0 to Q8_0, the K-quants, IQ1 to IQ4), each decoded to the
-  values llama.cpp's own code gives (checked bit for bit on the host). A file is usually a mix of them.
+- Both backends read all 19 of GGUF's block formats (Q4_0 to Q8_0, the K-quants, IQ1 to IQ4), and the three more of
+  Unsloth's llama.cpp builds (NVFP4, MXFP4, Q2_0), each decoded to the values llama.cpp's own code gives (checked
+  bit for bit on the host). A file is usually a mix of them.
 
 Commands per model: [model_recipes.md](model_recipes.md#importing-a-gguf-file). Every file's numbers:
 [docs/gguf_models.md](docs/gguf_models.md).

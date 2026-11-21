@@ -96,6 +96,12 @@ Streams streams_of(BlockFormat f, int64_t k) {
             return {3, {K / 2, K / 8, K / 16}};
         case BlockFormat::Q5_1:
             return {3, {K / 2, K / 8, K / 8}};
+        case BlockFormat::NVFP4:
+            return {2, {K / 2, K / 16}};
+        case BlockFormat::MXFP4:
+            return {2, {K / 2, K / 32}};
+        case BlockFormat::Q2_0:
+            return {2, {K / 4, K / 32}};
         default:
             return {};
     }
@@ -107,6 +113,10 @@ bool block_on_device(BlockFormat f) {
     return streams_of(f, 256).count > 0;
 }
 
+bool block_whole_rows(BlockFormat f, int64_t cols) {
+    return cols > 0 && cols % block_layout(f).weights == 0;
+}
+
 void block_stream_rows(BlockFormat f, int64_t cols, int64_t out[kBlockStreams]) {
     const Streams st = streams_of(f, cols);
     for (int s = 0; s < kBlockStreams; ++s)
@@ -116,7 +126,8 @@ void block_stream_rows(BlockFormat f, int64_t cols, int64_t out[kBlockStreams]) 
 BlockImage block_image(BlockFormat f, const uint8_t* blocks, int64_t rows, int64_t cols) {
     const BlockLayout layout = block_layout(f);
     XS_CHECK(block_on_device(f), "sycl: no kernel reads the block format ", block_format_name(f));
-    XS_CHECK(cols % 256 == 0, "sycl: a ", block_format_name(f), " weight needs a multiple of 256 columns, got ", cols);
+    XS_CHECK(block_whole_rows(f, cols), "sycl: a ", block_format_name(f), " weight needs a multiple of ",
+             layout.weights, " columns, got ", cols);
     const Streams st = streams_of(f, cols);
     BlockImage image;
     image.streams = st.count;
@@ -248,6 +259,23 @@ BlockImage block_image(BlockFormat f, const uint8_t* blocks, int64_t rows, int64
                     std::memcpy(out[2] + 4 * b, in, 4);
                     std::memcpy(out[1] + 4 * b, in + 4, 4);
                     put_split_nibbles(out[0], c0, in + 8);
+                    break;
+                case BlockFormat::NVFP4:  // scales[4], qs[32]: 16 columns in 8 bytes, the low nibbles first
+                    std::memcpy(out[1] + 4 * b, in, 4);
+                    for (int s = 0; s < 4; ++s) {
+                        for (int j = 0; j < 8; ++j) {
+                            put_nibble(out[0], c0 + 16 * s + j, in[4 + 8 * s + j] & 0x0Fu);
+                            put_nibble(out[0], c0 + 16 * s + 8 + j, in[4 + 8 * s + j] >> 4);
+                        }
+                    }
+                    break;
+                case BlockFormat::MXFP4:  // e, qs[16]
+                    out[1][b] = in[0];
+                    put_split_nibbles(out[0], c0, in + 1);
+                    break;
+                case BlockFormat::Q2_0:  // d, qs[16]: in column order already
+                    std::memcpy(out[1] + 2 * b, in, 2);
+                    std::memcpy(out[0] + 16 * b, in + 2, 16);
                     break;
                 default:
                     break;

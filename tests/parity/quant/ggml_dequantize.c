@@ -70,6 +70,9 @@ static const struct format formats[] = {
     FORMAT("IQ3_S", block_iq3_s, QK_K, dequantize_row_iq3_s),
     FORMAT("IQ4_NL", block_iq4_nl, QK4_NL, dequantize_row_iq4_nl),
     FORMAT("IQ4_XS", block_iq4_xs, QK_K, dequantize_row_iq4_xs),
+    FORMAT("NVFP4", block_nvfp4, QK_NVFP4, dequantize_row_nvfp4),
+    FORMAT("MXFP4", block_mxfp4, QK_MXFP4, dequantize_row_mxfp4),
+    FORMAT("Q2_0", block_q2_0, QK2_0, dequantize_row_q2_0),
 };
 #define FORMATS (sizeof(formats) / sizeof(formats[0]))
 
