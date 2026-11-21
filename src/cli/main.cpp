@@ -926,10 +926,10 @@ int cmd_bench(const std::vector<std::string>& argv) {
     const int n_gen = a.get_int("gen-tokens");
     if (!a.get("prompts").empty()) return bench_prompts(*service, a.get("prompts"), n_gen, a.get_int("runs"));
     const int n_prompt = a.get_int("prompt-tokens");
-    std::string text;
-    while (static_cast<int>(service->tokenizer().encode(text).size()) < n_prompt + 16) {
-        text += "The quick brown fox jumps over the lazy dog while the engine measures how fast it reads and writes. ";
-    }
+    // Doubled, not grown a sentence at a time: each check encodes the whole text.
+    std::string text =
+        "The quick brown fox jumps over the lazy dog while the engine measures how fast it reads and writes. ";
+    while (static_cast<int>(service->tokenizer().encode(text).size()) < n_prompt + 16) text += text;
     for (int run = 0; run < a.get_int("runs"); ++run) {
         // A different first token per run, so no run reuses the previous run's KV cache.
         std::vector<int32_t> prompt = service->tokenizer().encode("Run " + std::to_string(run) + ": " + text);
