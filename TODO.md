@@ -315,8 +315,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Inkling 2 Mini: GGUF files in mainline llama.cpp's layout (`inkling2_loop`: AtomicChat's uncensored files,
       Unsloth's `Mainline_Support` copies), each looped layer's message queries read from the file; the same pack as
       Unsloth's layout from the same model
-- [ ] Inkling 2 Mini: a GGUF LoRA adapter (AtomicChat's rank-1 edit, for any GGUF of the model; refused by name
-      today: the expert banks it changes are quantized, so it would run beside them rather than be merged)
+- [x] Inkling 2 Mini: a GGUF LoRA adapter (AtomicChat's rank-1 edit, for any GGUF of the model): `--lora`, any model
+      and any weight format, each change read beside the weight it changes (`graph/low_rank.h`)
 - [x] Inkling 2 Mini: its small kernels fused: elementwise trees as one kernel, the residual's scale in its queries,
       a gate's pair normed once and its forget and gain rows one weight (22.99 to 20.86 ms a decode step on the B60)
 - [ ] Inkling 2 Mini: the router's and the block residual's small kernels (some 13 launches a layer)

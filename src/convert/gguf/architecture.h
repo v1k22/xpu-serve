@@ -13,6 +13,7 @@
 
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -90,6 +91,10 @@ public:
     // its tensors under the checkpoint's names and what config.json says of it. Refuses by name a file that is not
     // this model's tower. The default refuses it by name, for an architecture whose tower is not read.
     virtual void add_projector(ImportPlan& plan, const gguf::File& file, const gguf::File& projector) const;
+    // The checkpoint's name for `tensor`, a tensor name of this architecture's files, when the file stores that
+    // weight whole and in the checkpoint's order (what an adapter of the file changes). Nothing otherwise; the
+    // default: nothing, for an architecture whose adapters are not read.
+    virtual std::optional<std::string> adapter_target(std::string_view tensor) const;
 };
 
 const Architecture& qwen35();

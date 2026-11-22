@@ -17,6 +17,25 @@ Entry reordered(Dims stored, std::string name, Dims shape, const FloatReorder* r
     return Entry{std::move(stored), {Piece{std::move(name), std::move(shape), nullptr, reorder}}};
 }
 
+std::optional<std::string> whole_tensor(const Layout& layout, std::string_view tensor) {
+    const Entries* entries = &layout.top;
+    std::string_view rest = tensor;
+    if (tensor.rfind("blk.", 0) == 0) {
+        const size_t dot = tensor.find('.', 4);
+        const std::string_view digits = tensor.substr(4, dot == std::string_view::npos ? 0 : dot - 4);
+        if (digits.empty() || digits.find_first_not_of("0123456789") != std::string_view::npos) return std::nullopt;
+        const auto block = static_cast<size_t>(std::stoll(std::string(digits)));
+        if (block >= layout.blocks.size()) return std::nullopt;
+        entries = &layout.blocks[block];
+        rest = tensor.substr(dot + 1);
+    }
+    const auto it = entries->find(rest);
+    if (it == entries->end() || it->second.pieces.size() != 1) return std::nullopt;
+    const Piece& p = it->second.pieces[0];
+    if (p.map != nullptr || p.reorder != nullptr) return std::nullopt;
+    return p.name;
+}
+
 bool same_shape(const Dims& shape, const Dims& stored) {
     const auto rest = [](const Dims& d) { return std::find_if(d.begin(), d.end(), [](int64_t n) { return n != 1; }); };
     return std::equal(rest(shape), shape.end(), rest(stored), stored.end());

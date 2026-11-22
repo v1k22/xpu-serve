@@ -7,8 +7,10 @@
 #include "audio/audio.h"
 #include "audio/split.h"
 #include "chat/chat_template.h"
+#include "convert/gguf/adapter.h"
 #include "engine/media.h"
 #include "image/image.h"
+#include "models/low_rank_model.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
 #include "util/log.h"
@@ -44,6 +46,12 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
                                                    .drafter = options.drafter,
                                                    .draft_shortlist = options.draft_shortlist,
                                                    .drafts = spec_k});
+    if (!options.lora.empty()) {
+        gguf_import::Adapter adapter = gguf_import::read_lora(options.lora, options.lora_scale);
+        log::info("adapter ", options.lora.filename().string(), " (", adapter.architecture, "): ",
+                  adapter.changes.size(), " weights changed, scale ", options.lora_scale);
+        model = with_low_rank(std::move(model), std::move(adapter.tensors), adapter.changes);
+    }
     const ModelInfo& info = model->info();
     log::info("model ", info.id, " (", info.arch, "): graph of ", model->graph().nodes().size(), " nodes, ",
               model->graph().kv_slots().size(), " KV slots", model->vision() ? "; vision encoder" : "",

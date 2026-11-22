@@ -1124,8 +1124,9 @@ order alone moved the lossless file's by 0.1 %); an `i8` KV cache moves each fil
 layer's refusal direction (attention outputs, routed experts and the embedding), merged into the weights, so it
 answers requests the original refuses. Three files (AD-Q4_K 16.5 GB, AD-IQ3_S 13.3 GB, AD-IQ2_M 8.67 GB) and the
 vision tower's, which `-hf` fetches with any of them: images work. The repository has no drafter, so `--spec dspark`
-is refused. Its adapter file (`Inkling-2-Mini-Uncensored-LoRA.gguf`, the same edit for another GGUF of the model) is
-refused by name: adapters are not imported.
+is refused. Its adapter file (`Inkling-2-Mini-Uncensored-LoRA.gguf`, 44 MB: the same edit for any GGUF of the model)
+applies with `--lora`, each change added where the model reads the weight it changes, which stays as the file stores
+it: Unsloth's files then keep their NVFP4 experts and DSpark.
 
 Arc Pro B60:
 
@@ -1152,6 +1153,14 @@ against the original's lossless file (8.108), so it holds the edit's change and 
   these measurements cannot tell.
 - **Contexts** were not measured on these files: they take less memory than UD-Q4_K_M (15.4 GiB), which takes 262,144
   tokens in `i8` on the B60. AD-Q4_K imports the same way and was not measured.
+- **The adapter** on Unsloth's UD-Q4_K_M (Arc Pro B60, 512 + 128 tokens): decode 38.8 to 37.2 tok/s, prefill 589 to
+  514 tok/s; the model then answers what it declined without it.
+
+```bash
+curl -LO https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF/resolve/main/Inkling-2-Mini-Uncensored-LoRA.gguf
+xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M --device GPU --kv-dtype i8 \
+    --lora Inkling-2-Mini-Uncensored-LoRA.gguf
+```
 
 ## Drafters
 

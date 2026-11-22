@@ -640,6 +640,33 @@ public:
     explicit Inkling2(const Flavor& flavor) : fl_(flavor) {}
     std::string_view name() const override { return fl_.name; }
 
+    // Names do not depend on the sizes: a layout of nominal ones, whose block i is a layer of each kind in turn,
+    // names every tensor a layer can hold.
+    std::optional<std::string> adapter_target(std::string_view tensor) const override {
+        int64_t block = 0;
+        if (tensor.rfind("blk.", 0) == 0) {
+            const size_t dot = tensor.find('.', 4);
+            const std::string digits(tensor.substr(4, dot == std::string_view::npos ? 0 : dot - 4));
+            if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) return std::nullopt;
+            block = std::stoll(digits);
+        }
+        for (const bool sliding : {true, false}) {
+            for (const bool looped : {true, false}) {
+                Dimensions d;
+                d.vocab = d.tokens = d.hidden = d.heads = d.kv_heads = d.head_dim = d.rel_width = d.rel_extent = 1;
+                d.window = d.conv_taps = d.block_layers = d.experts = d.experts_per_token = d.expert_width = 1;
+                d.gate_rank = 1;
+                d.passes = 2;
+                d.layers = block + 1;
+                d.sliding.assign(static_cast<size_t>(d.layers), sliding);
+                d.loop_start = looped ? 0 : d.layers;
+                d.loop_end = d.layers;
+                if (auto name = whole_tensor(layout(fl_, d), tensor)) return name;
+            }
+        }
+        return std::nullopt;
+    }
+
     ImportPlan plan(const gguf::File& f) const override {
         refuse_unknown_keys(f, fl_.name, known_keys(fl_));
         const Dimensions d = dimensions(f, fl_);

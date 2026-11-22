@@ -33,6 +33,8 @@ struct ServiceOptions {
     std::string spec;               // the kind of drafter asked for: "mtp", "dflash", "dspine" (empty: any)
     std::filesystem::path drafter;  // a drafter checkpoint for speculative decoding (an assistant, a block drafter)
     int64_t draft_shortlist = 64;   // LoadOptions::draft_shortlist
+    std::filesystem::path lora;     // a LoRA adapter (GGUF) read beside the model's weights (models/low_rank_model.h)
+    float lora_scale = 1.0f;        // its changes times this
 };
 
 // The real InferenceService: loads model, tokenizer and chat template from a model directory, compiles the step

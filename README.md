@@ -53,6 +53,8 @@ optimized one) and what was measured**; this page says what is supported and how
   NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them
 - ✅ **Speculative decoding**: Qwen's MTP heads, Gemma 4's assistants, DFlash 2 and DSpine block drafters
   (Qwen3.8-27B), a DFlash block drafter (Ornith-1.5-35B-A3B), Inkling 2's DSpark drafter
+- ✅ **LoRA adapters** in llama.cpp's GGUF form (`--lora`): each change added where the model reads the weight, which
+  stays as stored (quantized ones included)
 - ✅ **int8 KV cache** (`--kv-dtype i8`)
 - ✅ **TurboQuant KV cache** (`--kv-dtype turbo4 | turbo3 | turbo2`, or int8 keys with TurboQuant values): a cache
   3.9 to 7.5 times smaller than f16
@@ -221,7 +223,7 @@ xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
   images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
   drafter; `inkling2`, Inkling 2 Mini (Unsloth's files), with its drafter's file (`dspark-*.gguf`) and its vision tower's (`mmproj-*.gguf`), both fetched by `-hf`;
   `inkling2_loop`, the same model in mainline llama.cpp's layout (AtomicChat's uncensored files, with their vision
-  tower's; a LoRA adapter file is refused);
+  tower's; its LoRA adapter file applies with `--lora`);
   `clef`, the Clef decision models; and `modern-bert` with a Laya read-out, the files of Laya and Julia-1. Others
   are refused by name.
 - A Qwen3.5-family file that comes without its MTP head (the smallest files of Qwen3.8-27B) takes the head from its

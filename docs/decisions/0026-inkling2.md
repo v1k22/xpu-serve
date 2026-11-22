@@ -198,13 +198,18 @@ B390 from UD-Q4_K_M in `turbo3`, which costs 2.0 % of perplexity (`i8` 0.15 %, `
 Accuracy is perplexity over wikitext-2 against the lossless file (the multiple-choice read-out the other GGUF files
 were scored with has not been run on this model).
 
-## Read-out, verify
+## Read-out, adapters, verify
 
 - **`--readout`.** The template ends without a generation prompt and the model writes its own `<|message_model|>`
   and content tag before an answer, so a read-out at the first output position saw a structural token. A dialect now
   says how a prompt asks for an answer at once (`chat::direct_answer`): for `inkling2`, `reasoning_effort` none and
   the prompt ended with `<|message_model|><|content_text|>`, so the next token is the letter. UD-Q4_K_M answers the
   README's System One request (billing 0.99999, the capital of France 0.9999997).
+- **A LoRA adapter.** AtomicChat's file is a rank-1 edit of 49 weights (each layer's attention output, each layer's
+  128 experts' down projection, the embedding table) meant for any GGUF of the model. The banks it changes are
+  quantized, so it is not merged: `--lora` adds each change's product where a program reads the weight
+  (`graph/low_rank.h`), for any model and weight format. On UD-Q4_K_M it costs 4 % of decode and 13 % of prefill,
+  and the model answers what it declined without it.
 - **A verify's rows.** The per-row attention kernel served one token's query heads that share a KV head, in groups
   of 1, 2 or 4: Inkling's 3 heads a KV head read every key three times, a verify of two tokens six. A work-group
   now serves several tokens' heads (up to 8 rows): at a 32,768-token prompt decode went from 33.0 to 34.0 tok/s, and
@@ -215,5 +220,3 @@ were scored with has not been run on this model).
 - The small kernels left: a router's sigmoid, bias, top-k and gathers (some eight launches a layer) and a block
   residual's norm, concat, scores, softmax and mix (five) are kernels apiece.
 - DSpark at 128k tokens: measure again with the verify's rows sharing their reads (it lost to plain decoding there).
-- A GGUF LoRA adapter (AtomicChat's rank-1 edit, meant for any GGUF of the model) is refused by name: the expert
-  banks it changes are quantized, so it cannot be merged into them without rounding again; it would run beside them.

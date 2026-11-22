@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -47,6 +48,9 @@ struct Layout {
     std::function<std::string(int64_t)> block_kind;  // what block i is, for errors ("linear attention")
 };
 
+// The pack tensor `tensor` (a whole name, or "blk.<i>.<rest>") is in `layout` when it is one pack tensor taken as
+// stored: no map, no reorder. Nothing otherwise.
+std::optional<std::string> whole_tensor(const Layout& layout, std::string_view tensor);
 // Whether a tensor of the file of shape `shape` is stored as `stored`. Leading dims of 1 do not count: llama.cpp's
 // converter writes a [1, n] tensor as it is, llama-quantize writes it as [n] (ggml_n_dims), llama.cpp reads both.
 bool same_shape(const Dims& shape, const Dims& stored);

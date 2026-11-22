@@ -12,6 +12,7 @@
 //   * Matmul weights use the Hugging Face layout [out, in]: matmul(x, w) = x @ w^T.
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -371,6 +372,12 @@ public:
 
     // Checks graph-level invariants (outputs exist, every slot appended exactly once, unique names). Throws.
     void validate() const;
+
+    // A copy built node by node, with the same slots: after each node is copied, `after(copy, node, value)` gives the
+    // value that later nodes and outputs read in place of the node's first output (`value`, or ops it adds to `copy`
+    // reading it). Nodes keep their labels; ops `after` adds take the node's.
+    using Rewrite = std::function<Value(Graph& copy, const Node& node, Value value)>;
+    Graph rewritten(const Rewrite& after) const;
     // Human-readable listing, one node per line.
     std::string dump() const;
 

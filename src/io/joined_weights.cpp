@@ -6,7 +6,12 @@ namespace xs {
 
 JoinedWeights::JoinedWeights(std::unique_ptr<WeightStore> first, std::unique_ptr<WeightStore> second,
                              std::string prefix)
-    : first_(std::move(first)), second_(std::move(second)), prefix_(std::move(prefix)) {
+    : JoinedWeights(*first, std::move(second), std::move(prefix)) {
+    owned_ = std::move(first);
+}
+
+JoinedWeights::JoinedWeights(const WeightStore& first, std::unique_ptr<WeightStore> second, std::string prefix)
+    : first_(&first), second_(std::move(second)), prefix_(std::move(prefix)) {
     XS_CHECK(!prefix_.empty(), "joined weights need a prefix for the second store");
     for (const std::string& name : first_->names()) {
         XS_CHECK(name.rfind(prefix_, 0) != 0, "weight '", name, "' already starts with the prefix '", prefix_, "'");

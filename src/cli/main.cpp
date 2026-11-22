@@ -106,6 +106,10 @@ void add_engine_options(Args& a) {
                "speculative decoding: an MTP head picks among this many tokens, chosen by a one-bit "
                "sketch of the output layer and re-scored exactly (0: it reads the whole layer)",
                "64")
+        .value("lora",
+               "a LoRA adapter in llama.cpp's GGUF form, added to the weights it changes as the programs read them "
+               "(the weights stay as stored)")
+        .value("lora-scale", "--lora: its changes times this (llama.cpp's scale: and alpha / rank)", "1")
         .value("readout",
                "serve a language model as a decision model, its answers read at the option letters: letters | "
                "openjev (OpenJev's published calibration)")
@@ -165,6 +169,9 @@ ServiceOptions service_options(const Args& a) {
     if (o.drafter.empty() && (spec == "dflash" || spec == "dspine")) fail("--spec ", spec, " needs --drafter <its checkpoint>");
     o.draft_shortlist = a.get_int("draft-shortlist");
     if (o.draft_shortlist < 0) fail("--draft-shortlist must be 0 or more, got ", o.draft_shortlist);
+    o.lora = a.get("lora");
+    o.lora_scale = static_cast<float>(a.get_double("lora-scale"));
+    if (o.lora.empty() && a.get("lora-scale") != "1") fail("--lora-scale scales --lora <adapter.gguf>");
     const std::string& opts = a.get("backend-opt");
     for (size_t pos = 0; pos < opts.size();) {
         const size_t comma = std::min(opts.find(',', pos), opts.size());

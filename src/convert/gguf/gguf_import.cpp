@@ -245,6 +245,8 @@ void Architecture::add_projector(ImportPlan&, const gguf::File&, const gguf::Fil
     fail(name(), ": a vision tower from a file of its own (--mmproj) is not supported for this architecture");
 }
 
+std::optional<std::string> Architecture::adapter_target(std::string_view) const { return std::nullopt; }
+
 ImportReport import_gguf(const ImportOptions& o) {
     if (fs::exists(o.output) && !fs::is_empty(o.output)) {
         fail("convert: '", o.output.string(), "' exists and is not empty");

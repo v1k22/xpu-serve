@@ -14,12 +14,15 @@ namespace xs {
 class JoinedWeights final : public WeightStore {
 public:
     JoinedWeights(std::unique_ptr<WeightStore> first, std::unique_ptr<WeightStore> second, std::string prefix);
+    // The same over a first store it does not own (which must outlive it).
+    JoinedWeights(const WeightStore& first, std::unique_ptr<WeightStore> second, std::string prefix);
 
     const TensorView* find(const std::string& name) const override;
     std::vector<std::string> names() const override;
 
 private:
-    std::unique_ptr<WeightStore> first_;
+    std::unique_ptr<WeightStore> owned_;
+    const WeightStore* first_;
     std::unique_ptr<WeightStore> second_;
     std::string prefix_;
 };

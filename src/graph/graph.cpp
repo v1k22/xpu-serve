@@ -124,6 +124,30 @@ Value Graph::add_node(OpKind kind, std::vector<Value> inputs, Attrs attrs, std::
     return Value{static_cast<int32_t>(nodes_.size() - 1), 0};
 }
 
+Graph Graph::rewritten(const Rewrite& after) const {
+    Graph out;
+    out.kv_slots_ = kv_slots_;
+    out.conv_slots_ = conv_slots_;
+    out.recurrent_slots_ = recurrent_slots_;
+    std::vector<std::vector<Value>> map(nodes_.size());  // each node's outputs in the copy
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        const Node& n = nodes_[i];
+        Node copy = n;
+        for (Value& in : copy.inputs) in = map[static_cast<size_t>(in.node)][static_cast<size_t>(in.index)];
+        out.nodes_.push_back(std::move(copy));
+        const auto at = static_cast<int32_t>(out.nodes_.size() - 1);
+        for (size_t k = 0; k < n.outputs.size(); ++k) map[i].push_back(Value{at, static_cast<int32_t>(k)});
+        if (n.outputs.empty()) continue;
+        out.scope_ = n.label;
+        map[i][0] = after(out, n, map[i][0]);
+        out.scope_.clear();
+    }
+    for (const GraphOutput& o : outputs_) {
+        out.outputs_.push_back({o.name, map[static_cast<size_t>(o.value.node)][static_cast<size_t>(o.value.index)]});
+    }
+    return out;
+}
+
 Graph::Scope::Scope(Graph& g, std::string_view name) : g_(g), prev_size_(g.scope_.size()) {
     if (!g_.scope_.empty()) g_.scope_ += '.';
     g_.scope_ += name;
