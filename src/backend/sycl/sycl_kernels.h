@@ -219,6 +219,8 @@ struct RowsLayout {
     int sub_groups = 16;
 };
 RowsLayout attention_rows_layout(const AttentionShape& s);
+// The fewest keys worth a split of their own (attention_rows' split shares a query's keys between work-groups).
+inline constexpr int64_t kAttentionMinSplitKeys = 512;
 // The work-groups of one split: the tokens' groups times the query heads' chunks.
 int64_t attention_rows_units(const AttentionShape& s, const RowsLayout& layout);
 // One work-group per (RowsLayout rows, split), an online softmax per row over its share of the keys its rows see.

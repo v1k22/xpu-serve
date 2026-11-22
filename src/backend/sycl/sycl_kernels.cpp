@@ -1897,26 +1897,40 @@ void gated_delta(sycl::queue& q, const float* qp, const float* kp, const float* 
 RowsLayout attention_rows_layout(const AttentionShape& s) {
     const int64_t per_kv_head = s.q_heads / s.kv_heads;
     const int dpl = static_cast<int>(s.head_dim / kSubGroup);
+    const int slot_bytes = static_cast<int>(s.head_dim + 2) * static_cast<int>(sizeof(float));
+    const auto finish = [&](RowsLayout l) {
+        l.sub_groups = 16 * l.rows * slot_bytes <= (64 << 10) ? 16 : 8;
+        return l;
+    };
+    // One token's heads that share a KV head, two or four of them a work-group.
+    RowsLayout one_token;
+    for (const int heads : {4, 2}) {
+        if (per_kv_head % heads == 0 && heads * dpl <= kRowsSharedValues) {
+            one_token.rows = one_token.heads = heads;
+            break;
+        }
+    }
     // The fewest reads of each KV head's keys: ceil(T / tokens a work-group) * (heads sharing it / heads a work-group),
     // then the fewest rows.
-    RowsLayout layout;
-    int64_t reads = s.tokens * per_kv_head;
+    RowsLayout fewest = one_token;
+    int64_t reads = s.tokens * (per_kv_head / one_token.heads);
     for (const int rows : kRowsCounts) {
         if (rows * dpl > kRowsSharedValues) continue;
         for (int heads = rows; heads >= 1; --heads) {
             const int64_t tokens = rows / heads;
             if (rows % heads != 0 || per_kv_head % heads != 0 || tokens > s.tokens) continue;
             const int64_t r = (s.tokens + tokens - 1) / tokens * (per_kv_head / heads);
-            if (r < reads || (r == reads && rows < layout.rows)) {
+            if (r < reads || (r == reads && rows < fewest.rows)) {
                 reads = r;
-                layout.rows = rows;
-                layout.heads = heads;
+                fewest.rows = rows;
+                fewest.heads = heads;
             }
         }
     }
-    const int slot_bytes = static_cast<int>(s.head_dim + 2) * static_cast<int>(sizeof(float));
-    layout.sub_groups = 16 * layout.rows * slot_bytes <= (64 << 10) ? 16 : 8;
-    return layout;
+    // Rows that read a key once leave fewer work-groups; it pays where the keys split between enough of them to make up
+    // for it (a short cache gives one split: its reads come from the cache, and the work-groups set the time).
+    const int64_t splits = attention_visible_keys(s) / kAttentionMinSplitKeys;
+    return finish(splits * one_token.rows >= fewest.rows ? fewest : one_token);
 }
 
 int64_t attention_rows_units(const AttentionShape& s, const RowsLayout& layout) {

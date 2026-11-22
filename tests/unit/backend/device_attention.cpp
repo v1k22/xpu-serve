@@ -43,6 +43,7 @@ struct AttentionCase {
     float scale = 0.0f;  // 0 = 1/sqrt(head_dim)
     std::string impl = "auto";
     std::vector<int64_t> steps{5, 1, 3};
+    size_t unchecked = 0;  // the first steps only fill the cache: their outputs are not compared
     quant::KvFormats kv;  // --kv-dtype
     std::string kv_chunk;  // the backend's kv_chunk option ("": its default)
     bool causal = true;
@@ -86,7 +87,7 @@ HostTensor stored_values(const HostTensor& x, KvFormat format) {
 bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& reference_spec, dev::Tolerance tol,
                        uint32_t seed, bool rounded_reference = true) {
     test::TensorRng rng(seed);
-    SessionOptions options = dev::options();
+    SessionOptions options = dev::options(8192);
     options.extra["attention"] = c.impl;
     if (!c.kv_chunk.empty()) options.extra["kv_chunk"] = c.kv_chunk;
     options.kv = c.kv;
@@ -94,7 +95,8 @@ bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& r
     const auto session = dev::backend().compile(attention_graph(c), test::MemoryWeights{}, options);
     Tensor64 k_all, v_all;
     bool ok = true;
-    for (const int64_t t : c.steps) {
+    for (size_t step = 0; step < c.steps.size(); ++step) {
+        const int64_t t = c.steps[step];
         const HostTensor q = rng.uniform(DType::F32, {t, c.heads, c.head_dim});
         const HostTensor k = rng.uniform(DType::F32, {t, c.kv_heads, c.head_dim});
         const HostTensor v = rng.uniform(DType::F32, {t, c.kv_heads, c.head_dim});
@@ -102,6 +104,7 @@ bool attention_matches(const AttentionCase& c, const test::ref::AttentionSpec& r
         append_rows(v_all, stored_values(v, stored.v));
         TensorMap out;
         session->run({{"q", q}, {"k", k}, {"v", v}}, out);
+        if (step < c.unchecked) continue;
         const Tensor64 expected = test::ref::attention(to_f64(q), k_all, v_all, reference_spec);
         ok = dev::close(str_cat("attention ", describe(c)), out.at("out"), expected, tol) && ok;
     }
@@ -147,6 +150,11 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
                     c.steps = {13, 1, 2, 3, 5, 8, 7};
                     CAPTURE(describe(c));
                     CHECK(attention_matches(c, static_cast<uint32_t>(head_dim + heads + window)));
+                    // Over a cache long enough for the splits to make up for the work-groups the shared rows leave:
+                    // the rows of several tokens' heads read each key once.
+                    c.steps = {4600, 1, 2, 3, 5, 8, 7};
+                    c.unchecked = 1;
+                    CHECK(attention_matches(c, static_cast<uint32_t>(7 + head_dim + heads + window)));
                 }
             }
         }

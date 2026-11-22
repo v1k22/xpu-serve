@@ -19,7 +19,7 @@ using oneapi::mkl::transpose;
 constexpr int64_t kScoreBudget = int64_t{512} << 20;  // bytes of scores + probabilities per attention chunk
 constexpr int64_t kCacheChunkQueries = 64;            // fewest queries worth a chunk that fits the cache
 constexpr int64_t kTargetSubGroups = 2560;            // decode attention: sub-groups to keep the GPU busy
-constexpr int64_t kMinSplitKeys = 512;                // fewest keys worth a split of their own
+constexpr int64_t kMinSplitKeys = kAttentionMinSplitKeys;
 
 size_t align_up(size_t n) {
     return (n + 255) & ~size_t{255};
