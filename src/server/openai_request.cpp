@@ -258,6 +258,14 @@ ChatRequest parse_chat_request(const json& body, const SamplingParams& defaults)
     check_response_format(body);
     const json* kwargs = object_field(body, "chat_template_kwargs");
     r.template_kwargs = kwargs != nullptr ? *kwargs : json::object();
+    // OpenAI's reasoning_effort reaches the template under its own name (Inkling 2's reads it), unless the kwargs
+    // already set it.
+    if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
+        if (!body.at("reasoning_effort").is_string()) reject("reasoning_effort", "reasoning_effort must be a string");
+        if (!r.template_kwargs.contains("reasoning_effort")) {
+            r.template_kwargs["reasoning_effort"] = body.at("reasoning_effort");
+        }
+    }
     r.options = parse_generation_options(body, defaults);
     return r;
 }

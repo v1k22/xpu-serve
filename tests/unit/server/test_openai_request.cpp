@@ -113,6 +113,13 @@ TEST_SUITE("server.request") {
         CHECK(rejected_param(chat_body({{"tool_choice", "required"}})) == "tool_choice");
         CHECK(rejected_param(chat_body({{"tool_choice", "sometimes"}})) == "tool_choice");
         CHECK(rejected_param(chat_body({{"chat_template_kwargs", "x"}})) == "chat_template_kwargs");
+        // reasoning_effort is a template variable of its own name; the kwargs' value wins.
+        CHECK(parse_chat_request(chat_body({{"reasoning_effort", "low"}}), {}).template_kwargs.at("reasoning_effort") ==
+              "low");
+        const auto both = parse_chat_request(
+            chat_body({{"reasoning_effort", "low"}, {"chat_template_kwargs", {{"reasoning_effort", "none"}}}}), {});
+        CHECK(both.template_kwargs.at("reasoning_effort") == "none");
+        CHECK(rejected_param(chat_body({{"reasoning_effort", 3}})) == "reasoning_effort");
     }
 
     TEST_CASE("structured response formats are refused as not supported yet") {
