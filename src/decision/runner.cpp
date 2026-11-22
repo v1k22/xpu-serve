@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "chat/chat_template.h"
+#include "chat/output_parser.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
 #include "util/log.h"
@@ -12,9 +13,11 @@ namespace xs {
 
 class DecisionRunner::Tools final : public PromptTools {
 public:
-    // The tokenizer in `dir`, and its chat template when `chat_template`.
-    Tools(const std::filesystem::path& dir, bool chat_template)
-        : tokenizer_(tok::Tokenizer::load(dir)), template_(chat_template ? chat::ChatTemplate::load(dir) : nullptr) {
+    // The tokenizer in `dir`, and its chat template when `chat_template`, asking for an answer as `dialect` does.
+    Tools(const std::filesystem::path& dir, bool chat_template, std::string_view dialect)
+        : tokenizer_(tok::Tokenizer::load(dir)),
+          template_(chat_template ? chat::ChatTemplate::load(dir) : nullptr),
+          answer_(chat::direct_answer(dialect)) {
         for (int32_t id = 0; id < tokenizer_->vocab_size(); ++id) {
             if (tokenizer_->is_special(id)) special_.push_back(tokenizer_->token_text(id));
         }
@@ -25,12 +28,13 @@ public:
     std::vector<std::string> special_tokens() const override { return special_; }
     std::string chat(const Json& messages) const override {
         XS_CHECK(template_ != nullptr, "this decision model writes its prompts without a chat template");
-        return template_->render(messages, Json(nullptr), true, Json{{"enable_thinking", false}});
+        return template_->render(messages, Json(nullptr), true, Json(answer_.kwargs)) + answer_.opening;
     }
 
 private:
     std::unique_ptr<tok::Tokenizer> tokenizer_;
     std::unique_ptr<chat::ChatTemplate> template_;
+    chat::DirectAnswer answer_;
     std::vector<std::string> special_;
 };
 
@@ -46,7 +50,7 @@ std::unique_ptr<DecisionRunner> DecisionRunner::create(const std::filesystem::pa
     r->model_ = model ? std::move(model) : load_decision_model(dir, options.load);
     r->spec_ = r->model_->spec();
     r->tools_ = std::make_unique<Tools>(r->spec_.tokenizer_dir.empty() ? dir : dir / r->spec_.tokenizer_dir,
-                                        r->spec_.chat_template);
+                                        r->spec_.chat_template, r->spec_.dialect);
     if (!options.model_id.empty()) r->spec_.id = options.model_id;
     const std::vector<const graph::Graph*> programs = r->model_->programs();
     XS_CHECK(!programs.empty(), "decision model ", r->spec_.id, " has no program");

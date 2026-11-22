@@ -348,6 +348,7 @@ TEST_SUITE("decision models") {
                                                         xs::SessionOptions{.precision = xs::DType::F32});
         };
         const auto model = load(lr::Settings{});
+        CHECK(model->spec().dialect == xs::load_model(dir.path)->info().dialect);  // where its answers start
         const auto session = compile(*model);
         const DecisionLimits whole{4096, 4096};
         const xs::test::ByteTools tools;

@@ -109,6 +109,7 @@ public:
         const ModelInfo& info = model_->info();
         spec_.id = info.id;
         spec_.arch = "letter_readout";
+        spec_.dialect = info.dialect;
         spec_.max_tokens = info.max_position;
         const auto& outputs = model_->graph().outputs();
         const auto gives = [&](const char* name) {

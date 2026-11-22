@@ -5,6 +5,8 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace xs::chat {
 
 struct ToolCall {
@@ -36,6 +38,16 @@ public:
 // prompt_tail: the end of the rendered prompt (see prompt_tail()); the parser starts in the state it leaves open, e.g.
 // in reasoning when the prompt ends inside an opened thought channel (Gemma 4) or an open <think> (Qwen 3.5).
 std::unique_ptr<OutputParser> make_output_parser(std::string_view dialect, std::string_view prompt_tail = {});
+
+// How a prompt asks a model of `dialect` for its answer at once, without thinking: the chat template's kwargs, and
+// the text the model writes after the generation prompt before its answer's text, which such a prompt ends with
+// (Inkling 2's template stops before the model's message header: <|message_model|><|content_text|>). Throws as
+// make_output_parser for an unknown dialect.
+struct DirectAnswer {
+    nlohmann::json kwargs;
+    std::string opening;
+};
+DirectAnswer direct_answer(std::string_view dialect);
 
 // The end of a rendered prompt that make_output_parser needs; keeping only this avoids copying whole prompts.
 inline std::string_view prompt_tail(std::string_view rendered_prompt) {

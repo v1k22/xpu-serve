@@ -32,4 +32,12 @@ std::unique_ptr<OutputParser> make_output_parser(std::string_view dialect, std::
     fail("unknown output dialect '", dialect, "' (known: gemma4, inkling2, plain, qwen3, qwen3_5)");
 }
 
+DirectAnswer direct_answer(std::string_view dialect) {
+    make_output_parser(dialect);  // a known dialect
+    if (dialect == "inkling2") {
+        return {{{"enable_thinking", false}, {"reasoning_effort", "none"}}, "<|message_model|><|content_text|>"};
+    }
+    return {{{"enable_thinking", false}}, ""};
+}
+
 }  // namespace xs::chat

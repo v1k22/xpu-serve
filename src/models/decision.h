@@ -72,8 +72,9 @@ public:
     virtual std::optional<int32_t> token_id(std::string_view piece) const = 0;
     // The text of every special token (the tokenizer's added tokens marked special).
     virtual std::vector<std::string> special_tokens() const = 0;
-    // The checkpoint's chat template over OpenAI-style `messages`, with the generation prompt and thinking off. Only a
-    // model whose spec asks for the template (DecisionSpec::chat_template) may call it.
+    // The checkpoint's chat template over OpenAI-style `messages`, with the generation prompt and thinking off, up to
+    // where the model's answer text starts (DecisionSpec::dialect). Only a model whose spec asks for the template
+    // (DecisionSpec::chat_template) may call it.
     virtual std::string chat(const Json& messages) const = 0;
 };
 
@@ -109,6 +110,8 @@ struct DecisionSpec {
     // empty: the checkpoint's own directory.
     std::filesystem::path tokenizer_dir;
     bool chat_template = true;  // the model writes its prompts through the checkpoint's chat template
+    // The output dialect of a language model read as a decision model (chat/output_parser.h): where its answer starts.
+    std::string dialect = "plain";
 };
 
 // What the session a run's steps go to can take, and what it holds as the run starts.

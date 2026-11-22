@@ -129,3 +129,19 @@ TEST_CASE("inkling2 dialect: a prompt that ends inside a message starts the pars
                 "<|message_model|><|content_thinking|>old<|end_message|>")
               .content == "Hi.");
 }
+
+TEST_CASE("inkling2: an answer at once opens the model's text message after the prompt, with no thinking effort") {
+    const xs::chat::DirectAnswer a = xs::chat::direct_answer("inkling2");
+    CHECK(a.opening == "<|message_model|><|content_text|>");
+    CHECK(a.kwargs.at("reasoning_effort") == "none");
+    // What the parser reads after that opening is the answer's text.
+    CHECK(parse(a.opening + "B<|end_message|>", 0, "").content == "B");
+    // Other dialects' templates end their generation prompts where the answer starts.
+    for (const char* d : {"plain", "qwen3", "qwen3_5", "gemma4"}) {
+        CAPTURE(d);
+        const xs::chat::DirectAnswer other = xs::chat::direct_answer(d);
+        CHECK(other.opening.empty());
+        CHECK(other.kwargs == json{{"enable_thinking", false}});
+    }
+    CHECK_THROWS(xs::chat::direct_answer("nope"));
+}
