@@ -85,6 +85,9 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
         log::info("speculative decoding: ", name, ", ", engine_options.spec_k, " drafts per round, drafter graph of ",
                   spec->draft_graph().nodes().size(), " nodes");
     }
+    // The cache of the whole context and the largest step reserved at load: --ctx is refused now, not halfway into
+    // a long prompt.
+    session_options.max_step_tokens = std::max<int64_t>(engine_options.prefill_chunk, engine_options.spec_k + 1);
     auto backend = make_backend(options.backend);
     Timer compile_timer;
     auto session = backend->compile(programs, model->weights(), session_options);
@@ -262,7 +265,13 @@ void EngineService::worker_loop() {
             job = queue_.front();
             queue_.pop_front();
         }
-        job->done.set_value(engine_->generate(job->request, job->on_token));
+        // Anything a request throws past the engine (which turns its errors into a result) reaches the caller, rather
+        // than ending the process from this thread.
+        try {
+            job->done.set_value(engine_->generate(job->request, job->on_token));
+        } catch (...) {
+            job->done.set_exception(std::current_exception());
+        }
     }
 }
 

@@ -137,13 +137,14 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       skipped in decode; prefill without the f16 copy of one layer's keys and values; a verify step's queries
       sharing one decode of each key (with MTP at 64k tokens on Qwen3.8-27B the TurboQuant formats decode at 0.76 to
       0.84 of f16's speed)
-- [ ] Refuse a `--ctx` whose KV cache and largest step cannot fit the device, at load and by name: Qwen3.8-27B Q4_0
-      on an Arc Pro B60 runs 64k tokens with an f16 cache and 128k with int8, but a 96k f16 prompt ran out of device
-      memory in the middle of its prefill and the uncaught error ended the process
+- [x] Refuse a `--ctx` whose KV cache and largest step cannot fit the device, at load and by name: the KV cache of
+      the whole context and the arena of the largest step (a prefill chunk, a verify) are allocated when the session
+      compiles (`SessionOptions::max_step_tokens`); a refusal gives the bill and the most tokens that fit
 - [ ] Chunked prefill that yields to decode at chunk boundaries
 - [ ] Continuous batching (after batch 1 is solid)
 - [ ] Prefix cache: hash-chained full blocks, refcounts, LRU; validity rule for sliding layers (DESIGN.md 9.4)
-- [ ] Memory bill at load; refuse by name when it does not fit
+- [x] Memory bill at load; refuse by name when it does not fit (the weights, the KV cache, the largest step; scratch
+      that grows with a kernel's needs is not billed)
 - [x] Sampling: temperature, top-k, top-p, min-p, penalties, seed; device-side argmax / top-k
 - [x] OpenAI API: `/v1/chat/completions` (stream + non-stream, tools, reasoning), `/v1/completions`, `/v1/models`,
       `/health`, `/metrics`

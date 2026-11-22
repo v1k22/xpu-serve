@@ -269,6 +269,10 @@ bits a value); `<keys>:<values>` sets the two apart, e.g. `i8:turbo4`. All of th
 [docs/decisions/0010](docs/decisions/0010-int8-kv-cache.md) (int8) and
 [0020](docs/decisions/0020-turboquant-kv-cache.md) (TurboQuant).
 
+`--ctx` is reserved when the model loads: the KV cache of the whole context and the memory of the largest step (a
+prefill chunk, a verify). A context that does not fit the GPU is refused there, with what each part takes and the
+most tokens that fit, rather than running out of memory halfway into a long prompt.
+
 ## APIs
 
 `xpu-serve serve <dir>` serves whatever the directory holds: a language model behind the OpenAI API, a speech

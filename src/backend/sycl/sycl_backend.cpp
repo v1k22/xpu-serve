@@ -63,6 +63,13 @@ bool env_flag(const char* name) {
 
 // Live USM device allocations of this process (all sessions), for out-of-memory reports.
 std::atomic<size_t> g_device_bytes{0};
+
+// Bytes as GiB with one decimal, for messages.
+std::string gib(int64_t bytes) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.1f", static_cast<double>(bytes) / static_cast<double>(int64_t{1} << 30));
+    return buf;
+}
 std::atomic<size_t> g_device_buffers{0};
 
 // One USM device allocation. The owner makes sure the queue no longer uses it before it goes away.
@@ -557,6 +564,44 @@ public:
         return live_.emplace(std::move(key), std::move(live)).first->second;
     }
 
+    // What a full context and a step of up to `step` tokens need of the device for this program: per KV slot it
+    // writes, its bytes at its largest (the whole context; a slot that keeps its window alone, the window and a
+    // step) and whether that grows with the context; and the arena of such a step over a full cache.
+    struct Need {
+        std::map<size_t, std::pair<int64_t, bool>> slots;  // shared slot -> (bytes, grows with the context)
+        size_t arena = 0;
+    };
+    Need need(int64_t step) {
+        Need n;
+        if (!reads_kv_) {
+            for (const size_t slot : kv_slot_) {
+                const SharedKv& kv = shared_.kv[slot];
+                const KvTokenBytes b = kv_token_bytes(kv.buf);
+                const int64_t per_token = b.k + b.v + b.k_scale + b.v_scale;
+                n.slots[slot] = {kv_capacity(kv, step) * per_token, !keeps_window(kv)};
+            }
+        }
+        n.arena = plan_for(Step{std::min(step, max_context_), max_context_}).arena_bytes;
+        return n;
+    }
+    // The KV slots this program writes at the capacity need() bills (no slot holds anything yet).
+    void reserve_kv(int64_t step) {
+        if (reads_kv_) return;
+        for (const size_t slot : kv_slot_) {
+            SharedKv& kv = shared_.kv[slot];
+            KvBuffers& b = kv.buf;
+            const int64_t cap = kv_capacity(kv, step);
+            if (b.capacity >= cap) continue;
+            const KvTokenBytes bytes = kv_token_bytes(b);
+            b.k = DeviceBuffer(q_, static_cast<size_t>(cap * bytes.k));
+            b.v = DeviceBuffer(q_, static_cast<size_t>(cap * bytes.v));
+            b.k_scale = DeviceBuffer(q_, static_cast<size_t>(cap * bytes.k_scale));
+            b.v_scale = DeviceBuffer(q_, static_cast<size_t>(cap * bytes.v_scale));
+            b.capacity = cap;
+            kv.base = 0;
+        }
+    }
+
     // Tokens in the slots this program writes (they agree after every run and truncate).
     int64_t cached() const {
         if (!kv_slot_.empty() && !reads_kv_) return shared_.kv[kv_slot_[0]].len;
@@ -693,6 +738,10 @@ private:
     // reads the keys before that window.
     bool keeps_window(const SharedKv& s) const {
         return s.spec.sliding_window > 0 && s.attention_only && !shared_.fixed.empty();
+    }
+    // A slot's capacity at its largest: the context, or its window and a step of `step` tokens.
+    int64_t kv_capacity(const SharedKv& s, int64_t step) const {
+        return keeps_window(s) ? std::min(max_context_, s.spec.sliding_window + step) : max_context_;
     }
 
     // Bytes a token takes in each buffer of a slot.
@@ -2752,6 +2801,45 @@ public:
     SyclShared& shared() { return *shared_; }
     void add(std::unique_ptr<SyclProgram> program) { programs_.push_back(std::move(program)); }
 
+    // SessionOptions::max_step_tokens: the KV cache of the whole context and the arena of the largest step, allocated
+    // now, so that a long prompt cannot run out of device memory halfway; refused by name when they do not fit.
+    void reserve(int64_t step, const std::string& device) {
+        std::map<size_t, std::pair<int64_t, bool>> slots;
+        size_t arena = 0;
+        for (const auto& p : programs_) {
+            SyclProgram::Need n = p->need(step);
+            slots.merge(n.slots);
+            arena = std::max(arena, n.arena);
+        }
+        int64_t growing = 0, fixed = 0;
+        for (const auto& [slot, need] : slots) (need.second ? growing : fixed) += need.first;
+        const int64_t context = shared_->max_context;
+        const sycl::device dev = shared_->q.get_device();
+        const auto total = static_cast<int64_t>(dev.get_info<sycl::info::device::global_mem_size>());
+        const int64_t held = static_cast<int64_t>(g_device_bytes.load());  // weights, and what other sessions hold
+        const int64_t needed = held + growing + fixed + static_cast<int64_t>(arena);
+        const auto refuse = [&](const std::string& why) {
+            const int64_t per_token = growing / context;
+            const int64_t room = total - held - fixed - static_cast<int64_t>(arena);
+            const int64_t fits = per_token > 0 && room > 0 ? room / per_token / 1024 * 1024 : 0;
+            fail("sycl: a context of ", context, " tokens (--ctx) does not fit ", device, " (", gib(total),
+                 " GiB): ", gib(held), " GiB in use (the weights), the KV cache ", gib(growing + fixed), " GiB (",
+                 per_token, " bytes a token), a step of ", std::min(step, context), " tokens over it ",
+                 gib(static_cast<int64_t>(arena)), " GiB", why, "; at most ", fits,
+                 " tokens fit (or a KV format of fewer bytes a token, --kv-dtype i8 or turbo4)");
+        };
+        if (needed > total) refuse("");
+        try {
+            for (const auto& p : programs_) p->reserve_kv(step);
+            shared_->ensure_arena(arena);
+        } catch (const Error& e) {
+            refuse(str_cat(" (", e.what(), ")"));
+        }
+        log::info("sycl: reserved the KV cache of ", context, " tokens (", gib(growing + fixed), " GiB) and a step's ",
+                  gib(static_cast<int64_t>(arena)), " GiB; ", gib(total - static_cast<int64_t>(g_device_bytes.load())),
+                  " GiB of ", device, " left");
+    }
+
     void run(size_t program, const TensorMap& inputs, TensorMap& outputs, std::span<const std::string> only) override {
         at(program).run(inputs, outputs, only);
     }
@@ -2871,6 +2959,7 @@ public:
         for (const graph::Graph* graph : programs) {
             session->add(std::make_unique<SyclProgram>(*graph, weights, options, session->shared(), attention, quant));
         }
+        if (options.max_step_tokens > 0) session->reserve(options.max_step_tokens, str_cat("GPU.", index));
         return session;
     }
 
