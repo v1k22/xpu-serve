@@ -380,8 +380,8 @@ public:
         plan_half_values();
         upload_leaves(weights);
         finish_mm_parts();
-        size_t fresh = 0, quantized = 0;  // slots this program is the first to write
-        int64_t token_bytes = 0;
+        size_t fresh = 0, quantized = 0, windowed = 0;  // slots this program is the first to write
+        int64_t token_bytes = 0;  // what the cache grows by a token: a slot that keeps its window alone does not
         for (size_t i = 0; i < graph_.nodes().size(); ++i) {
             const Node& n = graph_.nodes()[i];
             if (n.kind != OpKind::KvCache) continue;
@@ -393,11 +393,16 @@ public:
             slot.typed = true;
             ++fresh;
             quantized += slot.buf.dtype == kKvCodes ? 1 : 0;
+            if (keeps_window(slot)) {
+                ++windowed;
+                continue;
+            }
             const KvTokenBytes bytes = kv_token_bytes(slot.buf);
             token_bytes += bytes.k + bytes.k_scale + bytes.v + bytes.v_scale;
         }
         if (fresh > 0) {
-            log::info("sycl: KV cache of ", token_bytes, " bytes a token in ", fresh, " slots",
+            log::info("sycl: KV cache of ", token_bytes, " bytes a token in ", fresh - windowed, " slots",
+                      windowed > 0 ? str_cat(" and ", windowed, " that keep their sliding window alone") : "",
                       quantized > 0 ? str_cat(", ", quantized, " of them in ", quant::kv_formats_name(kv_format_)) : "");
         }
     }
