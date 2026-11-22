@@ -53,8 +53,9 @@ const char* kUsage =
     "  xpu-serve bench <model-dir> [options]   prefill / decode speed, a decision model's latency, or an embedding\n"
     "                                          model's latency and throughput\n"
     "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--method rtn|awq]   quantized pack\n"
-    "  xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>]   a GGUF file as a pack, its tensors as the file\n"
-    "                                          stores them (--mtp: its MTP head from a file of its own)\n"
+    "  xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>] [--mmproj <mmproj.gguf>]\n"
+    "                                          a GGUF file as a pack, its tensors as the file stores them (--mtp: its\n"
+    "                                          MTP head, --mmproj: its vision tower, each from a file of its own)\n"
     "  xpu-serve info                          backends and devices\n"
     "\n"
     "Instead of <model-dir>, serve, run, bench and convert take -hf <org/name> (a Hugging Face repository, downloaded\n"
@@ -277,14 +278,15 @@ int convert_gguf(const Args& a, const hub::SourceFiles* from_hub) {
     std::vector<std::string> pos = a.positionals();
     if (from_hub != nullptr) pos.insert(pos.begin(), from_hub->gguf.string());
     if (pos.empty() || pos.size() > 2 || (pos.size() == 2) == a.has("out")) {
-        fail("usage: xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>], or convert --hf <org/name:QUANT> "
-             "<out-dir>");
+        fail("usage: xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>] [--mmproj <mmproj.gguf>], or "
+             "convert --hf <org/name:QUANT> <out-dir>");
     }
     gguf_import::ImportOptions o;
     o.source = pos[0];
     o.output = pos.size() == 2 ? pos[1] : a.get("out");
     o.mtp = a.has("mtp") || from_hub == nullptr ? std::filesystem::path(a.get("mtp")) : from_hub->mtp;
-    for (const std::filesystem::path& file : {o.source, o.mtp}) {
+    o.mmproj = a.has("mmproj") || from_hub == nullptr ? std::filesystem::path(a.get("mmproj")) : from_hub->mmproj;
+    for (const std::filesystem::path& file : {o.source, o.mtp, o.mmproj}) {
         if (file.empty()) continue;
         if (!std::filesystem::is_regular_file(file)) fail("convert: '", file.string(), "' is not a file");
         if (!gguf::has_gguf_magic(file)) fail("convert: '", file.string(), "' is not a GGUF file");
@@ -292,7 +294,8 @@ int convert_gguf(const Args& a, const hub::SourceFiles* from_hub) {
     o.converter = std::string("xpu-serve ") + XS_VERSION;
     const gguf_import::ImportReport r = gguf_import::import_gguf(o);
     const std::string named = r.model_name.empty() ? r.architecture : r.architecture + " (" + r.model_name + ")";
-    const std::string with = o.mtp.empty() ? "" : " with the MTP head of " + o.mtp.filename().string();
+    const std::string with = (o.mtp.empty() ? "" : " with the MTP head of " + o.mtp.filename().string()) +
+                             (o.mmproj.empty() ? "" : " with the vision tower of " + o.mmproj.filename().string());
     std::printf("imported %s%s: %s, %lld tensors\n", o.source.filename().string().c_str(), with.c_str(),
                 named.c_str(), static_cast<long long>(r.tensors));
     for (const gguf_import::FormatShare& f : r.formats) {
@@ -322,6 +325,7 @@ int cmd_convert(const std::vector<std::string>& argv) {
         .value("mtp",
                "a GGUF file: the model's MTP head from this file of its own (llama.cpp's draft model of it), for a "
                "GGUF file without one")
+        .value("mmproj", "a GGUF file: the model's vision tower from this file of its own (llama.cpp's mmproj)")
         .value("hf",
                "instead of <model-dir>: a Hugging Face repository, downloaded into the Hugging Face cache (org/name), "
                "or one GGUF file of it (org/name:QUANT; its MTP head too, when the repository publishes it apart)")
@@ -350,6 +354,7 @@ int cmd_convert(const std::vector<std::string>& argv) {
         o.source = model_arg(a, "convert").dir;
     }
     if (a.has("mtp")) fail("convert: --mtp applies to a GGUF file (the MTP head of a model file without one)");
+    if (a.has("mmproj")) fail("convert: --mmproj applies to a GGUF file (its vision tower from a file of its own)");
     if (std::filesystem::is_regular_file(o.source)) {
         fail("convert: '", o.source.string(), "' is a file; the source is a model directory or a .gguf file");
     }

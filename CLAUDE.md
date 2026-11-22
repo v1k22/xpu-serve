@@ -175,7 +175,7 @@ area).
 | `src/models/qwen3_omni/` | Qwen3-Omni's thinker (`qwen3_omni_moe`): `qwen3_omni_config.cpp` (the thinker_config's text, audio and vision configs), `qwen3_omni_model.cpp` (the audio encoder at its larger size, the vision tower, and the Qwen3 MoE decoder reading positions on three axes, the encoders' rows at `<|audio_pad|>` / `<|image_pad|>`, an image's deepstack rows added after the decoder's first layers; experts joined from one tensor each; text, audio and images in, text out in the `qwen3` dialect; the talker not read) |
 | `src/models/inkling2/` | Inkling 2 Mini (`inkling2_loop`): `inkling2_config.cpp` (the released config.json's own keys; refusals by name, its quantization_config among them), `inkling2_model.cpp` (the decoder: block residuals mixed by learned queries, attention with a relative bias and a sink over clipped queries and keys and normed values, short convolutions on keys, values and each sublayer's output (taps per token in the full-attention layers), softcapped experts behind a sigmoid router; the looped layers once per pass with KV and convolution slots of their own (`layers.<i>.pass<n>`) and messages from the pass before through gates; the released experts paired from NVFP4 and MXFP8, a GGUF import's banks with their rows in halves and a factor per expert; with the checkpoint's drafter (`mtp.safetensors`, `mtp_config`) the prefill and verify programs, which append the drafter's context from the stream entering the layer visits it names, and the block program; an image's rows in place of its tokens' normed embeddings), `inkling2_vision.cpp` (the vision tower of a checkpoint or a pack of one: Inkling2ImageProcessor's padding to whole image tokens of patch x merge pixels, no resizing; patch embeddings with a position table interpolated over half-pixel centres, a class token, pre-norm layers with 2-D rotary attention and layer scale, a two-layer projection of each token's patches; its program runs over the image's tokens and one more block that holds the class token beside padding a key bias hides) |
 | `src/models/drafters/dspark.cpp` | Inkling 2's block drafter (DSpark): its settings from the target's `mtp_config` (refusals by name), the context each layer reads (its row of `fuse_weight` through a softmax mixes the target's states; own key and value projections), the head's context row a target program outputs (`draft_context`), and the block program: the pending token's normed embedding and mask rows, layers over the context and the block (local layers: the window before the block's start), a gated recurrent step per draft whose latent corrects the row the target's output layer reads; drafts picked over the whole layer or a shortlist |
-| `src/convert/gguf/inkling2.cpp` | GGUF import of Inkling 2 (`inkling2`, Unsloth's llama.cpp layout): per-visit metadata arrays read back into the loop (refused unless the passes agree), names mapped to the checkpoint's, the transposes and flips the converter applied to float tensors undone (`FloatReorder`), the expert banks kept in the file's formats (NVFP4, MXFP4, K- and i-quants) with gate rows then up rows (`gate_up_rows: halves`) and each bank's factor per expert kept beside it; the drafter's file (`dflash` with `dflash.dspark.markov_rank`, `--mtp`) checked against the model's and mapped to `mtp.*` with config.json's `mtp_config` |
+| `src/convert/gguf/inkling2.cpp` | GGUF import of Inkling 2 (`inkling2`, Unsloth's llama.cpp layout): per-visit metadata arrays read back into the loop (refused unless the passes agree), names mapped to the checkpoint's, the transposes and flips the converter applied to float tensors undone (`FloatReorder`), the expert banks kept in the file's formats (NVFP4, MXFP4, K- and i-quants) with gate rows then up rows (`gate_up_rows: halves`) and each bank's factor per expert kept beside it; the drafter's file (`dflash` with `dflash.dspark.markov_rank`, `--mtp`) checked against the model's and mapped to `mtp.*` with config.json's `mtp_config`; the vision tower's file (`clip` with projector type `inkling2v`, `--mmproj`) mapped to `model.visual.*` with config.json's `vision_config`, its patch embedding put back from a convolution's layout |
 | `src/server/transcription_handlers.cpp` | `POST /v1/audio/transcriptions`: the multipart form (each refusal names its field; timestamps refused), json / text / streamed events; `/v1/audio/translations` refused |
 | `src/server/realtime_session.cpp` | `GET /v1/realtime`'s session: `session.update` (every refusal an `error` event naming its field), the audio buffer at 24 kHz, the server VAD's turns, commits, and the worker that transcribes committed turns in order (deltas, completed / failed) |
 | `src/backend/sycl/sycl_conv.cpp` | Conv2d: the input unfolded into rows of patches (any stride, padding, dilation; group by group), one GEMM, the result laid out NCHW with the bias |
@@ -599,8 +599,9 @@ Hugging Face safetensors (8.1 first, if it does not).
 
 ## 10. Known limitations
 
-- Inkling 2 Mini (`inkling2_loop`) reads images from its checkpoint or a pack of it; a GGUF import has no vision
-  tower (the repository keeps it in an mmproj file) and refuses an image. An image is not resized (one token per 40 x
+- Inkling 2 Mini (`inkling2_loop`) reads images from its checkpoint, a pack of it, or a GGUF import with the
+  repository's projector file (`convert --mmproj`, fetched by `-hf`; without it the import has no vision tower and
+  refuses an image). An image is not resized (one token per 40 x
   40 pixels, so a large one is many tokens), and a transparent one is read without its alpha, where the reference
   lays it on a checkerboard. Its released
   checkpoint (experts in NVFP4 and MXFP8) is the float model its codes decode to, which a backend holds as floats:
@@ -610,7 +611,7 @@ Hugging Face safetensors (8.1 first, if it does not).
   (DSpark) gains little: every row of a verify reads the experts of its own token, so each draft adds about a fifth
   of a decode step to the verify, and two drafts a round are the default. Of its GGUF repository, the files in
   Unsloth's layout (`inkling2`) import, with the drafter's file; the copies in mainline llama.cpp's layout
-  (`.gguf_file`) and the vision projector (mmproj) are not read.
+  (`.gguf_file`) are not read.
 - Three model families: Gemma 4 E2B/E4B (text and images) and 26B-A4B (text), Qwen3.5 dense and MoE (text; its
   vision tower is not loaded; SenseNova Loop's neither, and a block drafter beside SenseNova Loop is refused; a MoE
   checkpoint's expert banks come fused, as the released ones store them, expert by expert as an FP8 release does, or
@@ -705,7 +706,7 @@ Hugging Face safetensors (8.1 first, if it does not).
 - `-hf` reads the Hugging Face Hub's API and resolve URLs: a GGUF file is imported into a pack, so it takes its size
   twice on disk; a file split into parts is refused, as the import refuses it; no Xet chunk deduplication. The MTP
   head a repository publishes apart is fetched for a `qwen35` or `qwen35moe` file without one, and Inkling 2's
-  drafter (`dspark-*.gguf`) for an `inkling2` file.
+  drafter (`dspark-*.gguf`) and vision tower (`mmproj-*.gguf`, the bf16 one) for an `inkling2` file.
 - One sequence at a time; no batching.
 - Sliding-window layers keep every key in memory in a session that can be cut back to any prefix (Gemma 4, a DFlash
   drafter's local layers): the kernels read only the window, memory still grows with the context. With conv or

@@ -3,7 +3,9 @@
 // not read). The tokenizer written from the file passes the Inkling 2 parity cases and matches the checkpoint's token
 // by token; config.json gives the model code what the checkpoint's does, but for the order of the expert banks' rows.
 // With the drafter's file (XS_GGUF_DRAFTER_FILE, dspark-Inkling-2-Mini-Q8_0.gguf), the two files plan a pack with the
-// checkpoint's mtp_config and every tensor of its mtp.safetensors. Each case skips unless its variables are set.
+// checkpoint's mtp_config and every tensor of its mtp.safetensors; with the projector's (XS_GGUF_MMPROJ_FILE,
+// mmproj-BF16.gguf), the checkpoint's vision_config and every tensor of its tower. Each case skips unless its
+// variables are set.
 // The weights are checked by the model parity test on the imported pack (model_parity.cpp), the lossless file's
 // against Hugging Face fp32.
 #include <doctest/doctest.h>
@@ -151,5 +153,45 @@ TEST_SUITE("gguf real file") {
         // A model file is not a drafter's.
         CHECK_THROWS_WITH_AS(gguf_import::find_architecture("inkling2").plan_with_mtp(file, file),
                              doctest::Contains("is not Inkling 2's drafter"), xs::Error);
+    }
+
+    TEST_CASE("a real inkling2 GGUF and its projector file plan the checkpoint's vision tower") {
+        const auto real = real_file();
+        const char* m = std::getenv("XS_GGUF_MMPROJ_FILE");
+        if (!real || m == nullptr || *m == '\0') return;
+        const gguf::File file(real->gguf), projector(m);
+        const gguf_import::Architecture& arch = gguf_import::find_architecture("inkling2");
+        gguf_import::ImportPlan plan = arch.plan(file);
+        arch.add_projector(plan, file, projector);
+        nlohmann::json config = nlohmann::json::parse(plan.config.dump());
+        const inkling2::VisionConfig a = inkling2::parse_vision_config(config);
+        const inkling2::VisionConfig b = inkling2::parse_vision_config(checkpoint_config(real->hf));
+        CHECK(a.hidden == b.hidden);
+        CHECK(a.layers == b.layers);
+        CHECK(a.heads == b.heads);
+        CHECK(a.intermediate == b.intermediate);
+        CHECK(a.patch == b.patch);
+        CHECK(a.merge == b.merge);
+        CHECK(a.grid == b.grid);
+        CHECK(a.projection == b.projection);
+        CHECK(a.out_hidden == b.out_hidden);
+        CHECK(a.norm_eps == b.norm_eps);
+        CHECK(a.rope_theta == b.rope_theta);
+        // The 18 tensors of each layer and the 8 beside them, under the checkpoint's names.
+        std::set<std::string> names;
+        for (const gguf_import::PackTensor& t : plan.tensors) {
+            if (t.name.rfind("model.visual.", 0) == 0) names.insert(t.name);
+        }
+        CHECK(static_cast<int64_t>(names.size()) == 18 * a.layers + 8);
+        for (const char* name : {"model.visual.backbone.embeddings.patch_embedding.weight",
+                                 "model.visual.backbone.embeddings.cls_position_embedding",
+                                 "model.visual.backbone.layers.0.ls_1.gamma", "model.visual.proj_out.weight"}) {
+            CAPTURE(name);
+            CHECK(names.count(name) == 1);
+        }
+        // Neither a model file nor a drafter's is a vision tower's.
+        gguf_import::ImportPlan again = arch.plan(file);
+        CHECK_THROWS_WITH_AS(arch.add_projector(again, file, file),
+                             doctest::Contains("is not Inkling 2's vision tower"), xs::Error);
     }
 }

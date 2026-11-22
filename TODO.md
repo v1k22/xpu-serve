@@ -307,7 +307,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       matches Hugging Face fp32), its block drafter (DSpark, `--spec dspark`; from `mtp.safetensors` or the GGUF
       repository's `dspark-*.gguf`), KV memory for its windowed layers (a windowed slot keeps its window alone)
 - [x] Inkling 2 Mini: images from the checkpoint and its packs (the vision tower, a class token beside the patches
-      through a key bias a row; parity with transformers on a tiny checkpoint, cpu-ref and the GPU)
+      through a key bias a row; parity with transformers on a tiny checkpoint, cpu-ref and the GPU), and from a GGUF
+      import with the repository's projector file (`--mmproj`)
 - [x] Inkling 2 Mini: its output dialect (thinking as reasoning, tool calls from their JSON messages) and
       `reasoning_effort` as a template variable
 - [ ] Inkling 2 Mini: its small kernels fused (a step launches some 4,700: the block residual, the message gate, a

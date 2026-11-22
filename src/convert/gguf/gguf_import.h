@@ -32,6 +32,7 @@ struct ImportOptions {
     std::filesystem::path source;         // the .gguf file
     std::filesystem::path output;         // created; must not exist or be empty
     std::filesystem::path mtp;            // a .gguf file of the source's MTP head, or empty
+    std::filesystem::path mmproj;         // a .gguf file of the source's vision tower (llama.cpp's mmproj), or empty
     std::string converter = "xpu-serve";  // recorded in the manifest
 };
 

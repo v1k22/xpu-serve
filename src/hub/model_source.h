@@ -31,6 +31,7 @@ struct SourceFiles {
     std::vector<std::pair<std::string, std::filesystem::path>> companions;  // path beside the checkpoint, file
     std::filesystem::path gguf;  // empty for a checkpoint
     std::filesystem::path mtp;   // a GGUF file's MTP head, when it has none and the repository publishes one
+    std::filesystem::path mmproj;  // a GGUF file's vision tower, for a model whose importer reads one
     std::string name;            // HubSpec::name
     std::string folder;          // the repository's cache folder name, `models--org--name`
     std::string commit;

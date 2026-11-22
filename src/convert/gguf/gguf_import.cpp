@@ -32,14 +32,15 @@ bool starts_with(std::string_view s, std::string_view prefix) {
 }
 
 // What no architecture's importer reads but would change what the file means.
-void check_general(const gguf::File& f) {
+// `type`: the file's general.type, when it says one: a model's, or a vision tower's ("mmproj").
+void check_general(const gguf::File& f, std::string_view type = "model") {
     for (const gguf::Value& v : f.metadata()) {
         if (starts_with(v.key(), "prism.")) {
             fail("GGUF metadata '", v.key(), "': weights with transforms folded into them are not supported");
         }
     }
-    if (const gguf::Value* t = f.find("general.type"); t != nullptr && t->as_string() != "model") {
-        fail("GGUF '", f.path().string(), "' is general.type '", t->as_string(), "', not a model");
+    if (const gguf::Value* t = f.find("general.type"); t != nullptr && t->as_string() != type) {
+        fail("GGUF '", f.path().string(), "' is general.type '", t->as_string(), "', not a ", type);
     }
     // The block layouts read here are quantization version 2's (version 1 laid out Q4_0, Q4_1 and Q8_0 otherwise).
     if (const gguf::Value* q = f.find("general.quantization_version"); q != nullptr && q->as_int() != 2) {
@@ -240,6 +241,10 @@ const Architecture& find_architecture(std::string_view name) {
     fail("GGUF architecture '", name, "' is not supported (supported: ", list, ")");
 }
 
+void Architecture::add_projector(ImportPlan&, const gguf::File&, const gguf::File&) const {
+    fail(name(), ": a vision tower from a file of its own (--mmproj) is not supported for this architecture");
+}
+
 ImportReport import_gguf(const ImportOptions& o) {
     if (fs::exists(o.output) && !fs::is_empty(o.output)) {
         fail("convert: '", o.output.string(), "' exists and is not empty");
@@ -256,6 +261,13 @@ ImportReport import_gguf(const ImportOptions& o) {
     const std::string architecture(file.get_string("general.architecture"));
     const Architecture& arch = find_architecture(architecture);
     ImportPlan plan = mtp ? arch.plan_with_mtp(file, *mtp) : arch.plan(file);
+    std::optional<gguf::File> mmproj;
+    if (!o.mmproj.empty()) {
+        mmproj.emplace(o.mmproj);
+        check_general(*mmproj, "mmproj");
+        files.push_back(&*mmproj);
+        arch.add_projector(plan, file, *mmproj);
+    }
     // A language model's tokenizer, chat template and sampling defaults (a drafter has the target's); a decision
     // model's tokenizer.
     const bool language = plan.kind == ImportPlan::Kind::Language;
@@ -325,6 +337,7 @@ ImportReport import_gguf(const ImportOptions& o) {
     }
     if (const gguf::Value* v = file.find("general.file_type")) source["general.file_type"] = v->as_int();
     if (mtp) source["mtp"] = o.mtp.filename().string();
+    if (mmproj) source["mmproj"] = o.mmproj.filename().string();
     manifest["source"] = std::move(source);
     manifest["tensors"] = std::move(manifest_tensors);
     write_json(o.output / kPackManifest, manifest, 1);

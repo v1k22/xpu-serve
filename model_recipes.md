@@ -688,7 +688,8 @@ Checked against Hugging Face fp32 logits and greedy text (the checkpoint's own m
 `thinkingmachines/Inkling-2-Mini` (`inkling2_loop`; Apache 2.0): a mixture of experts of 26.4B parameters (128
 experts, 8 a token) whose layers 6 to 17 run three times, 48 layer runs a token, without rotary positions
 ([docs/decisions/0026](docs/decisions/0026-inkling2.md)). Text and images: a pack of the checkpoint keeps its vision
-tower (an image is one token per 40 x 40 pixels, not resized); a GGUF file's import has none. Its drafter (DSpark) is
+tower (an image is one token per 40 x 40 pixels, not resized), and so does a GGUF file's import, from the
+repository's `mmproj-BF16.gguf`, which `-hf` fetches with it. Its drafter (DSpark) is
 inside the checkpoint and its packs, and a file of its GGUF repository ([DSpark](#dspark-inkling-2s-drafter)). Its
 thinking comes back as `reasoning_content` and its tool calls as `tool_calls`; a request's `reasoning_effort` (none,
 minimal, low, medium, high, xhigh, max) sets how much it thinks, 0.9 (high) when left out.

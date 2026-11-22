@@ -22,6 +22,7 @@
 // Mainline llama.cpp's layout of the same tensors (general.architecture inkling2_loop, the repository's
 // Mainline_Support files) has other names and keys and is not read here.
 
+#include <cmath>
 #include <set>
 
 #include "convert/gguf/architecture.h"
@@ -475,6 +476,132 @@ Layout drafter_layout(const DrafterDimensions& d, int64_t vocab) {
     return l;
 }
 
+// The vision tower's file (llama.cpp's mmproj): general.architecture clip, its projector type inkling2v.
+constexpr std::string_view kProjector = "clip";
+constexpr std::string_view kProjectorType = "inkling2v";
+// Where a pack keeps the tower, under the checkpoint's names.
+const std::string kVisionPrefix = "model.visual.";
+
+// image_size is llama.cpp's own bound on an image; the processor here pads an image and does not resize it.
+const std::set<std::string_view> kProjectorKeys = {
+    "has_vision_encoder", "vision.projection_dim", "vision.image_size", "vision.patch_size",
+    "vision.embedding_length", "vision.feed_forward_length", "vision.block_count", "vision.attention.head_count",
+    "vision.image_mean", "vision.image_std", "vision.projector_type", "vision.attention.layer_norm_epsilon",
+    "vision.spatial_merge_size",
+};
+
+struct VisionDimensions {
+    int64_t hidden = 0, width = 0, layers = 0, heads = 0, patch = 0, merge = 0, grid = 0, projection = 0, out = 0;
+};
+
+// The patch embedding: stored as a convolution's weight [hidden, channels, y, x], the checkpoint's a linear layer's
+// over a patch as (y, x, channel).
+const FloatReorder kPatchLinear{"a convolution's weight as a linear layer's",
+                                [](const std::vector<float>& v, const Dims& stored) {
+                                    const int64_t n = stored[0], c = stored[1], h = stored[2], w = stored[3];
+                                    std::vector<float> out(v.size());
+                                    for (int64_t o = 0; o < n; ++o) {
+                                        for (int64_t ch = 0; ch < c; ++ch) {
+                                            for (int64_t y = 0; y < h; ++y) {
+                                                for (int64_t x = 0; x < w; ++x) {
+                                                    out[static_cast<size_t>(((o * h + y) * w + x) * c + ch)] =
+                                                        v[static_cast<size_t>(((o * c + ch) * h + y) * w + x)];
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return out;
+                                }};
+
+// The projector file `f` against the model's: vision_config as the released config.json has it. Refuses by name a
+// file that is not Inkling 2's tower, or another model's.
+nlohmann::ordered_json vision_config(const gguf::File& f, const Dimensions& d, VisionDimensions& v) {
+    const std::string_view arch = f.get_string("general.architecture");
+    const gguf::Value* type = f.find("clip.vision.projector_type");
+    if (arch != kProjector || type == nullptr || type->as_string() != kProjectorType) {
+        fail(kName, ": --mmproj: the file is not Inkling 2's vision tower (general.architecture '", arch,
+             "', clip.vision.projector_type '", type != nullptr ? type->as_string() : std::string_view("none"),
+             "'; expected '", kProjector, "' and '", kProjectorType, "')");
+    }
+    refuse_unknown_keys(f, kProjector, kProjectorKeys);
+    const auto positive_of = [&](std::string_view rest) {
+        return positive(f, kProjector, str_cat("clip.vision.", rest));
+    };
+    v.hidden = positive_of("embedding_length");
+    v.width = positive_of("feed_forward_length");
+    v.layers = positive_of("block_count");
+    v.heads = positive_of("attention.head_count");
+    v.patch = positive_of("patch_size");
+    v.merge = positive_of("spatial_merge_size");
+    v.out = positive_of("projection_dim");
+    XS_CHECK(v.out == d.hidden, kName, ": --mmproj: the tower projects to ", v.out, ", the model's hidden size is ",
+             d.hidden, ": another model's file");
+    // The processor's constants are the checkpoint's; a file that says otherwise is not read as it means.
+    for (const char* key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
+        const gguf::Value* a = f.find(key);
+        XS_CHECK(a != nullptr, kName, ": --mmproj: the file has no ", key);
+        for (const double m : a->floats()) {
+            XS_CHECK(m == 0.5, kName, ": --mmproj: ", key, " is not 0.5 a channel");
+        }
+    }
+    const gguf::TensorInfo* table = f.find_tensor("v.position_embd.weight");
+    const gguf::TensorInfo* first = f.find_tensor("mm.1.weight");
+    XS_CHECK(table != nullptr && first != nullptr && table->dims.size() == 2 && first->dims.size() == 2, kName,
+             ": --mmproj: the file lacks v.position_embd.weight or mm.1.weight");
+    v.grid = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(table->rows()))));
+    XS_CHECK(v.grid * v.grid == table->rows(), kName, ": --mmproj: v.position_embd.weight has ", table->rows(),
+             " rows, not a square grid");
+    v.projection = first->rows();
+    nlohmann::ordered_json c;
+    c["model_type"] = "inkling2_vision";
+    c["text_hidden_size"] = v.out;
+    c["native_patch_size"] = v.patch;
+    c["adapter_merge_size"] = v.merge;
+    c["projection_hidden_dim"] = v.projection;
+    c["projector_bias"] = false;
+    c["hidden_size"] = v.hidden;
+    c["num_hidden_layers"] = v.layers;
+    c["num_attention_heads"] = v.heads;
+    c["intermediate_size"] = v.width;
+    c["posemb_grid_size"] = v.grid;
+    c["layer_norm_eps"] = config_number(f.get("clip.vision.attention.layer_norm_epsilon"));
+    return c;
+}
+
+Layout vision_layout(const VisionDimensions& v) {
+    const std::string B = kVisionPrefix + "backbone.";
+    const int64_t h = v.hidden;
+    Layout l;
+    l.top["v.class_embd"] = one({h}, B + "embeddings.class_embedding");
+    l.top["v.class_position_embd.weight"] = one({h}, B + "embeddings.cls_position_embedding");
+    l.top["v.patch_embd.weight"] = reordered({h, 3, v.patch, v.patch}, B + "embeddings.patch_embedding.weight",
+                                             {h, 3 * v.patch * v.patch}, &kPatchLinear);
+    l.top["v.position_embd.weight"] = one({v.grid * v.grid, h}, B + "embeddings.position_embedding");
+    l.top["v.pre_ln.weight"] = one({h}, B + "ln_pre.weight");
+    l.top["v.pre_ln.bias"] = one({h}, B + "ln_pre.bias");
+    for (int64_t i = 0; i < v.layers; ++i) {
+        const std::string from = "v.blk." + std::to_string(i) + ".", to = B + "layers." + std::to_string(i) + ".";
+        for (const auto& [a, b] : {std::pair{"ln1", "ln_1"}, std::pair{"ln2", "ln_2"}}) {
+            l.top[from + a + ".weight"] = one({h}, to + b + ".weight");
+            l.top[from + a + ".bias"] = one({h}, to + b + ".bias");
+        }
+        l.top[from + "ls1.weight"] = one({h}, to + "ls_1.gamma");
+        l.top[from + "ls2.weight"] = one({h}, to + "ls_2.gamma");
+        l.top[from + "ffn_up.weight"] = one({v.width, h}, to + "mlp.c_fc.weight");
+        l.top[from + "ffn_up.bias"] = one({v.width}, to + "mlp.c_fc.bias");
+        l.top[from + "ffn_down.weight"] = one({h, v.width}, to + "mlp.c_proj.weight");
+        l.top[from + "ffn_down.bias"] = one({h}, to + "mlp.c_proj.bias");
+        for (const auto& [a, b] : {std::pair{"attn_q", "q_proj"}, std::pair{"attn_k", "k_proj"},
+                                   std::pair{"attn_v", "v_proj"}, std::pair{"attn_out", "out_proj"}}) {
+            l.top[from + a + ".weight"] = one({h, h}, to + "self_attn." + b + ".weight");
+            l.top[from + a + ".bias"] = one({h}, to + "self_attn." + b + ".bias");
+        }
+    }
+    l.top["mm.1.weight"] = one({v.projection, v.merge * v.merge * h}, kVisionPrefix + "proj_in.weight");
+    l.top["mm.2.weight"] = one({v.out, v.projection}, kVisionPrefix + "proj_out.weight");
+    return l;
+}
+
 class Inkling2 final : public Architecture {
 public:
     std::string_view name() const override { return kName; }
@@ -493,6 +620,12 @@ public:
     // The drafter is always a file of its own (its blocks are named as the model's are): its tensors go into the
     // pack beside the model's, under the names a pack of the released checkpoint gives them, and its settings into
     // config.json's mtp_config.
+    void add_projector(ImportPlan& p, const gguf::File& f, const gguf::File& projector) const override {
+        VisionDimensions v;
+        p.config["vision_config"] = vision_config(projector, dimensions(f), v);
+        map_tensors(projector, kProjector, vision_layout(v), p);
+    }
+
     ImportPlan plan_with_mtp(const gguf::File& f, const gguf::File& mtp) const override {
         ImportPlan p = plan(f);
         DrafterDimensions dd;

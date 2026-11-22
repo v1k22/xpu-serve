@@ -35,6 +35,13 @@ bool lacks_mtp_head(const fs::path& file) {
     return n == nullptr || n->as_int() == 0;
 }
 
+// A model file whose vision tower the importer reads from the repository's projector file: Inkling 2's.
+bool reads_projector(const fs::path& file) {
+    const gguf::File f(file);
+    const gguf::Value* arch = f.find("general.architecture");
+    return arch != nullptr && arch->as_string() == "inkling2";
+}
+
 std::string stem(const fs::path& p) { return p.stem().string(); }
 
 // `dir` once and for all: made by `make` in a partial directory renamed into place when whole, under a lock, so an
@@ -101,6 +108,13 @@ SourceFiles fetch_source(const std::string& text, FileRole role, const SourceOpt
             log::info(sel.gguf, " has no drafter: importing the one of ", head);
         }
     }
+    if (role == FileRole::Model && reads_projector(s.gguf)) {
+        if (const std::string tower = select_projector(listing); !tower.empty()) {
+            fetch_files(listing, {tower}, o.hub);
+            s.mmproj = s.snapshot / tower;
+            log::info(sel.gguf, " reads images through the vision tower of ", tower);
+        }
+    }
     return s;
 }
 
@@ -109,13 +123,15 @@ ModelSource resolve_model(const std::string& text, FileRole role, const SourceOp
     ModelSource m;
     m.name = s.name;
     if (!s.gguf.empty()) {
-        const std::string name = stem(s.gguf) + (s.mtp.empty() ? "" : "+" + stem(s.mtp));
+        const std::string name = stem(s.gguf) + (s.mtp.empty() ? "" : "+" + stem(s.mtp)) +
+                                 (s.mmproj.empty() ? "" : "+" + stem(s.mmproj));
         m.dir = o.cache / "packs" / s.folder / s.commit.substr(0, 12) / name;
         build_once(m.dir, m.dir / "xpu_pack.json", [&](const fs::path& out) {
             log::info("importing ", s.gguf.filename().string(), " into ", m.dir.string());
             gguf_import::ImportOptions io;
             io.source = s.gguf;
             io.mtp = s.mtp;
+            io.mmproj = s.mmproj;
             io.output = out;
             io.converter = o.converter;
             gguf_import::import_gguf(io);

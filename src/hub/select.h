@@ -41,4 +41,8 @@ Selection select_files(const RepoListing& listing, const HubSpec& spec, FileRole
 // its Q8_0; empty when the repository has none.
 std::string select_mtp_head(const RepoListing& listing, const std::string& model_file);
 
+// A GGUF repository's vision tower (llama.cpp's projector, `mmproj-*.gguf`): its bf16 file, else its f16, else its
+// f32, else the first; empty when the repository has none.
+std::string select_projector(const RepoListing& listing);
+
 }  // namespace xs::hub

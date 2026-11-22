@@ -188,6 +188,11 @@ TEST_SUITE("hub select") {
         CHECK(pick("unsloth/Inkling-2-Mini-GGUF:BF16", FileRole::Drafter) == "dspark/dspark-Inkling-2-Mini-BF16.gguf");
         CHECK(select_mtp_head(inkling, "Inkling-2-Mini-UD-Q4_K_XL.gguf") == "dspark-Inkling-2-Mini-Q8_0.gguf");
         CHECK(select_mtp_head(inkling, "Inkling-2-Mini-UD-IQ1_S.gguf") == "dspark-Inkling-2-Mini-Q8_0.gguf");
+        // its vision tower: the bf16 projector of the three; none in a repository without one
+        CHECK(select_projector(inkling) == "mmproj-BF16.gguf");
+        CHECK(select_projector(listing("org/m-GGUF", {"README.md", "m-Q4_K_M.gguf", "mmproj-m-f16.gguf"})) ==
+              "mmproj-m-f16.gguf");
+        CHECK(select_projector(listing("org/m-GGUF", {"README.md", "m-Q4_K_M.gguf"})).empty());
     }
 
     TEST_CASE("the MTP head of a model file published apart: named after it, else the only one, else none") {

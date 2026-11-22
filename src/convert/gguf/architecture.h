@@ -86,6 +86,10 @@ public:
     // of another model (metadata that disagrees with the file's) or with tensors beyond the head and the copies.
     // The default refuses it by name, for an architecture that has no such files.
     virtual ImportPlan plan_with_mtp(const gguf::File& file, const gguf::File& mtp) const;
+    // Adds to `plan`, the plan of `file`, the model's vision tower from `projector`, llama.cpp's file of it (mmproj):
+    // its tensors under the checkpoint's names and what config.json says of it. Refuses by name a file that is not
+    // this model's tower. The default refuses it by name, for an architecture whose tower is not read.
+    virtual void add_projector(ImportPlan& plan, const gguf::File& file, const gguf::File& projector) const;
 };
 
 const Architecture& qwen35();

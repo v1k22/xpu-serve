@@ -217,7 +217,7 @@ xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
 - The architecture comes from the file (`general.architecture`). Supported: `qwen35` and `qwen35moe`, the Qwen3.5 /
   Qwen3.6 / Qwen3.8 text models, dense and mixture of experts (Ornith-1.5-35B-A3B's files are `qwen35moe`); `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
   images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
-  drafter; `inkling2`, Inkling 2 Mini (Unsloth's files), with its drafter's file (`dspark-*.gguf`, fetched by `-hf`);
+  drafter; `inkling2`, Inkling 2 Mini (Unsloth's files), with its drafter's file (`dspark-*.gguf`) and its vision tower's (`mmproj-*.gguf`), both fetched by `-hf`;
   `clef`, the Clef decision models; and `modern-bert` with a Laya read-out, the files of Laya and Julia-1. Others
   are refused by name.
 - A Qwen3.5-family file that comes without its MTP head (the smallest files of Qwen3.8-27B) takes the head from its

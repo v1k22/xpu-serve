@@ -121,6 +121,10 @@ particular:
 - **Rotary pairs as neighbours.** The tower rotates channels (2 i, 2 i + 1); the graph's Rope pairs c with c + D / 2.
   Queries and keys go through it with their channels in that order, which their products do not see.
 
+A GGUF repository keeps the tower in a file of its own (llama.cpp's mmproj: `clip`, projector type `inkling2v`).
+`convert --mmproj` adds it to the model's pack under the checkpoint's names, and `-hf` fetches it with the model
+file; its tensors are the checkpoint's, the patch embedding stored as a convolution's weight and put back.
+
 An image's rows stand in place of its tokens' embeddings after the embedding norm, as the reference scatters them.
 On a tiny checkpoint the processor's pixels are equal, the tower's rows and the prompt's logits match at cosine 1
 (cpu-ref and the GPU), and greedy output is the reference's.
@@ -168,5 +172,4 @@ model (below), so the multiple-choice read-out the other GGUF files were scored 
   dialect splits the model's messages into reasoning, content and tool calls.)
 - A verify of several rows, and the drafter's block, read the whole KV cache once per row at long contexts: DSpark
   gains at 32k tokens and loses at 128k.
-- Images from a GGUF file (the repository keeps the vision tower in an mmproj file), and the files in mainline
-  llama.cpp's layout (`inkling2_loop`), which are other names for the same tensors.
+- The files in mainline llama.cpp's layout (`inkling2_loop`), which are other names for the same tensors.

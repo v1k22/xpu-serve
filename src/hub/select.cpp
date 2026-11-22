@@ -223,4 +223,18 @@ std::string select_mtp_head(const RepoListing& l, const std::string& model_file)
     return {};
 }
 
+std::string select_projector(const RepoListing& l) {
+    std::vector<std::string> files;
+    for (const RepoFile& f : l.files) {
+        if (extension(f.path) == ".gguf" && lower(basename(f.path)).starts_with("mmproj")) files.push_back(f.path);
+    }
+    for (const char* tag : {"BF16", "F16", "F32"}) {
+        for (const std::string& f : files) {
+            bool split = false;
+            if (has_quant(gguf_stem(f, &split), tag) && !split) return f;
+        }
+    }
+    return files.empty() ? std::string() : files.front();
+}
+
 }  // namespace xs::hub
