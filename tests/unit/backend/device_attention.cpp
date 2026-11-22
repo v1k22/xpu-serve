@@ -132,6 +132,26 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
         }
     }
 
+    TEST_CASE("few-token steps whose rows share a KV head: 3 and 6 heads to one, several tokens a work-group") {
+        // A verify of 2 to 8 tokens over a cache: the per-row kernel serves several tokens' heads per work-group,
+        // the last group short when the tokens do not divide.
+        for (const int64_t head_dim : {64, 128, 256}) {
+            for (const auto& [heads, kv_heads] : {std::pair<int64_t, int64_t>{24, 8}, {6, 1}, {12, 2}}) {
+                for (const int64_t window : {int64_t{0}, int64_t{6}}) {
+                    AttentionCase c;
+                    c.head_dim = head_dim;
+                    c.heads = heads;
+                    c.kv_heads = kv_heads;
+                    c.window = window;
+                    c.impl = "rows";
+                    c.steps = {13, 1, 2, 3, 5, 8, 7};
+                    CAPTURE(describe(c));
+                    CHECK(attention_matches(c, static_cast<uint32_t>(head_dim + heads + window)));
+                }
+            }
+        }
+    }
+
     TEST_CASE("sliding window over a prefill longer than the window, then decode steps") {
         for (const int64_t head_dim : {64, 256, 512}) {
             for (const std::string& impl : dev::attention_impls()) {

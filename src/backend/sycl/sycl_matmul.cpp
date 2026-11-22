@@ -283,7 +283,7 @@ void attention_by_rows(sycl::queue& q, Scratch& scratch, float* out, const Atten
     const int64_t rows = s.tokens * s.q_heads;
     const int64_t keys = attention_visible_keys(s);
     const RowsLayout layout = attention_rows_layout(s);
-    const int64_t sub_groups = rows / layout.heads * layout.sub_groups;
+    const int64_t sub_groups = attention_rows_units(s, layout) * layout.sub_groups;
     const int64_t split = std::clamp<int64_t>(std::min(kTargetSubGroups / sub_groups, keys / kMinSplitKeys), 1, 64);
     if (split == 1) {
         run(int64_t{1}, static_cast<float*>(nullptr));

@@ -211,17 +211,20 @@ void dequantize_kv(sycl::queue& q, const KvStream& s, CT* out, int64_t rows, int
 // (`inverse`); y may be x.
 void kv_rotate(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width, bool inverse);
 
-// How attention_rows lays a shape out: `heads` query heads a work-group (heads of one token that share a KV head, so
-// each key and value is read once for all of them), and its sub-groups.
+// How attention_rows lays a shape out: `rows` (token, query head) rows a work-group, `heads` query heads of each of
+// rows / heads tokens, all sharing a KV head, so each key and value is read once for all of them; and its sub-groups.
 struct RowsLayout {
+    int rows = 1;
     int heads = 1;
     int sub_groups = 16;
 };
 RowsLayout attention_rows_layout(const AttentionShape& s);
-// One work-group per (query, RowsLayout::heads query heads, split), an online softmax per head over its share of the
-// visible keys. For few queries. split == 1 writes `out`; otherwise each work-group writes [D partial sums, max,
-// denominator] per head to `part` ([T * Hq * split, D + 2]) and attention_combine merges them into `out`
-// (flash-decoding for long contexts).
+// The work-groups of one split: the tokens' groups times the query heads' chunks.
+int64_t attention_rows_units(const AttentionShape& s, const RowsLayout& layout);
+// One work-group per (RowsLayout rows, split), an online softmax per row over its share of the keys its rows see.
+// For few queries. split == 1 writes `out`; otherwise each work-group writes [D partial sums, max, denominator] per
+// row to `part` ([T * Hq * split, D + 2]) and attention_combine merges them into `out` (flash-decoding for long
+// contexts).
 template <typename KV>
 void attention_rows(sycl::queue& q, const float* qp, const KV* k, const KV* v, float* out, const AttentionShape& s,
                     int64_t split, float* part);

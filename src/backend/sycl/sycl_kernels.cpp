@@ -380,17 +380,18 @@ void gated_delta_t(sycl::queue& q, const float* qp, const float* kp, const float
 }
 
 // attention_rows' kernel. K and V: the readers of the cache's keys and values (sycl_kv_rows.h), DPL values of a row
-// per lane. A work-group serves G query heads of one token that share a KV head, over its share of the visible keys:
-// each sub-group takes every kSubGroups-th key, reads the key and the value once, and keeps an online softmax per
-// head. The sub-groups' partial sums meet in local memory.
+// per lane. A work-group serves G rows that share a KV head, `heads` query heads of each of G / heads tokens (row g:
+// token t0 + g / heads, head h0 + g % heads), over its share of the keys any of them sees: each sub-group takes every
+// kSubGroups-th key, reads the key and the value once, and keeps an online softmax per row. The sub-groups' partial
+// sums meet in local memory.
 template <typename K, typename V, int DPL, int G>
 struct AttentionRowsKernel {
     static constexpr int64_t D = static_cast<int64_t>(DPL) * kSubGroup;
-    static constexpr int kSlot = static_cast<int>(D) + 2;  // a (sub-group, head)'s D sums, its max and denominator
+    static constexpr int kSlot = static_cast<int>(D) + 2;  // a (sub-group, row)'s D sums, its max and denominator
     // As many sub-groups as keep their slots within a work-group's local memory.
     static constexpr int kSubGroups = 16 * G * kSlot * static_cast<int>(sizeof(float)) <= (64 << 10) ? 16 : 8;
     static constexpr int kWg = kSubGroups * kSubGroup;
-    // The queries and sums of several heads beside a row's values: past the default register file.
+    // The queries and sums of several rows beside a row's values: past the default register file.
     static constexpr bool kLargeRegisterFile = G * DPL > 32;
 
     const float* qp;
@@ -398,8 +399,8 @@ struct AttentionRowsKernel {
     V v;
     float* out;
     float* part;
-    sycl::local_accessor<float, 1> slm;  // [sub-group][head][kSlot]
-    int64_t hq_n, hkv_n, n, tokens, window, split;
+    sycl::local_accessor<float, 1> slm;  // [sub-group][row][kSlot]
+    int64_t hq_n, hkv_n, n, tokens, window, split, heads;
     float scale, softcap;
     bool causal;
     const float* key_bias;
@@ -420,34 +421,48 @@ struct AttentionRowsKernel {
     void operator()(sycl::nd_item<1> it) const {
         constexpr float kMasked = -std::numeric_limits<float>::infinity();
         const int64_t wg = static_cast<int64_t>(it.get_group(0));
-        const int64_t unit = wg / split;  // a token's chunk of G heads
+        const int64_t unit = wg / split;  // G / heads tokens' chunk of `heads` heads
         const int64_t sp = wg % split;
-        const int64_t chunks = hq_n / G;
-        const int64_t t = unit / chunks;
-        const int64_t h0 = (unit % chunks) * G;
+        const int64_t chunks = hq_n / heads;
+        const int64_t t0 = unit / chunks * (G / heads);
+        const int64_t h0 = (unit % chunks) * heads;
         const int64_t kh = h0 / (hq_n / hkv_n);
         const sycl::sub_group sg = it.get_sub_group();
         const int sgid = static_cast<int>(sg.get_group_linear_id());
         const int lane = static_cast<int>(sg.get_local_linear_id());
-        const int64_t pos = n - tokens + t;
-        const int64_t first =
-            anchored ? std::max<int64_t>(0, n - tokens - window) : window > 0 ? std::max<int64_t>(0, pos - window + 1) : 0;
-        const int64_t visible_last =
-            anchored ? n - 1
-                     : window > 0 ? std::min<int64_t>(causal ? pos : n - 1, pos + window - 1) : (causal ? pos : n - 1);
-        // This work-group's share of the visible keys [first, visible_last].
-        const int64_t share = (visible_last - first + split) / split;
-        const int64_t lo = first + sp * share;
-        const int64_t last = std::min<int64_t>(visible_last, lo + share - 1);
 
-        // Loops over the heads are unrolled by request: left rolled, a head's arrays would leave the registers.
+        // Each row's token, the keys it sees [first, last] (none past the step's tokens), and its row of the output.
+        int64_t tk[G], pos[G], first[G], last[G], head_row[G];
+        int64_t lo_all = n, hi_all = -1;
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            tk[g] = t0 + g / heads;
+            pos[g] = n - tokens + tk[g];
+            head_row[g] = tk[g] * hq_n + h0 + g % heads;
+            first[g] = anchored ? std::max<int64_t>(0, n - tokens - window)
+                                : window > 0 ? std::max<int64_t>(0, pos[g] - window + 1) : 0;
+            last[g] = anchored ? n - 1
+                               : window > 0 ? std::min<int64_t>(causal ? pos[g] : n - 1, pos[g] + window - 1)
+                                            : (causal ? pos[g] : n - 1);
+            if (tk[g] >= tokens) last[g] = -1;
+            if (last[g] >= first[g]) {
+                lo_all = std::min(lo_all, first[g]);
+                hi_all = std::max(hi_all, last[g]);
+            }
+        }
+        // This work-group's share of the keys [lo_all, hi_all].
+        const int64_t share = hi_all >= lo_all ? (hi_all - lo_all + split) / split : 0;
+        const int64_t lo = lo_all + sp * share;
+        const int64_t hi = std::min<int64_t>(hi_all, lo + share - 1);
+
+        // Loops over the rows are unrolled by request: left rolled, a row's arrays would leave the registers.
         float qv[G][DPL];
         float o[G][DPL];
         float m[G];
         float l[G];
 #pragma unroll
         for (int g = 0; g < G; ++g) {
-            const float* qr = qp + (t * hq_n + h0 + g) * D;
+            const float* qr = qp + std::min(head_row[g], tokens * hq_n - 1) * D;
             for (int e = 0; e < DPL; ++e) {
                 qv[g][e] = qr[K::dim(lane, e)];
                 o[g][e] = 0.0f;
@@ -456,9 +471,8 @@ struct AttentionRowsKernel {
             m[g] = kMasked;
             l[g] = 0.0f;
         }
-        for (int64_t j = lo + sgid; j <= last; j += kSubGroups) {
-            // Whether a key is masked is the same for every lane and head.
-            if (groups != nullptr && !group_sees(groups, t, j)) continue;
+        for (int64_t j = lo + sgid; j <= hi; j += kSubGroups) {
+            // Whether a key is masked is the same for every lane and row.
             if (key_bias != nullptr && key_bias[j] == kMasked) continue;
             const int64_t row = j * hkv_n + kh;
             float x[DPL];
@@ -471,9 +485,15 @@ struct AttentionRowsKernel {
                 for (int e = 0; e < DPL; ++e)
                     dot += qv[g][e] * x[e];
                 float sc = sycl::reduce_over_group(sg, dot, sycl::plus<float>()) * k_factor;
+                const bool sees = j >= first[g] && j <= last[g] && (groups == nullptr || group_sees(groups, tk[g], j));
+                if (!sees) {
+                    p[g] = 0.0f;
+                    corr[g] = 1.0f;
+                    continue;
+                }
                 if (softcap > 0.0f) sc = softcap * sycl::tanh(sc / softcap);
                 if (key_bias != nullptr) sc += key_bias[j];
-                if (rel != nullptr && pos - j < rel_extent) sc += rel[(t * hq_n + h0 + g) * rel_extent + (pos - j)];
+                if (rel != nullptr && pos[g] - j < rel_extent) sc += rel[head_row[g] * rel_extent + (pos[g] - j)];
                 const float m_new = sycl::fmax(m[g], sc);
                 corr[g] = sycl::exp(m[g] - m_new);
                 p[g] = sycl::exp(sc - m_new);
@@ -502,15 +522,15 @@ struct AttentionRowsKernel {
         sycl::group_barrier(it.get_group());
 #pragma unroll
         for (int g = 0; g < G; ++g) {
+            if (tk[g] >= tokens) continue;
             float m_all = kMasked;
             for (int sgi = 0; sgi < kSubGroups; ++sgi)
                 m_all = sycl::fmax(m_all, slm[(sgi * G + g) * kSlot + D]);
-            const int64_t head_row = t * hq_n + h0 + g;
             // The sink is a logit without a value: it only adds to the denominator, in the first split's share.
             float sunk = 0.0f;
             if (sink != nullptr && sp == 0) {
-                m_all = sycl::fmax(m_all, sink[head_row]);
-                sunk = sycl::exp(sink[head_row] - m_all);
+                m_all = sycl::fmax(m_all, sink[head_row[g]]);
+                sunk = sycl::exp(sink[head_row[g]] - m_all);
             }
             for (int64_t d = static_cast<int64_t>(it.get_local_linear_id()); d < D; d += kWg) {
                 float acc = 0.0f;
@@ -524,9 +544,9 @@ struct AttentionRowsKernel {
                     acc += slm[base + d] * w;
                 }
                 if (part == nullptr) {
-                    out[head_row * D + d] = acc / denom;
+                    out[head_row[g] * D + d] = acc / denom;
                 } else {  // unnormalized, relative to m_all; attention_combine merges the splits
-                    float* pr = part + (head_row * split + sp) * kSlot;
+                    float* pr = part + (head_row[g] * split + sp) * kSlot;
                     pr[d] = acc;
                     if (d == 0) {
                         pr[D] = m_all;
@@ -538,20 +558,22 @@ struct AttentionRowsKernel {
     }
 };
 
-// The most row values a lane keeps for the query heads of one work-group (its queries, and as many sums).
+// The most row values a lane keeps for the rows of one work-group (their queries, and as many sums).
 constexpr int kRowsSharedValues = 64;
+// The rows a work-group may serve (RowsLayout::rows): a kernel each, within kRowsSharedValues.
+constexpr int kRowsCounts[] = {8, 6, 4, 3, 2, 1};
 
 template <typename K, typename V, int DPL, int G>
 void attention_rows_launch(sycl::queue& q, const float* qp, const K& k, const V& v, float* out, const AttentionShape& s,
-                           int64_t split, float* part) {
+                           int64_t split, float* part, const RowsLayout& layout) {
     using Kernel = AttentionRowsKernel<K, V, DPL, G>;
-    const int64_t units = s.tokens * (s.q_heads / G);
+    const int64_t units = attention_rows_units(s, layout);
     syclex::submit(q, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>(Kernel::kSubGroups * G * Kernel::kSlot), h);
         syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(units * split * Kernel::kWg), Kernel::kWg),
                           Kernel{qp, k, v, out, part, slm, s.q_heads, s.kv_heads, s.kv_len, s.tokens, s.window, split,
-                                 s.scale, s.softcap, s.causal, s.key_bias, s.groups, s.rel, s.rel_extent, s.sink,
-                                 s.anchored});
+                                 layout.heads, s.scale, s.softcap, s.causal, s.key_bias, s.groups, s.rel, s.rel_extent,
+                                 s.sink, s.anchored});
     });
 }
 
@@ -559,18 +581,23 @@ void attention_rows_launch(sycl::queue& q, const float* qp, const K& k, const V&
 template <template <int> class K, template <int> class V, typename MakeK, typename MakeV>
 void attention_rows_dispatch(sycl::queue& q, const float* qp, float* out, const AttentionShape& s, int64_t split,
                              float* part, MakeK make_k, MakeV make_v) {
-    const int heads = attention_rows_layout(s).heads;
+    const RowsLayout layout = attention_rows_layout(s);
     const auto run = [&]<int DPL>() {
         const K<DPL> k = make_k.template operator()<DPL>();
         const V<DPL> v = make_v.template operator()<DPL>();
-        if constexpr (4 * DPL <= kRowsSharedValues) {
-            if (heads == 4) return attention_rows_launch<K<DPL>, V<DPL>, DPL, 4>(q, qp, k, v, out, s, split, part);
-        }
-        if constexpr (2 * DPL <= kRowsSharedValues) {
-            if (heads == 2) return attention_rows_launch<K<DPL>, V<DPL>, DPL, 2>(q, qp, k, v, out, s, split, part);
-        }
-        XS_CHECK(heads == 1, "sycl attention_rows: no kernel for ", heads, " heads of ", s.head_dim, " values");
-        attention_rows_launch<K<DPL>, V<DPL>, DPL, 1>(q, qp, k, v, out, s, split, part);
+        const auto with = [&]<int G>() {
+            if constexpr (G * DPL <= kRowsSharedValues) {
+                if (layout.rows == G) {
+                    attention_rows_launch<K<DPL>, V<DPL>, DPL, G>(q, qp, k, v, out, s, split, part, layout);
+                    return true;
+                }
+            }
+            return false;
+        };
+        const bool launched = with.template operator()<8>() || with.template operator()<6>() ||
+                              with.template operator()<4>() || with.template operator()<3>() ||
+                              with.template operator()<2>() || with.template operator()<1>();
+        XS_CHECK(launched, "sycl attention_rows: no kernel for ", layout.rows, " rows of ", s.head_dim, " values");
     };
     switch (s.head_dim / kSubGroup) {
         case 1: return run.template operator()<1>();
@@ -1870,16 +1897,31 @@ void gated_delta(sycl::queue& q, const float* qp, const float* kp, const float* 
 RowsLayout attention_rows_layout(const AttentionShape& s) {
     const int64_t per_kv_head = s.q_heads / s.kv_heads;
     const int dpl = static_cast<int>(s.head_dim / kSubGroup);
+    // The fewest reads of each KV head's keys: ceil(T / tokens a work-group) * (heads sharing it / heads a work-group),
+    // then the fewest rows.
     RowsLayout layout;
-    for (const int heads : {4, 2}) {
-        if (per_kv_head % heads == 0 && heads * dpl <= kRowsSharedValues) {
-            layout.heads = heads;
-            break;
+    int64_t reads = s.tokens * per_kv_head;
+    for (const int rows : kRowsCounts) {
+        if (rows * dpl > kRowsSharedValues) continue;
+        for (int heads = rows; heads >= 1; --heads) {
+            const int64_t tokens = rows / heads;
+            if (rows % heads != 0 || per_kv_head % heads != 0 || tokens > s.tokens) continue;
+            const int64_t r = (s.tokens + tokens - 1) / tokens * (per_kv_head / heads);
+            if (r < reads || (r == reads && rows < layout.rows)) {
+                reads = r;
+                layout.rows = rows;
+                layout.heads = heads;
+            }
         }
     }
     const int slot_bytes = static_cast<int>(s.head_dim + 2) * static_cast<int>(sizeof(float));
-    layout.sub_groups = 16 * layout.heads * slot_bytes <= (64 << 10) ? 16 : 8;
+    layout.sub_groups = 16 * layout.rows * slot_bytes <= (64 << 10) ? 16 : 8;
     return layout;
+}
+
+int64_t attention_rows_units(const AttentionShape& s, const RowsLayout& layout) {
+    const int64_t tokens = layout.rows / layout.heads;
+    return (s.tokens + tokens - 1) / tokens * (s.q_heads / layout.heads);
 }
 
 template <typename KV>

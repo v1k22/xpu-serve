@@ -198,6 +198,13 @@ B390 from UD-Q4_K_M in `turbo3`, which costs 2.0 % of perplexity (`i8` 0.15 %, `
 Accuracy is perplexity over wikitext-2 against the lossless file: `--readout` reads no answer letter from this
 model (below), so the multiple-choice read-out the other GGUF files were scored with is not available.
 
+## Verify
+
+- **A verify's rows.** The per-row attention kernel served one token's query heads that share a KV head, in groups
+  of 1, 2 or 4: Inkling's 3 heads a KV head read every key three times, a verify of two tokens six. A work-group
+  now serves several tokens' heads (up to 8 rows): at a 32,768-token prompt decode went from 33.0 to 34.0 tok/s, and
+  with DSpark from 36.0 to 37.5 (the GPU's cache had kept most of the repeated reads off memory).
+
 ## Open
 
 - The small kernels left: a router's sigmoid, bias, top-k and gathers (some eight launches a layer) and a block
@@ -205,7 +212,6 @@ model (below), so the multiple-choice read-out the other GGUF files were scored 
 - `--readout`: the template ends without a generation prompt and the model writes its own `<|message_model|>` and
   content tag, so the read-out sees a structural token, not an answer letter. (Chat is parsed: the `inkling2`
   dialect splits the model's messages into reasoning, content and tool calls.)
-- A verify of several rows, and the drafter's block, read the whole KV cache once per row at long contexts: DSpark
-  gains at 32k tokens and loses at 128k.
+- DSpark at 128k tokens: measure again with the verify's rows sharing their reads (it lost to plain decoding there).
 - A GGUF LoRA adapter (AtomicChat's rank-1 edit, meant for any GGUF of the model) is refused by name: the expert
   banks it changes are quantized, so it cannot be merged into them without rounding again; it would run beside them.
