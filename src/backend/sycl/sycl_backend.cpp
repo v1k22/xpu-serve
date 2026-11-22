@@ -2843,7 +2843,7 @@ public:
                 }
             }
             fail("sycl: a context of ", context, " tokens (--ctx) does not fit ", device, " (", gib(total),
-                 " GiB): ", gib(held), " GiB in use (the weights), the KV cache ", gib(b.growing + b.fixed), " GiB (",
+                 " GiB): ", gib(held), " GiB in use (weights, media encoders), the KV cache ", gib(b.growing + b.fixed), " GiB (",
                  b.growing / context, " bytes a token), a step of ", std::min(largest, context), " tokens over it ",
                  gib(b.arena), " GiB", why, "; at most ", lo * 1024,
                  " tokens fit (or fewer bytes a token, --kv-dtype i8 or turbo4, or a smaller step, --prefill-chunk)");

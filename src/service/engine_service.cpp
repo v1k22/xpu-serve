@@ -93,17 +93,8 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
         log::info("speculative decoding: ", name, ", ", engine_options.spec_k, " drafts per round, drafter graph of ",
                   spec->draft_graph().nodes().size(), " nodes");
     }
-    // The cache of the whole context and the largest steps reserved at load: --ctx is refused now, not halfway into
-    // a long prompt. Speculating, prefill chunks run the prefill program and verifies the verify program
-    // (spec::Program); a drafter's own steps are small.
-    const int64_t chunk = engine_options.prefill_chunk;
-    session_options.max_step_tokens =
-        speculate ? std::vector<int64_t>{0, chunk, engine_options.spec_k + 1, 0} : std::vector<int64_t>{chunk};
     auto backend = make_backend(options.backend);
-    Timer compile_timer;
-    auto session = backend->compile(programs, model->weights(), session_options);
-    log::info("compiled on ", options.backend, " ", session_options.device.empty() ? "(default device)" : session_options.device,
-              " in ", static_cast<int>(compile_timer.elapsed_ms()), " ms");
+    // The media encoders first: what they hold of the device is then part of the bill the decoder's session checks.
     EncoderSessions encoders;
     for (size_t k = 0; k < kModalities; ++k) {
         const auto m = static_cast<Modality>(k);
@@ -124,6 +115,23 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
                   " program(s), ", encoder_programs.front()->nodes().size(), " nodes) in ",
                   static_cast<int>(encoder_timer.elapsed_ms()), " ms");
     }
+    // The cache of the whole context and the largest steps reserved at load: --ctx is refused now, not halfway into
+    // a long prompt. Speculating, prefill chunks run the prefill program and verifies the verify program
+    // (spec::Program); a drafter's own steps are small.
+    const int64_t chunk = engine_options.prefill_chunk;
+    session_options.max_step_tokens =
+        speculate ? std::vector<int64_t>{0, chunk, engine_options.spec_k + 1, 0} : std::vector<int64_t>{chunk};
+    Timer compile_timer;
+    std::unique_ptr<Session> session;
+    try {
+        session = backend->compile(programs, model->weights(), session_options);
+    } catch (const Error& e) {
+        const bool media = std::any_of(encoders.begin(), encoders.end(), [](const auto& e) { return e != nullptr; });
+        if (!media) throw;
+        fail(e.what(), " (the media encoders hold some of that memory: --no-vision leaves them out)");
+    }
+    log::info("compiled on ", options.backend, " ", session_options.device.empty() ? "(default device)" : session_options.device,
+              " in ", static_cast<int>(compile_timer.elapsed_ms()), " ms");
 
     s->card_.id = options.model_id.empty() ? info.id : options.model_id;
     s->card_.arch = info.arch;
