@@ -142,4 +142,70 @@ json model_list_json(const ModelCard& card, int64_t created) {
     return model_list_json(card.id, card.context_length, created);
 }
 
+namespace {
+
+std::string_view finish_of(const GenerationOutcome& o, bool has_tool_calls) {
+    return finish_reason_text(o.result.finish, o.stop_string_hit, has_tool_calls);
+}
+
+class ChatFormat final : public ResponseFormat {
+public:
+    ChatFormat(ResponseMeta meta, bool include_usage) : meta_(std::move(meta)), include_usage_(include_usage) {}
+    std::string opening() override {
+        return sse_event(chat_chunk_json(meta_, {{"role", "assistant"}, {"content", ""}}));
+    }
+    std::string delta(const chat::ParsedDelta& d) override {
+        std::string event = sse_event(chat_chunk_json(meta_, chat_delta_json(d, tool_calls_)));
+        tool_calls_ += static_cast<int>(d.tool_calls.size());
+        return event;
+    }
+    std::string closing(const GenerationOutcome& o) override {
+        std::string out = sse_event(chat_chunk_json(meta_, json::object(), finish_of(o, has_tool_calls())));
+        if (include_usage_) out += sse_event(chat_usage_chunk_json(meta_, o.result.stats));
+        return out + std::string(kSseDone);
+    }
+    std::string error(std::string_view message) override {
+        return sse_event(error_body(message, "server_error")) + std::string(kSseDone);
+    }
+    json body(const chat::ParsedDelta& output, const GenerationOutcome& o) override {
+        return chat_completion_json(meta_, output, finish_of(o, !output.tool_calls.empty()), o.result.stats);
+    }
+
+private:
+    ResponseMeta meta_;
+    bool include_usage_;
+};
+
+class TextFormat final : public ResponseFormat {
+public:
+    TextFormat(ResponseMeta meta, bool include_usage) : meta_(std::move(meta)), include_usage_(include_usage) {}
+    std::string opening() override { return {}; }
+    std::string delta(const chat::ParsedDelta& d) override { return sse_event(text_chunk_json(meta_, d.content)); }
+    std::string closing(const GenerationOutcome& o) override {
+        std::string out = sse_event(text_chunk_json(meta_, "", finish_of(o, false)));
+        if (include_usage_) out += sse_event(text_usage_chunk_json(meta_, o.result.stats));
+        return out + std::string(kSseDone);
+    }
+    std::string error(std::string_view message) override {
+        return sse_event(error_body(message, "server_error")) + std::string(kSseDone);
+    }
+    json body(const chat::ParsedDelta& output, const GenerationOutcome& o) override {
+        return text_completion_json(meta_, output.content, finish_of(o, false), o.result.stats);
+    }
+
+private:
+    ResponseMeta meta_;
+    bool include_usage_;
+};
+
+}  // namespace
+
+std::unique_ptr<ResponseFormat> openai_chat_format(ResponseMeta meta, bool include_usage) {
+    return std::make_unique<ChatFormat>(std::move(meta), include_usage);
+}
+
+std::unique_ptr<ResponseFormat> openai_text_format(ResponseMeta meta, bool include_usage) {
+    return std::make_unique<TextFormat>(std::move(meta), include_usage);
+}
+
 }  // namespace xs::server

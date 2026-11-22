@@ -18,6 +18,8 @@ public:
     // End of stream: releases whatever is still held back (nothing once stopped).
     std::string flush();
     bool stopped() const { return stopped_; }
+    // The stop string that matched (the earliest in the text; empty before a match).
+    const std::string& matched() const { return matched_; }
 
 private:
     size_t held_back_length() const;
@@ -25,6 +27,7 @@ private:
     std::vector<std::string> stops_;
     std::string pending_;
     bool stopped_ = false;
+    std::string matched_;
 };
 
 }  // namespace xs::server

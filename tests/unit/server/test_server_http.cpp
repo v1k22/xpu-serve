@@ -351,6 +351,67 @@ TEST_SUITE("server.http") {
         CHECK(res->status == 200);
     }
 
+    TEST_CASE("anthropic messages: a message of blocks, its stream of events, count_tokens, errors in its shape") {
+        xs::test::FakeService service;
+        RunningServer server(service, "secret");
+        auto client = server.client();
+        const httplib::Headers key{{"x-api-key", "secret"}, {"anthropic-version", "2023-06-01"}};
+        const json body = {{"model", "fake-model"},
+                           {"max_tokens", 100},
+                           {"system", "Be nice."},
+                           {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}};
+        auto res = client.Post("/v1/messages", key, body.dump(), "application/json");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const json m = json::parse(res->body);
+        CHECK(m["type"] == "message");
+        CHECK(m["role"] == "assistant");
+        CHECK(m["content"] == json::array({{{"type", "text"}, {"text", "Hello!"}}}));
+        CHECK(m["stop_reason"] == "end_turn");
+        CHECK(m["usage"]["output_tokens"] == 6);
+        CHECK(decoded_prompt(service) == "system: Be nice.\nuser: hi\nassistant:");
+
+        json streamed = body;
+        streamed["stream"] = true;
+        streamed["max_tokens"] = 3;
+        res = client.Post("/v1/messages", key, streamed.dump(), "application/json");
+        REQUIRE(res);
+        CHECK(res->get_header_value("Content-Type") == "text/event-stream");
+        std::vector<std::string> names;
+        std::string text;
+        for (size_t pos = 0; pos < res->body.size();) {
+            const size_t end = res->body.find("\n\n", pos);
+            REQUIRE(end != std::string::npos);
+            const std::string e = res->body.substr(pos, end - pos);
+            const size_t nl = e.find('\n');
+            names.push_back(e.substr(7, nl - 7));
+            const json data = json::parse(e.substr(nl + 7));
+            if (names.back() == "content_block_delta") text += data["delta"]["text"].get<std::string>();
+            if (names.back() == "message_delta") CHECK(data["delta"]["stop_reason"] == "max_tokens");
+            pos = end + 2;
+        }
+        CHECK(names.front() == "message_start");
+        CHECK(names.back() == "message_stop");
+        CHECK(text == "Hel");
+
+        res = client.Post("/v1/messages/count_tokens", key, body.dump(), "application/json");
+        REQUIRE(res);
+        const std::string prompt = "system: Be nice.\nuser: hi\nassistant:";
+        CHECK(json::parse(res->body)["input_tokens"] == int(prompt.size()));
+
+        json bad = body;
+        bad.erase("max_tokens");
+        res = client.Post("/v1/messages", key, bad.dump(), "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(json::parse(res->body)["type"] == "error");
+        CHECK(json::parse(res->body)["error"]["type"] == "invalid_request_error");
+        res = client.Post("/v1/messages", body.dump(), "application/json");  // no key
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(json::parse(res->body)["error"]["type"] == "authentication_error");
+    }
+
     TEST_CASE("concurrent requests queue and both complete") {
         xs::test::FakeService service;
         service.token_delay = 5ms;

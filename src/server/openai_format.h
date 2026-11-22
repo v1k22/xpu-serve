@@ -12,6 +12,7 @@
 #include "chat/output_parser.h"
 #include "engine/service.h"
 #include "engine/types.h"
+#include "server/response_format.h"
 
 namespace xs::server {
 
@@ -58,5 +59,10 @@ nlohmann::json text_usage_chunk_json(const ResponseMeta& meta, const GenerateSta
 // GET /v1/models for the one model served; context_length 0 is left out.
 nlohmann::json model_list_json(std::string_view id, int64_t context_length, int64_t created);
 nlohmann::json model_list_json(const ModelCard& card, int64_t created);
+
+// OpenAI's chat completions and text completions as a ResponseFormat: chunks, a usage chunk when `include_usage`, then
+// [DONE].
+std::unique_ptr<ResponseFormat> openai_chat_format(ResponseMeta meta, bool include_usage);
+std::unique_ptr<ResponseFormat> openai_text_format(ResponseMeta meta, bool include_usage);
 
 }  // namespace xs::server

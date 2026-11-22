@@ -12,6 +12,7 @@
 
 #include <httplib/httplib.h>
 
+#include "server/anthropic_format.h"
 #include "server/completion_handlers.h"
 #include "server/decision_handlers.h"
 #include "server/embedding_handlers.h"
@@ -59,6 +60,30 @@ Handler guarded(Handler handler) {
         } catch (const std::exception& e) {
             log::error(req.method, " ", req.path, " -> 500: ", e.what());
             set_error(res, 500, e.what(), "server_error");
+        }
+    };
+}
+
+// Anthropic's routes answer errors in their API's shape.
+bool anthropic_route(const httplib::Request& req) {
+    return req.path.rfind("/v1/messages", 0) == 0;
+}
+
+void set_anthropic_error(httplib::Response& res, int status, std::string_view type, std::string_view message) {
+    res.status = status;
+    res.set_content(anthropic_error_body(type, message).dump(), "application/json");
+}
+
+Handler guarded_anthropic(Handler handler) {
+    return [handler = std::move(handler)](const httplib::Request& req, httplib::Response& res) {
+        try {
+            handler(req, res);
+        } catch (const InvalidRequest& e) {
+            log::info(req.method, " ", req.path, " -> 400: ", e.what());
+            set_anthropic_error(res, 400, "invalid_request_error", e.what());
+        } catch (const std::exception& e) {
+            log::error(req.method, " ", req.path, " -> 500: ", e.what());
+            set_anthropic_error(res, 500, "api_error", e.what());
         }
     };
 }
@@ -112,7 +137,8 @@ struct Server::Impl {
 
 bool Server::Impl::authorized(const httplib::Request& req) const {
     if (options.api_key.empty() || req.path == "/health" || req.path == "/ready" ||
-        req.get_header_value("Authorization") == "Bearer " + options.api_key) {
+        req.get_header_value("Authorization") == "Bearer " + options.api_key ||
+        req.get_header_value("x-api-key") == options.api_key) {  // Anthropic's clients send it so
         return true;
     }
     // A browser cannot set headers on a WebSocket: OpenAI's clients send the key as a subprotocol.
@@ -154,6 +180,11 @@ void Server::Impl::install_routes() {
 
     http.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         if (authorized(req)) return httplib::Server::HandlerResponse::Unhandled;
+        if (anthropic_route(req)) {
+            set_anthropic_error(res, 401, "authentication_error",
+                                "missing or invalid API key (send 'x-api-key: <key>')");
+            return httplib::Server::HandlerResponse::Handled;
+        }
         set_error(res, 401, "missing or invalid API key (send 'Authorization: Bearer <key>')", "invalid_request_error",
                   {}, "invalid_api_key");
         return httplib::Server::HandlerResponse::Handled;
@@ -206,6 +237,13 @@ void Server::Impl::install_routes() {
               guarded([this](const httplib::Request& req, httplib::Response& res) { handlers->chat(req, res); }));
     http.Post("/v1/completions",
               guarded([this](const httplib::Request& req, httplib::Response& res) { handlers->completion(req, res); }));
+    http.Post("/v1/messages", guarded_anthropic([this](const httplib::Request& req, httplib::Response& res) {
+                  handlers->messages(req, res);
+              }));
+    http.Post("/v1/messages/count_tokens",
+              guarded_anthropic([this](const httplib::Request& req, httplib::Response& res) {
+                  handlers->count_tokens(req, res);
+              }));
     if (transcription_handlers) {
         http.Post("/v1/audio/transcriptions", guarded([this](const httplib::Request& req, httplib::Response& res) {
                       transcription_handlers->transcribe(req, res);

@@ -60,6 +60,9 @@ struct CompletionRequest {
     GenerationOptions options;
 };
 
+// The sampling fields of a body (temperature, top_p, top_k, min_p, the penalties, seed); absent ones from `defaults`.
+SamplingParams parse_sampling(const RequestJson& body, const SamplingParams& defaults);
+
 // Parses a request body that must be a JSON object.
 RequestJson parse_json_body(std::string_view body);
 

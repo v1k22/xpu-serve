@@ -11,6 +11,7 @@ namespace xs::server {
 struct GenerationOutcome {
     GenerateResult result;  // a throwing service is reported as finish == Error
     bool stop_string_hit = false;
+    std::string stop_string;  // the one that matched
     bool client_gone = false;  // cancelled because on_delta failed or client_alive() turned false
 };
 

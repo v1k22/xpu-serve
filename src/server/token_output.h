@@ -26,6 +26,7 @@ public:
     chat::ParsedDelta finish();
     // True once a stop string matched; the caller should then cancel generation.
     bool stop_string_hit() const { return stops_.stopped(); }
+    const std::string& stop_string() const { return stops_.matched(); }
 
 private:
     chat::ParsedDelta apply_stop_strings(chat::ParsedDelta delta);

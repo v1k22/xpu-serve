@@ -375,7 +375,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       decode step of Qwen3.5-4B at f16)
 - [x] Data-aware quantization: AWQ-style scale and clip search in `convert`, calibrated on our own engine
 - [ ] GPTQ; AWQ with the full activation covariance (not per channel); larger calibration sets
-- [ ] Anthropic `/v1/messages`, Ollama `/api/chat` and `/api/generate`
+- [x] Anthropic `/v1/messages` and `/v1/messages/count_tokens` (blocks, tools, thinking, streaming events)
+- [ ] Ollama `/api/chat` and `/api/generate`
 - [ ] Constrained decoding (JSON schema / grammar), logprobs
 - **Done when:** each item lands as one PR with its parity and E2E tests.
 

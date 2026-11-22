@@ -59,7 +59,7 @@ GenerationOutcome run_generation(InferenceService& service, const GenerateReques
         }
     }
     worker.join();
-    return {std::move(result), output.stop_string_hit(), client_gone.load()};
+    return {std::move(result), output.stop_string_hit(), output.stop_string(), client_gone.load()};
 }
 
 }  // namespace xs::server

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -10,9 +11,12 @@
 #include <vector>
 
 #include "chat/chat_template.h"
+#include "server/anthropic_format.h"
+#include "server/anthropic_request.h"
 #include "server/generation_run.h"
 #include "server/openai_format.h"
 #include "server/openai_request.h"
+#include "server/response_format.h"
 #include "server/token_output.h"
 #include "tokenizer/tokenizer.h"
 #include "util/log.h"
@@ -23,8 +27,8 @@ using nlohmann::json;
 
 // Everything a response needs once the prompt is tokenized. Copyable: the stream provider keeps a copy.
 struct CompletionHandlers::Job {
-    bool chat = true;  // chat.completion objects vs text_completion objects
-    ResponseMeta meta;
+    std::string id;  // for the log
+    std::function<std::unique_ptr<ResponseFormat>()> format;
     GenerateRequest request;
     GenerationOptions options;
     std::string dialect;  // output parser; raw completions are always "plain"
@@ -32,61 +36,6 @@ struct CompletionHandlers::Job {
 };
 
 namespace {
-
-// The per-endpoint shape of a response: chat deltas with roles and tool calls, or plain text.
-class ResponseShape {
-public:
-    explicit ResponseShape(ResponseMeta meta) : meta_(std::move(meta)) {}
-    virtual ~ResponseShape() = default;
-    virtual std::optional<json> opening_chunk() const = 0;
-    virtual json delta_chunk(const chat::ParsedDelta& delta) = 0;
-    virtual json closing_chunk(std::string_view finish_reason) const = 0;
-    virtual json usage_chunk(const GenerateStats& stats) const = 0;
-    virtual json full_response(const chat::ParsedDelta& output, std::string_view finish_reason,
-                               const GenerateStats& stats) const = 0;
-
-protected:
-    ResponseMeta meta_;
-};
-
-class ChatShape final : public ResponseShape {
-public:
-    using ResponseShape::ResponseShape;
-    std::optional<json> opening_chunk() const override {
-        return chat_chunk_json(meta_, {{"role", "assistant"}, {"content", ""}});
-    }
-    json delta_chunk(const chat::ParsedDelta& delta) override {
-        json chunk = chat_chunk_json(meta_, chat_delta_json(delta, tool_calls_sent_));
-        tool_calls_sent_ += int(delta.tool_calls.size());
-        return chunk;
-    }
-    json closing_chunk(std::string_view finish_reason) const override {
-        return chat_chunk_json(meta_, json::object(), finish_reason);
-    }
-    json usage_chunk(const GenerateStats& stats) const override { return chat_usage_chunk_json(meta_, stats); }
-    json full_response(const chat::ParsedDelta& output, std::string_view finish_reason,
-                       const GenerateStats& stats) const override {
-        return chat_completion_json(meta_, output, finish_reason, stats);
-    }
-
-private:
-    int tool_calls_sent_ = 0;
-};
-
-class TextShape final : public ResponseShape {
-public:
-    using ResponseShape::ResponseShape;
-    std::optional<json> opening_chunk() const override { return std::nullopt; }
-    json delta_chunk(const chat::ParsedDelta& delta) override { return text_chunk_json(meta_, delta.content); }
-    json closing_chunk(std::string_view finish_reason) const override {
-        return text_chunk_json(meta_, "", finish_reason);
-    }
-    json usage_chunk(const GenerateStats& stats) const override { return text_usage_chunk_json(meta_, stats); }
-    json full_response(const chat::ParsedDelta& output, std::string_view finish_reason,
-                       const GenerateStats& stats) const override {
-        return text_completion_json(meta_, output.content, finish_reason, stats);
-    }
-};
 
 std::string random_id(std::string_view prefix) {
     thread_local std::mt19937_64 rng{std::random_device{}()};
@@ -125,11 +74,6 @@ GenerateRequest make_generate_request(std::vector<int32_t> prompt, const Generat
     return r;
 }
 
-std::unique_ptr<ResponseShape> make_shape(bool chat, const ResponseMeta& meta) {
-    if (chat) return std::make_unique<ChatShape>(meta);
-    return std::make_unique<TextShape>(meta);
-}
-
 std::string_view outcome_finish_reason(const GenerationOutcome& outcome, bool has_tool_calls) {
     return finish_reason_text(outcome.result.finish, outcome.stop_string_hit, has_tool_calls);
 }
@@ -153,44 +97,74 @@ void log_summary(std::string_view id, const GenerationOutcome& outcome, bool has
 
 }  // namespace
 
-void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& res) const {
+CompletionHandlers::Prompt CompletionHandlers::chat_prompt(const ChatRequest& chat) const {
     const ModelCard& card = service_.model();
-    ChatRequest chat = parse_chat_request(parse_json_body(req.body), card.default_sampling);
-    std::vector<MediaInput> media;
+    Prompt p;
     for (const MediaPart& part : chat.media) {
         if (!service_.accepts(part.modality)) {
             const char* kind = modality_name(part.modality);
             throw InvalidRequest(str_cat("model '", card.id, "' does not take ", kind, " input"), part.param);
         }
         try {
-            media.push_back(service_.prepare_media(part.modality, part.bytes));
+            p.media.push_back(service_.prepare_media(part.modality, part.bytes));
         } catch (const Error& e) {
             throw InvalidRequest(str_cat(part.param, ": ", e.what()), part.param);
         }
     }
-    std::vector<int32_t> prompt;
-    std::string text;
     try {
-        text = service_.chat_template().render(chat.messages, chat.tools, /*add_generation_prompt=*/true,
-                                               chat.template_kwargs);
-        prompt = service_.tokenizer().encode(text, /*parse_special=*/true);
+        p.text = service_.chat_template().render(chat.messages, chat.tools, /*add_generation_prompt=*/true,
+                                                 chat.template_kwargs);
+        p.tokens = service_.tokenizer().encode(p.text, /*parse_special=*/true);
     } catch (const std::exception& e) {
         throw InvalidRequest(str_cat("could not render the chat template: ", e.what()), "messages");
     }
     try {
-        prompt = service_.expand_media(std::move(prompt), media);
+        p.tokens = service_.expand_media(std::move(p.tokens), p.media);
     } catch (const Error& e) {
         throw InvalidRequest(e.what(), "messages");
     }
-    GenerateRequest request = make_generate_request(std::move(prompt), chat.options, card, "messages");
-    request.media = std::move(media);
-    Job job{.chat = true,
-            .meta = {random_id("chatcmpl-"), card.id, unix_seconds_now()},
+    return p;
+}
+
+void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& res) const {
+    const ModelCard& card = service_.model();
+    ChatRequest chat = parse_chat_request(parse_json_body(req.body), card.default_sampling);
+    Prompt p = chat_prompt(chat);
+    GenerateRequest request = make_generate_request(std::move(p.tokens), chat.options, card, "messages");
+    request.media = std::move(p.media);
+    const ResponseMeta meta{random_id("chatcmpl-"), card.id, unix_seconds_now()};
+    const bool usage = chat.options.include_usage;
+    Job job{.id = meta.id,
+            .format = [meta, usage] { return openai_chat_format(meta, usage); },
             .request = std::move(request),
             .options = std::move(chat.options),
             .dialect = card.dialect,
-            .prompt_tail = std::string(chat::prompt_tail(text))};
+            .prompt_tail = std::string(chat::prompt_tail(p.text))};
     respond(job, req, res);
+}
+
+void CompletionHandlers::messages(const httplib::Request& req, httplib::Response& res) const {
+    const ModelCard& card = service_.model();
+    ChatRequest chat = parse_messages_request(parse_json_body(req.body), card.default_sampling, card.dialect);
+    Prompt p = chat_prompt(chat);
+    const auto input_tokens = static_cast<int64_t>(p.tokens.size());
+    GenerateRequest request = make_generate_request(std::move(p.tokens), chat.options, card, "messages");
+    request.media = std::move(p.media);
+    const std::string id = random_id("msg_");
+    Job job{.id = id,
+            .format = [id, model = card.id, input_tokens] { return anthropic_format(id, model, input_tokens); },
+            .request = std::move(request),
+            .options = std::move(chat.options),
+            .dialect = card.dialect,
+            .prompt_tail = std::string(chat::prompt_tail(p.text))};
+    respond(job, req, res);
+}
+
+void CompletionHandlers::count_tokens(const httplib::Request& req, httplib::Response& res) const {
+    const ModelCard& card = service_.model();
+    const ChatRequest chat =
+        parse_messages_request(parse_json_body(req.body), card.default_sampling, card.dialect, /*count_only=*/true);
+    res.set_content(json{{"input_tokens", chat_prompt(chat).tokens.size()}}.dump(), "application/json");
 }
 
 void CompletionHandlers::completion(const httplib::Request& req, httplib::Response& res) const {
@@ -202,8 +176,10 @@ void CompletionHandlers::completion(const httplib::Request& req, httplib::Respon
     } catch (const std::exception& e) {
         throw InvalidRequest(str_cat("could not tokenize the prompt: ", e.what()), "prompt");
     }
-    Job job{.chat = false,
-            .meta = {random_id("cmpl-"), card.id, unix_seconds_now()},
+    const ResponseMeta meta{random_id("cmpl-"), card.id, unix_seconds_now()};
+    const bool usage = completion.options.include_usage;
+    Job job{.id = meta.id,
+            .format = [meta, usage] { return openai_text_format(meta, usage); },
             .request = make_generate_request(std::move(prompt), completion.options, card, "prompt"),
             .options = std::move(completion.options),
             .dialect = "plain",
@@ -232,47 +208,33 @@ void CompletionHandlers::write_full(const Job& job, const httplib::Request& req,
             return true;
         },
         [&] { return !req.is_connection_closed(); });
-    const bool has_tool_calls = !message.tool_calls.empty();
-    log_summary(job.meta.id, outcome, has_tool_calls);
+    log_summary(job.id, outcome, !message.tool_calls.empty());
     if (outcome.client_gone) return;
     if (outcome.result.finish == FinishReason::Error) fail(outcome.result.error);
-    const json body = make_shape(job.chat, job.meta)
-                          ->full_response(message, outcome_finish_reason(outcome, has_tool_calls),
-                                          outcome.result.stats);
-    res.set_content(body.dump(), "application/json");
+    res.set_content(job.format()->body(message, outcome).dump(), "application/json");
 }
 
 bool CompletionHandlers::write_stream(const Job& job, const httplib::Request& req, httplib::DataSink& sink) const {
-    const auto send = [&sink](std::string_view event) { return sink.write(event.data(), event.size()); };
-    const std::unique_ptr<ResponseShape> shape = make_shape(job.chat, job.meta);
-    if (const auto opening = shape->opening_chunk(); opening.has_value() && !send(sse_event(*opening))) return false;
+    const auto send = [&sink](std::string_view event) {
+        return event.empty() || sink.write(event.data(), event.size());
+    };
+    const std::unique_ptr<ResponseFormat> format = job.format();
+    if (!send(format->opening())) return false;
 
     GenerationOutcome outcome;
-    bool has_tool_calls = false;
     try {
         TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop);
         outcome = run_generation(
-            service_, job.request, output,
-            [&](const chat::ParsedDelta& delta) {
-                has_tool_calls = has_tool_calls || !delta.tool_calls.empty();
-                return send(sse_event(shape->delta_chunk(delta)));
-            },
+            service_, job.request, output, [&](const chat::ParsedDelta& delta) { return send(format->delta(delta)); },
             [&] { return !req.is_connection_closed(); });
     } catch (const std::exception& e) {
         outcome.result.finish = FinishReason::Error;
         outcome.result.error = e.what();
     }
-    log_summary(job.meta.id, outcome, has_tool_calls);
+    log_summary(job.id, outcome, format->has_tool_calls());
     if (outcome.client_gone) return false;
-
-    bool ok = true;
-    if (outcome.result.finish == FinishReason::Error) {
-        ok = send(sse_event(error_body(outcome.result.error, "server_error")));
-    } else {
-        ok = send(sse_event(shape->closing_chunk(outcome_finish_reason(outcome, has_tool_calls))));
-        if (ok && job.options.include_usage) ok = send(sse_event(shape->usage_chunk(outcome.result.stats)));
-    }
-    return ok && send(kSseDone);
+    if (outcome.result.finish == FinishReason::Error) return send(format->error(outcome.result.error));
+    return send(format->closing(outcome));
 }
 
 }  // namespace xs::server

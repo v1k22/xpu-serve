@@ -13,7 +13,13 @@ std::string StopStringMatcher::push(std::string_view text) {
     if (stopped_) return {};
     pending_ += text;
     size_t match = std::string::npos;
-    for (const std::string& stop : stops_) match = std::min(match, pending_.find(stop));
+    for (const std::string& stop : stops_) {
+        const size_t at = pending_.find(stop);
+        if (at < match) {
+            match = at;
+            matched_ = stop;
+        }
+    }
     if (match != std::string::npos) {
         stopped_ = true;
         std::string released = pending_.substr(0, match);
