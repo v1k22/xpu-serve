@@ -181,6 +181,13 @@ launching them. It is not. Measured on the Arc Pro B60 with the q4 pack:
 What remains is two thirds weight reading, near what the card's memory gives (the output layer reads at 386 GB/s),
 and the small kernels.
 
+- **The small kernels, next.** Elementwise ops of one shape run as one kernel a tree (`graph/elementwise_groups.h`):
+  a gate's mix of two streams, the experts' softcapped SwiGLU over the two slices of their bank's output, a
+  convolution's residual and scale. In the model, a block residual's scale is its queries' (a constant), a gate norms
+  its pair in one pass, and its forget and gain rows are one weight (joined at load). UD-Q4_K_M's decode step went
+  from 22.99 to 20.86 ms of device time, the bench's decode from 39.8 to 41.0 tok/s (512 + 128 tokens); perplexity
+  4.037 and 4.039, the same greedy text.
+
 ## What was measured
 
 The variants, the commands and every number are in model_recipes.md (Inkling-2-Mini, Inkling-2-Mini GGUF, DSpark).
@@ -193,9 +200,8 @@ model (below), so the multiple-choice read-out the other GGUF files were scored 
 
 ## Open
 
-- The small kernels of a decode step: about 6 of its 17 ms on the B60 (below). The message gate's 13 launches, the
-  block residual's 6 and the experts' activation chain are each a kernel or two's worth of work; fusing them would
-  take about 2 ms.
+- The small kernels left: a router's sigmoid, bias, top-k and gathers (some eight launches a layer) and a block
+  residual's norm, concat, scores, softmax and mix (five) are kernels apiece.
 - `--readout`: the template ends without a generation prompt and the model writes its own `<|message_model|>` and
   content tag, so the read-out sees a structural token, not an answer letter. (Chat is parsed: the `inkling2`
   dialect splits the model's messages into reasoning, content and tool calls.)

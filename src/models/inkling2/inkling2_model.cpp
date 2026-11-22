@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <optional>
+#include <span>
 
 #include "io/joined_weights.h"
 #include "models/common/blocks.h"
@@ -25,6 +26,8 @@ constexpr const char* kDrafterFile = "mtp.safetensors";
 constexpr const char* kDrafterPrefix = "mtp.";
 // transformers' Inkling2LoopUnweightedRMSNorm as the block residuals build it (its default, not rms_norm_eps).
 constexpr float kUnitEps = 1e-6f;
+// A message gate's forget_weight and gain_weight rows joined at load (join_gates), as one weight of a controller.
+constexpr const char* kGateRows = "forget_gain_weight";
 
 // The residual stream and the states at the start of each block so far, normed, each [T, 1, hidden].
 struct Stream {
@@ -101,22 +104,24 @@ private:
     }
 
     // A block residual's queries [count, hidden]: one is stored as a vector.
-    Value query(const std::string& name, int64_t count) {
-        const Value q = weight(name);
+    HostTensor query(const std::string& name, int64_t count) const {
+        HostTensor q = host(name);
         const Dims expected = count == 1 ? Dims{c_.hidden_size} : Dims{count, c_.hidden_size};
-        XS_CHECK(g_.type(q).shape == expected, "inkling2: ", kPrefix, name, " is ", dims_to_string(g_.type(q).shape),
-                 ", expected ", dims_to_string(expected));
-        return g_.reshape(q, {count, c_.hidden_size});
+        XS_CHECK(q.shape() == expected, "inkling2: ", kPrefix, name, " is ", dims_to_string(q.shape()), ", expected ",
+                 dims_to_string(expected));
+        return HostTensor::from_vector(DType::F32, {count, c_.hidden_size}, q.to_f32());
     }
 
     // Inkling2LoopBlockAttentionResidual: each query attends over the normed block states and the normed h, with no
-    // projections; its output is their mix. [T, count, hidden], or [T, hidden] for one query.
-    Value mix(const std::vector<Value>& blocks, Value h, Value queries, int64_t count) {
+    // projections; its output is their mix. [T, count, hidden], or [T, hidden] for one query. The scores' scale is
+    // the queries' (a constant), not a pass over the scores.
+    Value mix(const std::vector<Value>& blocks, Value h, HostTensor queries, int64_t count) {
         std::vector<Value> states = blocks;
         states.push_back(unit(h));
         const Value stack = states.size() == 1 ? states[0] : g_.concat(states, 1);  // [T, S, hidden]
         const float scale = 1.0f / std::sqrt(static_cast<float>(c_.hidden_size));
-        const Value by_state = g_.scale(g_.matmul(stack, queries), scale);  // [T, S, count]
+        for (float& v : std::span(queries.data<float>(), static_cast<size_t>(queries.numel()))) v *= scale;
+        const Value by_state = g_.matmul(stack, g_.constant(std::move(queries)));  // [T, S, count]
         // [T, count, S]: one query's scores lie that way already.
         const Value scores = count == 1 ? g_.reshape(by_state, {kT, 1, static_cast<int64_t>(states.size())})
                                         : g_.transpose(by_state, {0, 2, 1});
@@ -129,7 +134,7 @@ private:
     // Inkling2LoopMessageAttentionResidual: loop layer `index`'s four queries over the pass before.
     Messages messages(int64_t index, int64_t pass, const std::vector<Value>& heard, Value ended) {
         Graph::Scope scope(g_, "messages." + std::to_string(index) + ".pass" + std::to_string(pass));
-        const Value mixed = mix(heard, ended, g_.constant(message_queries(index)), 4);
+        const Value mixed = mix(heard, ended, message_queries(index), 4);
         return {part(mixed, 0), part(mixed, 1), part(mixed, 2), part(mixed, 3)};
     }
 
@@ -161,13 +166,17 @@ private:
         return queries;
     }
 
-    // Inkling2LoopMessageGate: (1 - forget) * h + gain * message, both gates from the normed pair.
+    // Inkling2LoopMessageGate: (1 - forget) * h + gain * message, both gates from the normed pair (each half normed
+    // alone), through one projection of the forget and gain rows (kGateRows).
     Value gate(const std::string& name, Value h, Value message) {
         Graph::Scope scope(g_, "gate");
-        const Value both = g_.concat({g_.rms_norm(h, eps()), g_.rms_norm(message, eps())}, 1);
+        const int64_t d = c_.hidden_size;
+        const Value pair = g_.reshape(g_.concat({h, message}, 1), {kT, 2, d});
+        const Value both = g_.reshape(g_.rms_norm(pair, eps()), {kT, 2 * d});
         const Value low = g_.matmul(both, weight(name + "down_weight"));
-        const Value forget = g_.tanh(g_.matmul(low, weight(name + "forget_weight")));
-        const Value gain = g_.tanh(g_.matmul(low, weight(name + "gain_weight")));
+        const Value gates = g_.matmul(low, weight(name + kGateRows));  // [T, 2 hidden]: forget, then gain
+        const Value forget = g_.tanh(g_.slice(gates, 1, 0, d));
+        const Value gain = g_.tanh(g_.slice(gates, 1, d, 2 * d));
         return g_.add(g_.add(h, g_.scale(g_.mul(forget, h), -1.0f)), g_.mul(gain, message));
     }
 
@@ -348,6 +357,21 @@ private:
     std::vector<Value> entered_;
 };
 
+// Each message gate's forget and gain projections read the same input: their rows as one weight (a pack written
+// from a model loaded so already holds it).
+void join_gates(SafetensorsWeights& weights, const Config& cfg) {
+    for (int64_t i = cfg.loop.start; i < cfg.loop.end; ++i) {
+        for (const char* c : {"attn.", "k.", "v.", "mlp."}) {
+            const std::string at = std::string(kPrefix) + "layers." + std::to_string(i) + ".controllers." + c;
+            if (weights.contains(at + kGateRows) || !weights.contains(at + "forget_weight")) continue;
+            const TensorView& forget = weights.get(at + "forget_weight");
+            XS_CHECK(forget.shape.size() == 2, "inkling2: ", at, "forget_weight is ", dims_to_string(forget.shape));
+            weights.join_rows(at + kGateRows, {at + "forget_weight", at + "gain_weight"},
+                              {2 * forget.shape[0], forget.shape[1]});
+        }
+    }
+}
+
 // The experts of a released checkpoint are NVFP4 (U8 codes) or MXFP8 (F8 codes) beside their scales; a pack's, or a
 // float checkpoint's, are weights already.
 void pair_experts(SafetensorsWeights& weights, const Config& cfg) {
@@ -499,6 +523,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
 
     auto checkpoint = SafetensorsWeights::open_dir(dir, SafetensorsWeights::Fp8::AsStored);
     pair_experts(*checkpoint, cfg);
+    join_gates(*checkpoint, cfg);
     std::unique_ptr<WeightStore> weights = std::move(checkpoint);
 
     // The drafter: a released checkpoint keeps it in a file of its own, a pack among the model's tensors.

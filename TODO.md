@@ -316,10 +316,12 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       Unsloth's layout from the same model
 - [ ] Inkling 2 Mini: a GGUF LoRA adapter (AtomicChat's rank-1 edit, for any GGUF of the model; refused by name
       today: the expert banks it changes are quantized, so it would run beside them rather than be merged)
-- [ ] Inkling 2 Mini: its small kernels fused (about 6 of a decode step's 17 ms on the B60: the message gate's 13
-      launches, the block residual's 6, the experts' activation chain), `--readout` (the model writes its own
-      `<|message_model|>` and content tag before an answer, so the read-out sees a structural token, not a letter), a
-      self-contained tiny GGUF for the importer's tests (the real lossless file is the check today)
+- [x] Inkling 2 Mini: its small kernels fused: elementwise trees as one kernel, the residual's scale in its queries,
+      a gate's pair normed once and its forget and gain rows one weight (22.99 to 20.86 ms a decode step on the B60)
+- [ ] Inkling 2 Mini: the router's and the block residual's small kernels (some 13 launches a layer)
+- [ ] Inkling 2 Mini: `--readout` (the model writes its own `<|message_model|>` and content tag before an answer, so
+      the read-out sees a structural token, not a letter), a self-contained tiny GGUF for the importer's tests (the
+      real lossless file is the check today)
 - [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`; `lfm3_vl`'s text decoder is read
       for d1 only); conv-window snapshots for prefix
       reuse after a turn with reasoning; the small ops of a q4 decode step (119 norms and 48 residual adds rank
