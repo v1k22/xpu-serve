@@ -4,6 +4,8 @@
 // and Rope over x [T, R, H, D] are the same as over the T * R rows laid out [T * R, H, D]; shared by the cpu-ref and
 // device op tests.
 
+#include <limits>
+
 #include "backend_test_util.h"
 #include "graph/graph.h"
 #include "reference_ops.h"
@@ -21,15 +23,29 @@ inline Tensor64 flat(const Tensor64& t) {
     return f;
 }
 
-inline graph::Graph attention_graph(float scale) {
+// `biased`: with a key_bias input "bias" [T, R], one a key.
+inline graph::Graph attention_graph(float scale, bool biased = false) {
     graph::Graph g;
     graph::AttentionAttrs attrs;
     attrs.causal = false;
     attrs.scale = scale;
-    g.output("out", g.attention(g.input("q", DType::F32, {graph::kT, kRows, kHeads, kDim}),
-                                g.input("k", DType::F32, {graph::kT, kRows, kKvHeads, kDim}),
-                                g.input("v", DType::F32, {graph::kT, kRows, kKvHeads, kDim}), attrs));
+    const graph::Value q = g.input("q", DType::F32, {graph::kT, kRows, kHeads, kDim});
+    const graph::Value k = g.input("k", DType::F32, {graph::kT, kRows, kKvHeads, kDim});
+    const graph::Value v = g.input("v", DType::F32, {graph::kT, kRows, kKvHeads, kDim});
+    g.output("out", biased ? g.attention(q, k, v, g.input("bias", DType::F32, {graph::kT, kRows}), attrs)
+                           : g.attention(q, k, v, attrs));
     return g;
+}
+
+// A bias a key over the rows: the last token keeps its first row alone (a class token beside padding), and one key
+// of the first token is turned down.
+inline HostTensor row_bias() {
+    std::vector<float> bias(static_cast<size_t>(kTokens * kRows), 0.0f);
+    for (int64_t r = 1; r < kRows; ++r) {
+        bias[static_cast<size_t>((kTokens - 1) * kRows + r)] = -std::numeric_limits<float>::infinity();
+    }
+    bias[2] = -1.5f;
+    return make_tensor(DType::F32, {kTokens, kRows}, bias);
 }
 
 // Attention within each token's rows only: the planted bug.

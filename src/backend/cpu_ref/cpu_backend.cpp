@@ -460,8 +460,10 @@ class CpuProgram {
                 if (in(0).rank() == 4) {  // T * R queries over N * R keys
                     const Dims qs = in(0).shape(), ks = in(1).shape();
                     const auto rows = [](const Dims& d) { return Dims{d[0] * d[1], d[2], d[3]}; };
-                    const HostTensor out = cpu_ref::attention(*pool_, f32(0).reshaped(rows(qs)),
-                                                              f32(1).reshaped(rows(ks)), f32(2).reshaped(rows(ks)), a);
+                    const HostTensor bias = n.inputs.size() == 4 ? f32(3).reshaped({ks[0] * ks[1]}) : HostTensor();
+                    const HostTensor out =
+                        cpu_ref::attention(*pool_, f32(0).reshaped(rows(qs)), f32(1).reshaped(rows(ks)),
+                                           f32(2).reshaped(rows(ks)), a, n.inputs.size() == 4 ? &bias : nullptr);
                     return {out.reshaped(qs)};
                 }
                 if (a.grouped) return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, nullptr, &in(3))};

@@ -207,7 +207,8 @@ struct StateAttrs {  // CausalConv, DynamicConv and GatedDelta: the slot that ca
 // Not causal with a block (an encoder over several images at once): q, k and v have one static length, a multiple of
 // `block`, and key j is visible to query i iff both fall in the same run of `block` tokens.
 // Not causal over rows of several a token (q [T, R, Hq, D], k / v [N, R, Hkv, D]: a vision tower's patches, R of each
-// merged token): one sequence of T * R queries over N * R keys, every key visible; no window, block or groups.
+// merged token): one sequence of T * R queries over N * R keys, every key visible; no window, block or groups. Its
+// key_bias is [N, R], one a key (-inf: a row that holds no patch).
 // Not causal in groups (`grouped`; questions packed after the state they ask about): q, k and v are the step's own
 // [T, ...] and a fourth input, groups [T] i32, gives each token's group; key j is visible to query i iff
 // groups[i] == 0, groups[j] == 0 or groups[i] == groups[j]. Group 0 sees every token and every token sees it; any

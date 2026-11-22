@@ -136,6 +136,15 @@ TEST_SUITE("cpu-ref encoder ops") {
         CHECK(test::all_close(out.reshaped({kTokens * kRows, kHeads, kDim}), expected, kAtol, kRtol));
         CHECK_FALSE(test::all_close(out, per_token(to_f64(q), to_f64(k), to_f64(v), spec), kAtol, kRtol));
 
+        // A bias a key: a row at -inf is as if it were not there; planted: the bias left out.
+        const HostTensor bias = row_bias();
+        const HostTensor biased = run_out(attention_graph(0.6f, true), {{"q", q}, {"k", k}, {"v", v}, {"bias", bias}});
+        const Tensor64 bias64 = to_f64(bias);
+        spec.key_bias.assign(bias64.data.begin(), bias64.data.end());
+        const Tensor64 masked = test::ref::attention(flat(to_f64(q)), flat(to_f64(k)), flat(to_f64(v)), spec);
+        CHECK(test::all_close(biased.reshaped({kTokens * kRows, kHeads, kDim}), masked, kAtol, kRtol));
+        CHECK_FALSE(test::all_close(biased.reshaped({kTokens * kRows, kHeads, kDim}), expected, 1e-3, 1e-3));
+
         const std::vector<float> freq{1.0f, 0.3f, 0.1f, 0.03f, 0.01f, 0.003f, 0.001f, 0.0003f};
         const HostTensor x = rng.uniform(DType::F32, {kTokens, kRows, kHeads, kDim});
         const HostTensor pos = rng.ints(DType::I32, {kTokens, kRows}, 0, 50);

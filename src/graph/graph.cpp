@@ -615,8 +615,10 @@ Value Graph::attention(Value q, Value k, Value v, Value key_bias, const Attentio
     XS_CHECK(!attrs.causal && !attrs.grouped, "attention with a key bias must not be causal or in groups");
     const Value out = attention(q, k, v, attrs);
     const TensorType& bt = type(key_bias);
-    XS_CHECK(bt.dtype == DType::F32 && bt.shape == (Dims{type(k).shape[0]}), "attention key_bias must be f32 [",
-             dim_to_string(type(k).shape[0]), "], got ", shape_to_string(bt.shape), " (", where(key_bias), ")");
+    const Dims& ks = type(k).shape;
+    const Dims per_key = ks.size() == 4 ? Dims{ks[0], ks[1]} : Dims{ks[0]};  // one a key: a token, or each of its rows
+    XS_CHECK(bt.dtype == DType::F32 && bt.shape == per_key, "attention key_bias must be f32 ",
+             shape_to_string(per_key), ", got ", shape_to_string(bt.shape), " (", where(key_bias), ")");
     nodes_[static_cast<size_t>(out.node)].inputs.push_back(key_bias);
     return out;
 }
