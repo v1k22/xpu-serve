@@ -48,7 +48,8 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **FP8 checkpoints** (Qwen3.8-27B-FP8, Qwen3.6-35B-A3B-FP8, Ornith-1.5-35B-A3B-FP8: a scale per 128 x 128 block,
   or compressed-tensors' scale per channel), served as they are or converted to a pack
 - ✅ **GGUF import**: `qwen35`, `qwen35moe`, `gemma4`, `gemma4-assistant`, `inkling2` (with its DSpark drafter's
-  file), `clef` and the `modern-bert` files of Laya and Julia-1, in all 19 of GGUF's block formats and Unsloth's
+  and vision tower's files) and `inkling2_loop` (mainline llama.cpp's layout of it), `clef` and the `modern-bert`
+  files of Laya and Julia-1, in all 19 of GGUF's block formats and Unsloth's
   NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them
 - ✅ **Speculative decoding**: Qwen's MTP heads, Gemma 4's assistants, DFlash 2 and DSpine block drafters
   (Qwen3.8-27B), a DFlash block drafter (Ornith-1.5-35B-A3B), Inkling 2's DSpark drafter
@@ -87,6 +88,7 @@ Each model's recipe has its commands and numbers.
 | Ornith-1.5-35B-A3B | language, MoE | `ornith-ai/Ornith-1.5-35B-A3B`, `-FP8`, `-GGUF` | q4 pack, GGUF Q4_K_M | [recipe](model_recipes.md#ornith-15-35b-a3b), [GGUF](model_recipes.md#ornith-15-35b-a3b-gguf) |
 | LFM3-1.7B | language | `LiquidAI/LFM3-1.7B` | original, q8 / q4 pack | [recipe](model_recipes.md#lfm3-17b) |
 | Inkling-2-Mini | language, MoE | `thinkingmachines/Inkling-2-Mini`, `unsloth/Inkling-2-Mini-GGUF` | q8 / q4 pack, GGUF | [recipe](model_recipes.md#inkling-2-mini), [GGUF](model_recipes.md#inkling-2-mini-gguf) |
+| Inkling-2-Mini Uncensored | language, MoE | `AtomicChat/Inkling-2-Mini-Uncensored-GGUF` | GGUF IQ3_S, IQ2_M | [GGUF](model_recipes.md#inkling-2-mini-uncensored-gguf) |
 | Clef-Flash | decision | `Cloudflare/clef-flash` | original, q8 / q4 pack, GGUF | [recipe](model_recipes.md#clef-flash) |
 | Clef | decision | `ggml-org/Clef-GGUF` (of `Cloudflare/clef`) | GGUF Q4_K_M | [recipe](model_recipes.md#clef) |
 | pplx-decider-flash-v1.2 | decision | `perplexity-ai/pplx-decider-flash-v1.2` | original, q8 / q4 pack | [recipe](model_recipes.md#pplx-decider-flash-v12) |
@@ -218,6 +220,8 @@ xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
   Qwen3.6 / Qwen3.8 text models, dense and mixture of experts (Ornith-1.5-35B-A3B's files are `qwen35moe`); `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
   images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
   drafter; `inkling2`, Inkling 2 Mini (Unsloth's files), with its drafter's file (`dspark-*.gguf`) and its vision tower's (`mmproj-*.gguf`), both fetched by `-hf`;
+  `inkling2_loop`, the same model in mainline llama.cpp's layout (AtomicChat's uncensored files, with their vision
+  tower's; a LoRA adapter file is refused);
   `clef`, the Clef decision models; and `modern-bert` with a Laya read-out, the files of Laya and Julia-1. Others
   are refused by name.
 - A Qwen3.5-family file that comes without its MTP head (the smallest files of Qwen3.8-27B) takes the head from its

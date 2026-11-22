@@ -74,6 +74,14 @@ GGUF (`src/convert/gguf/inkling2.cpp`). What was particular:
   expert's output (`MoeParts::gate_up_scale`, `expert_scale`).
 - **The lossless file is the proof.** UD-Q8_K_XL holds the checkpoint's own values; its pack matches Hugging Face
   fp32 as the checkpoint does (cosine 1, greedy tokens equal), which checks every name, shape and reorder.
+- **Mainline llama.cpp's layout is one more reading, not one more importer.** Its files (`inkling2_loop`:
+  AtomicChat's, Unsloth's `Mainline_Support` copies) hold the same tensors under other names, metadata per layer
+  rather than per visit, and the loop's gates under other names; the converter's transposes and flips are the same.
+  One reader takes both, told the layout (`Flavor`). One tensor differs in kind: each looped layer keeps its four
+  message queries (`loop_msg_query`), rows the checkpoint keeps in two tensors for the whole loop, so the pack keeps
+  them per layer and the model reads a layer's own when there. The check is Unsloth's UD-Q4_K_M in both layouts: the
+  same config, tensors, shapes, reorders and values (all 732 tensors in the same format), the queries equal to the
+  checkpoint's rows, and the same greedy text from the two packs.
 
 ## The drafter (DSpark)
 
@@ -193,4 +201,5 @@ model (below), so the multiple-choice read-out the other GGUF files were scored 
   dialect splits the model's messages into reasoning, content and tool calls.)
 - A verify of several rows, and the drafter's block, read the whole KV cache once per row at long contexts: DSpark
   gains at 32k tokens and loses at 128k.
-- The files in mainline llama.cpp's layout (`inkling2_loop`), which are other names for the same tensors.
+- A GGUF LoRA adapter (AtomicChat's rank-1 edit, meant for any GGUF of the model) is refused by name: the expert
+  banks it changes are quantized, so it cannot be merged into them without rounding again; it would run beside them.

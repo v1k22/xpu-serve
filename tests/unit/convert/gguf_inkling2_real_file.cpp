@@ -4,15 +4,19 @@
 // by token; config.json gives the model code what the checkpoint's does, but for the order of the expert banks' rows.
 // With the drafter's file (XS_GGUF_DRAFTER_FILE, dspark-Inkling-2-Mini-Q8_0.gguf), the two files plan a pack with the
 // checkpoint's mtp_config and every tensor of its mtp.safetensors; with the projector's (XS_GGUF_MMPROJ_FILE,
-// mmproj-BF16.gguf), the checkpoint's vision_config and every tensor of its tower. Each case skips unless its
-// variables are set.
+// mmproj-BF16.gguf), the checkpoint's vision_config and every tensor of its tower. With a copy of the same file in
+// mainline llama.cpp's layout (XS_GGUF_MAINLINE_FILE, inkling2_loop: the repository's Mainline_Support files), the
+// two plan the same pack. Each case skips unless its variables are set.
 // The weights are checked by the model parity test on the imported pack (model_parity.cpp), the lossless file's
 // against Hugging Face fp32.
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <set>
@@ -24,6 +28,8 @@
 #include "model/tiny_checkpoints.h"
 #include "models/drafters/dspark.h"
 #include "models/inkling2/inkling2.h"
+#include "quant/block_decode.h"
+#include "tensor/block_format.h"
 #include "tokenizer/parity_cases.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
@@ -42,6 +48,29 @@ std::optional<xs::test::RealGguf> real_file() {
 
 nlohmann::json checkpoint_config(const fs::path& dir) {
     return nlohmann::json::parse(std::ifstream(dir / "config.json"));
+}
+
+// The values a pack tensor takes from its file, as stored there (before any reorder).
+std::vector<float> stored_values(const gguf_import::PackTensor& t) {
+    const gguf::TensorInfo& src = *t.source;
+    const int64_t rows = numel(t.shape) / src.cols();
+    if (is_float(src.dtype)) return gguf_import::float_rows(src, t.first_row, rows);
+    const BlockLayout l = block_layout(src.block);
+    const int64_t per_row = src.cols() / l.weights;
+    std::vector<float> out(static_cast<size_t>(rows * src.cols()));
+    const auto* first = reinterpret_cast<const uint8_t*>(src.data) + t.first_row * per_row * l.bytes;
+    quant::decode_blocks(src.block, first, rows * per_row, out.data());
+    return out;
+}
+
+// The largest difference of two value lists against the largest magnitude of the first.
+double relative_difference(const std::vector<float>& a, const std::vector<float>& b) {
+    double diff = 0, scale = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff = std::max(diff, static_cast<double>(std::fabs(a[i] - b[i])));
+        scale = std::max(scale, static_cast<double>(std::fabs(a[i])));
+    }
+    return scale > 0 ? diff / scale : diff;
 }
 
 }  // namespace
@@ -193,5 +222,76 @@ TEST_SUITE("gguf real file") {
         gguf_import::ImportPlan again = arch.plan(file);
         CHECK_THROWS_WITH_AS(arch.add_projector(again, file, file),
                              doctest::Contains("is not Inkling 2's vision tower"), xs::Error);
+    }
+
+    TEST_CASE("a real inkling2 GGUF and its copy in mainline llama.cpp's layout plan the same pack") {
+        const auto real = real_file();
+        const char* m = std::getenv("XS_GGUF_MAINLINE_FILE");
+        if (!real || m == nullptr || *m == '\0') return;
+        const gguf::File unsloth(real->gguf), mainline(m);
+        REQUIRE(mainline.get_string("general.architecture") == "inkling2_loop");
+        const gguf_import::ImportPlan a = gguf_import::find_architecture("inkling2").plan(unsloth);
+        const gguf_import::ImportPlan b = gguf_import::find_architecture("inkling2_loop").plan(mainline);
+        CHECK(a.config == b.config);
+        std::map<std::string, const gguf_import::PackTensor*> by_name;
+        for (const gguf_import::PackTensor& t : b.tensors) by_name[t.name] = &t;
+        // Every tensor of the one in the other, with its values: the same bytes where both files keep one format (a
+        // file's rounding apart where they differ).
+        int64_t same_bytes = 0, close = 0;
+        double worst = 0;
+        std::string worst_name;
+        for (const gguf_import::PackTensor& t : a.tensors) {
+            if (t.name.find("middle_cycle_cross_pass") != std::string::npos) continue;  // the messages: below
+            CAPTURE(t.name);
+            const auto it = by_name.find(t.name);
+            REQUIRE(it != by_name.end());
+            const gguf_import::PackTensor& u = *it->second;
+            CHECK(u.shape == t.shape);
+            CHECK(u.reorder == t.reorder);
+            CHECK(u.map == t.map);
+            const std::vector<float> x = stored_values(t), y = stored_values(u);
+            REQUIRE(x.size() == y.size());
+            if (t.source->ggml_type == u.source->ggml_type) {
+                CHECK(x == y);
+                ++same_bytes;
+            } else {
+                const double d = relative_difference(x, y);
+                if (d > worst) worst = d, worst_name = t.name;
+                CHECK(d < 0.02);  // the coarser of the two formats' rounding
+                ++close;
+            }
+            by_name.erase(it);
+        }
+        MESSAGE(same_bytes << " tensors alike in one format, " << close << " in two (largest difference " << worst
+                           << ", " << worst_name << ")");
+        // What is left of the mainline plan: each looped layer's message queries, which are the rows (query, key,
+        // value, mlp) of the checkpoint's two tensors.
+        const inkling2::Config c = inkling2::parse_config(nlohmann::json::parse(a.config.dump()));
+        const auto top = [&](const char* name) {
+            const auto t = std::find_if(a.tensors.begin(), a.tensors.end(),
+                                        [&](const auto& p) { return p.name == std::string("model.llm.") + name; });
+            REQUIRE(t != a.tensors.end());
+            return stored_values(*t);
+        };
+        const std::vector<float> q = top("middle_cycle_cross_pass_queries");
+        const std::vector<float> kv = top("middle_cycle_cross_pass_kv_queries");
+        const auto d = static_cast<size_t>(c.hidden_size);
+        CHECK(static_cast<int64_t>(by_name.size()) == c.loop.end - c.loop.start);
+        for (int64_t i = 0; i < c.loop.end - c.loop.start; ++i) {
+            const std::string name = "model.llm.layers." + std::to_string(c.loop.start + i) + ".message_queries";
+            CAPTURE(name);
+            const auto it = by_name.find(name);
+            REQUIRE(it != by_name.end());
+            const std::vector<float> rows = stored_values(*it->second);
+            const auto row = [&](const std::vector<float>& from, int64_t r) {
+                return std::vector<float>(from.begin() + static_cast<std::ptrdiff_t>(r * d),
+                                          from.begin() + static_cast<std::ptrdiff_t>((r + 1) * d));
+            };
+            const std::vector<float> want[4] = {row(q, 2 * i), row(kv, 2 * i), row(kv, 2 * i + 1), row(q, 2 * i + 1)};
+            for (int r = 0; r < 4; ++r) {
+                CAPTURE(r);
+                CHECK(relative_difference(row(rows, r), want[r]) < 0.02);
+            }
+        }
     }
 }

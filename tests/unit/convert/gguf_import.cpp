@@ -369,7 +369,8 @@ TEST_SUITE("gguf import") {
             });
         };
         CHECK(architecture("llama").find("GGUF architecture 'llama' is not supported (supported: qwen35, qwen35moe, "
-                                         "gemma4, gemma4-assistant, clef, modern-bert, inkling2)") != std::string::npos);
+                                         "gemma4, gemma4-assistant, clef, modern-bert, inkling2, inkling2_loop)") !=
+              std::string::npos);
         CHECK(
             refusal(work.path,
                     [](GgufWriter& w) { w.f32_tensor("blk.0.ssm_extra.weight", {128}, std::vector<float>(128, 0.0f)); })

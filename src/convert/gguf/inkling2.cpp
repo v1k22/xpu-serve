@@ -1,13 +1,17 @@
-// GGUF architecture "inkling2": Inkling 2 Mini as the converter of Unsloth's llama.cpp builds writes it
-// (conversion/inkling2.py), imported for models/inkling2/ as a pack in the released checkpoint's layout (names under
-// model.llm.).
+// GGUF architectures "inkling2" and "inkling2_loop": Inkling 2 Mini as two converters write it, imported for
+// models/inkling2/ as a pack in the released checkpoint's layout (names under model.llm.). "inkling2" is the layout
+// of Unsloth's llama.cpp builds, "inkling2_loop" mainline llama.cpp's (conversion/inkling2.py, Inkling2LoopModel):
+// the same tensors, with the differences a Flavor names (its keys, how it counts layers, the loop's tensors).
 //
-// What the converter changed, and what the import does about it:
+// What the converters changed, and what the import does about it:
 // - names: blk.<i>.* for layer i (each layer once: the passes of the loop share its tensors), token_embd, output*,
 //   loop_*; mapped back to the checkpoint's names. A layer's attention query is the checkpoint's
 //   attn_res.attn_queries.<i - 1>.
-// - block_count counts layer visits (a looped layer once per pass) and the per-layer arrays have an entry per visit:
-//   read back as the layers and local_layer_ids.
+// - inkling2's block_count counts layer visits (a looped layer once per pass) and its per-layer arrays have an entry
+//   per visit; inkling2_loop's count layers: read back as the layers and local_layer_ids.
+// - the messages' queries: inkling2 keeps the checkpoint's two tensors; inkling2_loop gives each looped layer its four
+//   (those of its query, key, value and MLP messages, loop_msg_query), kept as layers.<i>.message_queries, which the
+//   model reads in their place.
 // - the experts' fused gate and up bank has its rows in halves (the gate rows, then the up rows) where the checkpoint
 //   alternates them. A block format's rows cannot be moved, so config.json says so (gate_up_rows) and the model reads
 //   the bank as it is.
@@ -18,10 +22,8 @@
 //   relative bias transposed: put back.
 // - convolution kernels lost their middle dimension of 1: put back (a shape).
 // - the vision tower is not in the file (llama.cpp writes it to an mmproj file of its own): the pack is the text model.
-//
-// Mainline llama.cpp's layout of the same tensors (general.architecture inkling2_loop, the repository's
-// Mainline_Support files) has other names and keys and is not read here.
 
+#include <array>
 #include <cmath>
 #include <set>
 
@@ -32,10 +34,28 @@
 namespace xs::gguf_import {
 namespace {
 
-constexpr std::string_view kName = "inkling2";
 const std::string kPrefix = "model.llm.";
 
-const std::set<std::string_view> kKnownKeys = {
+// What tells the two layouts apart.
+struct Flavor {
+    std::string_view name;  // general.architecture, and its metadata's namespace
+    bool per_visit;         // block_count and the per-layer arrays count layer visits, not layers
+    std::string_view passes, loop_start, loop_end, loop_gate_rank;  // the loop's keys
+    // A looped layer's message gates (attention's query, key, value, the MLP's), as the file names them:
+    // loop_<word><suffix>down.weight.
+    std::array<std::string_view, 4> gates;
+    std::string_view gate_suffix;
+};
+
+const Flavor kUnsloth{"inkling2", true, "num_loops", "loop.core_start", "loop.core_end", "loop.gate_rank",
+                      {"attn", "k", "v", "mlp"}, "_"};
+const Flavor kMainline{"inkling2_loop", false, "loop.count", "loop.start", "loop.end", "loop.gate_rank",
+                       {"q", "k", "v", "ffn"}, "_ctrl_"};
+// The same gates as the checkpoint names them: controllers.<word>.down_weight.
+constexpr std::array<std::string_view, 4> kCheckpointGates = {"attn", "k", "v", "mlp"};
+
+// The keys both layouts write, beside a layout's own loop keys.
+const std::set<std::string_view> kSharedKeys = {
     "block_count",
     "context_length",
     "embedding_length",
@@ -46,10 +66,6 @@ const std::set<std::string_view> kKnownKeys = {
     "expert_weights_scale",
     "vocab_size",
     "vocab_size_unpadded",
-    "num_loops",
-    "loop.core_start",
-    "loop.core_end",
-    "loop.gate_rank",
     "attention.head_count",
     "attention.head_count_kv",
     "attention.key_length",
@@ -73,8 +89,15 @@ const std::set<std::string_view> kKnownKeys = {
     "final_logit_softcapping",
 };
 
-std::string key(std::string_view rest) {
-    return str_cat(kName, ".", rest);
+std::set<std::string_view> known_keys(const Flavor& fl) {
+    std::set<std::string_view> keys = kSharedKeys;
+    keys.insert({fl.passes, fl.loop_start, fl.loop_end, fl.loop_gate_rank});
+    if (!fl.per_visit) keys.insert("loop.varying");
+    return keys;
+}
+
+std::string key(const Flavor& fl, std::string_view rest) {
+    return str_cat(fl.name, ".", rest);
 }
 
 struct Dimensions {
@@ -86,6 +109,7 @@ struct Dimensions {
     std::vector<bool> sliding;  // per layer
 
     bool looped(int64_t i) const { return i >= loop_start && i < loop_end; }
+    int64_t visits() const { return layers + (passes - 1) * (loop_end - loop_start); }
 };
 
 // The layer a visit runs: the layers before the loop, the looped ones once per pass, the layers after it.
@@ -96,80 +120,85 @@ int64_t layer_of_visit(const Dimensions& d, int64_t visit) {
     return visit - (d.passes - 1) * span;
 }
 
-// A value every visit must agree on.
-int64_t same_per_visit(const gguf::File& f, std::string_view rest, int64_t visits) {
-    const std::vector<int64_t> values = f.get(key(rest)).ints();
-    if (static_cast<int64_t>(values.size()) != visits) {
-        fail(kName, ": ", key(rest), " has ", values.size(), " entries for ", visits, " layer visits");
+// A value every entry of a per-layer array (`entries`: of layers or of visits) must agree on.
+int64_t same_per_entry(const gguf::File& f, const Flavor& fl, std::string_view rest, int64_t entries) {
+    const std::vector<int64_t> values = f.get(key(fl, rest)).ints();
+    if (static_cast<int64_t>(values.size()) != entries) {
+        fail(fl.name, ": ", key(fl, rest), " has ", values.size(), " entries for ", entries,
+             fl.per_visit ? " layer visits" : " layers");
     }
     for (const int64_t v : values) {
         if (v != values[0] || v <= 0) {
-            fail(kName, ": ", key(rest), " holds ", v, " beside ", values[0],
+            fail(fl.name, ": ", key(fl, rest), " holds ", v, " beside ", values[0],
                  ": layers of different head counts are not supported");
         }
     }
     return values[0];
 }
 
-Dimensions dimensions(const gguf::File& f) {
-    for (const char* loop : {"num_loops", "loop.core_start", "loop.core_end", "loop.gate_rank"}) {
-        if (f.find(key(loop)) == nullptr) {
-            fail(kName, ": the file has no ", key(loop), ": an Inkling 2 without looped layers is not supported");
+Dimensions dimensions(const gguf::File& f, const Flavor& fl) {
+    for (const std::string_view loop : {fl.passes, fl.loop_start, fl.loop_end, fl.loop_gate_rank}) {
+        if (f.find(key(fl, loop)) == nullptr) {
+            fail(fl.name, ": the file has no ", key(fl, loop), ": an Inkling 2 without looped layers is not supported");
         }
     }
+    if (const gguf::Value* v = f.find(key(fl, "loop.varying")); v != nullptr && v->as_bool()) {
+        fail(fl.name, ": ", key(fl, "loop.varying"), " true (a variable number of passes) is not supported");
+    }
     Dimensions d;
-    const int64_t visits = positive(f, kName, key("block_count"));
-    d.passes = positive(f, kName, key("num_loops"));
-    d.loop_start = positive(f, kName, key("loop.core_start"));
-    d.loop_end = positive(f, kName, key("loop.core_end"));
-    d.gate_rank = positive(f, kName, key("loop.gate_rank"));
-    d.layers = visits - (d.passes - 1) * (d.loop_end - d.loop_start);
+    const int64_t count = positive(f, fl.name, key(fl, "block_count"));
+    d.passes = positive(f, fl.name, key(fl, fl.passes));
+    d.loop_start = positive(f, fl.name, key(fl, fl.loop_start));
+    d.loop_end = positive(f, fl.name, key(fl, fl.loop_end));
+    d.gate_rank = positive(f, fl.name, key(fl, fl.loop_gate_rank));
+    d.layers = fl.per_visit ? count - (d.passes - 1) * (d.loop_end - d.loop_start) : count;
     if (d.loop_end <= d.loop_start || d.layers < d.loop_end) {
-        fail(kName, ": ", visits, " layer visits do not hold ", d.passes, " passes over layers ", d.loop_start, " to ",
-             d.loop_end);
+        fail(fl.name, ": ", count, fl.per_visit ? " layer visits" : " layers", " do not hold ", d.passes,
+             " passes over layers ", d.loop_start, " to ", d.loop_end);
     }
-    d.hidden = positive(f, kName, key("embedding_length"));
-    d.vocab = positive(f, kName, key("vocab_size"));
-    d.tokens = positive(f, kName, key("vocab_size_unpadded"));
+    const int64_t entries = fl.per_visit ? d.visits() : d.layers;  // of a per-layer array
+    d.hidden = positive(f, fl.name, key(fl, "embedding_length"));
+    d.vocab = positive(f, fl.name, key(fl, "vocab_size"));
+    d.tokens = positive(f, fl.name, key(fl, "vocab_size_unpadded"));
     if (f.get("tokenizer.ggml.tokens").size() != static_cast<uint64_t>(d.tokens) || d.tokens > d.vocab) {
-        fail(kName, ": the tokenizer has ", f.get("tokenizer.ggml.tokens").size(), " tokens, ",
-             key("vocab_size_unpadded"), " is ", d.tokens, " and ", key("vocab_size"), " ", d.vocab);
+        fail(fl.name, ": the tokenizer has ", f.get("tokenizer.ggml.tokens").size(), " tokens, ",
+             key(fl, "vocab_size_unpadded"), " is ", d.tokens, " and ", key(fl, "vocab_size"), " ", d.vocab);
     }
-    d.heads = same_per_visit(f, "attention.head_count", visits);
-    d.kv_heads = same_per_visit(f, "attention.head_count_kv", visits);
-    d.head_dim = positive(f, kName, key("attention.key_length"));
+    d.heads = same_per_entry(f, fl, "attention.head_count", entries);
+    d.kv_heads = same_per_entry(f, fl, "attention.head_count_kv", entries);
+    d.head_dim = positive(f, fl.name, key(fl, "attention.key_length"));
     for (const char* same : {"attention.value_length", "attention.key_length_swa", "attention.value_length_swa"}) {
-        if (const int64_t v = positive(f, kName, key(same)); v != d.head_dim) {
-            fail(kName, ": ", key(same), " ", v, " differs from attention.key_length ", d.head_dim,
+        if (const int64_t v = positive(f, fl.name, key(fl, same)); v != d.head_dim) {
+            fail(fl.name, ": ", key(fl, same), " ", v, " differs from attention.key_length ", d.head_dim,
                  ", which is not supported");
         }
     }
-    if (const int64_t rope = f.get_int(key("rope.dimension_count")); rope != 0) {
-        fail(kName, ": ", key("rope.dimension_count"), " is ", rope, "; the model has no rotary positions");
+    if (const int64_t rope = f.get_int(key(fl, "rope.dimension_count")); rope != 0) {
+        fail(fl.name, ": ", key(fl, "rope.dimension_count"), " is ", rope, "; the model has no rotary positions");
     }
-    d.rel_width = positive(f, kName, key("attention.relative_length"));
-    d.rel_extent = positive(f, kName, key("attention.relative_extent"));
-    d.window = positive(f, kName, key("attention.sliding_window"));
-    d.conv_taps = positive(f, kName, key("shortconv.l_cache"));
-    d.block_layers = positive(f, kName, key("attn_res.block_size"));
-    d.experts = positive(f, kName, key("expert_count"));
-    d.experts_per_token = positive(f, kName, key("expert_used_count"));
-    d.expert_width = positive(f, kName, key("expert_feed_forward_length"));
-    if (const int64_t ffn = positive(f, kName, key("feed_forward_length")); ffn != d.expert_width) {
-        fail(kName, ": ", key("feed_forward_length"), " ", ffn, " differs from the experts' ", d.expert_width);
+    d.rel_width = positive(f, fl.name, key(fl, "attention.relative_length"));
+    d.rel_extent = positive(f, fl.name, key(fl, "attention.relative_extent"));
+    d.window = positive(f, fl.name, key(fl, "attention.sliding_window"));
+    d.conv_taps = positive(f, fl.name, key(fl, "shortconv.l_cache"));
+    d.block_layers = positive(f, fl.name, key(fl, "attn_res.block_size"));
+    d.experts = positive(f, fl.name, key(fl, "expert_count"));
+    d.experts_per_token = positive(f, fl.name, key(fl, "expert_used_count"));
+    d.expert_width = positive(f, fl.name, key(fl, "expert_feed_forward_length"));
+    if (const int64_t ffn = positive(f, fl.name, key(fl, "feed_forward_length")); ffn != d.expert_width) {
+        fail(fl.name, ": ", key(fl, "feed_forward_length"), " ", ffn, " differs from the experts' ", d.expert_width);
     }
 
-    const std::vector<bool> pattern = f.get(key("attention.sliding_window_pattern")).bools();
-    if (static_cast<int64_t>(pattern.size()) != visits) {
-        fail(kName, ": attention.sliding_window_pattern has ", pattern.size(), " entries for ", visits,
-             " layer visits");
+    const std::vector<bool> pattern = f.get(key(fl, "attention.sliding_window_pattern")).bools();
+    if (static_cast<int64_t>(pattern.size()) != entries) {
+        fail(fl.name, ": attention.sliding_window_pattern has ", pattern.size(), " entries for ", entries,
+             fl.per_visit ? " layer visits" : " layers");
     }
     d.sliding.assign(static_cast<size_t>(d.layers), false);
     std::vector<bool> seen(static_cast<size_t>(d.layers), false);
-    for (int64_t v = 0; v < visits; ++v) {
-        const auto layer = static_cast<size_t>(layer_of_visit(d, v));
+    for (int64_t v = 0; v < entries; ++v) {
+        const auto layer = static_cast<size_t>(fl.per_visit ? layer_of_visit(d, v) : v);
         if (seen[layer] && d.sliding[layer] != pattern[static_cast<size_t>(v)]) {
-            fail(kName, ": attention.sliding_window_pattern gives layer ", layer, " two kinds on two passes");
+            fail(fl.name, ": attention.sliding_window_pattern gives layer ", layer, " two kinds on two passes");
         }
         seen[layer] = true;
         d.sliding[layer] = pattern[static_cast<size_t>(v)];
@@ -177,11 +206,11 @@ Dimensions dimensions(const gguf::File& f) {
     return d;
 }
 
-nlohmann::ordered_json text_config(const gguf::File& f, const Dimensions& d) {
-    const auto number = [&](std::string_view rest) { return config_number(f.get(key(rest))); };
+nlohmann::ordered_json text_config(const gguf::File& f, const Flavor& fl, const Dimensions& d) {
+    const auto number = [&](std::string_view rest) { return config_number(f.get(key(fl, rest))); };
     nlohmann::ordered_json t;
     t["model_type"] = "inkling2_loop_text";
-    t["model_max_length"] = positive(f, kName, key("context_length"));
+    t["model_max_length"] = positive(f, fl.name, key(fl, "context_length"));
     t["hidden_size"] = d.hidden;
     t["num_hidden_layers"] = d.layers;
     t["vocab_size"] = d.vocab;
@@ -197,7 +226,7 @@ nlohmann::ordered_json text_config(const gguf::File& f, const Dimensions& d) {
     t["rel_extent"] = d.rel_extent;
     t["q_bias"] = false;
     t["o_bias"] = false;
-    t["log_scaling_n_floor"] = positive(f, kName, key("attention.log_scale_floor"));
+    t["log_scaling_n_floor"] = positive(f, fl.name, key(fl, "attention.log_scale_floor"));
     t["log_scaling_alpha"] = number("attention.log_scale_alpha");
     t["rms_norm_eps"] = number("attention.layer_norm_rms_epsilon");
     t["use_value_norm_no_gamma"] = true;
@@ -253,7 +282,7 @@ const FloatReorder kTaps{"a transpose and a flip of the taps", [](const std::vec
                              return out;
                          }};
 
-Entries layer(const Dimensions& d, int64_t i) {
+Entries layer(const Flavor& fl, const Dimensions& d, int64_t i) {
     const bool sliding = d.sliding[static_cast<size_t>(i)];
     const int64_t h = d.hidden, q = d.heads * d.head_dim, kv = d.kv_heads * d.head_dim, taps = d.conv_taps;
     const std::string L = kPrefix + "layers." + std::to_string(i) + ".";
@@ -306,18 +335,19 @@ Entries layer(const Dimensions& d, int64_t i) {
     e["ffn_down_exps.scale"] = one({d.experts}, X + "w2_weight_factor");
     e["ffn_gate_up_exps.scale"].optional = e["ffn_down_exps.scale"].optional = true;
     if (d.looped(i)) {
-        for (const char* which : {"attn", "k", "v", "mlp"}) {
-            const std::string file = str_cat("loop_", which, "_");
-            const std::string name = str_cat(L, "controllers.", which, ".");
+        for (size_t m = 0; m < kCheckpointGates.size(); ++m) {
+            const std::string file = str_cat("loop_", fl.gates[m], fl.gate_suffix);
+            const std::string name = str_cat(L, "controllers.", kCheckpointGates[m], ".");
             e[file + "down.weight"] = one({d.gate_rank, 2 * h}, name + "down_weight");
             e[file + "forget.weight"] = one({h, d.gate_rank}, name + "forget_weight");
             e[file + "gain.weight"] = one({h, d.gate_rank}, name + "gain_weight");
         }
+        if (!fl.per_visit) e["loop_msg_query.weight"] = one({4, h}, L + "message_queries");
     }
     return e;
 }
 
-Layout layout(const Dimensions& d) {
+Layout layout(const Flavor& fl, const Dimensions& d) {
     Layout l;
     const int64_t h = d.hidden, message_queries = 2 * (d.loop_end - d.loop_start);
     l.top["token_embd.weight"] = one({d.vocab, h}, kPrefix + "embed.weight");
@@ -325,10 +355,12 @@ Layout layout(const Dimensions& d) {
     l.top["output.weight"] = one({d.vocab, h}, kPrefix + "unembed.weight");
     l.top["output_norm.weight"] = one({h}, kPrefix + "norm.weight");
     l.top["output_res_query.weight"] = one({h}, kPrefix + "attn_res.output_query");
-    l.top["loop_res_query.weight"] = one({message_queries, h}, kPrefix + "middle_cycle_cross_pass_queries");
-    l.top["loop_kv_res_query.weight"] = one({message_queries, h}, kPrefix + "middle_cycle_cross_pass_kv_queries");
+    if (fl.per_visit) {
+        l.top["loop_res_query.weight"] = one({message_queries, h}, kPrefix + "middle_cycle_cross_pass_queries");
+        l.top["loop_kv_res_query.weight"] = one({message_queries, h}, kPrefix + "middle_cycle_cross_pass_kv_queries");
+    }
     for (int64_t i = 0; i < d.layers; ++i)
-        l.blocks.push_back(layer(d, i));
+        l.blocks.push_back(layer(fl, d, i));
     l.block_kind = [d](int64_t i) {
         return str_cat(d.sliding[static_cast<size_t>(i)] ? "sliding" : "full", " attention",
                        d.looped(i) ? ", looped" : "");
@@ -360,18 +392,18 @@ struct DrafterDimensions {
 
 // The drafter file `f` against the model's: mtp_config as the released config.json has it. Refuses a drafter of
 // another kind or another model by name.
-nlohmann::ordered_json drafter_config(const gguf::File& f, const gguf::File& model, const Dimensions& d,
-                                      DrafterDimensions& out) {
+nlohmann::ordered_json drafter_config(const gguf::File& f, const gguf::File& model, const Flavor& fl,
+                                      const Dimensions& d, DrafterDimensions& out) {
     const std::string_view arch = f.get_string("general.architecture");
     if (arch != kDrafter || f.find(drafter_key("dspark.markov_rank")) == nullptr) {
-        fail(kName, ": --mtp: the file is not Inkling 2's drafter (general.architecture '", arch, "'; expected '",
+        fail(fl.name, ": --mtp: the file is not Inkling 2's drafter (general.architecture '", arch, "'; expected '",
              kDrafter, "' with ", drafter_key("dspark.markov_rank"), ")");
     }
     refuse_unknown_keys(f, kDrafter, kDrafterKeys);
     const auto positive_of = [&](std::string_view rest) { return positive(f, kDrafter, drafter_key(rest)); };
     const auto refuse_true = [&](std::string_view rest) {
         if (const gguf::Value* v = f.find(drafter_key(rest)); v != nullptr && v->as_bool()) {
-            fail(kName, ": --mtp: ", drafter_key(rest), " true is not supported");
+            fail(fl.name, ": --mtp: ", drafter_key(rest), " true is not supported");
         }
     };
     refuse_true("attention.causal");
@@ -389,10 +421,10 @@ nlohmann::ordered_json drafter_config(const gguf::File& f, const gguf::File& mod
     out.taps = static_cast<int64_t>(taps.size());
     // The model the drafter was made for: the same width, vocabulary and softcap, and as many layer visits as the
     // last state it reads names.
-    const int64_t visits = positive(model, kName, key("block_count"));
+    const int64_t visits = d.visits();
     const auto same = [&](std::string_view what, double mine, double models) {
         if (mine != models) {
-            fail(kName, ": --mtp: the drafter's ", what, " is ", mine, ", the model's ", models,
+            fail(fl.name, ": --mtp: the drafter's ", what, " is ", mine, ", the model's ", models,
                  ": it drafts for another model");
         }
     };
@@ -400,16 +432,16 @@ nlohmann::ordered_json drafter_config(const gguf::File& f, const gguf::File& mod
     same("vocab_size", static_cast<double>(positive_of("vocab_size")), static_cast<double>(d.vocab));
     same("vocab_size_unpadded", static_cast<double>(positive_of("vocab_size_unpadded")), static_cast<double>(d.tokens));
     same("final_logit_softcapping", f.get_float(drafter_key("final_logit_softcapping")),
-         model.get_float(key("final_logit_softcapping")));
+         model.get_float(key(fl, "final_logit_softcapping")));
     same("last target layer", static_cast<double>(taps.empty() ? -1 : taps.back()), static_cast<double>(visits));
     if (f.get_int(drafter_key("attention.value_length")) != out.head_dim ||
         f.get_int(drafter_key("rope.dimension_count")) != out.head_dim) {
-        fail(kName, ": --mtp: attention.value_length and rope.dimension_count must equal attention.key_length ",
+        fail(fl.name, ": --mtp: attention.value_length and rope.dimension_count must equal attention.key_length ",
              out.head_dim);
     }
     const std::vector<gguf::Value> pattern = f.get(drafter_key("attention.sliding_window_pattern")).elements();
     if (static_cast<int64_t>(pattern.size()) != out.layers) {
-        fail(kName, ": --mtp: attention.sliding_window_pattern has ", pattern.size(), " entries for ", out.layers,
+        fail(fl.name, ": --mtp: attention.sliding_window_pattern has ", pattern.size(), " entries for ", out.layers,
              " layers");
     }
     std::vector<int64_t> local;
@@ -515,11 +547,12 @@ const FloatReorder kPatchLinear{"a convolution's weight as a linear layer's",
 
 // The projector file `f` against the model's: vision_config as the released config.json has it. Refuses by name a
 // file that is not Inkling 2's tower, or another model's.
-nlohmann::ordered_json vision_config(const gguf::File& f, const Dimensions& d, VisionDimensions& v) {
+nlohmann::ordered_json vision_config(const gguf::File& f, const Flavor& fl, const Dimensions& d,
+                                     VisionDimensions& v) {
     const std::string_view arch = f.get_string("general.architecture");
     const gguf::Value* type = f.find("clip.vision.projector_type");
     if (arch != kProjector || type == nullptr || type->as_string() != kProjectorType) {
-        fail(kName, ": --mmproj: the file is not Inkling 2's vision tower (general.architecture '", arch,
+        fail(fl.name, ": --mmproj: the file is not Inkling 2's vision tower (general.architecture '", arch,
              "', clip.vision.projector_type '", type != nullptr ? type->as_string() : std::string_view("none"),
              "'; expected '", kProjector, "' and '", kProjectorType, "')");
     }
@@ -534,22 +567,22 @@ nlohmann::ordered_json vision_config(const gguf::File& f, const Dimensions& d, V
     v.patch = positive_of("patch_size");
     v.merge = positive_of("spatial_merge_size");
     v.out = positive_of("projection_dim");
-    XS_CHECK(v.out == d.hidden, kName, ": --mmproj: the tower projects to ", v.out, ", the model's hidden size is ",
+    XS_CHECK(v.out == d.hidden, fl.name, ": --mmproj: the tower projects to ", v.out, ", the model's hidden size is ",
              d.hidden, ": another model's file");
     // The processor's constants are the checkpoint's; a file that says otherwise is not read as it means.
     for (const char* key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
         const gguf::Value* a = f.find(key);
-        XS_CHECK(a != nullptr, kName, ": --mmproj: the file has no ", key);
+        XS_CHECK(a != nullptr, fl.name, ": --mmproj: the file has no ", key);
         for (const double m : a->floats()) {
-            XS_CHECK(m == 0.5, kName, ": --mmproj: ", key, " is not 0.5 a channel");
+            XS_CHECK(m == 0.5, fl.name, ": --mmproj: ", key, " is not 0.5 a channel");
         }
     }
     const gguf::TensorInfo* table = f.find_tensor("v.position_embd.weight");
     const gguf::TensorInfo* first = f.find_tensor("mm.1.weight");
-    XS_CHECK(table != nullptr && first != nullptr && table->dims.size() == 2 && first->dims.size() == 2, kName,
+    XS_CHECK(table != nullptr && first != nullptr && table->dims.size() == 2 && first->dims.size() == 2, fl.name,
              ": --mmproj: the file lacks v.position_embd.weight or mm.1.weight");
     v.grid = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(table->rows()))));
-    XS_CHECK(v.grid * v.grid == table->rows(), kName, ": --mmproj: v.position_embd.weight has ", table->rows(),
+    XS_CHECK(v.grid * v.grid == table->rows(), fl.name, ": --mmproj: v.position_embd.weight has ", table->rows(),
              " rows, not a square grid");
     v.projection = first->rows();
     nlohmann::ordered_json c;
@@ -604,16 +637,17 @@ Layout vision_layout(const VisionDimensions& v) {
 
 class Inkling2 final : public Architecture {
 public:
-    std::string_view name() const override { return kName; }
+    explicit Inkling2(const Flavor& flavor) : fl_(flavor) {}
+    std::string_view name() const override { return fl_.name; }
 
     ImportPlan plan(const gguf::File& f) const override {
-        refuse_unknown_keys(f, kName, kKnownKeys);
-        const Dimensions d = dimensions(f);
+        refuse_unknown_keys(f, fl_.name, known_keys(fl_));
+        const Dimensions d = dimensions(f, fl_);
         ImportPlan plan;
         plan.config["architectures"] = {"Inkling2LoopForConditionalGeneration"};
         plan.config["model_type"] = "inkling2_loop";
-        plan.config["text_config"] = text_config(f, d);
-        map_tensors(f, kName, layout(d), plan);
+        plan.config["text_config"] = text_config(f, fl_, d);
+        map_tensors(f, fl_.name, layout(fl_, d), plan);
         return plan;
     }
 
@@ -622,24 +656,32 @@ public:
     // config.json's mtp_config.
     void add_projector(ImportPlan& p, const gguf::File& f, const gguf::File& projector) const override {
         VisionDimensions v;
-        p.config["vision_config"] = vision_config(projector, dimensions(f), v);
+        p.config["vision_config"] = vision_config(projector, fl_, dimensions(f, fl_), v);
         map_tensors(projector, kProjector, vision_layout(v), p);
     }
 
     ImportPlan plan_with_mtp(const gguf::File& f, const gguf::File& mtp) const override {
         ImportPlan p = plan(f);
         DrafterDimensions dd;
-        const Dimensions d = dimensions(f);
-        p.config["mtp_config"] = drafter_config(mtp, f, d, dd);
+        const Dimensions d = dimensions(f, fl_);
+        p.config["mtp_config"] = drafter_config(mtp, f, fl_, d, dd);
         map_tensors(mtp, kDrafter, drafter_layout(dd, d.vocab), p);
         return p;
     }
+
+private:
+    const Flavor& fl_;
 };
 
 }  // namespace
 
 const Architecture& inkling2() {
-    static const Inkling2 a;
+    static const Inkling2 a(kUnsloth);
+    return a;
+}
+
+const Architecture& inkling2_loop() {
+    static const Inkling2 a(kMainline);
     return a;
 }
 

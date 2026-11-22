@@ -232,7 +232,7 @@ ImportPlan Architecture::plan_with_mtp(const gguf::File&, const gguf::File&) con
 
 const Architecture& find_architecture(std::string_view name) {
     const std::vector<const Architecture*> all{&qwen35(), &qwen35moe(),   &gemma4(),  &gemma4_assistant(),
-                                               &clef(),   &modern_bert(), &inkling2()};
+                                               &clef(),   &modern_bert(), &inkling2(), &inkling2_loop()};
     std::string list;
     for (const Architecture* a : all) {
         if (a->name() == name) return *a;

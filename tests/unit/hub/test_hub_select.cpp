@@ -193,6 +193,27 @@ TEST_SUITE("hub select") {
         CHECK(select_projector(listing("org/m-GGUF", {"README.md", "m-Q4_K_M.gguf", "mmproj-m-f16.gguf"})) ==
               "mmproj-m-f16.gguf");
         CHECK(select_projector(listing("org/m-GGUF", {"README.md", "m-Q4_K_M.gguf"})).empty());
+
+        // A repository of mainline llama.cpp's files beside a LoRA adapter (AtomicChat's): a quantization names its
+        // file, never the adapter's; the projector is the bf16 one; no quantization names none of several.
+        const RepoListing atomic = listing(
+            "AtomicChat/Inkling-2-Mini-Uncensored-GGUF",
+            {".gitattributes", "Inkling-2-Mini-Uncensored-AD-IQ2_M.gguf", "Inkling-2-Mini-Uncensored-AD-IQ3_S.gguf",
+             "Inkling-2-Mini-Uncensored-AD-Q4_K.gguf", "Inkling-2-Mini-Uncensored-LoRA.gguf", "LICENSE", "README.md",
+             "mmproj-Inkling-2-Mini-Uncensored-BF16.gguf", "mmproj-Inkling-2-Mini-Uncensored-F16.gguf"});
+        const auto atomic_pick = [&](const char* spec) {
+            return select_files(atomic, parse_hub_spec(spec), FileRole::Model).gguf;
+        };
+        CHECK(atomic_pick("AtomicChat/Inkling-2-Mini-Uncensored-GGUF:IQ2_M") ==
+              "Inkling-2-Mini-Uncensored-AD-IQ2_M.gguf");
+        CHECK(atomic_pick("AtomicChat/Inkling-2-Mini-Uncensored-GGUF:IQ3_S") ==
+              "Inkling-2-Mini-Uncensored-AD-IQ3_S.gguf");
+        CHECK(atomic_pick("AtomicChat/Inkling-2-Mini-Uncensored-GGUF:Q4_K") ==
+              "Inkling-2-Mini-Uncensored-AD-Q4_K.gguf");
+        CHECK_THROWS_WITH_AS(atomic_pick("AtomicChat/Inkling-2-Mini-Uncensored-GGUF"),
+                             doctest::Contains("name one by its quantization"), Error);
+        CHECK(select_projector(atomic) == "mmproj-Inkling-2-Mini-Uncensored-BF16.gguf");
+        CHECK(select_mtp_head(atomic, "Inkling-2-Mini-Uncensored-AD-IQ2_M.gguf").empty());
     }
 
     TEST_CASE("the MTP head of a model file published apart: named after it, else the only one, else none") {

@@ -129,9 +129,24 @@ private:
     // Inkling2LoopMessageAttentionResidual: loop layer `index`'s four queries over the pass before.
     Messages messages(int64_t index, int64_t pass, const std::vector<Value>& heard, Value ended) {
         Graph::Scope scope(g_, "messages." + std::to_string(index) + ".pass" + std::to_string(pass));
-        // Stored as (query, mlp) and (key, value) pairs of rows per loop layer.
+        const Value mixed = mix(heard, ended, g_.constant(message_queries(index)), 4);
+        return {part(mixed, 0), part(mixed, 1), part(mixed, 2), part(mixed, 3)};
+    }
+
+    // Loop layer `index`'s queries of its query, key, value and MLP messages, [4, hidden]: the checkpoint stores
+    // them as (query, mlp) and (key, value) pairs of rows per loop layer; a GGUF import of mainline llama.cpp's
+    // layout keeps each layer's four rows as layers.<i>.message_queries.
+    HostTensor message_queries(int64_t index) const {
+        const int64_t d = c_.hidden_size;
+        const std::string own = "layers." + std::to_string(c_.loop.start + index) + ".message_queries";
+        if (weights_.contains(kPrefix + own)) {
+            HostTensor q = host(own);
+            XS_CHECK(q.shape() == (Dims{4, d}), "inkling2: ", kPrefix, own, " is ", dims_to_string(q.shape()),
+                     ", expected ", dims_to_string(Dims{4, d}));
+            return q;
+        }
         const HostTensor a = host("middle_cycle_cross_pass_queries"), b = host("middle_cycle_cross_pass_kv_queries");
-        const int64_t loop_layers = c_.loop.end - c_.loop.start, d = c_.hidden_size;
+        const int64_t loop_layers = c_.loop.end - c_.loop.start;
         XS_CHECK(a.shape() == (Dims{2 * loop_layers, d}) && b.shape() == a.shape(),
                  "inkling2: the message queries are ", dims_to_string(a.shape()), " and ", dims_to_string(b.shape()),
                  ", expected ", dims_to_string(Dims{2 * loop_layers, d}), " each");
@@ -143,8 +158,7 @@ private:
         row(1, b, 0);
         row(2, b, 1);
         row(3, a, 1);
-        const Value mixed = mix(heard, ended, g_.constant(std::move(queries)), 4);
-        return {part(mixed, 0), part(mixed, 1), part(mixed, 2), part(mixed, 3)};
+        return queries;
     }
 
     // Inkling2LoopMessageGate: (1 - forget) * h + gain * message, both gates from the normed pair.

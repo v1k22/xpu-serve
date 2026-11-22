@@ -29,6 +29,7 @@ APIs look; the numbers live here.
   - [Qwen3.8-27B GGUF](#qwen38-27b-gguf)
   - [Ornith-1.5-35B-A3B GGUF](#ornith-15-35b-a3b-gguf)
   - [Inkling-2-Mini GGUF](#inkling-2-mini-gguf)
+  - [Inkling-2-Mini Uncensored GGUF](#inkling-2-mini-uncensored-gguf)
 - [Drafters](#drafters)
   - [Speculative decoding](#speculative-decoding)
   - [Gemma 4 assistants](#gemma-4-assistants)
@@ -1058,8 +1059,11 @@ model (UD-IQ1_S to UD-Q8_K_XL, 7.8 to 22.9 GB) and the drafter's (`dspark-Inklin
 copy in `dspark/`). `-hf` fetches the drafter's file with the model's and imports both into one pack, so
 `--spec dspark` works on every file. The 4-bit and larger files keep the release's NVFP4 expert banks of 20 layers
 as they are (77 % of the weights) and differ in the rest; the smaller ones quantize more of the banks further (NVFP4
-is 57 % of UD-Q3_K_XL, 1 % of UD-IQ1_S). The copies in mainline llama.cpp's layout (`.gguf_file`) and the vision
-projector (mmproj) are not read.
+is 57 % of UD-Q3_K_XL, 1 % of UD-IQ1_S). `-hf` also fetches the vision tower's file (`mmproj-BF16.gguf`), so images
+work from every file. The copies in mainline llama.cpp's layout (`Mainline_Support/*.gguf_file`) import too, as
+`inkling2_loop` (as [AtomicChat's files](#inkling-2-mini-uncensored-gguf) do), but not through `-hf`: downloaded and
+renamed to `.gguf`, `convert <file.gguf> <pack-dir> --mmproj <mmproj.gguf>`. Unsloth's UD-Q4_K_M in that layout is
+the same model (16.6 GB, perplexity 8.131, greedy text equal to its twin's).
 
 Closest to the reference, on either device (the release's own values; with the drafter, 32,768 tokens of context on
 a 24 GB card, 65,536 without):
@@ -1113,6 +1117,42 @@ output stays the model's own and sampling keeps its distribution (rejection samp
 
 | `--spec` | Drafter | Where it comes from |
 |---|---|---|
+### Inkling-2-Mini Uncensored GGUF
+
+[AtomicChat/Inkling-2-Mini-Uncensored-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF)
+(`inkling2_loop`, mainline llama.cpp's layout; Apache 2.0): Inkling-2-Mini with a rank-1 edit that removes each
+layer's refusal direction (attention outputs, routed experts and the embedding), merged into the weights, so it
+answers requests the original refuses. Three files (AD-Q4_K 16.5 GB, AD-IQ3_S 13.3 GB, AD-IQ2_M 8.67 GB) and the
+vision tower's, which `-hf` fetches with any of them: images work. The repository has no drafter, so `--spec dspark`
+is refused. Its adapter file (`Inkling-2-Mini-Uncensored-LoRA.gguf`, the same edit for another GGUF of the model) is
+refused by name: adapters are not imported.
+
+Arc Pro B60:
+
+```bash
+xpu-serve serve -hf AtomicChat/Inkling-2-Mini-Uncensored-GGUF:IQ3_S --device GPU --kv-dtype i8   # closer to the model
+xpu-serve serve -hf AtomicChat/Inkling-2-Mini-Uncensored-GGUF:IQ2_M --device GPU --kv-dtype i8   # smallest, fastest
+```
+
+Measured on the Arc Pro B60: perplexity over 4,096 positions of wikitext-2 as for [Inkling-2-Mini](#inkling-2-mini),
+against the original's lossless file (8.108), so it holds the edit's change and the file's rounding together; what an
+`i8` KV cache changes in it; greedy decode over six chat prompts of 256 tokens; prefill of 512 tokens:
+
+| File | Size | GPU memory | Perplexity | With an `i8` cache | Decode | Prefill (512 tokens) |
+|---|---|---|---|---|---|---|
+| AD-IQ3_S | 13.3 GB | 12.40 GiB | 8.321 (+2.6 %) | −0.16 %, KL 0.003 | 39.1 tok/s | 597 tok/s |
+| AD-IQ2_M | 8.67 GB | 8.04 GiB | 9.014 (+11.2 %) | +0.10 %, KL 0.003 | 44.9 tok/s | 630 tok/s |
+
+- **Answers.** Through the server on both files: 17 x 23, why Canberra and not Sydney, a tool call and the answer
+  from its result, the shapes and colours of a picture and the text in another, a 150-word story. Every answer was
+  right, the tool calls well formed and the stories coherent.
+- **Their experts are i-quants.** The edit changes every routed expert, and these files store them as IQ3_S and
+  IQ4_NL (AD-IQ3_S) or IQ2_XXS, Q2_0 and IQ4_NL (AD-IQ2_M), where Unsloth's files keep the release's NVFP4. AD-IQ3_S
+  scores below UD-Q3_K_XL (13.6 GB, +0.84 %, its experts mostly NVFP4); how much of that is the edit's own change
+  these measurements cannot tell.
+- **Contexts** were not measured on these files: they take less memory than UD-Q4_K_M (15.4 GiB), which takes 262,144
+  tokens in `i8` on the B60. AD-Q4_K imports the same way and was not measured.
+
 | `mtp` | the MTP head of a Qwen3.5-family checkpoint | inside the model (and its pack) |
 | `mtp` | a Gemma 4 assistant | `-hfd google/gemma-4-*-it-assistant` (or `--drafter <dir>`) |
 | `dflash` | a DFlash or DFlash 2 block drafter | `-hfd z-lab/Qwen3.8-27B-DFlash2` (or `--drafter <dir>`) |

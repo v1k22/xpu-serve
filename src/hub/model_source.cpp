@@ -29,17 +29,18 @@ std::string env(const char* name) {
 bool lacks_mtp_head(const fs::path& file) {
     const gguf::File f(file);
     const gguf::Value* arch = f.find("general.architecture");
-    if (arch != nullptr && arch->as_string() == "inkling2") return true;
+    if (arch != nullptr && (arch->as_string() == "inkling2" || arch->as_string() == "inkling2_loop")) return true;
     if (arch == nullptr || (arch->as_string() != "qwen35" && arch->as_string() != "qwen35moe")) return false;
     const gguf::Value* n = f.find(std::string(arch->as_string()) + ".nextn_predict_layers");
     return n == nullptr || n->as_int() == 0;
 }
 
-// A model file whose vision tower the importer reads from the repository's projector file: Inkling 2's.
+// A model file whose vision tower the importer reads from the repository's projector file: Inkling 2's, in either
+// layout.
 bool reads_projector(const fs::path& file) {
     const gguf::File f(file);
     const gguf::Value* arch = f.find("general.architecture");
-    return arch != nullptr && arch->as_string() == "inkling2";
+    return arch != nullptr && (arch->as_string() == "inkling2" || arch->as_string() == "inkling2_loop");
 }
 
 std::string stem(const fs::path& p) { return p.stem().string(); }

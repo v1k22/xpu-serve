@@ -311,6 +311,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       import with the repository's projector file (`--mmproj`)
 - [x] Inkling 2 Mini: its output dialect (thinking as reasoning, tool calls from their JSON messages) and
       `reasoning_effort` as a template variable
+- [x] Inkling 2 Mini: GGUF files in mainline llama.cpp's layout (`inkling2_loop`: AtomicChat's uncensored files,
+      Unsloth's `Mainline_Support` copies), each looped layer's message queries read from the file; the same pack as
+      Unsloth's layout from the same model
+- [ ] Inkling 2 Mini: a GGUF LoRA adapter (AtomicChat's rank-1 edit, for any GGUF of the model; refused by name
+      today: the expert banks it changes are quantized, so it would run beside them rather than be merged)
 - [ ] Inkling 2 Mini: its small kernels fused (about 6 of a decode step's 17 ms on the B60: the message gate's 13
       launches, the block residual's 6, the experts' activation chain), `--readout` (the model writes its own
       `<|message_model|>` and content tag before an answer, so the read-out sees a structural token, not a letter), a
