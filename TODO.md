@@ -311,10 +311,10 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       import with the repository's projector file (`--mmproj`)
 - [x] Inkling 2 Mini: its output dialect (thinking as reasoning, tool calls from their JSON messages) and
       `reasoning_effort` as a template variable
-- [ ] Inkling 2 Mini: its small kernels fused (a step launches some 4,700: the block residual, the message gate, a
-      convolution with its residual, the router), `--readout` (the model writes its own `<|message_model|>` and
-      content tag before an answer, so the read-out sees a structural token, not a letter), a self-contained tiny GGUF
-      for the importer's tests (the real lossless file is the check today)
+- [ ] Inkling 2 Mini: its small kernels fused (about 6 of a decode step's 17 ms on the B60: the message gate's 13
+      launches, the block residual's 6, the experts' activation chain), `--readout` (the model writes its own
+      `<|message_model|>` and content tag before an answer, so the read-out sees a structural token, not a letter), a
+      self-contained tiny GGUF for the importer's tests (the real lossless file is the check today)
 - [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`; `lfm3_vl`'s text decoder is read
       for d1 only); conv-window snapshots for prefix
       reuse after a turn with reasoning; the small ops of a q4 decode step (119 norms and 48 residual adds rank

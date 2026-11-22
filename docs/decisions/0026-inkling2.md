@@ -152,6 +152,27 @@ Three backend changes the measurements asked for, each general:
   4 GiB at a million tokens, more than a `turbo3` cache of that length. Past 65,536 keys the fused kernel now reads
   one decoded chunk at a time and merges each chunk's partial softmax into the rows'.
 
+## Decode speed
+
+A decode step launches some 4,600 kernels over its 48 layer applications, and was first taken to be bound by
+launching them. It is not. Measured on the Arc Pro B60 with the q4 pack:
+
+- **The host is not the bound.** Submitting a step's launches takes the host 11.8 ms. With every run of launches
+  between two that read the cache's length recorded as a command graph (sycl_ext_oneapi_graph) and replayed, it
+  takes 0.9 ms, and the device still needs 19.7 ms for the step. The recordings were not kept: they bought nothing.
+- **The profile hid it.** A barrier after every op costs the device about 24 us, more than nearly every op of the
+  step, so all read alike. Recording each kind of op and running it back to back (`XS_SYCL_PROFILE=1`, CLAUDE.md
+  section 2) gives times that add up to the step's: 21.1 ms, of which the expert matmuls 5.5 (1.7 GB of weights a
+  token, read at 314 GB/s), the other matmuls 5.4, the routers' top-k 4.1, RmsNorm 1.2, and some 3,400 small
+  kernels of 1 to 3 us the rest.
+- **What that bought.** The top-k gave a row one work-item that read it k times, an element after another: 86 us for
+  a decode step's one row. An element now counts its own place in one pass (8 us). RmsNorm reads a row in whole
+  loads (2.6 to 1.9 us), and a block residual with one query needs no transpose. The step went from 21.1 to 17.0 ms:
+  the q4 pack from 42.3 to 51.9 tok/s over six chat prompts, UD-Q4_K_M from 35.5 to 42.0.
+
+What remains is two thirds weight reading, near what the card's memory gives (the output layer reads at 386 GB/s),
+and the small kernels.
+
 ## What was measured
 
 The variants, the commands and every number are in model_recipes.md (Inkling-2-Mini, Inkling-2-Mini GGUF, DSpark).
@@ -164,9 +185,9 @@ model (below), so the multiple-choice read-out the other GGUF files were scored 
 
 ## Open
 
-- A step launches some 4,700 small kernels, which bounds decode speed: the block residual, the message gate, the
-  convolution with its residual and the router are each one kernel's worth of work. On the B60 every GGUF file
-  decodes at 35 to 37 tok/s whatever its size.
+- The small kernels of a decode step: about 6 of its 17 ms on the B60 (below). The message gate's 13 launches, the
+  block residual's 6 and the experts' activation chain are each a kernel or two's worth of work; fusing them would
+  take about 2 ms.
 - `--readout`: the template ends without a generation prompt and the model writes its own `<|message_model|>` and
   content tag, so the read-out sees a structural token, not an answer letter. (Chat is parsed: the `inkling2`
   dialect splits the model's messages into reasoning, content and tool calls.)

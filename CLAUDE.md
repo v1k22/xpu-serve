@@ -606,8 +606,9 @@ Hugging Face safetensors (8.1 first, if it does not).
   lays it on a checkerboard. Its released
   checkpoint (experts in NVFP4 and MXFP8) is the float model its codes decode to, which a backend holds as floats:
   far more than the download, so it is served from a pack `convert` makes of it, or from a GGUF file's import, which
-  keeps the experts in NVFP4. The variable-pass research checkpoint (`is_varloop`) is refused by name. A step runs
-  some 4,700 small kernels (48 layer applications), which bounds decode speed until they are fused. Its drafter
+  keeps the experts in NVFP4. The variable-pass research checkpoint (`is_varloop`) is refused by name. A decode step
+  is bound by the device, not by its launches: two thirds of it reads the 2.8 GB of weights a token goes through, the
+  rest is some 3,400 small kernels of 1 to 3 us each (48 layer applications; docs/decisions/0026). Its drafter
   (DSpark) gains little: every row of a verify reads the experts of its own token, so each draft adds about a fifth
   of a decode step to the verify, and two drafts a round are the default. Of its GGUF repository, the files in
   Unsloth's layout (`inkling2`) import, with the drafter's file; the copies in mainline llama.cpp's layout
