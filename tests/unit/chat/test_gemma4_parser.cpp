@@ -341,6 +341,6 @@ TEST_SUITE("chat output parser") {
     }
 
     TEST_CASE("unknown dialect is refused by name") {
-        CHECK_THROWS_WITH_AS(make_output_parser("nope"), doctest::Contains("known: gemma4, plain"), xs::Error);
+        CHECK_THROWS_WITH_AS(make_output_parser("nope"), doctest::Contains("known: gemma4, inkling2, plain"), xs::Error);
     }
 }

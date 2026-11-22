@@ -471,7 +471,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     info.vocab_size = cfg.output_size;
     info.hidden_size = cfg.hidden_size;
     info.max_position = cfg.max_position;
-    info.dialect = "plain";
+    info.dialect = "inkling2";
 
     std::vector<int32_t> stops;
     info.default_sampling = cfg::read_generation_defaults(dir, &stops);

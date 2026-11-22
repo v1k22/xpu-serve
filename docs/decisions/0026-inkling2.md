@@ -163,8 +163,9 @@ model (below), so the multiple-choice read-out the other GGUF files were scored 
 - A step launches some 4,700 small kernels, which bounds decode speed: the block residual, the message gate, the
   convolution with its residual and the router are each one kernel's worth of work. On the B60 every GGUF file
   decodes at 35 to 37 tok/s whatever its size.
-- The output dialect: the template switches thinking by `reasoning_effort` and ends without a generation prompt, the
-  model writing its own `<|message_model|>` and content tag, so `--readout` reads a structural token, not a letter.
+- `--readout`: the template ends without a generation prompt and the model writes its own `<|message_model|>` and
+  content tag, so the read-out sees a structural token, not an answer letter. (Chat is parsed: the `inkling2`
+  dialect splits the model's messages into reasoning, content and tool calls.)
 - A verify of several rows, and the drafter's block, read the whole KV cache once per row at long contexts: DSpark
   gains at 32k tokens and loses at 128k.
 - Images from a GGUF file (the repository keeps the vision tower in an mmproj file), and the files in mainline

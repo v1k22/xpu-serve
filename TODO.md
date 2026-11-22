@@ -308,10 +308,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       repository's `dspark-*.gguf`), KV memory for its windowed layers (a windowed slot keeps its window alone)
 - [x] Inkling 2 Mini: images from the checkpoint and its packs (the vision tower, a class token beside the patches
       through a key bias a row; parity with transformers on a tiny checkpoint, cpu-ref and the GPU)
+- [x] Inkling 2 Mini: its output dialect (thinking as reasoning, tool calls from their JSON messages) and
+      `reasoning_effort` as a template variable
 - [ ] Inkling 2 Mini: its small kernels fused (a step launches some 4,700: the block residual, the message gate, a
-      convolution with its residual, the router), its output dialect (thinking and tool calls; its template
-      switches thinking by `reasoning_effort` and the model writes its own `<|message_model|>` and content tag, so
-      `--readout` reads no answer letter until the dialect gives it the answer's prefix), a self-contained tiny GGUF
+      convolution with its residual, the router), `--readout` (the model writes its own `<|message_model|>` and
+      content tag before an answer, so the read-out sees a structural token, not a letter), a self-contained tiny GGUF
       for the importer's tests (the real lossless file is the check today)
 - [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`; `lfm3_vl`'s text decoder is read
       for d1 only); conv-window snapshots for prefix
