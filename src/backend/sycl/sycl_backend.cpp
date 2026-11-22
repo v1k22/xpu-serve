@@ -20,6 +20,7 @@
 #include "backend/sycl/sycl_kernels.h"
 #include "backend/sycl/sycl_conv.h"
 #include "backend/sycl/sycl_matmul.h"
+#include "backend/sycl/sycl_replay.h"
 #include "quant/quant.h"
 #include "util/error.h"
 #include "util/half.h"
@@ -210,6 +211,9 @@ constexpr int64_t kScoreCacheBytes = int64_t{4} << 20;
 constexpr int64_t kXmxGemvRows = 4;
 // The same for the GGUF block formats (gemv_block_xmx), whose GEMV costs more with every row than the q4 one.
 constexpr int64_t kXmxBlockRows = 2;
+// A step of up to this many tokens (a decode step, a speculative verify, a drafter's block) is profiled kind by kind
+// (SyclProgram::profile_kinds): its ops are too small to time one by one.
+constexpr int64_t kFewTokens = 8;
 
 // How quantized matmuls run (the GEMV option: auto, vector = the GEMV only, xmx = its matrix-engine version from one
 // row, where it fits; few_rows: the most rows quant_gemm takes, the device's own choice when negative).
@@ -291,6 +295,7 @@ public:
         return scratch_.get();
     }
     void* get_host(size_t bytes) override {
+        sycl_be::refuse_recording(q);  // the caller fills it for the launches it is about to make
         if (bytes > host_bytes_) {
             q.wait();
             if (host_ != nullptr) sycl::free(host_, q);
@@ -349,7 +354,7 @@ public:
           kv_format_(options.kv),
           max_context_(options.max_context),
           profiling_(env_flag("XS_SYCL_PROFILE")),
-          sync_(profiling_ || env_flag("XS_SYCL_SYNC")),
+          sync_(env_flag("XS_SYCL_SYNC")),
           trace_(env_flag("XS_SYCL_TRACE")) {
         // Plans are cached per T. They depend on L too when anything but a KvCache op makes an L-long value or
         // anything but Attention reads one; otherwise L only reaches Attention (and outputs), resolved per run.
@@ -438,14 +443,21 @@ public:
             }
             const auto& nodes = graph_.nodes();
             const auto submit_start = std::chrono::steady_clock::now();
-            // The first run of a step shape compiles kernels (JIT, oneMKL): not part of the profile.
+            // The first run of a step shape compiles kernels (JIT, oneMKL): not part of the profile. A step of a few
+            // tokens is profiled kind by kind once it has run (profile_kinds), a longer one op by op as it runs.
             const bool profile_step = profiling_ && !profiled_shapes_.insert(step.tokens).second;
-            if (profile_step) marks_.assign(1, {std::string(), q_.ext_oneapi_submit_barrier()});
+            const bool few = step.tokens <= kFewTokens;
+            const bool timed = profile_step && !few;
             for (size_t i = 0; i < nodes.size(); ++i) {
-                if (plan.alias[i] != 0 || nodes[i].kind == OpKind::Input) continue;
-                if (live != nullptr && (*live)[i] == 0) continue;
-                if (profile_step) {
-                    timed_launch(i, plan, step);
+                if (!launches(i, plan, live)) continue;
+                if (timed) {  // the op and a wait for it: the round trip is small beside an op over many tokens
+                    const auto start = std::chrono::steady_clock::now();
+                    launch(i, plan, step);
+                    q_.wait();
+                    Profiled& kind = prefill_profile_.kinds[profile_key(i, plan, step)];
+                    const auto took = std::chrono::steady_clock::now() - start;
+                    kind.ms += std::chrono::duration<double, std::milli>(took).count();
+                    ++kind.launches;
                 } else if (sync_) {
                     try {
                         if (trace_) std::fprintf(stderr, "%s T=%lld L=%lld\n", where(i).c_str(),
@@ -458,6 +470,10 @@ public:
                 } else {
                     launch(i, plan, step);
                 }
+            }
+            if (profile_step) {
+                if (few) profile_kinds(plan, step, live);
+                ++(few ? decode_profile_ : prefill_profile_).steps;
             }
             if (log::level() <= log::Level::Debug) {  // host-bound when submitting takes about as long as the run
                 const auto submitted = std::chrono::steady_clock::now();
@@ -495,20 +511,6 @@ public:
             st.base = st.tokens;
             st.replay = rewinding_;  // the step's inputs went to st.inputs
             st.tokens += step.tokens;
-        }
-        if (!marks_.empty()) {
-            // Device time between consecutive barriers is the op's: no host round trip in the measurement.
-            auto& ms = step.tokens == 1 ? decode_ms_ : prefill_ms_;
-            uint64_t prev = marks_[0].second.get_profiling_info<sycl::info::event_profiling::command_end>();
-            for (size_t m = 1; m < marks_.size(); ++m) {
-                const uint64_t end = marks_[m].second.get_profiling_info<sycl::info::event_profiling::command_end>();
-                ms[marks_[m].first] += static_cast<double>(end - prev) * 1e-6;
-                prev = end;
-            }
-            marks_.clear();
-        }
-        if (profiling_ && profiled_shapes_.count(step.tokens) != 0 && profiled_runs_[step.tokens]++ > 0) {
-            ++(step.tokens == 1 ? decode_steps_ : prefill_steps_);
         }
     }
 
@@ -1674,6 +1676,12 @@ private:
         return plans_.emplace(key, build_plan(step)).first->second;
     }
 
+    // Whether the step launches node i: not a name for other memory, and wanted by the outputs asked for.
+    bool launches(size_t i, const Plan& p, const std::vector<char>* live) const {
+        if (p.alias[i] != 0 || graph_.nodes()[i].kind == OpKind::Input) return false;
+        return live == nullptr || (*live)[i] != 0;
+    }
+
     Plan build_plan(const Step& step) const {
         const auto& nodes = graph_.nodes();
         const size_t count = nodes.size();
@@ -1682,6 +1690,9 @@ private:
         p.locs.resize(count);
         p.alias.assign(count, 0);
         p.in_place.assign(count, 0);
+        // A profiled step of a few tokens runs its ops again once it is done (profile_kinds): no value's memory is
+        // given to another, and nothing is computed in place.
+        const bool keep_values = profiling_ && step.tokens <= kFewTokens;
         // For residual GEMMs (mm_add_): the last reader of each value, and whether a view (reshape, slice) reads it
         // (then its memory may be read later under another name).
         std::vector<std::vector<size_t>> last_reader(count);
@@ -1747,7 +1758,7 @@ private:
                 const OpKind ak = nodes[an].kind;
                 const bool own = p.alias[an] == 0 && p.locs[an][ai].store == Store::Arena && ak != OpKind::Input &&
                                  block_of[an][ai] >= 0;
-                if (own && graph_output[an] == 0 && viewed[an][ai] == 0 && last_reader[an][ai] == i &&
+                if (own && !keep_values && graph_output[an] == 0 && viewed[an][ai] == 0 && last_reader[an][ai] == i &&
                     dtype_[an][ai] == DType::F32 && dtype_[i][0] == DType::F32 && p.shapes[an][ai] == p.shapes[i][0]) {
                     p.locs[i][0] = p.locs[an][ai];
                     block_of[i][0] = block_of[an][ai];
@@ -1815,6 +1826,7 @@ private:
             const int b = block_of[static_cast<size_t>(out.value.node)][static_cast<size_t>(out.value.index)];
             if (b >= 0) block_last[static_cast<size_t>(b)] = count;
         }
+        if (keep_values) std::fill(block_last.begin(), block_last.end(), count);
 
         // First fit over the blocks live at each node; a block is free again after its last reader.
         std::vector<std::vector<size_t>> starts_at(count), ends_at(count + 1);
@@ -2522,45 +2534,85 @@ private:
         fail(where(i), ": unhandled op");
     }
 
-    // XS_SYCL_PROFILE=1: op i's device time (between its barrier and the previous one's) adds to its kind's total;
-    // the run reads the barriers' timestamps once it is done.
-    void timed_launch(size_t i, const Plan& p, const Step& step) {
-        launch(i, p, step);
+    // What a profile groups node i under: its op, with what sets its cost.
+    std::string profile_key(size_t i, const Plan& p, const Step& step) const {
         const Node& n = graph_.nodes()[i];
         std::string key(graph::op_name(n.kind));
         const auto shape = [&](size_t k) -> const Dims& {
             return p.shapes[static_cast<size_t>(n.inputs[k].node)][static_cast<size_t>(n.inputs[k].index)];
         };
         if (n.kind == OpKind::MatMul) {
-            key += str_cat(" ", shape(1)[0], "x", shape(1)[1]);
-        } else if (n.kind == OpKind::Attention) {
-            key += str_cat(" T=", shape(0)[0] == kT ? step.tokens : shape(0)[0], " N=",
-                           shape(1)[0] == kL ? step.kv_len : shape(1)[0], " D=", shape(0).back());
+            key += str_cat(" ", shape(1)[0], "x", shape(1)[1], " ", dtype_name(dt(n.inputs[1])));
+        } else if (n.kind == OpKind::Attention) {  // a cache's length only where steps are few (a kind per step else)
+            key += str_cat(" T=", shape(0)[0] == kT ? step.tokens : shape(0)[0]);
+            if (shape(1)[0] != kL || step.tokens > kFewTokens) {
+                key += str_cat(" N=", shape(1)[0] == kL ? step.kv_len : shape(1)[0]);
+            }
+            key += str_cat(" D=", shape(0).back());
         } else {  // elementwise passes: by output shape, dtype and fusion
             const Dims& o = p.shapes[i][0];
             key += " [";
             for (size_t d = 0; d < o.size(); ++d) key += str_cat(d ? "," : "", o[d]);
             key += str_cat("] ", dtype_name(dtype_[i][0]), fused_[i] != Fused::No ? " fused" : "");
         }
-        marks_.emplace_back(std::move(key), q_.ext_oneapi_submit_barrier());
+        return key;
     }
 
+    // XS_SYCL_PROFILE=1, a step of a few tokens, where a barrier per op would cost more than the op: what each kind
+    // of op costs the device. Once the step has run, a kind's launches are recorded as one command graph and run
+    // again several times back to back, with no host work and no wait between two of them. They compute what the step
+    // computed: its plan gave every value memory of its own (build_plan), so each still reads the inputs it read.
+    void profile_kinds(const Plan& p, const Step& step, const std::vector<char>* live) {
+        std::map<std::string, std::vector<size_t>> kinds;
+        for (size_t i = 0; i < graph_.nodes().size(); ++i) {
+            if (launches(i, p, live)) kinds[profile_key(i, p, step)].push_back(i);
+        }
+        constexpr int kRepeats = 8;
+        const auto timed = [&](const auto& run) {
+            q_.wait();
+            const auto start = std::chrono::steady_clock::now();
+            for (int r = 0; r < kRepeats; ++r) run();
+            q_.wait();
+            const auto took = std::chrono::steady_clock::now() - start;
+            return std::chrono::duration<double, std::milli>(took).count() / kRepeats;
+        };
+        for (const auto& [key, nodes] : kinds) {
+            const auto launch_all = [&] {
+                for (const size_t i : nodes) launch(i, p, step);
+            };
+            log::debug("sycl profile: ", key, " x", nodes.size());
+            const auto recording = sycl_be::record(q_, launch_all);  // null: a kind a recording cannot hold
+            Profiled& kind = decode_profile_.kinds[key];
+            kind.ms += recording != nullptr ? timed([&] { sycl_be::replay(q_, *recording); }) : timed(launch_all);
+            kind.launches += nodes.size();
+        }
+    }
+
+    struct Profiled {  // over every profiled step
+        double ms = 0;
+        size_t launches = 0;
+    };
+    struct Profile {
+        std::map<std::string, Profiled> kinds;
+        int64_t steps = 0;
+    };
     void report_profile() const {
-        const auto report = [](const char* what, const std::map<std::string, double>& ms, int64_t steps) {
-            if (steps == 0) return;
+        const auto report = [](const char* what, const Profile& profile) {
+            if (profile.steps == 0) return;
             std::vector<std::pair<double, std::string>> rows;
             double total = 0;
-            for (const auto& [k, v] : ms) {
-                rows.emplace_back(v / static_cast<double>(steps), k);
-                total += v;
+            for (const auto& [key, kind] : profile.kinds) {
+                rows.emplace_back(kind.ms / static_cast<double>(profile.steps),
+                                  str_cat(key, " x", kind.launches / static_cast<size_t>(profile.steps)));
+                total += rows.back().first;
             }
             std::sort(rows.rbegin(), rows.rend());
-            log::info("sycl profile (", what, ", ", steps, " steps): ", total / static_cast<double>(steps), " ms/step");
+            log::info("sycl profile (", what, ", ", profile.steps, " steps): ", total, " ms/step");
             for (const auto& [v, k] : rows)
                 log::info("  ", k, ": ", v, " ms/step");
         };
-        report("decode", decode_ms_, decode_steps_);
-        report("prefill", prefill_ms_, prefill_steps_);
+        report("steps of a few tokens", decode_profile_);
+        report("longer steps", prefill_profile_);
     }
 
     const graph::Graph graph_;
@@ -2601,12 +2653,8 @@ private:
     std::map<std::string, std::vector<char>> live_;  // live_for, by the requested outputs
     bool rewinding_ = false;  // the running step keeps its conv and recurrent inputs (SharedFixed)
     std::map<std::pair<int64_t, int64_t>, Plan> plans_;
-    std::map<std::string, double> decode_ms_, prefill_ms_;
-    std::vector<std::pair<std::string, sycl::event>> marks_;  // a profiled run's barriers: (op, event)
-    std::set<int64_t> profiled_shapes_;      // step token counts seen (their first run is not profiled)
-    std::map<int64_t, int64_t> profiled_runs_;
-    int64_t decode_steps_ = 0;
-    int64_t prefill_steps_ = 0;
+    Profile decode_profile_, prefill_profile_;  // XS_SYCL_PROFILE=1: steps of a few tokens, longer ones
+    std::set<int64_t> profiled_shapes_;         // step token counts seen (their first run is not profiled)
 };
 
 // A session: the shared state and its programs (backend.h).
@@ -2724,11 +2772,7 @@ public:
         if (it == queues_.end()) {
             // A context of this device alone: in the platform's default context (every GPU), device allocations of a
             // large model failed at 14 to 18 GiB of a 24 GiB card with two cards present.
-            sycl::property_list props{sycl::property::queue::in_order()};
-            if (env_flag("XS_SYCL_PROFILE")) {
-                props = sycl::property_list{sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()};
-            }
-            sycl::queue q(sycl::context(devices_[index]), devices_[index], props);
+            sycl::queue q(sycl::context(devices_[index]), devices_[index], sycl::property::queue::in_order());
             it = queues_.emplace(index, std::move(q)).first;
         }
         attention.xmx = sycl_be::xmx_device(devices_[index]);

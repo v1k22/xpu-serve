@@ -105,10 +105,12 @@ build/src/xpu-serve run   <embedding-model-dir> --device GPU --prompt "text"    
   them), or of a block
   drafter for one (`--drafter`), or an encoder in a sentence-transformers checkpoint (`--arch bert|nomic_bert`), to run
   the reference scripts and the parity tests on in seconds.
-- `XS_SYCL_PROFILE=1` logs the SYCL backend's per-op device time per step (barrier timestamps between ops, no host
-  round trip; each barrier stalls the GPU briefly, so small ops read high: rank by it, measure with `bench`);
-  `XS_SYCL_SYNC=1` waits after
-  every op and names the op a device error comes from (`XS_SYCL_TRACE=1` also prints each op before it runs).
+- `XS_SYCL_PROFILE=1` logs what each kind of op costs the SYCL backend per step. A step of up to 8 tokens (decode, a
+  speculative verify) is profiled once it has run: every launch of a kind is recorded as one command graph and run
+  again several times back to back, with no host work between two kernels, so a kind's time is the device's and the
+  kinds add up to the step's (the plan of such a step gives every value memory of its own, so the ops can run again).
+  In a longer step each op is timed on the host with a wait after it. `XS_SYCL_SYNC=1` waits after every op and names
+  the op a device error comes from (`XS_SYCL_TRACE=1` also prints each op before it runs).
 - The GPU suites ("device ops", "device attention", "device session", "device vs cpu-ref", ...) run when
   `XS_DEVICE_TEST_DEVICE=GPU.0` is set (`XS_DEVICE_TEST_PRECISION=f32` for f32; `XS_DEVICE_BENCH=1` adds the decode
   timing case).
@@ -209,6 +211,7 @@ area).
 | `src/backend/sycl/sycl_matmul.cpp` | MatMul (GEMV up to 8 rows, oneMKL GEMM beyond; quantized: `quant_path` picks the GEMV or its matrix-engine version, quant_gemm, quant_gemm_tiled or dequantize + oneMKL per device and shape), ExpertMatMul over many pairs (grouped by expert into one grouped GEMM; a quantized bank's experts decoded into scratch, a float bank in the GEMM's type read in place) and Attention (per-row kernel with split-K, the fused kernel, or GEMMs) |
 | `src/backend/sycl/sycl_flash_attention.cpp` | Fused attention on the matrix engines (joint_matrix; head_dim up to 128; blocks of tokens in one launch; a relative bias and a sink in its online softmax) |
 | `src/backend/sycl/sycl_quant_gemm.cpp` | Quantized matmuls on the matrix engines (DPAS and 2D block load builtins): gemv_quant_xmx (up to 8 rows at about the cost of one: a speculative verify; x in f16 and its group sums from one small launch before), quant_gemm (9 to 64 rows, the weight read once, 64 bytes of codes a lane and 32 rows of x a load; weights that read the same x share a launch) and quant_gemm_tiled (many rows: each weight tile dequantized once per work-group of 512 rows into local memory, no f16 copy of the weight) |
+| `src/backend/sycl/sycl_replay.h` | A run of launches recorded as a command graph and run again (sycl_ext_oneapi_graph): what the profile of a step of a few tokens times its kinds of op with; what a recording cannot hold refuses by throwing |
 | `src/backend/sycl/sycl_xmx.h` | What the kernels written against the matrix engines directly share: the DPAS and 2D block load builtins, their operand types, and `xmx_prep` (x in f16 and its sums per group of columns: the A operand of the GEMVs on the matrix engines) |
 | `src/backend/sycl/sycl_block_layout.cpp` | GGUF block-format weights for the device: a block's fields regrouped into aligned streams with codes in column order (the same bits, nothing re-encoded); Q4_0, Q4_1 and Q8_0 rewritten as a pack's q4 / q8 with a group of 32 (the same values), which the pack kernels then read |
 | `src/backend/sycl/sycl_block_kernels.cpp` | Kernels over those streams, one decoder per format (`Fmt<F>`: K-quants read their codes without an int-to-float conversion, codebook formats look their magnitudes up in a table on the device): the GEMV (up to 8 rows, each weight read once) and its matrix-engine version (`gemv_block_xmx`: each lane writes its own output feature's codes or levels, exact in f16, into DPAS B operands, so the cost hardly grows with the rows: a speculative verify), the weight written out as f16 / f32 for a GEMM, rows gathered by id. an expert bank's GEMV per (token, expert) pair, or per expert over its pairs (`expert_matmul_block`). `QuantWeight::block` routes a weight to them through the pack kernels' entry points |
