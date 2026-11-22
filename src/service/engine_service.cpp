@@ -93,9 +93,12 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
         log::info("speculative decoding: ", name, ", ", engine_options.spec_k, " drafts per round, drafter graph of ",
                   spec->draft_graph().nodes().size(), " nodes");
     }
-    // The cache of the whole context and the largest step reserved at load: --ctx is refused now, not halfway into
-    // a long prompt.
-    session_options.max_step_tokens = std::max<int64_t>(engine_options.prefill_chunk, engine_options.spec_k + 1);
+    // The cache of the whole context and the largest steps reserved at load: --ctx is refused now, not halfway into
+    // a long prompt. Speculating, prefill chunks run the prefill program and verifies the verify program
+    // (spec::Program); a drafter's own steps are small.
+    const int64_t chunk = engine_options.prefill_chunk;
+    session_options.max_step_tokens =
+        speculate ? std::vector<int64_t>{0, chunk, engine_options.spec_k + 1, 0} : std::vector<int64_t>{chunk};
     auto backend = make_backend(options.backend);
     Timer compile_timer;
     auto session = backend->compile(programs, model->weights(), session_options);

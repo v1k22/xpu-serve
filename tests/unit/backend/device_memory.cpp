@@ -30,7 +30,7 @@ Graph cache_graph(int64_t window) {
 TEST_SUITE("device memory" * doctest::skip(!dev::enabled())) {
     TEST_CASE("a context whose KV cache cannot fit the device is refused at compile time, naming what fits") {
         SessionOptions o = dev::options(int64_t{1} << 24);  // 16M tokens of 4 KiB (f16): 64 GiB of keys and values
-        o.max_step_tokens = 256;
+        o.max_step_tokens = {256};
         try {
             dev::backend().compile(cache_graph(0), test::MemoryWeights{}, o);
             FAIL("compiled");
@@ -42,7 +42,7 @@ TEST_SUITE("device memory" * doctest::skip(!dev::enabled())) {
             CHECK(what.find("tokens fit") != std::string::npos);
         }
         // Without max_step_tokens nothing is reserved: the cache grows as steps need it.
-        o.max_step_tokens = 0;
+        o.max_step_tokens.clear();
         CHECK_NOTHROW(dev::backend().compile(cache_graph(0), test::MemoryWeights{}, o));
     }
 
@@ -51,7 +51,7 @@ TEST_SUITE("device memory" * doctest::skip(!dev::enabled())) {
         for (const int64_t window : {int64_t{0}, int64_t{64}}) {
             CAPTURE(window);
             SessionOptions o = dev::options(65536);
-            o.max_step_tokens = 32;
+            o.max_step_tokens = {32};
             const auto session = dev::backend().compile(cache_graph(window), test::MemoryWeights{}, o);
             for (const int64_t t : {int64_t{32}, int64_t{1}}) {
                 TensorMap out;

@@ -36,10 +36,11 @@ struct SessionOptions {
     // Steps of up to this many tokens can be cut back to any point inside them (truncate), conv and recurrent state
     // included: the verify step of speculative decoding (k + 1 tokens). 0: a step is kept or dropped whole.
     int64_t rewind_tokens = 0;
-    // The most tokens one step feeds (a prefill chunk, a verify): a backend that sizes its device memory reserves at
-    // compile time what a step of that size over a cache of max_context tokens needs, and the cache itself, and
-    // refuses the context by name when they do not fit. 0: nothing reserved ahead (memory grows as runs need it).
-    int64_t max_step_tokens = 0;
+    // Per program, in compile's order: the most tokens one step of it feeds (a prefill chunk, a verify). A backend that
+    // sizes its device memory reserves at compile time what such steps over a cache of max_context tokens need, and
+    // the cache itself, and refuses the context by name when they do not fit. Empty: nothing reserved ahead (memory
+    // grows as runs need it); 0, or a program past the list: one that adds nothing to the reservation.
+    std::vector<int64_t> max_step_tokens;
     std::map<std::string, std::string> extra;  // backend-specific options, refused by name when unknown
 };
 

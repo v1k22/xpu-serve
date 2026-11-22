@@ -564,24 +564,24 @@ public:
         return live_.emplace(std::move(key), std::move(live)).first->second;
     }
 
-    // What a full context and a step of up to `step` tokens need of the device for this program: per KV slot it
-    // writes, its bytes at its largest (the whole context; a slot that keeps its window alone, the window and a
-    // step) and whether that grows with the context; and the arena of such a step over a full cache.
+    // What a context of `context` tokens and a step of up to `step` tokens need of the device for this program: per KV
+    // slot it writes, its bytes at its largest (the whole context; a slot that keeps its window alone, the window and
+    // a step) and whether that grows with the context; and the arena of such a step over a full cache.
     struct Need {
         std::map<size_t, std::pair<int64_t, bool>> slots;  // shared slot -> (bytes, grows with the context)
         size_t arena = 0;
     };
-    Need need(int64_t step) {
+    Need need(int64_t step, int64_t context) {
         Need n;
         if (!reads_kv_) {
             for (const size_t slot : kv_slot_) {
                 const SharedKv& kv = shared_.kv[slot];
                 const KvTokenBytes b = kv_token_bytes(kv.buf);
                 const int64_t per_token = b.k + b.v + b.k_scale + b.v_scale;
-                n.slots[slot] = {kv_capacity(kv, step) * per_token, !keeps_window(kv)};
+                n.slots[slot] = {kv_capacity(kv, step, context) * per_token, !keeps_window(kv)};
             }
         }
-        n.arena = plan_for(Step{std::min(step, max_context_), max_context_}).arena_bytes;
+        n.arena = plan_for(Step{std::min(step, context), context}).arena_bytes;
         return n;
     }
     // The KV slots this program writes at the capacity need() bills (no slot holds anything yet).
@@ -590,7 +590,7 @@ public:
         for (const size_t slot : kv_slot_) {
             SharedKv& kv = shared_.kv[slot];
             KvBuffers& b = kv.buf;
-            const int64_t cap = kv_capacity(kv, step);
+            const int64_t cap = kv_capacity(kv, step, max_context_);
             if (b.capacity >= cap) continue;
             const KvTokenBytes bytes = kv_token_bytes(b);
             b.k = DeviceBuffer(q_, static_cast<size_t>(cap * bytes.k));
@@ -740,8 +740,8 @@ private:
         return s.spec.sliding_window > 0 && s.attention_only && !shared_.fixed.empty();
     }
     // A slot's capacity at its largest: the context, or its window and a step of `step` tokens.
-    int64_t kv_capacity(const SharedKv& s, int64_t step) const {
-        return keeps_window(s) ? std::min(max_context_, s.spec.sliding_window + step) : max_context_;
+    int64_t kv_capacity(const SharedKv& s, int64_t step, int64_t context) const {
+        return keeps_window(s) ? std::min(context, s.spec.sliding_window + step) : context;
     }
 
     // Bytes a token takes in each buffer of a slot.
@@ -2803,40 +2803,62 @@ public:
 
     // SessionOptions::max_step_tokens: the KV cache of the whole context and the arena of the largest step, allocated
     // now, so that a long prompt cannot run out of device memory halfway; refused by name when they do not fit.
-    void reserve(int64_t step, const std::string& device) {
-        std::map<size_t, std::pair<int64_t, bool>> slots;
-        size_t arena = 0;
-        for (const auto& p : programs_) {
-            SyclProgram::Need n = p->need(step);
-            slots.merge(n.slots);
-            arena = std::max(arena, n.arena);
-        }
-        int64_t growing = 0, fixed = 0;
-        for (const auto& [slot, need] : slots) (need.second ? growing : fixed) += need.first;
+    void reserve(const std::vector<int64_t>& steps, const std::string& device) {
+        const auto step_of = [&](size_t p) { return p < steps.size() ? steps[p] : int64_t{0}; };
+        struct Bill {
+            int64_t growing = 0, fixed = 0, arena = 0;  // the KV slots that grow with the context, the others; a step
+            int64_t total() const { return growing + fixed + arena; }
+        };
+        const auto bill = [&](int64_t context) {
+            std::map<size_t, std::pair<int64_t, bool>> slots;
+            Bill b;
+            for (size_t p = 0; p < programs_.size(); ++p) {
+                if (step_of(p) <= 0) continue;
+                SyclProgram::Need n = programs_[p]->need(step_of(p), context);
+                for (const auto& [slot, need] : n.slots) {  // a slot two programs write: its larger need
+                    auto [it, fresh] = slots.emplace(slot, need);
+                    if (!fresh) it->second.first = std::max(it->second.first, need.first);
+                }
+                b.arena = std::max(b.arena, static_cast<int64_t>(n.arena));
+            }
+            for (const auto& [slot, need] : slots) (need.second ? b.growing : b.fixed) += need.first;
+            return b;
+        };
         const int64_t context = shared_->max_context;
+        const Bill b = bill(context);
+        const int64_t largest = *std::max_element(steps.begin(), steps.end());
         const sycl::device dev = shared_->q.get_device();
         const auto total = static_cast<int64_t>(dev.get_info<sycl::info::device::global_mem_size>());
         const int64_t held = static_cast<int64_t>(g_device_bytes.load());  // weights, and what other sessions hold
-        const int64_t needed = held + growing + fixed + static_cast<int64_t>(arena);
         const auto refuse = [&](const std::string& why) {
-            const int64_t per_token = growing / context;
-            const int64_t room = total - held - fixed - static_cast<int64_t>(arena);
-            const int64_t fits = per_token > 0 && room > 0 ? room / per_token / 1024 * 1024 : 0;
+            // The longest context, in steps of 1024 tokens, whose bill fits beside what is held (a step's arena
+            // shrinks with the cache it reads).
+            int64_t lo = 0, hi = context / 1024;
+            while (lo < hi) {
+                const int64_t mid = (lo + hi + 1) / 2;
+                if (held + bill(mid * 1024).total() <= total) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
             fail("sycl: a context of ", context, " tokens (--ctx) does not fit ", device, " (", gib(total),
-                 " GiB): ", gib(held), " GiB in use (the weights), the KV cache ", gib(growing + fixed), " GiB (",
-                 per_token, " bytes a token), a step of ", std::min(step, context), " tokens over it ",
-                 gib(static_cast<int64_t>(arena)), " GiB", why, "; at most ", fits,
-                 " tokens fit (or a KV format of fewer bytes a token, --kv-dtype i8 or turbo4)");
+                 " GiB): ", gib(held), " GiB in use (the weights), the KV cache ", gib(b.growing + b.fixed), " GiB (",
+                 b.growing / context, " bytes a token), a step of ", std::min(largest, context), " tokens over it ",
+                 gib(b.arena), " GiB", why, "; at most ", lo * 1024,
+                 " tokens fit (or fewer bytes a token, --kv-dtype i8 or turbo4, or a smaller step, --prefill-chunk)");
         };
-        if (needed > total) refuse("");
+        if (held + b.total() > total) refuse("");
         try {
-            for (const auto& p : programs_) p->reserve_kv(step);
-            shared_->ensure_arena(arena);
+            for (size_t p = 0; p < programs_.size(); ++p) {
+                if (step_of(p) > 0) programs_[p]->reserve_kv(step_of(p));
+            }
+            shared_->ensure_arena(static_cast<size_t>(b.arena));
         } catch (const Error& e) {
             refuse(str_cat(" (", e.what(), ")"));
         }
-        log::info("sycl: reserved the KV cache of ", context, " tokens (", gib(growing + fixed), " GiB) and a step's ",
-                  gib(static_cast<int64_t>(arena)), " GiB; ", gib(total - static_cast<int64_t>(g_device_bytes.load())),
+        log::info("sycl: reserved the KV cache of ", context, " tokens (", gib(b.growing + b.fixed),
+                  " GiB) and a step's ", gib(b.arena), " GiB; ", gib(total - static_cast<int64_t>(g_device_bytes.load())),
                   " GiB of ", device, " left");
     }
 
@@ -2959,7 +2981,7 @@ public:
         for (const graph::Graph* graph : programs) {
             session->add(std::make_unique<SyclProgram>(*graph, weights, options, session->shared(), attention, quant));
         }
-        if (options.max_step_tokens > 0) session->reserve(options.max_step_tokens, str_cat("GPU.", index));
+        if (!options.max_step_tokens.empty()) session->reserve(options.max_step_tokens, str_cat("GPU.", index));
         return session;
     }
 
