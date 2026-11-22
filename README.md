@@ -25,7 +25,9 @@ optimized one) and what was measured**; this page says what is supported and how
 > The format is lossy and opt-in; what it costs and what was measured:
 > [model_recipes.md](model_recipes.md#measured-on-qwen38-27b-a-gguf-pack). Ornith-1.5-35B-A3B, a 35B mixture of
 > experts, does the same from its Q4_K_M GGUF file (22.8 GiB at 262,144 tokens;
-> [its recipe](model_recipes.md#ornith-15-35b-a3b-gguf)).
+> [its recipe](model_recipes.md#ornith-15-35b-a3b-gguf)). Inkling-2-Mini, a 26B mixture of experts, reads all
+> 1,048,576 tokens it takes on the same card, and on an Arc B390 integrated GPU, from its UD-Q4_K_M file in `turbo3`
+> (perplexity +2.0 %; [its recipe](model_recipes.md#inkling-2-mini)).
 
 ## What is supported
 
@@ -45,10 +47,11 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Quantized packs**: q8 and q4 from `xpu-serve convert` (round to nearest; AWQ calibration opt-in)
 - ✅ **FP8 checkpoints** (Qwen3.8-27B-FP8, Qwen3.6-35B-A3B-FP8, Ornith-1.5-35B-A3B-FP8: a scale per 128 x 128 block,
   or compressed-tensors' scale per channel), served as they are or converted to a pack
-- ✅ **GGUF import**: `qwen35`, `qwen35moe`, `gemma4`, `gemma4-assistant`, `clef` and the `modern-bert` files of Laya
-  and Julia-1, in all 19 of GGUF's block formats (expert banks included), kept as the file stores them
+- ✅ **GGUF import**: `qwen35`, `qwen35moe`, `gemma4`, `gemma4-assistant`, `inkling2` (with its DSpark drafter's
+  file), `clef` and the `modern-bert` files of Laya and Julia-1, in all 19 of GGUF's block formats and Unsloth's
+  NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them
 - ✅ **Speculative decoding**: Qwen's MTP heads, Gemma 4's assistants, DFlash 2 and DSpine block drafters
-  (Qwen3.8-27B), a DFlash block drafter (Ornith-1.5-35B-A3B)
+  (Qwen3.8-27B), a DFlash block drafter (Ornith-1.5-35B-A3B), Inkling 2's DSpark drafter
 - ✅ **int8 KV cache** (`--kv-dtype i8`)
 - ✅ **TurboQuant KV cache** (`--kv-dtype turbo4 | turbo3 | turbo2`, or int8 keys with TurboQuant values): a cache
   3.9 to 7.5 times smaller than f16
@@ -83,6 +86,7 @@ Each model's recipe has its commands and numbers.
 | Qwen3.8-27B | language | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-27B-FP8` | q4 pack, GGUF | [recipe](model_recipes.md#qwen38-27b), [GGUF](model_recipes.md#qwen38-27b-gguf) |
 | Ornith-1.5-35B-A3B | language, MoE | `ornith-ai/Ornith-1.5-35B-A3B`, `-FP8`, `-GGUF` | q4 pack, GGUF Q4_K_M | [recipe](model_recipes.md#ornith-15-35b-a3b), [GGUF](model_recipes.md#ornith-15-35b-a3b-gguf) |
 | LFM3-1.7B | language | `LiquidAI/LFM3-1.7B` | original, q8 / q4 pack | [recipe](model_recipes.md#lfm3-17b) |
+| Inkling-2-Mini | language, MoE | `thinkingmachines/Inkling-2-Mini`, `unsloth/Inkling-2-Mini-GGUF` | q8 / q4 pack, GGUF | [recipe](model_recipes.md#inkling-2-mini), [GGUF](model_recipes.md#inkling-2-mini-gguf) |
 | Clef-Flash | decision | `Cloudflare/clef-flash` | original, q8 / q4 pack, GGUF | [recipe](model_recipes.md#clef-flash) |
 | Clef | decision | `ggml-org/Clef-GGUF` (of `Cloudflare/clef`) | GGUF Q4_K_M | [recipe](model_recipes.md#clef) |
 | pplx-decider-flash-v1.2 | decision | `perplexity-ai/pplx-decider-flash-v1.2` | original, q8 / q4 pack | [recipe](model_recipes.md#pplx-decider-flash-v12) |
@@ -213,8 +217,9 @@ xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
 - The architecture comes from the file (`general.architecture`). Supported: `qwen35` and `qwen35moe`, the Qwen3.5 /
   Qwen3.6 / Qwen3.8 text models, dense and mixture of experts (Ornith-1.5-35B-A3B's files are `qwen35moe`); `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
   images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
-  drafter; `clef`, the Clef decision models; and `modern-bert` with a Laya read-out, the files of Laya and Julia-1.
-  Others are refused by name.
+  drafter; `inkling2`, Inkling 2 Mini (Unsloth's files), with its drafter's file (`dspark-*.gguf`, fetched by `-hf`);
+  `clef`, the Clef decision models; and `modern-bert` with a Laya read-out, the files of Laya and Julia-1. Others
+  are refused by name.
 - A Qwen3.5-family file that comes without its MTP head (the smallest files of Qwen3.8-27B) takes the head from its
   `MTP/mtp-*.gguf` file with `--mtp`: the pack is the one a file with the head gives, and `--spec mtp` drafts with it.
 - config.json, the tokenizer and the chat template are written from the file's metadata (on Qwen3.5-4B and Gemma 4
@@ -239,6 +244,7 @@ output stays the model's own and sampling keeps its distribution (rejection samp
 | `mtp` | a Gemma 4 assistant | `--drafter <google/gemma-4-*-it-assistant>` |
 | `dflash` | a DFlash or DFlash 2 block drafter | `--drafter <z-lab/Qwen3.8-27B-DFlash2>`, `--drafter <ornith-ai/Ornith-1.5-35B-A3B-DFlash>` |
 | `dspine` | a DSpine block drafter | `--drafter <tencent/Qwen3.8-27B-DSpine-b16>` |
+| `dspark` | Inkling 2's DSpark block drafter | inside the checkpoint and its packs; `dspark-*.gguf` of its GGUF repository |
 
 ```bash
 xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4

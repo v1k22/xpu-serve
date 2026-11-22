@@ -365,7 +365,7 @@ One test binary, `xs_tests` (doctest). Every `tests/unit/**/*.cpp` is compiled i
 | `tests/unit/backend/*_relative_ops.cpp` | L2Clip (rows on both sides of the threshold, a row of zeros), DynamicConv over several steps (state carried, taps per token and group) and causal attention with a relative bias and a sink over a cache fed in steps (on the per-row, GEMM and fused paths; an extent shorter and longer than the cache, a window shorter and longer than it, keys split between work-groups), attention over a window anchored at the step (blocks after contexts shorter and longer than the window), on cpu-ref and the GPU | fp64 references (`relative_ops_cases.h`); planted: a norm in place of the clip, taps in time order, the sink left out, the bias read toward the future, a window around each row |
 | `tests/unit/backend/*_shortlist_ops.cpp` | SignMatMul (words loaded whole and one by one, rows that fill no sub-group) and the shortlist head: the best rows by sketch, their exact logits, the head's pick, on cpu-ref and the GPU | fp64 references (`shortlist_cases.h`) |
 | `tests/unit/backend/*_programs.cpp` | sessions of several programs: KV slots shared by label, KvRead, truncate inside a short step (conv, gated delta, KV) equals never running the dropped tokens, the last step undone whole equals never running it; a KV slot with a sliding window beside conv state over many steps, some undone or cut, far past the window (a backend may keep the window alone); a run asked for some outputs returns those and advances the state all the same | the same session without them (`session_cases.h`) |
-| `tests/unit/engine/` | rotary positions (`rotary_positions.cpp`: an image's tokens at their offsets, the text after it one past its largest, generated tokens after that, prefix reuse, a one-position model refusing media with positions); speculative decoding emits exactly the greedy tokens (a stateful tiny model, a partly wrong drafter that drafts a token a run or a block a run, prefix reuse, stops); the same tokens when greedy decoding reads each row's `argmax` output instead of the logits; rejection sampling draws the target's distribution | plain greedy decoding; exact distributions |
+| `tests/unit/engine/` | rotary positions (`rotary_positions.cpp`: an image's tokens at their offsets, the text after it one past its largest, generated tokens after that, prefix reuse, a one-position model refusing media with positions); speculative decoding emits exactly the greedy tokens (a stateful tiny model, a partly wrong drafter that drafts a token a run or a block a run, prefix reuse, stops); a block drafter's runner handing the draft program the target's row of the last token kept (a prefill's rows or its last alone, a verify cut inside, the sequence cut back); the same tokens when greedy decoding reads each row's `argmax` output instead of the logits; rejection sampling draws the target's distribution | plain greedy decoding; exact distributions |
 | `tests/unit/backend/*_recurrent_ops.cpp` | sigmoid/silu/softplus, partial rope, CausalConv and GatedDelta over several steps (state carried), on cpu-ref and the GPU | one fp64 pass over the whole sequence (`recurrent_ops_cases.h`) |
 | `tests/unit/tokenizer/` | encode/decode, streaming, the post-processor's special tokens; NFC and regex Split hermetically (`test_tokenizer_qwen35.cpp`); WordPiece, BertNormalizer, BertPreTokenizer and the WordPiece decoder on a hand-written vocabulary, and the BERT normalizer and pre-tokenizer over every code point (`test_tokenizer_wordpiece.cpp`); the GPT-2 regex, ByteLevel and Metaspace, the regex over every code point (`test_tokenizer_laya_julia.cpp`); a tokenizer read from slow files, a hand-written Qwen2Tokenizer's (merges.txt as tokenizers reads it, added tokens and their flags, the special tokens transformers names, the class's eos; refusals by name) and Qwen3-ASR's (`test_tokenizer_slow_files.cpp`); the o200k regex over hand-picked and random text, and the letter cases it reads (`test_tokenizer_inkling2.cpp`); whole tokenizers of Gemma 4, Qwen3.5, LFM3, Inkling 2, Qwen3-ASR, the WordPiece embedding models and the Laya and Julia-1 decision models (ModernBERT's and mmBERT's) (`parity_cases.h`; each needs its checkpoint's `tokenizer.json`, Qwen3-ASR its vocab.json, merges.txt and tokenizer_config.json; `scratch_model_dir.h` writes hand-written files to load) | Hugging Face `tokenizers` outputs in `tests/fixtures/tokenizer/` (`tests/parity/tokenizer/gen_cases.py`, `gen_qwen35_cases.py`, `gen_lfm3_cases.py`, `gen_inkling2_cases.py`, `gen_wordpiece_cases.py`, `gen_laya_julia_cases.py`; `gen_qwen3_asr_cases.py`: AutoTokenizer over the slow files, checked against the Qwen2Converter's tokenizer; tables from `gen_unicode_tables.py`) |
 | `tests/unit/chat/` | template rendering (LFM3's template comes from `XS_LFM3_DIR`; Qwen3-ASR's is a chat_template.json, with audio parts), which template file wins, Gemma 4, Qwen3.5 and Qwen3 output parsing (`test_qwen3_parser.cpp`: XML and JSON tool calls), the Qwen3.5 dialect on LFM3's prompts too | `apply_chat_template` outputs in `tests/fixtures/chat/` (`tests/parity/chat/gen_cases.py`) |
@@ -597,9 +597,13 @@ Hugging Face safetensors (8.1 first, if it does not).
 
 - Inkling 2 Mini (`inkling2_loop`) is text only: its vision tower is not read and an image is refused. Its released
   checkpoint (experts in NVFP4 and MXFP8) is the float model its codes decode to, which a backend holds as floats:
-  far more than the download, so it is served from a pack `convert` makes of it. The variable-pass research
-  checkpoint (`is_varloop`) is refused by name. A step runs some 4,700 small kernels (48 layer applications), which
-  bounds decode speed until they are fused.
+  far more than the download, so it is served from a pack `convert` makes of it, or from a GGUF file's import, which
+  keeps the experts in NVFP4. The variable-pass research checkpoint (`is_varloop`) is refused by name. A step runs
+  some 4,700 small kernels (48 layer applications), which bounds decode speed until they are fused. Its drafter
+  (DSpark) gains little: every row of a verify reads the experts of its own token, so each draft adds about a fifth
+  of a decode step to the verify, and two drafts a round are the default. Of its GGUF repository, the files in
+  Unsloth's layout (`inkling2`) import, with the drafter's file; the copies in mainline llama.cpp's layout
+  (`.gguf_file`) and the vision projector (mmproj) are not read.
 - Three model families: Gemma 4 E2B/E4B (text and images) and 26B-A4B (text), Qwen3.5 dense and MoE (text; its
   vision tower is not loaded; SenseNova Loop's neither, and a block drafter beside SenseNova Loop is refused; a MoE
   checkpoint's expert banks come fused, as the released ones store them, expert by expert as an FP8 release does, or
@@ -612,9 +616,10 @@ Hugging Face safetensors (8.1 first, if it does not).
   out, the talker, not yet). No video.
   Images only as base64 data: URLs.
 - Speculative decoding drafts greedily (rejection sampling keeps sampled output exact). Drafters: the MTP heads, the
-  Gemma 4 assistants, and block drafters for Qwen3.5-family targets (checkpoints exist for Qwen3.8-27B and
-  Ornith-1.5-35B-A3B). An MTP head picks each draft among 64 tokens (`--draft-shortlist`; a one-bit sketch of the output
-  layer chooses them, the exact layer ranks them): a pick the shortlist misses costs a draft. A verify of more than 8
+  Gemma 4 assistants, block drafters for Qwen3.5-family targets (checkpoints exist for Qwen3.8-27B and
+  Ornith-1.5-35B-A3B), and Inkling 2's own (DSpark, whose head reads the whole output layer for each draft). An MTP
+  head picks each draft among 64 tokens (`--draft-shortlist`; a one-bit sketch of the output layer chooses them, the
+  exact layer ranks them): a pick the shortlist misses costs a draft. A verify of more than 8
   tokens leaves the fast path (a block drafter drafts 7 by default).
 - Models with conv or recurrent state (Qwen3.5's linear attention, LFM3's convolutions) re-prefill when a new prompt
   does not extend the cached sequence (no state snapshots): with thinking on, a template that drops earlier turns'
@@ -648,14 +653,17 @@ Hugging Face safetensors (8.1 first, if it does not).
   (an encoder alone, another decision type or prompt template) is refused, as are Laya's files with a question budget
   no published Laya has (the file holds no state budget, which is taken from the published checkpoint with that
   question budget). A Julia-1 file's max_head_tokens is the converter's default (256); the pack takes Julia's own
-  inference-policy.json (512, strict encoding), which accepts more and encodes the same. A Gemma 4 with
-  experts (26B-A4B) and every other architecture are refused by name. Tokenizers of the importer's table: byte-level
-  BPE (`tokenizer.ggml.model` gpt2) with `tokenizer.ggml.pre` `qwen35`, `modern-bert` and `mmbert`, and `gemma4`. The pack's chat
-  template and stop tokens are the file's: a publisher's changed template is what it renders, and a stop token only
-  the original checkpoint's config names (Qwen3.5's `<|endoftext|>`) is not one; for `gemma4` the import adds the
-  end-of-turn tokens llama.cpp stops at (`<eos>`, `<turn|>`, `<|tool_response>`, the original's), and the
-  tokenizer_config.json eos_token is the file's (unsloth's `<turn|>`, Google's `<eos>`). A file that is one part of a
-  split model, or holds tensor types beyond F32, F16, BF16 and the block formats, is refused by name.
+  inference-policy.json (512, strict encoding), which accepts more and encodes the same. `inkling2` (Inkling 2 Mini,
+  Unsloth's layout) imports with its experts in the file's formats and, with `--mtp`, its drafter's file (`dflash`
+  with `dflash.dspark.markov_rank`; any other `dflash` file is refused). A Gemma 4 with experts (26B-A4B) and every
+  other architecture are refused by name. Tokenizers of the importer's table: byte-level BPE
+  (`tokenizer.ggml.model` gpt2) with `tokenizer.ggml.pre` `qwen35`, `inkling2`, `modern-bert` and `mmbert`, and
+  `gemma4`. The pack's chat template and stop tokens are the file's: a publisher's changed template is what it
+  renders, and a stop token only the original checkpoint's config names (Qwen3.5's `<|endoftext|>`) is not one; for
+  `gemma4` the import adds the end-of-turn tokens llama.cpp stops at (`<eos>`, `<turn|>`, `<|tool_response>`, the
+  original's), and the tokenizer_config.json eos_token is the file's (unsloth's `<turn|>`, Google's `<eos>`). A file
+  that is one part of a split model, or holds tensor types beyond F32, F16, BF16 and the block formats, is refused by
+  name.
 - A pack can hold weights in GGUF's block formats (`DType::Block`, kept as the file stores them): the host decodes all
   22 as ggml does (its own 19, and NVFP4, MXFP4 and Q2_0 of Unsloth's llama.cpp builds), so cpu-ref runs them. The SYCL backend has kernels for all of them, expert banks included (a GEMV
   per token's expert, or per expert over its tokens; from 256 (token, expert) pairs each expert dequantized for a
@@ -689,6 +697,9 @@ Hugging Face safetensors (8.1 first, if it does not).
   (docs/decisions/0010, 0020).
 - `-hf` reads the Hugging Face Hub's API and resolve URLs: a GGUF file is imported into a pack, so it takes its size
   twice on disk; a file split into parts is refused, as the import refuses it; no Xet chunk deduplication. The MTP
-  head a repository publishes apart is fetched for a `qwen35` or `qwen35moe` file without one.
+  head a repository publishes apart is fetched for a `qwen35` or `qwen35moe` file without one, and Inkling 2's
+  drafter (`dspark-*.gguf`) for an `inkling2` file.
 - One sequence at a time; no batching.
-- Sliding-window layers keep every key in memory (the kernels read only the window; memory still grows with context).
+- Sliding-window layers keep every key in memory in a session that can be cut back to any prefix (Gemma 4, a DFlash
+  drafter's local layers): the kernels read only the window, memory still grows with the context. With conv or
+  recurrent state beside them (LFM3, Inkling 2) a windowed slot keeps its window alone, on the SYCL backend.

@@ -1,6 +1,7 @@
 # 0026: Inkling 2 Mini
 
-Status: **accepted** for the text decoder; fused kernels, the drafter, GGUF files and images follow · 2026-11-21
+Status: **accepted** for the text decoder, its GGUF files and its drafter; fused small kernels and images follow ·
+2026-11-21
 
 ## Context
 
@@ -56,9 +57,96 @@ initialized parameters, and a route scale of 2, brought the gain to under ten; t
 (cosine 0.999996 or better, greedy tokens equal). A trained checkpoint is not that sensitive; a random one has to be
 made well conditioned on purpose (`make_tiny.py --arch inkling2_loop`).
 
+## The GGUF files
+
+Unsloth's files (`general.architecture` `inkling2`, their llama.cpp builds' layout) import into a pack like any other
+GGUF (`src/convert/gguf/inkling2.cpp`). What was particular:
+
+- **Metadata per layer visit.** The file counts 48 blocks of metadata (a looped layer once per pass) over 24 blocks
+  of tensors. The importer reads the loop back out of those arrays and refuses a file whose passes disagree.
+- **Float tensors the converter moved.** It transposes the relative bias projection and stores the dynamic
+  convolutions' taps flipped and transposed. The importer puts the values back (`FloatReorder`: a whole float tensor
+  in another order, written as F32), so the model code reads one layout.
+- **Expert banks stay in the file's format**, NVFP4 included (a block format of its own: 36 bytes for 64 weights).
+  Two things differ from the checkpoint and cannot be undone on a quantized tensor, so the model reads either form:
+  the fused gate and up bank holds the gate rows and then the up rows (`gate_up_rows: halves` in config.json), and
+  a bank's factor per expert is a tensor beside it (`w13_weight_factor`, `w2_weight_factor`) that multiplies the
+  expert's output (`MoeParts::gate_up_scale`, `expert_scale`).
+- **The lossless file is the proof.** UD-Q8_K_XL holds the checkpoint's own values; its pack matches Hugging Face
+  fp32 as the checkpoint does (cosine 1, greedy tokens equal), which checks every name, shape and reorder.
+
+## The drafter (DSpark)
+
+The checkpoint ships a block drafter (`mtp.safetensors`, `mtp_config`): three decoder layers that fill a block of 8
+(the pending token and 7 mask rows) in one pass, and a recurrent head that then picks the 7 drafts one after
+another. It is not DFlash's shape, so it is a drafter of its own (`src/models/drafters/dspark.cpp`) behind the same
+`BlockDrafting` interface:
+
+- **Context per layer.** Each drafter layer mixes four of the target's states with its own weights (the softmax of
+  its row of `fuse_weight`), norms the mix and projects it to keys and values with projections kept for that. The
+  states are the stream entering three layer visits (a looped layer has a visit per pass) and the state the output
+  layer reads; the target's prefill and verify programs append them, as for DFlash.
+- **A window anchored at the block.** A local layer's block sees itself and the 1,024 positions before its first
+  row, the same keys for every row. No setting of the per-row window gives that set, so attention gained a mode
+  (`AttentionAttrs::anchored`).
+- **One row through the host.** The head also reads its own mix of the target's states at the last position the
+  target ran. That row depends on which drafts a verify accepted, so the target's programs output it for every row
+  (`draft_context`) and the engine's block runner hands the last kept one to the draft program
+  (`BlockDrafting::target_rows`).
+- **The head in the graph.** Each draft needs the token before it, so the steps are unrolled: a gated recurrent
+  step, a correction added to the block's row, the target's output layer, an argmax. Each step reads the whole
+  output layer: the MTP heads' shortlist (64 rows a one-bit sketch picks) lowered the first draft's acceptance from
+  63 % to 56 % on the six chat prompts, more than its time saved.
+- **The block is always 8 rows.** Its layers see the whole block, so a shorter one would be other hidden states;
+  `--spec-k` below 7 runs fewer head steps over the same block.
+- **No public module to compare with.** The reference is the math written out in float64 from llama.cpp's and
+  vLLM's ports (`tests/parity/model/dspark_reference.py`) over transformers' target; on the released weights the
+  check is the acceptance rate.
+
+In a GGUF repository the drafter is a file of its own (`dflash` with `dflash.dspark.markov_rank`); `-hf` fetches it
+with the model file and the import puts its tensors beside the model's, as a pack of the checkpoint holds them.
+
+## KV memory
+
+Forty of the 48 layer applications attend within 1,024 tokens, yet their KV slots grew with the context. A session
+with conv or recurrent state can never be cut back before its last step, so no later step reads a windowed slot's
+older keys: the SYCL backend now keeps only the window for such slots (docs: CLAUDE.md section 6). Inkling 2's KV
+then grows by 8 full-attention slots a token instead of 48 (and one more with the drafter).
+
+## Kernels for its files and its long contexts
+
+Three backend changes the measurements asked for, each general:
+
+- **Float expert banks on the grouped GEMM.** The lossless file keeps four layers' experts in bf16 (the release's
+  MXFP8 layers), which the device holds as f16. An f16 bank took one GEMV per (token, expert) pair at every size,
+  reading an expert's weights once for each of its tokens; from 256 pairs it now takes the grouped GEMM the quantized
+  banks take, its rows read in place. The file's 512-token prefill went from 361 to 590 tok/s on the Arc Pro B60 and
+  from 112 to 210 on the Arc B390.
+- **The relative bias and the sink in the fused attention kernel.** They took the GEMM path, whose scores for a chunk
+  of queries grow with the context. The flash kernel adds the bias within its extent and starts a row's online
+  softmax at the sink (in the first split of the keys alone). A 130,816-token prefill went from 422 to 592 tok/s.
+- **A long quantized cache by chunks.** For the matrix paths every key and value in view was decoded to f16 first:
+  4 GiB at a million tokens, more than a `turbo3` cache of that length. Past 65,536 keys the fused kernel now reads
+  one decoded chunk at a time and merges each chunk's partial softmax into the rows'.
+
+## What was measured
+
+The variants, the commands and every number are in model_recipes.md (Inkling-2-Mini, Inkling-2-Mini GGUF, DSpark).
+In short: the lossless file matches Hugging Face fp32 (cosine 0.9999) and is the closest to the release on either
+device; UD-Q4_K_M is within 0.3 % of its perplexity at 15.4 GiB; the q4 pack of the checkpoint is the fastest (+1.6 %).
+With the windowed slots and the chunked cache, the model's whole context (1,048,576 tokens) fits the B60 and the
+B390 from UD-Q4_K_M in `turbo3`, which costs 2.0 % of perplexity (`i8` 0.15 %, `turbo4` 0.28 %).
+Accuracy is perplexity over wikitext-2 against the lossless file: `--readout` reads no answer letter from this
+model (below), so the multiple-choice read-out the other GGUF files were scored with is not available.
+
 ## Open
 
 - A step launches some 4,700 small kernels, which bounds decode speed: the block residual, the message gate, the
-  convolution with its residual and the router are each one kernel's worth of work.
-- The checkpoint's own block drafter (`mtp.safetensors`), the GGUF files (which keep NVFP4 as a block type), images,
-  and KV memory for the windowed layers (40 of the 48 applications read only their last 1,024 keys).
+  convolution with its residual and the router are each one kernel's worth of work. On the B60 every GGUF file
+  decodes at 35 to 37 tok/s whatever its size.
+- The output dialect: the template switches thinking by `reasoning_effort` and ends without a generation prompt, the
+  model writing its own `<|message_model|>` and content tag, so `--readout` reads a structural token, not a letter.
+- A verify of several rows, and the drafter's block, read the whole KV cache once per row at long contexts: DSpark
+  gains at 32k tokens and loses at 128k.
+- Images (the vision tower; a GGUF repository keeps it in an mmproj file), and the files in mainline llama.cpp's
+  layout (`inkling2_loop`), which are other names for the same tensors.

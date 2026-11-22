@@ -303,8 +303,14 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       L2Clip, DynamicConv) on cpu-ref and SYCL, block residuals and loop passes from the existing ops, the released
       experts read from NVFP4 and MXFP8, the o200k Split regex; parity with transformers on a tiny checkpoint (cpu-ref
       and the GPU, f32 and f16) — docs/decisions/0026
-- [ ] Inkling 2 Mini: its small kernels fused (a step launches some 4,700), its block drafter (`mtp.safetensors`,
-      DSpark), its GGUF files (NVFP4 as a block format), images, its output dialect (thinking and tool calls)
+- [x] Inkling 2 Mini: its GGUF files (Unsloth's layout; NVFP4, MXFP4 and Q2_0 as block formats; the lossless file
+      matches Hugging Face fp32), its block drafter (DSpark, `--spec dspark`; from `mtp.safetensors` or the GGUF
+      repository's `dspark-*.gguf`), KV memory for its windowed layers (a windowed slot keeps its window alone)
+- [ ] Inkling 2 Mini: its small kernels fused (a step launches some 4,700: the block residual, the message gate, a
+      convolution with its residual, the router), images, its output dialect (thinking and tool calls; its template
+      switches thinking by `reasoning_effort` and the model writes its own `<|message_model|>` and content tag, so
+      `--readout` reads no answer letter until the dialect gives it the answer's prefix), a self-contained tiny GGUF
+      for the importer's tests (the real lossless file is the check today)
 - [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`; `lfm3_vl`'s text decoder is read
       for d1 only); conv-window snapshots for prefix
       reuse after a turn with reasoning; the small ops of a q4 decode step (119 norms and 48 residual adds rank
