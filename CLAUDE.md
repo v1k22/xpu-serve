@@ -41,7 +41,8 @@ docs/decisions/0018),
 served end to end on the SYCL backend (Arc Pro B60), matching Hugging Face fp32 logits and greedy output; q8 / q4 packs
 from `convert`; speculative decoding with the model's drafter (`--spec mtp`: Qwen's MTP head, a Gemma 4 assistant
 with `--drafter`; `--spec dflash|dspine`: a block drafter checkpoint for Qwen3.8-27B or Ornith-1.5-35B-A3B with
-`--drafter`; `--spec dspark`: Inkling 2's drafter, in its checkpoint; docs/design-spec-decode.md). One sequence at a time. Embedding models behind `POST /v1/embeddings` (all-MiniLM-L6-v2
+`--drafter`; `--spec dspark`: Inkling 2's drafter, in its checkpoint; docs/design-spec-decode.md). Several requests in flight on sequences of one session (`--sequences`), advanced in
+turn (docs/decisions/0027). Embedding models behind `POST /v1/embeddings` (all-MiniLM-L6-v2
 and bge-small-en-v1.5: BERT; nomic-embed-text-v1.5: NomicBERT; docs/decisions/0017), checked against
 sentence-transformers on cpu-ref. Speech recognition behind `POST /v1/audio/transcriptions` (Qwen3-ASR: an audio
 encoder run by windows of 8 s and a Qwen3 decoder; audio in chat as `input_audio`; docs/decisions/0023) and OpenAI's
@@ -218,7 +219,7 @@ area).
 | `src/backend/sycl/sycl_xmx.h` | What the kernels written against the matrix engines directly share: the DPAS and 2D block load builtins, their operand types, and `xmx_prep` (x in f16 and its sums per group of columns: the A operand of the GEMVs on the matrix engines) |
 | `src/backend/sycl/sycl_block_layout.cpp` | GGUF block-format weights for the device: a block's fields regrouped into aligned streams with codes in column order (the same bits, nothing re-encoded); Q4_0, Q4_1 and Q8_0 rewritten as a pack's q4 / q8 with a group of 32 (the same values), which the pack kernels then read |
 | `src/backend/sycl/sycl_block_kernels.cpp` | Kernels over those streams, one decoder per format (`Fmt<F>`: K-quants read their codes without an int-to-float conversion, codebook formats look their magnitudes up in a table on the device): the GEMV (up to 8 rows, each weight read once) and its matrix-engine version (`gemv_block_xmx`: each lane writes its own output feature's codes or levels, exact in f16, into DPAS B operands, so the cost hardly grows with the rows: a speculative verify), the weight written out as f16 / f32 for a GEMM, rows gathered by id. an expert bank's GEMV per (token, expert) pair, or per expert over its pairs (`expert_matmul_block`). `QuantWeight::block` routes a weight to them through the pack kernels' entry points |
-| `src/engine/engine.cpp` | Generation loop for one sequence; encodes images and splices their rows into prefill chunks; speculative rounds (`spec_round`) |
+| `src/engine/engine.cpp` | Generations advanced a step at a time (`start`, `advance`, `finish`), each on a sequence of the session; encodes images and splices their rows into prefill chunks; speculative rounds (`spec_round`) |
 | `src/models/model.h` (`Speculation`) | What a model with a drafter adds: prefill, verify and draft programs, and its way of drafting (`ChainDrafting`: a token a run from the target's `hidden`; `BlockDrafting`: a block a run from state the target's programs write) |
 | `src/service/engine_service.cpp` | Wiring from a model directory to a ready service |
 | `src/server/completion_handlers.cpp` | `/v1/chat/completions` and `/v1/completions` |
@@ -247,8 +248,8 @@ HTTP POST /v1/chat/completions                                     server/comple
   -> stop strings, SSE chunks or one JSON body                     server/
 ```
 
-Threads: HTTP threads parse, render and tokenize; one engine thread owns the device and runs generations one at a
-time in arrival order.
+Threads: HTTP threads parse, render and tokenize; one engine thread owns the device and advances the generations in
+flight in turn (one each with `--sequences 1`), those reading their prompts and those decoding sharing its time.
 
 A transcription:
 
@@ -712,7 +713,8 @@ Hugging Face safetensors (8.1 first, if it does not).
   head a repository publishes apart is fetched for a `qwen35` or `qwen35moe` file without one, and Inkling 2's
   drafter (`dspark-*.gguf`) and vision tower (`mmproj-*.gguf`, the bf16 one) for an `inkling2` or `inkling2_loop`
   file (the drafter when the repository has one).
-- One sequence at a time; no batching.
+- Requests in flight take turns on the device (`--sequences N`, each sequence its own KV cache, billed at load):
+  their decode steps are not batched into one yet, so N streams share one stream's speed.
 - Sliding-window layers keep every key in memory in a session that can be cut back to any prefix (Gemma 4, a DFlash
   drafter's local layers): the kernels read only the window, memory still grows with the context. With conv or
   recurrent state beside them (LFM3, Inkling 2) a windowed slot keeps its window alone, on the SYCL backend.

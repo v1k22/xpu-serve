@@ -655,7 +655,7 @@ are pinned by parity tests against them (docs/design-spec-decode.md, docs/decisi
 | `POST /v1/completions` | 2 |
 | `GET /v1/models`, `GET /health` | 2 |
 | `GET /metrics` (Prometheus: tok/s, queue, KV use, spec acceptance) | 2 |
-| `POST /v1/messages` (Anthropic) | 6 |
+| `POST /v1/messages`, `/v1/messages/count_tokens` (Anthropic) | 6 (done) |
 | Ollama `/api/chat`, `/api/generate` | 6 |
 | `POST /v1/responses` | later |
 

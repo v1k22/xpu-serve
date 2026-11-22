@@ -213,10 +213,17 @@ were scored with has not been run on this model).
 - **A verify's rows.** The per-row attention kernel served one token's query heads that share a KV head, in groups
   of 1, 2 or 4: Inkling's 3 heads a KV head read every key three times, a verify of two tokens six. A work-group
   now serves several tokens' heads (up to 8 rows): at a 32,768-token prompt decode went from 33.0 to 34.0 tok/s, and
-  with DSpark from 36.0 to 37.5 (the GPU's cache had kept most of the repeated reads off memory).
+  with DSpark from 36.0 to 37.5 (the GPU's cache had kept most of the repeated reads off memory). Over a short
+  cache the grouping left too few work-groups (decode attention at a 64-token prompt went from 0.40 to 0.77 ms a
+  step), so rows share their reads only where the keys split between enough work-groups to make up for it.
+- **DSpark at 126,000 tokens** (UD-Q4_K_M, `i8`, the rows sharing their reads): 24.3 tok/s with it, 28.4 without.
+  Each draft's row still adds its own experts and the drafter's block reads the window before it; between 32,768
+  tokens (38.7 against 35.6) and 126,000 the drafter turns from a gain into a loss, as before.
+- **What fits.** The load-time reservation bills the whole context's KV cache, the largest step of each program and
+  the media encoders, which compile first: the vision tower's arena (a whole image's patches) takes most of what the
+  lossless file leaves on a 24 GB card, so its best-accuracy setting there runs with `--no-vision`.
 
 ## Open
 
 - The small kernels left: a router's sigmoid, bias, top-k and gathers (some eight launches a layer) and a block
   residual's norm, concat, scores, softmax and mix (five) are kernels apiece.
-- DSpark at 128k tokens: measure again with the verify's rows sharing their reads (it lost to plain decoding there).

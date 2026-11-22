@@ -704,14 +704,14 @@ accuracy, speed and context. UD-Q4_K_M scores within 0.3 % of the lossless file'
 
 | | Best accuracy: UD-Q8_K_XL | Balanced: UD-Q4_K_M |
 |---|---|---|
-| Arc Pro B60 (24 GB) | 34.6 tok/s, 38.4 with DSpark; 65,536 tokens with an `i8` cache, 196,608 in `turbo3` | 42.0 tok/s, 47.2 with DSpark; 262,144 tokens in `i8`, all 1,048,576 the model takes in `turbo3` |
+| Arc Pro B60 (24 GB) | 35.5 tok/s, 39.7 with DSpark; text only: 63,488 tokens with an `i8` cache, 186,368 in `turbo3` | 43.2 tok/s, 47.7 with DSpark; 369,664 tokens in `i8`, 993,280 in `turbo3` (all 1,048,576 text only) |
 | Arc B390 (30 GB of system memory) | 16.3 tok/s, 18.1 with DSpark; 262,144 tokens in `i8`, 524,288 in `turbo3` | 23.1 tok/s, 24.9 with DSpark; 524,288 tokens in `i8`, all 1,048,576 in `turbo3` |
 
 Arc Pro B60:
 
 ```bash
 xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q8_K_XL --device GPU --spec dspark --spec-k 1 \
-    --kv-dtype i8 --ctx 32768                                                        # best accuracy
+    --kv-dtype i8 --ctx 32768 --no-vision                                            # best accuracy
 xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M --device GPU --spec dspark --spec-k 1 \
     --kv-dtype i8 --ctx 262144                                                       # balanced
 ```
@@ -725,10 +725,21 @@ xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M --device GPU --spec ds
     --kv-dtype i8 --ctx 262144                                                       # balanced
 ```
 
-The drafter adds its weights (0.4 GiB) and a ninth KV slot that grows with the context: these contexts are the longest
-checked with it. Without `--spec dspark` the files take the contexts of the table (all of the balanced one's with
-`--kv-dtype turbo3 --ctx 1048576`), and a long document decodes faster without it (below). With it the lossless file at
-65,536 tokens on the B60 did not finish in three hours a prefill that takes 97 s without it.
+`--ctx` is reserved when the model loads, and a context that does not fit is refused there with the most tokens that
+do. On the Arc Pro B60 (strict bill: the KV cache of the whole context, each program's largest step, the vision
+tower's arena):
+
+| File, KV cache | Text and images | With DSpark | Text only (`--no-vision`) | Text only, with DSpark |
+|---|---|---|---|---|
+| UD-Q8_K_XL, `i8` | 1,024 | none | 63,488 | 33,792 |
+| UD-Q8_K_XL, `turbo3` | 7,168 | none | 186,368 | 105,472 |
+| UD-Q4_K_M, `i8` | 369,664 | 305,152 | 437,248 | 365,568 |
+| UD-Q4_K_M, `turbo3` | 993,280 | 823,296 | all 1,048,576 | 982,016 |
+
+The vision tower's arena holds a whole image's patches, which the lossless file cannot spare beside the drafter: its
+best-accuracy setting on the B60 is text only. The drafter adds its weights (0.4 GiB), a ninth KV slot that grows
+with the context and a verify's step; a long document decodes faster without it (below). The B390's contexts are the
+longest run there, its memory shared with the system, before the load-time reservation: not yet checked against it.
 
 Fastest (a q4 pack of the checkpoint with its drafter, perplexity +1.6 %: 57.7 tok/s over six chat prompts on the Arc
 Pro B60, 26.7 on the Arc B390):
@@ -756,8 +767,8 @@ Hugging Face fp32 (transformers' `Inkling2Loop`), the last-token logits' cosine 
 
 | | GPU memory | Decode | With DSpark | Prefill (512 tokens) | Perplexity | Logits cosine | Greedy tokens kept |
 |---|---|---|---|---|---|---|---|
-| Arc Pro B60, GGUF UD-Q8_K_XL | 21.3 GiB | 34.6 tok/s | 38.4 tok/s | 590 tok/s | 8.108 | 0.9999 / 1.0000 | 32 on all six |
-| Arc Pro B60, GGUF UD-Q4_K_M | 15.4 GiB | 42.0 tok/s | 47.2 tok/s | 569 tok/s | 8.131 (+0.29 %) | 0.9995 / 0.9999 | 32, 31, 32, 26, 32, 32 |
+| Arc Pro B60, GGUF UD-Q8_K_XL | 21.3 GiB | 35.5 tok/s | 39.7 tok/s | 612 tok/s | 8.108 | 0.9999 / 1.0000 | 32 on all six |
+| Arc Pro B60, GGUF UD-Q4_K_M | 15.4 GiB | 43.2 tok/s | 47.7 tok/s | 589 tok/s | 8.131 (+0.29 %) | 0.9995 / 0.9999 | 32, 31, 32, 26, 32, 32 |
 | Arc Pro B60, q4 pack | 15.4 GiB | 51.9 tok/s | 57.7 tok/s | 604 tok/s | 8.240 (+1.63 %) | 0.9981 / 0.9991 | 32, 31, 22, 26, 4, 32 |
 | Arc B390, GGUF UD-Q8_K_XL | 21.3 GiB | 16.3 tok/s | 18.1 tok/s | 216 tok/s | | 0.9999 / 1.0000 | 32, 31, 32, 32, 4, 32 |
 | Arc B390, GGUF UD-Q4_K_M | 15.4 GiB | 23.1 tok/s | 24.9 tok/s | 220 tok/s | | 0.9997 / 0.9999 | 32, 32, 32, 26, 32, 32 |
@@ -803,7 +814,8 @@ the system's (30.3 GiB): the most in use during a run, the system's own included
 
 DSpark at length (one draft a round, `i8`; before the decode fixes †): at 32,768 tokens on the B60 the lossless
 file decodes at 30.0 tok/s with it (25.0 without) and the balanced one at 33.3 (28.5); at 131,072 the balanced one at
-18.4 (19.8) and at 262,144 at 11.4 (14.0). On the B390 the lossless file decodes at 8.5 tok/s at 131,072 (8.9 without), the balanced one at 5.8 at 262,144.
+18.4 (19.8) and at 262,144 at 11.4 (14.0). Measured again on the balanced file with the decode fixes and a verify's
+rows sharing their reads of the cache: at 32,768 tokens 38.7 tok/s with it (35.6 without), at 126,000 24.3 (28.4). On the B390 the lossless file decodes at 8.5 tok/s at 131,072 (8.9 without), the balanced one at 5.8 at 262,144.
 Each row of a verify, and the drafter's block, reads the whole cache: between 32,768 and 131,072 tokens the drafter
 turns from a gain into a loss. Prefill is the same with it.
 
@@ -1070,12 +1082,12 @@ work from every file. The copies in mainline llama.cpp's layout (`Mainline_Suppo
 renamed to `.gguf`, `convert <file.gguf> <pack-dir> --mmproj <mmproj.gguf>`. Unsloth's UD-Q4_K_M in that layout is
 the same model (16.6 GB, perplexity 8.131, greedy text equal to its twin's).
 
-Closest to the reference, on either device (the release's own values; with the drafter, 32,768 tokens of context on
-a 24 GB card, 65,536 without):
+Closest to the reference, on either device (the release's own values; on a 24 GB card text only, with the drafter
+33,792 tokens of context, 63,488 without; [what fits](#inkling-2-mini)):
 
 ```bash
 xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q8_K_XL --device GPU --spec dspark --spec-k 1 --kv-dtype i8 \
-    --ctx 32768
+    --ctx 32768 --no-vision
 ```
 
 Balanced (perplexity +0.29 %, two thirds of the memory; long contexts in [Inkling-2-Mini](#inkling-2-mini)):
@@ -1090,9 +1102,9 @@ six chat prompts without and with the drafter (k = 1, the best of 1 to 3 on ever
 
 | Variant | File | GPU memory | Perplexity | Logits cosine | Greedy kept (192) | B60 decode | With DSpark | B390 decode | With DSpark |
 |---|---|---|---|---|---|---|---|---|---|
-| UD-Q8_K_XL | 22.9 GB | 21.27 GiB | 8.108 | 0.9999 / 1.0000 | 192 | 34.6 tok/s | 38.4 tok/s | 16.3 tok/s | 18.1 tok/s |
+| UD-Q8_K_XL | 22.9 GB | 21.27 GiB | 8.108 | 0.9999 / 1.0000 | 192 | 35.5 tok/s | 39.7 tok/s | 16.3 tok/s | 18.1 tok/s |
 | UD-Q4_K_XL | 17.6 GB | 16.34 GiB | 8.129 (+0.27 %) | 0.9994 / 0.9999 | 163 | 35.5 † | 41.8 † | 20.7 † | 23.4 † |
-| UD-Q4_K_M | 16.6 GB | 15.39 GiB | 8.131 (+0.29 %) | 0.9995 / 0.9999 | 185 | 42.0 | 47.2 | 23.1 | 24.9 |
+| UD-Q4_K_M | 16.6 GB | 15.39 GiB | 8.131 (+0.29 %) | 0.9995 / 0.9999 | 185 | 43.2 | 47.7 | 23.1 | 24.9 |
 | UD-IQ4_XS | 15.7 GB | 14.57 GiB | 8.136 (+0.34 %) | 0.9997 / 0.9999 | 163 | 35.4 † | 40.2 † | 21.6 † | 24.5 † |
 | UD-Q3_K_XL | 13.6 GB | 12.62 GiB | 8.176 (+0.84 %) | 0.9908 / 0.9964 | 131 | 35.3 † | 40.5 † | 22.4 † | 25.3 † |
 | UD-IQ3_XXS | 11.7 GB | 10.78 GiB | 8.306 (+2.44 %) | 0.9937 / 0.9965 | 128 | 35.7 † | 41.0 † | 23.6 † | 26.3 † |
@@ -1113,9 +1125,10 @@ order alone moved the lossless file's by 0.1 %); an `i8` KV cache moves each fil
 
 - **Speed.** A decode step is bound by the device, not by its launches: on the B60 two thirds of it reads the
   weights a token goes through, the rest is some 3,400 small kernels of 1 to 3 us
-  ([docs/decisions/0026](docs/decisions/0026-inkling2.md)). So a smaller file is faster by less than its size: 34.6
-  tok/s for UD-Q8_K_XL, 42.0 for UD-Q4_K_M. On the B390, whose memory is slower, size counts for more.
-- **Memory is the file's**, the drafter included (0.4 GB).
+  ([docs/decisions/0026](docs/decisions/0026-inkling2.md)). So a smaller file is faster by less than its size: 35.5
+  tok/s for UD-Q8_K_XL, 43.2 for UD-Q4_K_M. On the B390, whose memory is slower, size counts for more.
+- **Memory is the file's**, the drafter included (0.4 GB), and the vision tower's when it is loaded; the contexts each
+  file takes are in [Inkling-2-Mini](#inkling-2-mini).
 
 ### Inkling-2-Mini Uncensored GGUF
 
@@ -1198,7 +1211,7 @@ without → with that technique, and the `--spec-k` (drafts per round) that gave
 | LFM3-1.7B | | – | – | – | – |
 | Inkling-2-Mini | q4, Arc Pro B60 | – | – | – | 51.9 → 57.7, k = 1 |
 | Inkling-2-Mini | q4, Arc B390 | – | – | – | 24.1 → 26.7, k = 1 (before the decode fixes) |
-| Inkling-2-Mini | GGUF UD-Q8_K_XL, Arc Pro B60 | – | – | – | 34.6 → 38.4, k = 1 |
+| Inkling-2-Mini | GGUF UD-Q8_K_XL, Arc Pro B60 | – | – | – | 35.5 → 39.7, k = 1 |
 | Inkling-2-Mini | GGUF UD-Q8_K_XL, Arc B390 | – | – | – | 16.3 → 18.1, k = 1 |
 
 Greedy decode over six chat prompts of up to 256 new tokens (`bench --prompts`); the drafters as q4 packs, the Gemma 4
