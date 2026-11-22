@@ -41,6 +41,9 @@ struct SessionOptions {
     // the cache itself, and refuses the context by name when they do not fit. Empty: nothing reserved ahead (memory
     // grows as runs need it); 0, or a program past the list: one that adds nothing to the reservation.
     std::vector<int64_t> max_step_tokens;
+    // Sequences the session holds at once, each with state slots of its own (Session::use picks the one that runs);
+    // the programs and their step memory are shared.
+    int64_t sequences = 1;
     std::map<std::string, std::string> extra;  // backend-specific options, refused by name when unknown
 };
 
@@ -65,8 +68,11 @@ public:
     // Tokens in the slots `program` writes (L of its last run, 0 after reset or for a program writing none).
     virtual int64_t num_cached(size_t program) const = 0;
     int64_t num_cached() const { return num_cached(0); }
-    // Drops the state of every slot.
+    // Drops the state of every slot of the current sequence.
     virtual void reset() = 0;
+    // Makes `sequence` (0 to SessionOptions::sequences - 1) the one later runs, num_cached, reset and truncate act on;
+    // the others keep their state. Sequence 0 is current after compile.
+    virtual void use(int64_t sequence) = 0;
     // Keeps the first `n` tokens of the slots `program` writes (n <= num_cached(program)). Conv and recurrent state
     // (Graph::has_fixed_state) summarize the sequence: it keeps 0 tokens, all of them, the tokens before the last
     // step (that step undone whole, whatever its size), or, after a step of at most SessionOptions::rewind_tokens

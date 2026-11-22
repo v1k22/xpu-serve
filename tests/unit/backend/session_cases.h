@@ -24,7 +24,8 @@ using graph::kT;
 using graph::Value;
 
 struct Env {
-    std::function<std::unique_ptr<Session>(std::span<const Graph* const>, const WeightStore&, int64_t rewind_tokens)>
+    std::function<std::unique_ptr<Session>(std::span<const Graph* const>, const WeightStore&, int64_t rewind_tokens,
+                                           int64_t sequences)>
         compile;
     double atol = 1e-5;
     double rtol = 1e-5;
@@ -110,8 +111,8 @@ inline void requested_outputs(const Env& env) {
     const Graph* programs[] = {&layer.graph};
     TensorRng rng(43);
     const TensorMap first = HybridLayer::inputs(rng, 3), second = HybridLayer::inputs(rng, 2);
-    const auto full = env.compile(programs, layer.weights, 0);
-    const auto some = env.compile(programs, layer.weights, 0);
+    const auto full = env.compile(programs, layer.weights, 0, 1);
+    const auto some = env.compile(programs, layer.weights, 0, 1);
     TensorMap want, got;
     full->run(0, first, want);
     const std::string only[] = {"attn"};
@@ -135,7 +136,7 @@ inline void requested_outputs(const Env& env) {
     g.output("scores", scores);
     g.output("argmax", g.reshape(g.topk(scores, 1).second, {kT}));
     const Graph* heads[] = {&g};
-    const auto session = env.compile(heads, w, 0);
+    const auto session = env.compile(heads, w, 0, 1);
     const TensorMap in{{"x", rng.uniform(DType::F32, {4, 64})}};
     TensorMap all, one;
     session->run(0, in, all);
@@ -160,8 +161,8 @@ inline void truncate_inside_step(const Env& env) {
                     next = HybridLayer::inputs(rng, 2);
     for (const int64_t keep : {0, 1, 2, 3}) {
         CAPTURE(keep);
-        const auto spec = env.compile(programs, layer.weights, 4);
-        const auto plain = env.compile(programs, layer.weights, 0);
+        const auto spec = env.compile(programs, layer.weights, 4, 1);
+        const auto plain = env.compile(programs, layer.weights, 0, 1);
         TensorMap out, want;
         spec->run(prefix, out);
         plain->run(prefix, want);
@@ -182,7 +183,7 @@ inline void truncate_inside_step(const Env& env) {
         outputs_close(out, want, env);
     }
     // Without rewind_tokens a step is kept or dropped whole: no count inside it.
-    const auto plain = env.compile(programs, layer.weights, 0);
+    const auto plain = env.compile(programs, layer.weights, 0, 1);
     TensorMap out;
     plain->run(prefix, out);
     plain->run(step, out);
@@ -200,15 +201,15 @@ inline void undo_last_step(const Env& env) {
     TensorRng rng(43);
     const TensorMap prefix = HybridLayer::inputs(rng, 5), first = HybridLayer::inputs(rng, 6),
                     second = HybridLayer::inputs(rng, 3), third = HybridLayer::inputs(rng, 4);
-    const auto session = env.compile(programs, layer.weights, 0);
-    const auto plain = env.compile(programs, layer.weights, 0);
+    const auto session = env.compile(programs, layer.weights, 0, 1);
+    const auto plain = env.compile(programs, layer.weights, 0, 1);
     TensorMap out, want;
     session->run(prefix, out);
     plain->run(prefix, want);
     // Three tails after one prefix, each read from the prefix's state.
     for (const TensorMap* tail : {&first, &second, &third}) {
         session->run(*tail, out);
-        const auto fresh = env.compile(programs, layer.weights, 0);
+        const auto fresh = env.compile(programs, layer.weights, 0, 1);
         TensorMap prefix_out;
         fresh->run(prefix, prefix_out);
         fresh->run(*tail, want);
@@ -238,7 +239,7 @@ inline void windowed_slot(const Env& env) {
     const HybridLayer layer(window);
     const Graph* programs[] = {&layer.graph};
     TensorRng rng(45);
-    const auto session = env.compile(programs, layer.weights, 4);
+    const auto session = env.compile(programs, layer.weights, 4, 1);
     ref::AttentionSpec spec;
     spec.scale = 0.2;
     spec.sliding_window = window;
@@ -306,7 +307,7 @@ inline void shared_kv_slot(const Env& env) {
     };
     const auto first = writer(kD), second = writer(kD), read = reader(kD);
     const Graph* programs[] = {first.get(), second.get(), read.get()};
-    const auto session = env.compile(programs, MemoryWeights{}, 0);
+    const auto session = env.compile(programs, MemoryWeights{}, 0, 1);
     TensorRng rng(43);
     std::vector<HostTensor> ks, vs;
     const auto write = [&](size_t program, int64_t tokens) {
@@ -359,7 +360,41 @@ inline void shared_kv_slot(const Env& env) {
 
     const auto wide = reader(2 * kD);
     const Graph* mismatched[] = {first.get(), wide.get()};
-    CHECK_THROWS_AS(env.compile(mismatched, MemoryWeights{}, 0), xs::Error);
+    CHECK_THROWS_AS(env.compile(mismatched, MemoryWeights{}, 0, 1), xs::Error);
+}
+
+// Three sequences of one session, each with its conv, recurrent and KV state, run in turns: each gives what a session
+// of its own gives over the same steps; reset and truncate touch the current one alone.
+inline void sequences(const Env& env) {
+    const HybridLayer layer(6);
+    const Graph* programs[] = {&layer.graph};
+    const auto shared = env.compile(programs, layer.weights, 0, 3);
+    TensorRng rng(9);
+    std::vector<std::unique_ptr<Session>> alone;
+    for (int s = 0; s < 3; ++s) alone.push_back(env.compile(programs, layer.weights, 0, 1));
+    const std::vector<std::pair<int, int64_t>> turns = {{0, 5}, {1, 3}, {0, 1}, {2, 7}, {1, 1}, {0, 2}, {2, 1}, {1, 4}};
+    for (const auto& [s, tokens] : turns) {
+        CAPTURE(s);
+        const TensorMap in = HybridLayer::inputs(rng, tokens);
+        TensorMap got, want;
+        shared->use(s);
+        shared->run(in, got);
+        alone[static_cast<size_t>(s)]->run(in, want);
+        CHECK(outputs_close(got, want, env));
+        CHECK(shared->num_cached() == alone[static_cast<size_t>(s)]->num_cached());
+    }
+    // A reset of sequence 1 leaves 0 and 2 as they were.
+    shared->use(1);
+    shared->reset();
+    CHECK(shared->num_cached() == 0);
+    shared->use(2);
+    CHECK(shared->num_cached() == 8);
+    const TensorMap in = HybridLayer::inputs(rng, 2);
+    TensorMap got, want;
+    shared->run(in, got);
+    alone[2]->run(in, want);
+    CHECK(outputs_close(got, want, env));
+    CHECK_THROWS_AS(shared->use(3), xs::Error);
 }
 
 }  // namespace xs::test::session

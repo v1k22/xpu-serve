@@ -9,9 +9,11 @@ namespace {
 
 xs::test::session::Env device_env() {
     xs::test::session::Env env;
-    env.compile = [](std::span<const xs::graph::Graph* const> programs, const xs::WeightStore& w, int64_t rewind) {
+    env.compile = [](std::span<const xs::graph::Graph* const> programs, const xs::WeightStore& w, int64_t rewind,
+                     int64_t sequences) {
         xs::SessionOptions o = dev::options();
         o.rewind_tokens = rewind;
+        o.sequences = sequences;
         return dev::backend().compile(programs, w, o);
     };
     const dev::Tolerance tol = dev::tolerance({2e-5, 2e-5}, {5e-3, 5e-3});
@@ -37,5 +39,8 @@ TEST_SUITE("device programs" * doctest::skip(!dev::enabled())) {
     }
     TEST_CASE("programs share KV slots by label; KvRead attends without appending") {
         xs::test::session::shared_kv_slot(device_env());
+    }
+    TEST_CASE("sequences: three in one session run in turns, each as a session of its own; reset touches one") {
+        xs::test::session::sequences(device_env());
     }
 }

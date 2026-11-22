@@ -189,13 +189,15 @@ private:
     Graph step_, prefill_, verify_, draft_;
 };
 
-std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argmax = false, bool block = false) {
+std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argmax = false, bool block = false,
+                                    int64_t sequences = 1) {
     static const auto backend = make_cpu_ref_backend();
     auto model = std::make_unique<TinySpecModel>(argmax, block);
     std::vector<const Graph*> programs{&model->graph()};
     SessionOptions options;
     options.precision = DType::F32;
     options.max_context = 256;
+    options.sequences = sequences;
     if (spec_k > 0) {
         programs.insert(programs.end(), {&model->prefill_graph(), &model->verify_graph(), &model->draft_graph()});
         options.rewind_tokens = spec_k + 1;
@@ -205,6 +207,7 @@ std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argm
     engine.max_context = options.max_context;
     engine.prefill_chunk = prefill_chunk;
     engine.spec_k = spec_k;
+    engine.sequences = sequences;
     return std::make_unique<Engine>(std::move(model), std::move(session), EncoderSessions{}, engine);
 }
 
@@ -218,6 +221,46 @@ GenerateRequest greedy(std::vector<int32_t> prompt, int max_new, std::vector<int
 }
 
 }  // namespace
+
+TEST_CASE("requests in flight together on sequences of their own: each as it runs alone, and its prefix kept") {
+    for (const int k : {0, 2}) {
+        CAPTURE(k);
+        const GenerateRequest a = greedy({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, 9);
+        const GenerateRequest b = greedy({3, 1, 4, 1, 5, 9, 2, 6}, 12);
+        const GenerateResult alone_a = make_engine(k, 3)->generate(a, {});
+        const GenerateResult alone_b = make_engine(k, 3)->generate(b, {});
+        const auto engine = make_engine(k, 3, false, false, 2);
+        const auto ha = engine->start(a, {});
+        const auto hb = engine->start(b, {});
+        REQUIRE(ha.has_value());
+        REQUIRE(hb.has_value());
+        CHECK_FALSE(engine->has_free_sequence());
+        CHECK_FALSE(engine->start(a, {}).has_value());  // both sequences are busy
+        bool done_a = false, done_b = false;
+        while (!done_a || !done_b) {  // a's prefill chunks and decode steps between b's
+            if (!done_a) done_a = engine->advance(*ha);
+            if (!done_b) done_b = engine->advance(*hb);
+        }
+        const GenerateResult got_a = engine->finish(*ha);
+        const GenerateResult got_b = engine->finish(*hb);
+        CHECK(got_a.tokens == alone_a.tokens);
+        CHECK(got_b.tokens == alone_b.tokens);
+        CHECK(engine->has_free_sequence());
+        // A conversation's next turn finds the sequence that holds it (the model's conv state cannot be cut back, so
+        // the turn extends all that is cached).
+        const auto next_turn = [](const GenerateRequest& r, const GenerateResult& got) {
+            GenerateRequest t = r;
+            t.prompt.insert(t.prompt.end(), got.tokens.begin(), got.tokens.end());
+            t.prompt.push_back(7);
+            return t;
+        };
+        const GenerateRequest b2 = next_turn(b, got_b), a2 = next_turn(a, got_a);
+        CHECK(engine->generate(b2, {}).stats.cached_tokens > static_cast<int>(b.prompt.size()));
+        const GenerateResult again_a = engine->generate(a2, {});
+        CHECK(again_a.stats.cached_tokens > static_cast<int>(a.prompt.size()));
+        CHECK(again_a.tokens == make_engine(k, 3)->generate(a2, {}).tokens);
+    }
+}
 
 TEST_CASE("speculative decoding emits exactly the greedy tokens") {
     for (const int k : {1, 2, 4}) {
@@ -358,6 +401,7 @@ struct RecordingSession final : Session {
     int64_t num_cached(size_t) const override { return cached; }
     void reset() override { cached = 0; }
     void truncate(size_t, int64_t n) override { cached = n; }
+    void use(int64_t sequence) override { REQUIRE(sequence == 0); }
 };
 
 // What a target's run of `rows` tokens gives the drafter: row r holds r + `first` in every column.

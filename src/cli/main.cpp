@@ -89,6 +89,10 @@ void add_engine_options(Args& a) {
                "auto")
         .value("ctx", "context length in tokens (prompt + output)", "8192")
         .value("prefill-chunk", "tokens per prefill step", "1024")
+        .value("sequences",
+               "requests in flight at once, each its own cached prompt and its KV cache of --ctx tokens (a long "
+               "prefill gives way to the others at the end of each chunk)",
+               "1")
         .value("backend-opt", "backend options as key=value[,key=value]")
         .value("spec",
                "speculative decoding: off | mtp (the model's MTP head, or a Gemma 4 assistant with --drafter) | "
@@ -152,6 +156,8 @@ ServiceOptions service_options(const Args& a) {
     if (a.has("image-max-pixels")) o.image_max_pixels = a.get_int("image-max-pixels");
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");
+    o.engine.sequences = a.get_int("sequences");
+    if (o.engine.sequences < 1) fail("--sequences must be at least 1, got ", o.engine.sequences);
     const std::string& spec = a.get("spec");
     if (spec == "mtp" || spec == "dflash" || spec == "dspine" || spec == "dspark") {
         o.spec = spec;

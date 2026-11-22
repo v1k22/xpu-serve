@@ -3,7 +3,9 @@
 #include <array>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -23,20 +25,38 @@ struct EngineOptions {
     // Speculative decoding with the model's drafter: drafts per round, 0 = off. The session must hold the programs
     // of spec::Program (the model's Speculation) and rewind steps of spec_k + 1 tokens.
     int spec_k = 0;
+    // Requests in flight at once: the session's sequences (SessionOptions::sequences), each its own cached prompt.
+    int64_t sequences = 1;
 };
 
 // The stateless sessions of a model's media encoders, by modality: null where the model has none (or it is not
 // loaded).
 using EncoderSessions = std::array<std::unique_ptr<Session>, kModalities>;
 
-// Runs generations for one sequence at a time on one backend session. Not thread-safe: one caller (the engine
-// thread) owns it. Consecutive requests that share a prompt prefix reuse the cached KV; a media item's soft tokens
-// count as shared only when the item's content is the same.
+// Runs generations on one backend session of EngineOptions::sequences sequences. Not thread-safe: one caller (the
+// engine thread) owns it. A request runs on a free sequence, the one whose cached prompt it shares the longest prefix
+// with (a media item's soft tokens count as shared only when the item's content is the same), and reuses that KV;
+// the steps of the requests in flight interleave as the caller advances them, so a long prefill gives way to the
+// others at the end of each of its chunks.
 class Engine {
 public:
+    using Handle = int64_t;  // a request in flight
+
     Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, EncoderSessions encoders,
            EngineOptions options);
+    ~Engine();
 
+    // The request on a free sequence; nothing when every sequence is busy. `on_token` runs on the caller's thread,
+    // in advance(), for every token generated (stop tokens are not passed); false stops the request (Cancelled).
+    std::optional<Handle> start(const GenerateRequest& request, TokenCallback on_token);
+    // One step of the request: a prefill chunk (with its first token once the prompt is in), or its next token (or a
+    // speculative round's). True when it is done: finish() then gives its result, and its sequence is free.
+    bool advance(Handle h);
+    GenerateResult finish(Handle h);
+    bool has_free_sequence() const;
+    // Whether the request is past its prompt (its steps are decode tokens).
+    bool decoding(Handle h) const;
+    // One request alone: start it, advance it until it is done.
     GenerateResult generate(const GenerateRequest& request, const TokenCallback& on_token);
 
     const Model& model() const { return *model_; }
@@ -47,6 +67,24 @@ public:
 private:
     // What a cached position holds: the token id, or for a media item's soft token the item's hash and the row.
     using PositionKey = uint64_t;
+    struct Generation;
+    // What a sequence of the session holds between requests.
+    struct Sequence {
+        std::vector<PositionKey> cached;          // positions whose KV the session holds, in order
+        std::unique_ptr<spec::Drafter> drafter;   // speculating
+        int64_t rotary_delta = 0;                 // a token past the prompt at cached position i is at i + delta
+        bool busy = false;
+        uint64_t used = 0;                        // when it last ran a request (the oldest free one is taken first)
+    };
+    // Makes sequence `s` the one the session, cached_, drafter_ and rotary_delta_ are.
+    void select(size_t s);
+    // The sequence a request with these prompt positions runs on: the free one sharing the longest prefix.
+    size_t pick_sequence(const std::vector<PositionKey>& keys) const;
+    // The steps of advance(): the rest of the prompt's next chunk, and the next token.
+    void prefill_chunk(Generation& g);
+    void begin_decode(Generation& g);
+    void decode_step(Generation& g);
+    void fail_generation(Generation& g, const std::exception& e);
 
     // Runs a target program over `tokens` (appended after the cached ones); the outputs the round reads are in
     // outputs_: each row's logits, or with argmax_only_ its argmax alone, and the hidden rows a drafter takes.
@@ -81,14 +119,20 @@ private:
     std::unique_ptr<Session> session_;
     EncoderSessions encoders_;
     EngineOptions options_;
-    std::unique_ptr<spec::Drafter> drafter_;  // speculating
-    std::vector<PositionKey> cached_;  // positions whose KV the session holds, in order
+    std::vector<Sequence> sequences_;
+    size_t current_ = 0;  // the selected sequence: cached_, drafter_ and rotary_delta_ are its
+    // The selected sequence's: kept here while it runs (select() swaps them with its Sequence).
+    std::unique_ptr<spec::Drafter> drafter_;
+    std::vector<PositionKey> cached_;
+    int64_t rotary_delta_ = 0;
+    std::map<Handle, std::unique_ptr<Generation>> active_;
+    Handle next_handle_ = 0;
+    uint64_t clock_ = 0;
     std::list<std::pair<uint64_t, std::shared_ptr<const HostTensor>>> encoded_;  // most recent first
     TensorMap inputs_;
     TensorMap outputs_;
     bool has_argmax_ = false;   // every target program outputs "argmax" beside "logits"
-    bool argmax_only_ = false;  // this request's sampler reads no more than a row's argmax, and the programs give it
-    int64_t rotary_delta_ = 0;  // a token past the prompt at cached position i has rotary position i + delta
+    bool argmax_only_ = false;  // the running request's sampler reads no more than a row's argmax, and programs give it
 };
 
 }  // namespace xs

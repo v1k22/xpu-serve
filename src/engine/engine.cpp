@@ -39,6 +39,8 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
                  " input, which model ", model_->info().id, " does not take");
     }
     XS_CHECK(options_.spec_k >= 0, "spec_k must not be negative, got ", options_.spec_k);
+    XS_CHECK(options_.sequences >= 1, "an engine of ", options_.sequences, " sequences");
+    sequences_.resize(static_cast<size_t>(options_.sequences));
     const auto offers_argmax = [](const graph::Graph& g) {
         return std::any_of(g.outputs().begin(), g.outputs().end(), [](const auto& o) { return o.name == "argmax"; });
     };
@@ -49,8 +51,69 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
         drafter_ = spec::make_drafter(*spec, *session_);
         XS_CHECK(options_.spec_k <= drafter_->max_drafts(), "spec_k ", options_.spec_k, " is more than the ",
                  drafter_->max_drafts(), " drafts a round of ", spec->drafter_name(), " proposes");
+        for (size_t q = 1; q < sequences_.size(); ++q) sequences_[q].drafter = spec::make_drafter(*spec, *session_);
         has_argmax_ = has_argmax_ && offers_argmax(spec->prefill_graph()) && offers_argmax(spec->verify_graph());
     }
+}
+
+Engine::~Engine() = default;
+
+// A request in flight: its prompt as positions, where its prefill stands, and its decode state.
+struct Engine::Generation {
+    GenerateRequest request;
+    TokenCallback on_token;
+    GenerateResult result;
+    bool done = false;
+    bool holds_sequence = false;
+    size_t sequence = 0;
+    std::vector<PositionKey> keys;      // the prompt's positions
+    std::vector<int32_t> media_item;    // a soft token's media item, -1 for text
+    std::vector<int64_t> media_row;     // and its row of that item's encoder output
+    std::vector<RotaryPosition> positions;
+    std::vector<std::shared_ptr<const HostTensor>> encoded;  // by media item, once encoded
+    std::unique_ptr<Sampler> sampler;
+    bool argmax_only = false;
+    size_t fed = 0;  // prompt positions the sequence holds
+    bool decoding = false;
+    int64_t max_new = 0;
+    int32_t token = 0;           // the next token to emit
+    std::deque<int32_t> ready;   // tokens a speculative round produced, not emitted yet
+    Timer decode_timer;          // from the first emitted token
+};
+
+void Engine::select(size_t s) {
+    if (s == current_) return;
+    Sequence& was = sequences_[current_];
+    was.cached = std::move(cached_);
+    was.drafter = std::move(drafter_);
+    was.rotary_delta = rotary_delta_;
+    Sequence& now = sequences_[s];
+    cached_ = std::move(now.cached);
+    drafter_ = std::move(now.drafter);
+    rotary_delta_ = now.rotary_delta;
+    session_->use(static_cast<int64_t>(s));
+    current_ = s;
+}
+
+bool Engine::has_free_sequence() const {
+    return std::any_of(sequences_.begin(), sequences_.end(), [](const Sequence& q) { return !q.busy; });
+}
+
+size_t Engine::pick_sequence(const std::vector<PositionKey>& keys) const {
+    size_t best = sequences_.size();
+    int64_t best_common = -1;
+    for (size_t q = 0; q < sequences_.size(); ++q) {
+        if (sequences_[q].busy) continue;
+        const std::vector<PositionKey>& cached = q == current_ ? cached_ : sequences_[q].cached;
+        const auto common = static_cast<int64_t>(
+            std::mismatch(cached.begin(), cached.end(), keys.begin(), keys.end()).first - cached.begin());
+        if (common > best_common || (common == best_common && sequences_[q].used < sequences_[best].used)) {
+            best = q;
+            best_common = common;
+        }
+    }
+    XS_CHECK(best < sequences_.size(), "every sequence of the engine is busy");
+    return best;
 }
 
 size_t Engine::state_program() const {
@@ -221,29 +284,37 @@ std::shared_ptr<const HostTensor> Engine::encode(const MediaInput& media, Genera
     return rows;
 }
 
-GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallback& on_token) {
-    GenerateResult result;
-    const auto& prompt = request.prompt;
+std::optional<Engine::Handle> Engine::start(const GenerateRequest& request, TokenCallback on_token) {
+    if (!has_free_sequence()) return std::nullopt;
+    auto owned = std::make_unique<Generation>();
+    Generation& g = *owned;
+    g.request = request;
+    g.on_token = std::move(on_token);
+    const Handle h = next_handle_++;
+    active_.emplace(h, std::move(owned));
+    GenerateResult& result = g.result;
+    const auto& prompt = g.request.prompt;
     if (prompt.empty()) {
         result.finish = FinishReason::Error;
         result.error = "empty prompt";
-        return result;
+        g.done = true;
+        return h;
     }
     if (static_cast<int64_t>(prompt.size()) >= options_.max_context) {
         result.finish = FinishReason::Error;
         result.error = str_cat("prompt of ", prompt.size(), " tokens does not fit the context limit of ",
                                options_.max_context, " tokens");
-        return result;
+        g.done = true;
+        return h;
     }
     result.stats.prompt_tokens = static_cast<int>(prompt.size());
-
     try {
         // Soft-token positions take the encoder rows of the request's media items, in order.
         const auto n = prompt.size();
-        std::vector<PositionKey> keys(n);
-        std::vector<int32_t> media_item(n, -1);
-        std::vector<int64_t> media_row(n, 0);
-        for (const MediaInput& m : request.media) {
+        g.keys.assign(n, 0);
+        g.media_item.assign(n, -1);
+        g.media_row.assign(n, 0);
+        for (const MediaInput& m : g.request.media) {
             if (!accepts(m.modality)) fail("this model does not take ", modality_name(m.modality), " input");
         }
         // The modality whose soft token `token` is, among the loaded encoders; -1 for none.
@@ -255,110 +326,189 @@ GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallb
             }
             return -1;
         };
-        const int64_t needed = std::accumulate(request.media.begin(), request.media.end(), int64_t{0},
+        const int64_t needed = std::accumulate(g.request.media.begin(), g.request.media.end(), int64_t{0},
                                                [](int64_t sum, const MediaInput& m) { return sum + m.num_tokens; });
         int64_t found = 0;
         for (size_t i = 0; i < n; ++i) found += soft_modality(prompt[i]) >= 0;
-        XS_CHECK(found == needed, "the prompt holds ", found, " media tokens but its ", request.media.size(),
+        XS_CHECK(found == needed, "the prompt holds ", found, " media tokens but its ", g.request.media.size(),
                  " media items need ", needed);
         size_t item = 0;
         int64_t row = 0;
         for (size_t i = 0; i < n; ++i) {
             const int k = soft_modality(prompt[i]);
             if (k < 0) {
-                keys[i] = text_key(prompt[i]);
+                g.keys[i] = text_key(prompt[i]);
                 continue;
             }
-            while (row == request.media[item].num_tokens) {
+            while (row == g.request.media[item].num_tokens) {
                 ++item;
                 row = 0;
             }
-            XS_CHECK(static_cast<int>(request.media[item].modality) == k, "the prompt's ",
+            XS_CHECK(static_cast<int>(g.request.media[item].modality) == k, "the prompt's ",
                      modality_name(static_cast<Modality>(k)), " tokens at position ", i, " fall to media item ", item,
-                     ", which is ", modality_name(request.media[item].modality));
-            media_item[i] = static_cast<int32_t>(item);
-            media_row[i] = row;
-            keys[i] = media_key(request.media[item].key, row++);
+                     ", which is ", modality_name(g.request.media[item].modality));
+            g.media_item[i] = static_cast<int32_t>(item);
+            g.media_row[i] = row;
+            g.keys[i] = media_key(g.request.media[item].key, row++);
         }
+        PromptPositions rotary = rotary_positions(g.media_item, g.media_row, g.request.media);
+        g.positions = std::move(rotary.positions);
 
-        const PromptPositions rotary = rotary_positions(media_item, media_row, request.media);
-        const std::vector<RotaryPosition>& positions = rotary.positions;
+        g.sequence = pick_sequence(g.keys);
+        sequences_[g.sequence].busy = true;
+        sequences_[g.sequence].used = ++clock_;
+        g.holds_sequence = true;
+        select(g.sequence);
         rotary_delta_ = rotary.next - static_cast<int64_t>(n);
-
-        Sampler sampler(request.sampling);
-        argmax_only_ = has_argmax_ && !sampler.needs_logits();
-        Timer prefill_timer;
-        const int64_t cached = reuse_prefix(keys);
+        g.sampler = std::make_unique<Sampler>(g.request.sampling);
+        g.argmax_only = has_argmax_ && !g.sampler->needs_logits();
+        argmax_only_ = g.argmax_only;
+        Timer timer;
+        const int64_t cached = reuse_prefix(g.keys);
         result.stats.cached_tokens = static_cast<int>(cached);
-        std::vector<std::shared_ptr<const HostTensor>> encoded(request.media.size());
-        std::vector<const float*> rows;
-        const int64_t width = media_width();
-        for (auto pos = static_cast<size_t>(cached); pos < n;) {
-            const size_t len = std::min(n - pos, static_cast<size_t>(options_.prefill_chunk));
-            rows.assign(len, nullptr);
-            bool any_rows = false;
-            for (size_t j = 0; j < len; ++j) {
-                const int32_t m = media_item[pos + j];
-                if (m < 0) continue;
-                auto& e = encoded[static_cast<size_t>(m)];
-                if (!e) e = encode(request.media[static_cast<size_t>(m)], result.stats);
-                rows[j] = e->data<float>() + media_row[pos + j] * width;
-                any_rows = true;
-            }
-            forward(std::span<const int32_t>(prompt).subspan(pos, len),
-                    std::span<const PositionKey>(keys).subspan(pos, len),
-                    std::span<const RotaryPosition>(positions).subspan(pos, len),
-                    any_rows ? std::span<const float* const>(rows) : std::span<const float* const>());
-            pos += len;
-        }
-        result.stats.prefill_ms = prefill_timer.elapsed_ms() - result.stats.encode_ms;
-
-        Timer decode_timer;
-        const int64_t room = options_.max_context - static_cast<int64_t>(n);
-        const int64_t max_new = std::min<int64_t>(request.max_new_tokens, room);
-        result.finish = FinishReason::Length;
-        std::deque<int32_t> ready;  // tokens a speculative round produced, not emitted yet
-        int32_t token = max_new > 0 ? target_token(sampler, 0, prompt, result.tokens, nullptr) : 0;
-        while (static_cast<int64_t>(result.tokens.size()) < max_new) {
-            if (std::find(request.stop_token_ids.begin(), request.stop_token_ids.end(), token) !=
-                request.stop_token_ids.end()) {
-                result.finish = FinishReason::Stop;
-                break;
-            }
-            // Decode speed is measured between the first and the last emitted token.
-            if (result.tokens.empty()) decode_timer.reset();
-            result.tokens.push_back(token);
-            result.stats.decode_ms = decode_timer.elapsed_ms();
-            if (on_token && !on_token(token)) {
-                result.finish = FinishReason::Cancelled;
-                break;
-            }
-            const auto emitted = static_cast<int64_t>(result.tokens.size());
-            if (emitted >= max_new) break;
-            if (ready.empty() && drafter_) {
-                // Drafts past the last token wanted, or past the context, are never verified.
-                const int64_t fits = options_.max_context - static_cast<int64_t>(cached_.size()) - 1;
-                const auto k = static_cast<int>(std::min<int64_t>({options_.spec_k, max_new - emitted - 1, fits}));
-                const std::vector<int32_t> round = spec_round(token, k, sampler, prompt, result.tokens, result.stats);
-                ready.assign(round.begin(), round.end());
-            } else if (ready.empty()) {
-                const int32_t fed[] = {token};
-                const PositionKey fed_key[] = {text_key(token)};
-                forward(fed, fed_key, text_positions(static_cast<int64_t>(cached_.size()), 1), {});
-                ready.push_back(target_token(sampler, 0, prompt, result.tokens, nullptr));
-            }
-            token = ready.front();
-            ready.pop_front();
-        }
-        result.stats.generated_tokens = static_cast<int>(result.tokens.size());
+        result.stats.prefill_ms += timer.elapsed_ms();
+        g.fed = static_cast<size_t>(cached);
+        g.encoded.resize(g.request.media.size());
     } catch (const std::exception& e) {
-        // The KV state may be partially written; start the next request from scratch.
-        reset_sequence();
-        result.finish = FinishReason::Error;
-        result.error = e.what();
-        log::error("generation failed: ", e.what());
+        fail_generation(g, e);
     }
+    return h;
+}
+
+bool Engine::advance(Handle h) {
+    const auto it = active_.find(h);
+    XS_CHECK(it != active_.end(), "no request ", h, " in flight");
+    Generation& g = *it->second;
+    if (g.done) return true;
+    try {
+        select(g.sequence);
+        argmax_only_ = g.argmax_only;
+        if (!g.decoding) {
+            prefill_chunk(g);
+        } else {
+            decode_step(g);
+        }
+    } catch (const std::exception& e) {
+        fail_generation(g, e);
+    }
+    if (g.done && g.holds_sequence) {
+        sequences_[g.sequence].busy = false;
+        g.holds_sequence = false;
+    }
+    return g.done;
+}
+
+bool Engine::decoding(Handle h) const {
+    const auto it = active_.find(h);
+    XS_CHECK(it != active_.end(), "no request ", h, " in flight");
+    return it->second->decoding;
+}
+
+GenerateResult Engine::finish(Handle h) {
+    const auto it = active_.find(h);
+    XS_CHECK(it != active_.end() && it->second->done, "request ", h, " is not done");
+    GenerateResult result = std::move(it->second->result);
+    result.stats.generated_tokens = static_cast<int>(result.tokens.size());
+    active_.erase(it);
     return result;
+}
+
+GenerateResult Engine::generate(const GenerateRequest& request, const TokenCallback& on_token) {
+    const std::optional<Handle> h = start(request, on_token);
+    XS_CHECK(h.has_value(), "every sequence of the engine is busy");
+    while (!advance(*h)) {
+    }
+    return finish(*h);
+}
+
+void Engine::fail_generation(Generation& g, const std::exception& e) {
+    // The KV state may be partially written; the sequence's next request starts from scratch.
+    if (g.holds_sequence) {
+        select(g.sequence);
+        reset_sequence();
+    }
+    g.result.finish = FinishReason::Error;
+    g.result.error = e.what();
+    g.done = true;
+    log::error("generation failed: ", e.what());
+}
+
+void Engine::prefill_chunk(Generation& g) {
+    GenerateStats& stats = g.result.stats;
+    Timer timer;
+    const double encode_before = stats.encode_ms;
+    const std::vector<int32_t>& prompt = g.request.prompt;
+    const size_t n = prompt.size();
+    const size_t pos = g.fed;
+    const size_t len = std::min(n - pos, static_cast<size_t>(options_.prefill_chunk));
+    const int64_t width = media_width();
+    std::vector<const float*> rows(len, nullptr);
+    bool any_rows = false;
+    for (size_t j = 0; j < len; ++j) {
+        const int32_t m = g.media_item[pos + j];
+        if (m < 0) continue;
+        auto& e = g.encoded[static_cast<size_t>(m)];
+        if (!e) e = encode(g.request.media[static_cast<size_t>(m)], stats);
+        rows[j] = e->data<float>() + g.media_row[pos + j] * width;
+        any_rows = true;
+    }
+    forward(std::span<const int32_t>(prompt).subspan(pos, len), std::span<const PositionKey>(g.keys).subspan(pos, len),
+            std::span<const RotaryPosition>(g.positions).subspan(pos, len),
+            any_rows ? std::span<const float* const>(rows) : std::span<const float* const>());
+    g.fed += len;
+    stats.prefill_ms += timer.elapsed_ms() - (stats.encode_ms - encode_before);
+    if (g.fed == n) begin_decode(g);  // the last row's logits give the first token: before another request runs
+}
+
+void Engine::begin_decode(Generation& g) {
+    const int64_t room = options_.max_context - static_cast<int64_t>(g.request.prompt.size());
+    g.max_new = std::min<int64_t>(g.request.max_new_tokens, room);
+    g.result.finish = FinishReason::Length;
+    g.decoding = true;
+    if (g.max_new <= 0) {
+        g.done = true;
+        return;
+    }
+    g.token = target_token(*g.sampler, 0, g.request.prompt, g.result.tokens, nullptr);
+}
+
+void Engine::decode_step(Generation& g) {
+    GenerateResult& result = g.result;
+    const std::vector<int32_t>& stops = g.request.stop_token_ids;
+    if (std::find(stops.begin(), stops.end(), g.token) != stops.end()) {
+        result.finish = FinishReason::Stop;
+        g.done = true;
+        return;
+    }
+    // Decode speed is measured between the first and the last emitted token.
+    if (result.tokens.empty()) g.decode_timer.reset();
+    result.tokens.push_back(g.token);
+    result.stats.decode_ms = g.decode_timer.elapsed_ms();
+    if (g.on_token && !g.on_token(g.token)) {
+        result.finish = FinishReason::Cancelled;
+        g.done = true;
+        return;
+    }
+    const auto emitted = static_cast<int64_t>(result.tokens.size());
+    if (emitted >= g.max_new) {
+        g.done = true;
+        return;
+    }
+    if (g.ready.empty() && drafter_) {
+        // Drafts past the last token wanted, or past the context, are never verified.
+        const int64_t fits = options_.max_context - static_cast<int64_t>(cached_.size()) - 1;
+        const auto k = static_cast<int>(std::min<int64_t>({options_.spec_k, g.max_new - emitted - 1, fits}));
+        const std::vector<int32_t> round =
+            spec_round(g.token, k, *g.sampler, g.request.prompt, result.tokens, result.stats);
+        g.ready.assign(round.begin(), round.end());
+    } else if (g.ready.empty()) {
+        const int32_t fed[] = {g.token};
+        const PositionKey fed_key[] = {text_key(g.token)};
+        forward(fed, fed_key, text_positions(static_cast<int64_t>(cached_.size()), 1), {});
+        g.ready.push_back(target_token(*g.sampler, 0, g.request.prompt, result.tokens, nullptr));
+    }
+    g.token = g.ready.front();
+    g.ready.pop_front();
 }
 
 }  // namespace xs

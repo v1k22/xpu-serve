@@ -66,6 +66,7 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     }
     SessionOptions session_options = options.session;
     session_options.max_context = engine_options.max_context;
+    session_options.sequences = engine_options.sequences;
 
     // Speculating, the session also runs the model's prefill, verify and draft programs (spec::Program order) and
     // cuts a verify back to its accepted tokens.
@@ -102,6 +103,7 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
         if (encoder == nullptr) continue;
         SessionOptions encoder_options = session_options;
         encoder_options.max_context = int64_t{1} << 20;  // stateless: bounds one run's rows only
+        encoder_options.sequences = 1;
         Timer encoder_timer;
         const std::vector<const graph::Graph*> encoder_programs = encoder->programs();
         encoders[k] = backend->compile(encoder_programs, model->weights(), encoder_options);
@@ -274,23 +276,57 @@ TranscriptionResult EngineService::transcribe(const TranscriptionRequest& reques
     return result;
 }
 
+// Requests the engine has a sequence for are in flight together, each advanced a step at a time: a prefill chunk,
+// or a decode token (a speculative round). The requests still reading their prompts and those decoding share the
+// device's time evenly from the moment both have work (a decoding chat is not left one token per chunk of a long
+// prompt), each side's requests in turn.
 void EngineService::worker_loop() {
+    struct InFlight {
+        Job* job;
+        Engine::Handle handle;
+    };
+    std::vector<InFlight> active;
+    size_t turn[2] = {0, 0};  // by side: prefilling, decoding
+    double spent[2] = {0, 0};  // ms each side ran since both last had work
+    bool had[2] = {false, false};
     for (;;) {
-        Job* job = nullptr;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-            if (queue_.empty()) return;  // stopping and drained
-            job = queue_.front();
-            queue_.pop_front();
+        for (;;) {  // admit what the engine has room for
+            Job* job = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                if (active.empty()) cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+                if (queue_.empty()) {
+                    if (active.empty()) return;  // stopping and drained
+                    break;
+                }
+                if (!engine_->has_free_sequence()) break;
+                job = queue_.front();
+                queue_.pop_front();
+            }
+            active.push_back({job, *engine_->start(job->request, job->on_token)});
         }
-        // Anything a request throws past the engine (which turns its errors into a result) reaches the caller, rather
-        // than ending the process from this thread.
+        std::vector<size_t> side[2];
+        for (size_t i = 0; i < active.size(); ++i) side[engine_->decoding(active[i].handle) ? 1 : 0].push_back(i);
+        for (int k = 0; k < 2; ++k) {
+            const bool has = !side[k].empty();
+            if (has && !had[k]) spent[0] = spent[1] = 0;  // a side that starts having work starts even
+            had[k] = has;
+        }
+        const int k = side[0].empty() ? 1 : side[1].empty() ? 0 : spent[1] <= spent[0] ? 1 : 0;
+        const size_t at = side[k][turn[k]++ % side[k].size()];
+        InFlight& f = active[at];
+        // Anything a request throws past the engine (which turns its errors into a result) reaches its caller,
+        // rather than ending the process from this thread.
+        bool done = true;
+        Timer timer;
         try {
-            job->done.set_value(engine_->generate(job->request, job->on_token));
+            done = engine_->advance(f.handle);
+            if (done) f.job->done.set_value(engine_->finish(f.handle));
         } catch (...) {
-            job->done.set_exception(std::current_exception());
+            f.job->done.set_exception(std::current_exception());
         }
+        spent[k] += timer.elapsed_ms();
+        if (done) active.erase(active.begin() + static_cast<std::ptrdiff_t>(at));
     }
 }
 

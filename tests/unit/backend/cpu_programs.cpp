@@ -6,11 +6,13 @@ namespace {
 
 xs::test::session::Env cpu_env() {
     xs::test::session::Env env;
-    env.compile = [](std::span<const xs::graph::Graph* const> programs, const xs::WeightStore& w, int64_t rewind) {
+    env.compile = [](std::span<const xs::graph::Graph* const> programs, const xs::WeightStore& w, int64_t rewind,
+                     int64_t sequences) {
         static const auto backend = xs::make_cpu_ref_backend();
         xs::SessionOptions o;
         o.precision = xs::DType::F32;
         o.rewind_tokens = rewind;
+        o.sequences = sequences;
         return backend->compile(programs, w, o);
     };
     return env;
@@ -33,5 +35,8 @@ TEST_SUITE("cpu-ref programs") {
     }
     TEST_CASE("programs share KV slots by label; KvRead attends without appending") {
         xs::test::session::shared_kv_slot(cpu_env());
+    }
+    TEST_CASE("sequences: three in one session run in turns, each as a session of its own; reset touches one") {
+        xs::test::session::sequences(cpu_env());
     }
 }

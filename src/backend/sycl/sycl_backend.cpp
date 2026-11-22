@@ -333,11 +333,28 @@ public:
         q.wait();
     }
 
+    // Makes `sequence` the one whose slots kv and fixed hold (SessionOptions::sequences); the others wait in stored.
+    void use(int64_t sequence) {
+        XS_CHECK(sequence >= 0 && sequence < static_cast<int64_t>(stored.size()), "sycl: no sequence ", sequence, " (",
+                 stored.size(), " held)");
+        if (sequence == current) return;
+        stored[static_cast<size_t>(current)] = {std::move(kv), std::move(fixed)};
+        kv = std::move(stored[static_cast<size_t>(sequence)].kv);
+        fixed = std::move(stored[static_cast<size_t>(sequence)].fixed);
+        current = sequence;
+    }
+
     sycl::queue q;
     const int64_t max_context;
     const int64_t rewind_tokens;
-    std::vector<SharedKv> kv;
-    std::vector<SharedFixed> fixed;
+    std::vector<SharedKv> kv;        // the current sequence's slots
+    std::vector<SharedFixed> fixed;  // the current sequence's
+    struct Slots {
+        std::vector<SharedKv> kv;
+        std::vector<SharedFixed> fixed;
+    };
+    std::vector<Slots> stored;  // by sequence; the current one's moved into kv and fixed
+    int64_t current = 0;
     std::map<std::pair<std::string, DType>, SharedLeaf> weights;  // uploaded weights by name and device dtype
     std::vector<DeviceBuffer> weight_buffers;
     std::vector<std::unique_ptr<sycl_be::BlockWeight>> block_weights;  // what a QuantWeight::block points at
@@ -2805,13 +2822,16 @@ public:
     // now, so that a long prompt cannot run out of device memory halfway; refused by name when they do not fit.
     void reserve(const std::vector<int64_t>& steps, const std::string& device) {
         const auto step_of = [&](size_t p) { return p < steps.size() ? steps[p] : int64_t{0}; };
+        const auto sequences = static_cast<int64_t>(shared_->stored.size());
         struct Bill {
-            int64_t growing = 0, fixed = 0, arena = 0;  // the KV slots that grow with the context, the others; a step
-            int64_t total() const { return growing + fixed + arena; }
+            // A sequence's KV slots that grow with the context, and the others; a step; the sequences.
+            int64_t growing = 0, fixed = 0, arena = 0, sequences = 1;
+            int64_t total() const { return sequences * (growing + fixed) + arena; }
         };
         const auto bill = [&](int64_t context) {
             std::map<size_t, std::pair<int64_t, bool>> slots;
             Bill b;
+            b.sequences = sequences;
             for (size_t p = 0; p < programs_.size(); ++p) {
                 if (step_of(p) <= 0) continue;
                 SyclProgram::Need n = programs_[p]->need(step_of(p), context);
@@ -2842,22 +2862,29 @@ public:
                     hi = mid - 1;
                 }
             }
-            fail("sycl: a context of ", context, " tokens (--ctx) does not fit ", device, " (", gib(total),
-                 " GiB): ", gib(held), " GiB in use (weights, media encoders), the KV cache ", gib(b.growing + b.fixed), " GiB (",
+            fail("sycl: a context of ", context, " tokens (--ctx)", sequences > 1 ? str_cat(" in each of ", sequences,
+                 " sequences") : "", " does not fit ", device, " (", gib(total), " GiB): ", gib(held),
+                 " GiB in use (weights, media encoders), the KV cache ", gib(sequences * (b.growing + b.fixed)),
+                 " GiB (",
                  b.growing / context, " bytes a token), a step of ", std::min(largest, context), " tokens over it ",
                  gib(b.arena), " GiB", why, "; at most ", lo * 1024,
                  " tokens fit (or fewer bytes a token, --kv-dtype i8 or turbo4, or a smaller step, --prefill-chunk)");
         };
         if (held + b.total() > total) refuse("");
         try {
-            for (size_t p = 0; p < programs_.size(); ++p) {
-                if (step_of(p) > 0) programs_[p]->reserve_kv(step_of(p));
+            for (int64_t q = 0; q < sequences; ++q) {
+                shared_->use(q);
+                for (size_t p = 0; p < programs_.size(); ++p) {
+                    if (step_of(p) > 0) programs_[p]->reserve_kv(step_of(p));
+                }
             }
+            shared_->use(0);
             shared_->ensure_arena(static_cast<size_t>(b.arena));
         } catch (const Error& e) {
             refuse(str_cat(" (", e.what(), ")"));
         }
-        log::info("sycl: reserved the KV cache of ", context, " tokens (", gib(b.growing + b.fixed),
+        log::info("sycl: reserved the KV cache of ", context, " tokens", sequences > 1 ? str_cat(" for each of ",
+                  sequences, " sequences") : "", " (", gib(sequences * (b.growing + b.fixed)),
                   " GiB) and a step's ", gib(b.arena), " GiB; ", gib(total - static_cast<int64_t>(g_device_bytes.load())),
                   " GiB of ", device, " left");
     }
@@ -2871,6 +2898,48 @@ public:
     }
     void reset() override { shared_->reset(); }
     void truncate(size_t program, int64_t n) override { at(program).truncate(n); }
+    void use(int64_t sequence) override { shared_->use(sequence); }
+
+    // Once the programs have declared their slots: the slots of `count` sequences, each empty, its conv and
+    // recurrent state in buffers of its own.
+    void hold_sequences(int64_t count) {
+        XS_CHECK(count >= 1, "sycl: a session of ", count, " sequences");
+        SyclShared& sh = *shared_;
+        sh.stored.clear();
+        sh.stored.resize(static_cast<size_t>(count));
+        for (int64_t s = 1; s < count; ++s) {
+            SyclShared::Slots& slots = sh.stored[static_cast<size_t>(s)];
+            for (const SharedKv& k : sh.kv) {
+                SharedKv copy;
+                copy.spec = k.spec;
+                copy.buf.heads = k.buf.heads;
+                copy.buf.row = k.buf.row;
+                copy.buf.dtype = k.buf.dtype;
+                copy.typed = k.typed;
+                copy.attention_only = k.attention_only;
+                slots.kv.push_back(std::move(copy));
+            }
+            for (const SharedFixed& f : sh.fixed) {
+                SharedFixed copy;
+                copy.conv = f.conv;
+                copy.label = f.label;
+                copy.state.bytes = f.state.bytes;
+                for (DeviceBuffer& b : copy.state.buf) {
+                    b = DeviceBuffer(sh.q, f.state.bytes);
+                    sh.q.memset(b.get(), 0, f.state.bytes);
+                }
+                copy.channels = f.channels;
+                copy.kernel = f.kernel;
+                copy.k_heads = f.k_heads;
+                copy.v_heads = f.v_heads;
+                copy.key_dim = f.key_dim;
+                copy.value_dim = f.value_dim;
+                copy.eps = f.eps;
+                slots.fixed.push_back(std::move(copy));
+            }
+        }
+        sh.q.wait();
+    }
 
 private:
     SyclProgram& at(size_t program) {
@@ -2981,6 +3050,7 @@ public:
         for (const graph::Graph* graph : programs) {
             session->add(std::make_unique<SyclProgram>(*graph, weights, options, session->shared(), attention, quant));
         }
+        session->hold_sequences(options.sequences);
         if (!options.max_step_tokens.empty()) session->reserve(options.max_step_tokens, str_cat("GPU.", index));
         return session;
     }

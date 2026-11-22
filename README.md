@@ -67,7 +67,8 @@ optimized one) and what was measured**; this page says what is supported and how
 
 Not yet:
 
-- Several sequences at once (batching): one request runs at a time.
+- Batching: `--sequences N` keeps several requests in flight, each its own cached prompt, their steps interleaved (a
+  long prefill gives way at the end of each chunk), but a step still runs one sequence.
 - One model across two GPUs.
 - Timestamps and translation of speech; speech output; video input; images for Qwen3.5 (its vision tower is not
   loaded) and Gemma 4 26B-A4B; images from remote URLs.

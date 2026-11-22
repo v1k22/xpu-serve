@@ -590,6 +590,19 @@ class CpuSession final : public Session {
         }
     }
     void truncate(size_t program, int64_t n) override { at(program).truncate(n); }
+    void use(int64_t sequence) override {
+        XS_CHECK(sequence >= 0 && sequence < static_cast<int64_t>(stored_.size()), "cpu-ref: no sequence ", sequence,
+                 " (", stored_.size(), " held)");
+        if (sequence == current_) return;
+        stored_[static_cast<size_t>(current_)] = std::move(shared_);
+        shared_ = std::move(stored_[static_cast<size_t>(sequence)]);
+        current_ = sequence;
+    }
+    // Once the programs have declared their slots: the slots of `count` sequences, each empty.
+    void hold_sequences(int64_t count) {
+        XS_CHECK(count >= 1, "cpu-ref: a session of ", count, " sequences");
+        stored_.assign(static_cast<size_t>(count), shared_);
+    }
 
   private:
     CpuProgram& at(size_t program) {
@@ -597,7 +610,9 @@ class CpuSession final : public Session {
         return *programs_[program];
     }
 
-    SharedState shared_;  // before the programs, which refer to it
+    SharedState shared_;  // the current sequence's; before the programs, which refer to it
+    std::vector<SharedState> stored_;  // by sequence; the current one's moved into shared_
+    int64_t current_ = 0;
     std::vector<std::unique_ptr<CpuProgram>> programs_;
 };
 
@@ -637,6 +652,7 @@ class CpuBackend final : public Backend {
                                                       options.max_context, options.kv,
                                                       options.rewind_tokens));
         }
+        session->hold_sequences(options.sequences);
         return session;
     }
 
