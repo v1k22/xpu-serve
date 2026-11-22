@@ -9,6 +9,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <utility>
@@ -19,8 +20,10 @@
 #include "backend/sycl/sycl_block_kernels.h"
 #include "backend/sycl/sycl_kernels.h"
 #include "backend/sycl/sycl_conv.h"
+#include "backend/sycl/sycl_elementwise.h"
 #include "backend/sycl/sycl_matmul.h"
 #include "backend/sycl/sycl_replay.h"
+#include "graph/elementwise_groups.h"
 #include "quant/quant.h"
 #include "util/error.h"
 #include "util/half.h"
@@ -129,6 +132,7 @@ struct Plan {
     std::vector<uint8_t> alias;     // the node only names memory another value owns: nothing to run
     std::vector<uint8_t> in_place;  // a fused residual GEMM (mm_add_) writing into its residual's memory
     size_t arena_bytes = 0;
+    DeviceBuffer ew_programs;  // the elementwise programs (sycl_be::EwProgram) at this plan's shapes, by group
 };
 
 // The dtype a plan gives the k and v of a KV slot stored in the session's quantized formats (SessionOptions::kv):
@@ -992,9 +996,6 @@ private:
         conv_silu_.assign(nodes.size(), 0);
         norm_bias_.assign(nodes.size(), -1);
         norm_shift_.assign(nodes.size(), 0);
-        add_mul_.assign(nodes.size(), -1);
-        unary_bias_.assign(nodes.size(), -1);
-        add3_.assign(nodes.size(), -1);
         attn_split_.assign(nodes.size(), -1);
         mm_add_.assign(nodes.size(), -1);
         reads_.resize(nodes.size());
@@ -1034,73 +1035,25 @@ private:
                 }
             }
         }
-        // act(Add(x, b)) with b a row vector and the Add read only by act: one act(x + b) (a matmul's bias).
-        for (size_t i = 0; i < nodes.size(); ++i) {
-            const Node& n = nodes[i];
-            if (act_of(n.kind) < 0 || fused_[i] != Fused::No) continue;
-            const auto u = static_cast<size_t>(n.inputs[0].node);
-            const Node& add = nodes[u];
-            if (add.kind != OpKind::Add || readers[u] != 1 || fused_[u] != Fused::No) continue;
-            const Dims& out = n.outputs[0].shape;
-            for (size_t k = 0; k < 2; ++k) {
-                const Dims& bs = graph_.type(add.inputs[1 - k]).shape;
-                if (graph_.type(add.inputs[k]).shape != out || bs.size() != 1 || bs[0] != out.back()) continue;
-                fused_[u] = Fused::Skip;
-                unary_bias_[i] = static_cast<int32_t>(u);
-                reads_[i] = {add.inputs[k], add.inputs[1 - k]};
-                reads_[u].clear();
-                break;
-            }
-        }
-        // Add(RmsNorm(x, w), c) with c a row vector: one norm with a bias (adaptive norms' shift). Add(a, Mul(b, c))
-        // with a and b of the output's shape and c the same or a row vector: one a + b * c (gated residuals).
-        // Add(a, Add(b, c)) with c a row vector: one a + (b + c) (a residual and a biased matmul).
+        // Add(RmsNorm(x, w), c) with c a row vector: one norm with a bias (adaptive norms' shift).
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
             if (n.kind != OpKind::Add || fused_[i] != Fused::No) continue;
             const Dims& out = n.outputs[0].shape;
-            const auto row_vector = [&](Value v) {
-                const Dims& s = graph_.type(v).shape;
-                return s.size() == 1 && !out.empty() && s[0] == out.back();
-            };
             for (size_t k = 0; k < 2; ++k) {
                 const Value x = n.inputs[k];
                 const Value other = n.inputs[1 - k];
                 const auto u = static_cast<size_t>(x.node);
-                if (readers[u] != 1 || fused_[u] != Fused::No || graph_.type(x).shape != out) continue;
-                if (nodes[u].kind == OpKind::RmsNorm && row_vector(other)) {
-                    fused_[u] = Fused::Skip;
-                    norm_bias_[i] = static_cast<int32_t>(u);
-                    reads_[i] = nodes[u].inputs;
-                    reads_[i].push_back(other);
-                    reads_[u].clear();
-                    break;
-                }
-                if (nodes[u].kind == OpKind::Add && graph_.type(other).shape == out && norm_bias_[u] < 0 &&
-                    add_mul_[u] < 0 && add3_[u] < 0) {
-                    const Value b = nodes[u].inputs[0];
-                    const Value c = nodes[u].inputs[1];
-                    const bool c_row = graph_.type(b).shape == out && row_vector(c);
-                    const bool b_row = graph_.type(c).shape == out && row_vector(b);
-                    if (!c_row && !b_row) continue;
-                    fused_[u] = Fused::Skip;
-                    add3_[i] = static_cast<int32_t>(u);
-                    reads_[i] = c_row ? std::vector<Value>{other, b, c} : std::vector<Value>{other, c, b};
-                    reads_[u].clear();
-                    break;
-                }
-                if (nodes[u].kind == OpKind::Mul && act_mul_[u] < 0 && graph_.type(other).shape == out) {
-                    const Value b = nodes[u].inputs[0];
-                    const Value c = nodes[u].inputs[1];
-                    const bool b_full = graph_.type(b).shape == out;
-                    const bool c_full = graph_.type(c).shape == out;
-                    if (!(b_full && (c_full || row_vector(c))) && !(c_full && row_vector(b))) continue;
-                    fused_[u] = Fused::Skip;
-                    add_mul_[i] = static_cast<int32_t>(u);
-                    reads_[i] = b_full ? std::vector<Value>{other, b, c} : std::vector<Value>{other, c, b};
-                    reads_[u].clear();
-                    break;
-                }
+                const Dims& os = graph_.type(other).shape;
+                if (readers[u] != 1 || fused_[u] != Fused::No || graph_.type(x).shape != out ||
+                    nodes[u].kind != OpKind::RmsNorm || os.size() != 1 || out.empty() || os[0] != out.back())
+                    continue;
+                fused_[u] = Fused::Skip;
+                norm_bias_[i] = static_cast<int32_t>(u);
+                reads_[i] = nodes[u].inputs;
+                reads_[i].push_back(other);
+                reads_[u].clear();
+                break;
             }
         }
         // LayerNorm(Add(x, c)) with c a row vector and the Add read only by the norm: one norm of x + c (a residual
@@ -1110,9 +1063,7 @@ private:
             if (n.kind != OpKind::LayerNorm) continue;
             const auto u = static_cast<size_t>(n.inputs[0].node);
             const Node& add = nodes[u];
-            if (add.kind != OpKind::Add || readers[u] != 1 || fused_[u] != Fused::No || norm_bias_[u] >= 0 ||
-                add_mul_[u] >= 0 || add3_[u] >= 0)
-                continue;
+            if (add.kind != OpKind::Add || readers[u] != 1 || fused_[u] != Fused::No || norm_bias_[u] >= 0) continue;
             const Dims& out = n.outputs[0].shape;
             for (size_t k = 0; k < 2; ++k) {
                 const Dims& cs = graph_.type(add.inputs[1 - k]).shape;
@@ -1130,8 +1081,7 @@ private:
         // reads_: a, x, w.
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
-            if (n.kind != OpKind::Add || fused_[i] != Fused::No || norm_bias_[i] >= 0 || add_mul_[i] >= 0 || add3_[i] >= 0)
-                continue;
+            if (n.kind != OpKind::Add || fused_[i] != Fused::No || norm_bias_[i] >= 0) continue;
             const Dims& out = n.outputs[0].shape;
             for (size_t k = 0; k < 2; ++k) {
                 const auto mm = static_cast<size_t>(n.inputs[1 - k].node);
@@ -1181,6 +1131,7 @@ private:
             reads_[i].push_back(nodes[kc].inputs[1]);
             reads_[i].push_back(nodes[vc].inputs[1]);
         }
+        plan_elementwise(readers);
         // MatMuls with quantized weights of one format that read the same x (an MLP's gate and up, attention's q, k
         // and v): at decode sizes the first runs them all in one GEMV launch, which fills the device where a small
         // one alone does not, and at a few rows in one quant_gemm launch (mm_parts_run), each output in its own
@@ -1207,6 +1158,152 @@ private:
         }
         for (auto& parts : mm_parts_) {
             if (parts.size() == 1) parts.clear();
+        }
+    }
+
+    // Trees of elementwise ops that no other fusion claimed run as one elementwise program each (a gated residual
+    // a + b * c, an activation of a matmul's output plus its bias, a gate's mix of two streams), their leaves in
+    // f32; a tree whose values need more registers than the program has runs op by op. reads_ of a root: its leaves.
+    void plan_elementwise(const std::vector<int>& readers) {
+        const auto& nodes = graph_.nodes();
+        graph::GroupRules rules;
+        rules.max_leaves = sycl_be::kEwLeaves;
+        rules.max_ops = sycl_be::kEwSteps;
+        rules.free = [&](size_t i) {
+            return fused_[i] == Fused::No && act_mul_[i] < 0 && norm_bias_[i] < 0 && mm_add_[i] < 0 &&
+                   attn_split_[i] < 0;
+        };
+        rules.readable = [&](Value v) { return dt(v) == DType::F32; };
+        ew_group_.assign(nodes.size(), -1);
+        for (graph::ElementwiseGroup& group : graph::elementwise_groups(graph_, readers, rules)) {
+            std::optional<std::vector<sycl_be::EwStep>> steps = elementwise_steps(group);
+            if (!steps) continue;
+            for (const int32_t f : group.folded) {
+                fused_[static_cast<size_t>(f)] = Fused::Skip;
+                reads_[static_cast<size_t>(f)].clear();
+            }
+            const auto root = static_cast<size_t>(group.root);
+            ew_group_[root] = static_cast<int32_t>(ew_groups_.size());
+            reads_[root].clear();
+            for (const graph::GroupLeaf& leaf : group.leaves) reads_[root].push_back(leaf.value);
+            ew_groups_.push_back({std::move(group), std::move(*steps)});
+        }
+    }
+
+    // A group's steps with their registers, or nothing when they do not fit the program's.
+    std::optional<std::vector<sycl_be::EwStep>> elementwise_steps(const graph::ElementwiseGroup& group) const {
+        std::vector<std::pair<int, int>> operands;
+        std::vector<bool> unary;
+        for (const graph::GroupOp& op : group.ops) {
+            const OpKind k = graph_.nodes()[static_cast<size_t>(op.node)].kind;
+            operands.emplace_back(op.a, op.b);
+            unary.push_back(k != OpKind::Add && k != OpKind::Mul && k != OpKind::Div);
+        }
+        std::optional<std::vector<sycl_be::EwStep>> steps =
+            sycl_be::allocate_registers(static_cast<int>(group.leaves.size()), operands, unary);
+        if (!steps) return std::nullopt;
+        for (size_t s = 0; s < group.ops.size(); ++s) {
+            const Node& n = graph_.nodes()[static_cast<size_t>(group.ops[s].node)];
+            sycl_be::EwStep& st = (*steps)[s];
+            st.op = sycl_be::EwOp::Unary;
+            switch (n.kind) {
+                case OpKind::Add: st.op = sycl_be::EwOp::Add; break;
+                case OpKind::Mul: st.op = sycl_be::EwOp::Mul; break;
+                case OpKind::Div: st.op = sycl_be::EwOp::Div; break;
+                case OpKind::Scale:
+                    st.unary = sycl_be::UnaryOp::Scale;
+                    st.p = std::get<graph::ScaleAttrs>(n.attrs).factor;
+                    break;
+                case OpKind::Softcap:
+                    st.unary = sycl_be::UnaryOp::Softcap;
+                    st.p = std::get<graph::SoftcapAttrs>(n.attrs).cap;
+                    break;
+                case OpKind::Clamp:
+                    st.unary = sycl_be::UnaryOp::Clamp;
+                    st.p = std::get<graph::ClampAttrs>(n.attrs).lo;
+                    st.q = std::get<graph::ClampAttrs>(n.attrs).hi;
+                    break;
+                case OpKind::Tanh: st.unary = sycl_be::UnaryOp::Tanh; break;
+                case OpKind::GeluTanh: st.unary = sycl_be::UnaryOp::GeluTanh; break;
+                case OpKind::Gelu: st.unary = sycl_be::UnaryOp::Gelu; break;
+                case OpKind::Sigmoid: st.unary = sycl_be::UnaryOp::Sigmoid; break;
+                case OpKind::Silu: st.unary = sycl_be::UnaryOp::Silu; break;
+                case OpKind::Softplus: st.unary = sycl_be::UnaryOp::Softplus; break;
+                default: fail(where(static_cast<size_t>(group.ops[s].node)), ": not an elementwise op");
+            }
+        }
+        return steps;
+    }
+
+    // The programs of every group at a plan's shapes, in device memory (Plan::ew_programs).
+    void build_elementwise_programs(Plan& p) const {
+        if (ew_groups_.empty()) return;
+        const auto shape = [&](Value v) -> const Dims& {
+            return p.shapes[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
+        };
+        std::vector<sycl_be::EwProgram> programs(ew_groups_.size());
+        for (size_t g = 0; g < ew_groups_.size(); ++g) {
+            const graph::ElementwiseGroup& group = ew_groups_[g].group;
+            sycl_be::EwProgram& pr = programs[g];
+            const int64_t n = numel(p.shapes[static_cast<size_t>(group.root)][0]);
+            for (size_t k = 0; k < ew_groups_[g].steps.size(); ++k) {
+                const sycl_be::EwStep& st = ew_groups_[g].steps[k];
+                pr.code[k] = sycl_be::pack_step(st);
+                pr.p[k] = st.p;
+                pr.q[k] = st.q;
+            }
+            for (size_t l = 0; l < group.leaves.size(); ++l) {
+                const graph::GroupLeaf& ref = group.leaves[l];
+                sycl_be::EwLeaf& leaf = pr.leaf[l];
+                leaf.f16 = dt(ref.value) == DType::F16 ? 1 : 0;
+                switch (ref.map) {
+                    case graph::LeafMap::Same:
+                        break;
+                    case graph::LeafMap::Period:
+                        leaf.inner = static_cast<int32_t>(numel(shape(ref.operand)));
+                        leaf.outer = 0;
+                        leaf.step = 1;
+                        break;
+                    case graph::LeafMap::Block:
+                        leaf.inner = static_cast<int32_t>(n / numel(shape(ref.operand)));
+                        break;
+                    case graph::LeafMap::Slice: {
+                        const Node& s = graph_.nodes()[static_cast<size_t>(ref.slice)];
+                        const auto& a = std::get<graph::SliceAttrs>(s.attrs);
+                        const Dims& in = shape(s.inputs[0]);
+                        const auto axis = static_cast<size_t>(a.axis);
+                        int64_t rest = 1;
+                        for (size_t d = axis + 1; d < in.size(); ++d) rest *= in[d];
+                        const int64_t begin = a.begin < 0 ? a.begin + in[axis] : a.begin;
+                        leaf.inner = static_cast<int32_t>(p.shapes[static_cast<size_t>(ref.slice)][0][axis] * rest);
+                        leaf.outer = static_cast<int32_t>(in[axis] * rest);
+                        leaf.step = 1;
+                        leaf.offset = static_cast<int32_t>(begin * rest);
+                        break;
+                    }
+                }
+            }
+        }
+        const size_t bytes = programs.size() * sizeof(sycl_be::EwProgram);
+        p.ew_programs = DeviceBuffer(q_, bytes);
+        q_.memcpy(p.ew_programs.get(), programs.data(), bytes).wait();
+    }
+
+    // Root i's elementwise program.
+    void run_elementwise(size_t i, const Plan& p) {
+        const auto g = static_cast<size_t>(ew_group_[i]);
+        const graph::ElementwiseGroup& group = ew_groups_[g].group;
+        const void* data[sycl_be::kEwLeaves] = {};
+        for (size_t l = 0; l < group.leaves.size(); ++l) data[l] = ptr(p, group.leaves[l].value);
+        const auto* program = reinterpret_cast<const sycl_be::EwProgram*>(p.ew_programs.get()) + g;
+        const auto leaves = static_cast<int>(group.leaves.size());
+        const auto steps = static_cast<int>(ew_groups_[g].steps.size());
+        const int64_t n = numel(p.shapes[i][0]);
+        char* out = ptr(p, Value{static_cast<int32_t>(i), 0});
+        if (dt(Value{static_cast<int32_t>(i), 0}) == DType::F16) {
+            sycl_be::elementwise(q_, program, leaves, steps, data, reinterpret_cast<half*>(out), n);
+        } else {
+            sycl_be::elementwise(q_, program, leaves, steps, data, reinterpret_cast<float*>(out), n);
         }
     }
 
@@ -1865,6 +1962,7 @@ private:
                 l.index = 0;
             }
         }
+        build_elementwise_programs(p);
         return p;
     }
 
@@ -1884,6 +1982,7 @@ private:
     }
 
     void launch(size_t i, const Plan& p, const Step& step) {
+        if (ew_group_[i] >= 0) return run_elementwise(i, p);
         const Node& n = graph_.nodes()[i];
         const auto in_ptr = [&](size_t k) { return ptr(p, n.inputs[k]); };
         const auto in_f32 = [&](size_t k) { return reinterpret_cast<const float*>(in_ptr(k)); };
@@ -1914,12 +2013,6 @@ private:
             }
         };
         const auto unary = [&](UnaryOp op, float a = 0.0f, float b = 0.0f) {
-            if (unary_bias_[i] >= 0) {  // act(x + bias): op is Silu, GeluTanh or Sigmoid
-                const Value bias = reads_[i][1];
-                const int64_t period = numel(p.shapes[static_cast<size_t>(bias.node)][static_cast<size_t>(bias.index)]);
-                with_out([&](auto* y) { sycl_be::unary_bias(q_, op, read_f32(0), read_f32(1), y, out_n, period); });
-                return;
-            }
             with_out([&](auto* y) { sycl_be::unary(q_, op, in_f32(0), y, out_n, a, b); });
         };
         switch (n.kind) {
@@ -2081,12 +2174,6 @@ private:
                     });
                     return;
                 }
-                if (add3_[i] >= 0) {
-                    const Value c = reads_[i][2];
-                    const int64_t period = numel(p.shapes[static_cast<size_t>(c.node)][static_cast<size_t>(c.index)]);
-                    with_out([&](auto* y) { sycl_be::add3(q_, read_f32(0), read_f32(1), read_f32(2), y, out_n, period); });
-                    return;
-                }
                 if (norm_bias_[i] >= 0) {
                     const Node& norm = graph_.nodes()[static_cast<size_t>(norm_bias_[i])];
                     const int64_t width = out_shape.back();
@@ -2095,12 +2182,6 @@ private:
                         sycl_be::rms_norm(q_, read_f32(0), weighted ? read_f32(1) : nullptr, read_f32(weighted ? 2 : 1), y,
                                           out_n / width, width, std::get<graph::NormAttrs>(norm.attrs).eps);
                     });
-                    return;
-                }
-                if (add_mul_[i] >= 0) {
-                    const Value c = reads_[i][2];
-                    const int64_t period = numel(p.shapes[static_cast<size_t>(c.node)][static_cast<size_t>(c.index)]);
-                    with_out([&](auto* y) { sycl_be::add_mul(q_, read_f32(0), read_f32(1), read_f32(2), y, out_n, period); });
                     return;
                 }
                 const auto op = n.kind == OpKind::Add   ? sycl_be::BinaryOp::Add
@@ -2554,6 +2635,9 @@ private:
             key += " [";
             for (size_t d = 0; d < o.size(); ++d) key += str_cat(d ? "," : "", o[d]);
             key += str_cat("] ", dtype_name(dtype_[i][0]), fused_[i] != Fused::No ? " fused" : "");
+            if (ew_group_[i] >= 0) {
+                key += str_cat(" program of ", ew_groups_[static_cast<size_t>(ew_group_[i])].steps.size());
+            }
         }
         return key;
     }
@@ -2636,9 +2720,12 @@ private:
     std::vector<uint8_t> conv_silu_;         // CausalConv that applies the SiLU after it
     std::vector<int32_t> norm_bias_;         // Add run as RmsNorm(node) + bias: the norm node, or -1
     std::vector<uint8_t> norm_shift_;        // LayerNorm run on x + a row, the Add folded in
-    std::vector<int32_t> add_mul_;           // Add run as a + b * c with the Mul node folded in, or -1
-    std::vector<int32_t> unary_bias_;        // activation run as act(x + bias) with the Add folded in, or -1
-    std::vector<int32_t> add3_;              // Add run as a + (b + c) with the inner Add folded in, or -1
+    struct EwGroup {
+        graph::ElementwiseGroup group;
+        std::vector<sycl_be::EwStep> steps;  // its ops with their registers
+    };
+    std::vector<EwGroup> ew_groups_;  // trees of elementwise ops run as one program (plan_elementwise)
+    std::vector<int32_t> ew_group_;            // the group a node runs (its root), or -1
     std::vector<int8_t> attn_split_;         // Attention over two-part keys and values: where k2 is in reads_, or -1
     std::vector<int32_t> mm_add_;            // Add run as a GEMM adding into the residual (the MatMul folded in), or -1
     std::vector<std::vector<int32_t>> mm_parts_;  // MatMul whose siblings run in its GEMV: all of them, itself first

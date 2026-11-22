@@ -10,6 +10,7 @@
 
 #include "backend/sycl/sycl_block_kernels.h"
 #include "backend/sycl/sycl_kv_rows.h"
+#include "backend/sycl/sycl_unary.h"
 #include "util/error.h"
 
 namespace xs::sycl_be {
@@ -28,32 +29,6 @@ int64_t ceil_div(int64_t a, int64_t b) {
     return (a + b - 1) / b;
 }
 
-template <UnaryOp Op>
-inline float apply_unary(float x, float a, float b) {
-    if constexpr (Op == UnaryOp::Scale) {
-        return x * a;
-    } else if constexpr (Op == UnaryOp::Tanh) {
-        return sycl::tanh(x);
-    } else if constexpr (Op == UnaryOp::GeluTanh) {
-        // 1 + tanh(u) = 2 - 2 / (exp(2u) + 1): the hardware exponential instead of sycl::tanh's long sequence (the
-        // product with the gate is a large pass), absolute error near 1e-7.
-        const float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
-        return x * (1.0f - 1.0f / (sycl::native::exp(2.0f * inner) + 1.0f));
-    } else if constexpr (Op == UnaryOp::Gelu) {
-        return 0.5f * x * (1.0f + sycl::erf(x * 0.7071067811865476f));
-    } else if constexpr (Op == UnaryOp::Softcap) {
-        return a * sycl::tanh(x / a);
-    } else if constexpr (Op == UnaryOp::Sigmoid) {
-        return 1.0f / (1.0f + sycl::exp(-x));
-    } else if constexpr (Op == UnaryOp::Silu) {
-        return x / (1.0f + sycl::exp(-x));
-    } else if constexpr (Op == UnaryOp::Softplus) {
-        return x > 20.0f ? x : sycl::log1p(sycl::exp(x));  // torch's threshold: identity above 20
-    } else {
-        return sycl::fmin(sycl::fmax(x, a), b);
-    }
-}
-
 template <UnaryOp Op, typename Y>
 void unary_t(sycl::queue& q, const float* x, Y* y, int64_t n, float a, float b) {
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)),
@@ -64,13 +39,6 @@ template <UnaryOp Act, typename X, typename Y>
 void act_mul_t(sycl::queue& q, const X* x, const X* b, Y* y, int64_t n) {
     syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
         y[i] = static_cast<Y>(apply_unary<Act>(static_cast<float>(x[i]), 0.0f, 0.0f) * static_cast<float>(b[i]));
-    });
-}
-
-template <UnaryOp Op, typename Y>
-void unary_bias_t(sycl::queue& q, const float* x, const float* bias, Y* y, int64_t n, int64_t period) {
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
-        y[i] = static_cast<Y>(apply_unary<Op>(x[i] + bias[static_cast<int64_t>(i[0]) % period], 0.0f, 0.0f));
     });
 }
 
@@ -1033,15 +1001,6 @@ void act_mul(sycl::queue& q, UnaryOp act, const X* x, const X* b, Y* y, int64_t 
 }
 
 template <typename Y>
-void unary_bias(sycl::queue& q, UnaryOp act, const float* x, const float* bias, Y* y, int64_t n, int64_t period) {
-    switch (act) {
-        case UnaryOp::Silu: return unary_bias_t<UnaryOp::Silu, Y>(q, x, bias, y, n, period);
-        case UnaryOp::GeluTanh: return unary_bias_t<UnaryOp::GeluTanh, Y>(q, x, bias, y, n, period);
-        default: return unary_bias_t<UnaryOp::Sigmoid, Y>(q, x, bias, y, n, period);
-    }
-}
-
-template <typename Y>
 void binary(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, const Broadcast& shape) {
     switch (op) {
         case BinaryOp::Add: return binary_t<BinaryOp::Add, Y>(q, a, b, y, n, shape);
@@ -1660,33 +1619,16 @@ void layer_norm(sycl::queue& q, const float* x, const float* shift, const float*
     });
 }
 
-template <typename Y>
-void add_mul(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period) {
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
-        y[i] = static_cast<Y>(a[i] + b[i] * c[static_cast<int64_t>(i[0]) % period]);
-    });
-}
-
-template <typename Y>
-void add3(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period) {
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(n)), [=](sycl::id<1> i) {
-        y[i] = static_cast<Y>(a[i] + (b[i] + c[static_cast<int64_t>(i[0]) % period]));
-    });
-}
-
 #define XS_INSTANTIATE_OUT(Y)                                                                                         \
     template void unary<Y>(sycl::queue&, UnaryOp, const float*, Y*, int64_t, float, float);                           \
     template void act_mul<float, Y>(sycl::queue&, UnaryOp, const float*, const float*, Y*, int64_t);                  \
     template void act_mul<half, Y>(sycl::queue&, UnaryOp, const half*, const half*, Y*, int64_t);                     \
-    template void unary_bias<Y>(sycl::queue&, UnaryOp, const float*, const float*, Y*, int64_t, int64_t);             \
-    template void add3<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t);              \
     template void binary<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, const Broadcast&);      \
     template void binary_same<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t);                   \
     template void binary_period<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, int64_t);        \
     template void rms_norm<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t, float);   \
     template void layer_norm<Y>(sycl::queue&, const float*, const float*, const float*, const float*, Y*, int64_t, \
-                                int64_t, float);                                                                    \
-    template void add_mul<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t);
+                                int64_t, float);
 XS_INSTANTIATE_OUT(float)
 XS_INSTANTIATE_OUT(half)
 #undef XS_INSTANTIATE_OUT

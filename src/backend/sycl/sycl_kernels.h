@@ -27,9 +27,6 @@ void unary(sycl::queue& q, UnaryOp op, const float* x, Y* y, int64_t n, float a,
 // y = act(x) * b, same shapes; act is Silu, GeluTanh or Sigmoid (a fused activation-times-gate).
 template <typename X, typename Y>
 void act_mul(sycl::queue& q, UnaryOp act, const X* x, const X* b, Y* y, int64_t n);
-// y = act(x + bias), bias repeating every `period` elements (a matmul's bias folded into its activation).
-template <typename Y>
-void unary_bias(sycl::queue& q, UnaryOp act, const float* x, const float* bias, Y* y, int64_t n, int64_t period);
 
 enum class BinaryOp : uint8_t { Add, Mul, Div };
 // numpy broadcasting over at most kMaxRank dims: out shape and the element strides of a and b per out dim (0 where
@@ -47,12 +44,6 @@ template <typename Y>
 void binary_same(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n);
 template <typename Y>
 void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, int64_t period);
-// y = a + b * c, c repeating every `period` elements (period == n: the same shape): a gated residual.
-template <typename Y>
-void add_mul(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period);
-// y = a + (b + c), c repeating every `period` elements (a residual plus a matmul with its bias).
-template <typename Y>
-void add3(sycl::queue& q, const float* a, const float* b, const float* c, Y* y, int64_t n, int64_t period);
 
 // Rows of `width`.
 void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width);
