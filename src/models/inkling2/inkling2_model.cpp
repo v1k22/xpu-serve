@@ -113,7 +113,10 @@ private:
         states.push_back(unit(h));
         const Value stack = states.size() == 1 ? states[0] : g_.concat(states, 1);  // [T, S, hidden]
         const float scale = 1.0f / std::sqrt(static_cast<float>(c_.hidden_size));
-        const Value scores = g_.transpose(g_.scale(g_.matmul(stack, queries), scale), {0, 2, 1});  // [T, count, S]
+        const Value by_state = g_.scale(g_.matmul(stack, queries), scale);  // [T, S, count]
+        // [T, count, S]: one query's scores lie that way already.
+        const Value scores = count == 1 ? g_.reshape(by_state, {kT, 1, static_cast<int64_t>(states.size())})
+                                        : g_.transpose(by_state, {0, 2, 1});
         const Value out = g_.stream_mix(g_.softmax(scores), stack);
         return count == 1 ? g_.reshape(out, {kT, c_.hidden_size}) : out;
     }
