@@ -40,7 +40,9 @@ struct Messages {
 // The decoder's program for one step, built over a checkpoint's weights.
 class Builder {
 public:
-    Builder(Graph& g, const Config& cfg, const WeightStore& weights) : g_(g), c_(cfg), weights_(weights) {}
+    // `media`: the step takes image rows in place of their tokens' embeddings (blocks::splice_media).
+    Builder(Graph& g, const Config& cfg, const WeightStore& weights, bool media)
+        : g_(g), c_(cfg), weights_(weights), media_(media) {}
 
     // The embedded tokens through every layer application and the last block residual: [T, hidden], before the
     // final norm.
@@ -49,6 +51,7 @@ public:
         log_scale_ = g_.input("log_scale", DType::F32, {kT, 1, 1});
         Stream s;
         s.h = g_.rms_norm(g_.gather(weight("embed.weight"), ids_), weight("embed_norm.weight"), eps());
+        if (media_) s.h = blocks::splice_media(g_, s.h, c_.hidden_size);  // an image's rows are not normed again
         for (int64_t i = 0; i < c_.loop.start; ++i) s = layer(i, 0, s, nullptr);
         const Stream before = s;
         for (int64_t i = c_.loop.start; i < c_.loop.end; ++i) s = layer(i, 0, s, nullptr);
@@ -326,6 +329,7 @@ private:
     Graph& g_;
     const Config& c_;
     const WeightStore& weights_;
+    const bool media_;
     Value ids_, log_scale_;
     std::vector<Value> entered_;
 };
@@ -347,10 +351,11 @@ void pair_experts(SafetensorsWeights& weights, const Config& cfg) {
 // prefill and verify programs, the same decoder appending the drafter's context, and the drafter's block program.
 class Inkling2Model final : public Model, public Speculation {
 public:
-    // `drafter`: the checkpoint's drafter, its weights in `weights` under kDrafterPrefix.
+    // `drafter`: the checkpoint's drafter, its weights in `weights` under kDrafterPrefix. `vision`: its tower.
     Inkling2Model(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights, const LoadOptions& options,
-                  std::optional<dspark::Config> drafter)
+                  std::optional<dspark::Config> drafter, const std::optional<VisionConfig>& vision)
         : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)) {
+        if (vision) vision_ = make_vision(*vision, *weights_);
         if (drafter) {
             block_ = std::make_unique<dspark::Drafter>(std::move(*drafter), *weights_, kDrafterPrefix, options.drafts);
         }
@@ -367,6 +372,7 @@ public:
     const graph::Graph& graph() const override { return step_; }
     const WeightStore& weights() const override { return *weights_; }
     const Speculation* speculation() const override { return block_ ? this : nullptr; }
+    const VisionEncoder* vision() const override { return vision_.get(); }
 
     const graph::Graph& prefill_graph() const override { return prefill_; }
     const graph::Graph& verify_graph() const override { return verify_; }
@@ -376,9 +382,14 @@ public:
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
                         TensorMap& inputs) const override {
-        XS_CHECK(embeddings.empty(), "inkling2: image input is not supported yet");
         const auto n = static_cast<int64_t>(tokens.size());
         XS_CHECK(n > 0, "inkling2: a step needs at least one token");
+        if (vision_ != nullptr) {
+            blocks::media_inputs(embeddings, n, cfg_.hidden_size, inputs);
+        } else {
+            XS_CHECK(std::all_of(embeddings.begin(), embeddings.end(), [](const float* row) { return row == nullptr; }),
+                     "inkling2: this model was loaded without a vision tower and takes no image");
+        }
         HostTensor ids(DType::I32, {n});
         HostTensor scale(DType::F32, {n, 1, 1});
         HostTensor positions(DType::I32, {n});
@@ -405,7 +416,7 @@ private:
     };
 
     void build_target(Graph& g, Head head) const {
-        Builder b(g, cfg_, *weights_);
+        Builder b(g, cfg_, *weights_, vision_ != nullptr);
         const Value h = b.decoder();
         // With a drafter every program takes the positions prepare_inputs gives, the step graph without reading them.
         const Value positions = block_ != nullptr ? b.positions() : Value{};
@@ -431,7 +442,7 @@ private:
     }
 
     void build_draft() {
-        Builder b(draft_, cfg_, *weights_);
+        Builder b(draft_, cfg_, *weights_, false);
         dspark::Target target;
         target.embed = b.weight("embed.weight");
         target.embed_norm = b.weight("embed_norm.weight");
@@ -445,6 +456,7 @@ private:
     std::unique_ptr<WeightStore> weights_;
     graph::Graph step_, prefill_, verify_, draft_;
     std::unique_ptr<dspark::Drafter> block_;
+    std::unique_ptr<VisionEncoder> vision_;
 };
 
 }  // namespace
@@ -490,8 +502,16 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
                       "speculative decoding is unavailable");
         }
     }
+    // The tower: in a checkpoint and a pack of one; a GGUF import has none (its repository keeps it in another file).
+    std::optional<VisionConfig> vision;
+    if (options.vision && weights->contains("model.visual.backbone.embeddings.class_embedding")) {
+        vision = parse_vision_config(config_json);
+        XS_CHECK(vision->out_hidden == cfg.hidden_size, "config.json vision_config: text_hidden_size ",
+                 vision->out_hidden, " is not the decoder's hidden size ", cfg.hidden_size);
+        info.media_width = cfg.hidden_size;
+    }
     return std::make_unique<Inkling2Model>(std::move(cfg), std::move(info), std::move(weights), options,
-                                           std::move(drafter));
+                                           std::move(drafter), vision);
 }
 
 }  // namespace xs::inkling2

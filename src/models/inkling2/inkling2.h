@@ -11,7 +11,11 @@
 // over the whole context. A layer's input is not the residual stream alone: learned queries mix it with the states
 // at the start of each block of six layers (block residuals). The layers `loop.start` to `loop.end` run `loop.passes`
 // times with the same weights, each pass from the state before the first, with KV and convolution state of its own
-// and, from the second on, messages mixed from the pass before it through learned gates. Served: the text decoder.
+// and, from the second on, messages mixed from the pass before it through learned gates.
+//
+// Images (transformers' Inkling2VisionModel): a tower of pre-norm layers with 2-D rotary attention and layer scale
+// over patches of `patch` pixels a side and one class token, then a two-layer projection of each square of `merge`
+// by `merge` patches to one row of the decoder's width, which stands where the prompt holds the image token.
 
 #include <filesystem>
 #include <memory>
@@ -71,6 +75,28 @@ struct Config {
 
 // `config_json`: an inkling2_loop checkpoint's config.json. Throws naming what is not supported.
 Config parse_config(const nlohmann::json& config_json);
+
+struct VisionConfig {
+    int64_t hidden = 0;
+    int64_t layers = 0;
+    int64_t heads = 0;
+    int64_t intermediate = 0;
+    int64_t channels = 3;
+    int64_t patch = 0;       // native_patch_size: pixels a side
+    int64_t merge = 0;       // adapter_merge_size: patches a side of the square one image token holds
+    int64_t grid = 0;        // posemb_grid_size: side of the position table, interpolated to an image's patches
+    int64_t projection = 0;  // projection_hidden_dim
+    int64_t out_hidden = 0;  // text_hidden_size
+    double norm_eps = 1e-5;
+    double rope_theta = 10000.0;
+    int32_t image_token = 0;  // what the chat template renders once an image and the prompt holds once a row
+};
+
+// The vision_config of `config_json`, with the image token (image_token_id). Throws naming what is not supported.
+VisionConfig parse_vision_config(const nlohmann::json& config_json);
+
+// The tower over `weights` (the released names, under model.visual.).
+std::unique_ptr<VisionEncoder> make_vision(const VisionConfig& cfg, const WeightStore& weights);
 
 std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
                             const LoadOptions& options);

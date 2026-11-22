@@ -126,4 +126,46 @@ Config parse_config(const nlohmann::json& config_json) {
     return c;
 }
 
+VisionConfig parse_vision_config(const nlohmann::json& config_json) {
+    if (!config_json.contains("vision_config") || !config_json.at("vision_config").is_object()) {
+        fail("config.json: an inkling2_loop checkpoint without a vision_config");
+    }
+    const nlohmann::json& v = config_json.at("vision_config");
+    const std::string where = "config.json vision_config";
+    require(v, "projector_bias", false, where);
+    if (v.contains("hidden_act") && cfg::get_string(v, "hidden_act", where) != "gelu") {
+        fail(where, ": hidden_act '", cfg::get_string(v, "hidden_act", where), "' is not supported (gelu)");
+    }
+    VisionConfig c;
+    c.hidden = cfg::get_int(v, "hidden_size", where);
+    c.layers = cfg::get_int(v, "num_hidden_layers", where);
+    c.heads = cfg::get_int(v, "num_attention_heads", where);
+    c.intermediate = v.contains("intermediate_size") && !v.at("intermediate_size").is_null()
+                         ? cfg::get_int(v, "intermediate_size", where)
+                         : static_cast<int64_t>(static_cast<double>(c.hidden) * cfg::get_float(v, "mlp_ratio", where));
+    c.channels = cfg::get_int_or(v, "num_channels", 3, where);
+    c.patch = cfg::get_int(v, "native_patch_size", where);
+    c.merge = cfg::get_int(v, "adapter_merge_size", where);
+    c.grid = cfg::get_int(v, "posemb_grid_size", where);
+    c.projection = cfg::get_int(v, "projection_hidden_dim", where);
+    c.out_hidden = cfg::get_int(v, "text_hidden_size", where);
+    c.norm_eps = cfg::get_float(v, "layer_norm_eps", where);
+    if (v.contains("rope_parameters") && v.at("rope_parameters").is_object()) {
+        const nlohmann::json& r = v.at("rope_parameters");
+        const std::string rw = where + " rope_parameters";
+        if (r.contains("rope_type") && cfg::get_string(r, "rope_type", rw) != "axial") {
+            fail(rw, ": rope_type '", cfg::get_string(r, "rope_type", rw), "' is not supported (axial)");
+        }
+        c.rope_theta = cfg::get_float(r, "rope_theta", rw);
+    }
+    c.image_token = static_cast<int32_t>(cfg::get_int_or(config_json, "image_token_id", 200054, "config.json"));
+    XS_CHECK(c.hidden > 0 && c.layers > 0 && c.heads > 0 && c.hidden % c.heads == 0 && (c.hidden / c.heads) % 4 == 0 &&
+                 c.intermediate > 0 && c.channels == 3 && c.patch > 0 && c.merge > 0 && c.grid > 0 &&
+                 c.projection > 0 && c.out_hidden > 0 && c.rope_theta > 0,
+             where, ": sizes do not fit (hidden ", c.hidden, ", ", c.heads, " heads, ", c.layers,
+             " layers, patches of ", c.patch, " in squares of ", c.merge, ", a position grid of ", c.grid, ", ",
+             c.channels, " channels)");
+    return c;
+}
+
 }  // namespace xs::inkling2

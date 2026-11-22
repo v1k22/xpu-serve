@@ -39,7 +39,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja", "chat_template.json", "vocab.json",
-                   "merges.txt", "preprocessor_config.json"]
+                   "merges.txt", "preprocessor_config.json", "processor_config.json"]
 
 
 def qwen3_5_moe(vocab_size, source):
@@ -180,8 +180,8 @@ def sensenova_loop(vocab_size, source):
 def inkling2_loop(vocab_size, source):
     """Inkling 2 Mini's layout, from the released checkpoint's own config.json (the --tokenizer-from one): twelve
     layers in blocks of three, the sixth and the twelfth attending over the whole context, layers 3 to 8 run three
-    times with messages between the passes, a tiny vision tower (the class builds one). Everything the released
-    values would hide at this size is brought into reach: clip thresholds near the typical norm of a query, key or
+    times with messages between the passes, a tiny vision tower (two layers over the release's patches). Everything
+    the released values would hide at this size is brought into reach: clip thresholds near the typical norm of a query, key or
     relative state, softcaps near the experts' and the logits' range, a floor of the position scaling below a
     prompt's length, a window and a bias extent shorter than a prompt. Parameters the class starts at zero or one
     (the residual and message queries, the stored taps of the dynamic convolutions, the clip scales) are random, as
@@ -217,7 +217,11 @@ def inkling2_loop(vocab_size, source):
               "_gate_proj.weight": 0.15}
     with torch.no_grad():
         for name, p in model.named_parameters():
-            if "vision_tower" in name:
+            if "vision_tower" in name:  # what the class starts at one, zero or near zero, so a skipped one shows
+                if "layernorm" in name or "lambda_" in name:
+                    p.normal_(0.0, 0.2) if name.endswith(".bias") else p.uniform_(0.5, 1.5)
+                elif name.endswith(("class_embedding", "cls_position_embedding")):
+                    p.normal_(0.0, 0.5)
                 continue
             scale = next((v for k, v in spread.items() if name.endswith(k)), None)
             if scale is not None:

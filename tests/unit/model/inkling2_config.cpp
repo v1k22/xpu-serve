@@ -194,3 +194,42 @@ TEST_CASE("inkling2 drafter config: the released mtp_config, and what it refuses
     CHECK(drafter_refuses(drafter_config(), "target_layer_ids", 2304, 24));  // a target that runs each layer once
     CHECK(drafter_refuses(with("block_size", 1), "sizes do not fit"));
 }
+
+TEST_CASE("inkling2 vision config: the released vision_config, and what it refuses by name") {
+    json config = inkling2_config();
+    config["vision_config"] = {{"model_type", "inkling2_vision"}, {"text_hidden_size", 2304}, {"temporal_patch_size", 2},
+                               {"native_patch_size", 20}, {"adapter_merge_size", 2}, {"projection_hidden_dim", 4096},
+                               {"projector_bias", false}, {"hidden_size", 1024}, {"num_hidden_layers", 23},
+                               {"num_attention_heads", 16}, {"mlp_ratio", 4.0}, {"posemb_grid_size", 32},
+                               {"layer_norm_eps", 1e-5}};
+    const xs::inkling2::VisionConfig c = xs::inkling2::parse_vision_config(config);
+    CHECK(c.hidden == 1024);
+    CHECK(c.layers == 23);
+    CHECK(c.heads == 16);
+    CHECK(c.intermediate == 4096);  // hidden * mlp_ratio
+    CHECK(c.patch == 20);
+    CHECK(c.merge == 2);
+    CHECK(c.grid == 32);
+    CHECK(c.projection == 4096);
+    CHECK(c.out_hidden == 2304);
+    CHECK(c.rope_theta == 10000.0);
+    CHECK(c.image_token == 200054);  // <|unused_200054|>, unless config.json names another
+
+    const auto refuses = [&](const char* key, const json& value, const char* what) {
+        json changed = config;
+        changed["vision_config"][key] = value;
+        try {
+            xs::inkling2::parse_vision_config(changed);
+        } catch (const xs::Error& e) {
+            return std::string(e.what()).find(what) != std::string::npos;
+        }
+        return false;
+    };
+    CHECK(refuses("projector_bias", true, "projector_bias"));
+    CHECK(refuses("hidden_act", "quick_gelu", "hidden_act 'quick_gelu'"));
+    CHECK(refuses("rope_parameters", {{"rope_type", "default"}, {"rope_theta", 10000.0}}, "rope_type 'default'"));
+    CHECK(refuses("num_attention_heads", 15, "sizes do not fit"));
+    config.erase("vision_config");
+    CHECK_THROWS_WITH_AS(xs::inkling2::parse_vision_config(config), doctest::Contains("without a vision_config"),
+                         xs::Error);
+}

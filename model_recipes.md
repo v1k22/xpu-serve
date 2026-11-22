@@ -687,7 +687,8 @@ Checked against Hugging Face fp32 logits and greedy text (the checkpoint's own m
 
 `thinkingmachines/Inkling-2-Mini` (`inkling2_loop`; Apache 2.0): a mixture of experts of 26.4B parameters (128
 experts, 8 a token) whose layers 6 to 17 run three times, 48 layer runs a token, without rotary positions
-([docs/decisions/0026](docs/decisions/0026-inkling2.md)). Text: its vision tower is not read. Its drafter (DSpark) is
+([docs/decisions/0026](docs/decisions/0026-inkling2.md)). Text and images: a pack of the checkpoint keeps its vision
+tower (an image is one token per 40 x 40 pixels, not resized); a GGUF file's import has none. Its drafter (DSpark) is
 inside the checkpoint and its packs, and a file of its GGUF repository ([DSpark](#dspark-inkling-2s-drafter)). Its
 output dialect is not parsed yet: thinking and tool calls come back as the text the model writes.
 

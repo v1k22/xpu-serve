@@ -13,7 +13,7 @@ below are done and tested; the parity numbers are in `tests/unit/model/model_par
 tokenizer with NFC, Qwen3.5 chat template parity and output parser.
 
 **v0.2 (2026-11-07):** image input for Gemma 4 E2B/E4B (OpenAI `image_url` data URLs), checked against Hugging Face
-end to end (`docs/decisions/0005`, `tests/unit/model/gemma4_vision_parity.cpp`). `CLAUDE.md` maps the code.
+end to end (`docs/decisions/0005`, `tests/unit/model/vision_parity.cpp`). `CLAUDE.md` maps the code.
 
 Legend: `[x]` done · `[ ]` to do · **Done when** = the check that closes the item.
 
@@ -306,8 +306,10 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Inkling 2 Mini: its GGUF files (Unsloth's layout; NVFP4, MXFP4 and Q2_0 as block formats; the lossless file
       matches Hugging Face fp32), its block drafter (DSpark, `--spec dspark`; from `mtp.safetensors` or the GGUF
       repository's `dspark-*.gguf`), KV memory for its windowed layers (a windowed slot keeps its window alone)
+- [x] Inkling 2 Mini: images from the checkpoint and its packs (the vision tower, a class token beside the patches
+      through a key bias a row; parity with transformers on a tiny checkpoint, cpu-ref and the GPU)
 - [ ] Inkling 2 Mini: its small kernels fused (a step launches some 4,700: the block residual, the message gate, a
-      convolution with its residual, the router), images, its output dialect (thinking and tool calls; its template
+      convolution with its residual, the router), its output dialect (thinking and tool calls; its template
       switches thinking by `reasoning_effort` and the model writes its own `<|message_model|>` and content tag, so
       `--readout` reads no answer letter until the dialect gives it the answer's prefix), a self-contained tiny GGUF
       for the importer's tests (the real lossless file is the check today)

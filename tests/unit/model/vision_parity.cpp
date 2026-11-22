@@ -1,7 +1,7 @@
-// End-to-end parity of Gemma 4 image input against Hugging Face (tests/parity/model/hf_vision_reference.py):
-// preprocessing, the vision tower, the expanded prompt, prompt logits and greedy continuations. Opt-in: needs
-// XS_TEST_MODEL_DIR and the generated fixtures. Same XS_PARITY_* variables as model_parity.cpp; fixtures default to
-// <source>/tests/fixtures/generated/gemma4_vision.
+// End-to-end parity of image input against Hugging Face (tests/parity/model/hf_vision_reference.py: Gemma 4,
+// Inkling 2): preprocessing, the vision tower, the expanded prompt, prompt logits and greedy continuations. Opt-in:
+// needs XS_TEST_MODEL_DIR and the generated fixtures. Same XS_PARITY_* variables as model_parity.cpp; fixtures
+// default to <source>/tests/fixtures/generated/gemma4_vision.
 
 #include <doctest/doctest.h>
 
@@ -39,7 +39,7 @@ bool lossless(const std::string& file) { return file.size() > 4 && file.substr(f
 
 }  // namespace
 
-TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and greedy output" *
+TEST_CASE("image input matches Hugging Face preprocessing, tower, logits and greedy output" *
           doctest::skip(!enabled())) {
     std::ifstream mf(fixtures() / "manifest.json");
     const auto manifest = nlohmann::json::parse(mf);
@@ -74,13 +74,16 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
         m.key = xs::image::content_hash(img);
         CHECK(m.num_tokens == im["soft_tokens"].get<int64_t>());
 
-        // The processor's pixel values are in [0, 1]; the tower's first step, 2 * (x - 0.5), is part of our input.
+        // The reference's pixel values are the tower's input ("signed"), or in [0, 1] where the tower's first step,
+        // 2 * (x - 0.5), is part of our input. Ours may hold more than the image's patches (a class token's rows).
+        const bool is_signed = manifest.value("pixel_range", "unit") == "signed";
         const xs::HostTensor& pixels = m.runs.at(0).inputs.at("pixels");
         const std::vector<float> ref_pixels = read_f32(fixtures() / im["pixels"].get<std::string>());
-        REQUIRE(pixels.numel() == static_cast<int64_t>(ref_pixels.size()));
+        REQUIRE(pixels.numel() >= static_cast<int64_t>(ref_pixels.size()));
         double max_diff = 0, sum_diff = 0;
         for (size_t i = 0; i < ref_pixels.size(); ++i) {
-            const double d = std::fabs(pixels.data<float>()[i] - 2.0f * (ref_pixels[i] - 0.5f));
+            const float want = is_signed ? ref_pixels[i] : 2.0f * (ref_pixels[i] - 0.5f);
+            const double d = std::fabs(pixels.data<float>()[i] - want);
             max_diff = std::max(max_diff, d);
             sum_diff += d;
         }
@@ -93,13 +96,16 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
         } else {
             CHECK(mean_diff < 0.01);  // one 8-bit level is 2/255 = 0.0078 after the tower's 2x - 1
         }
-        const auto ref_pos = im["positions"].get<std::vector<std::vector<int32_t>>>();
-        const xs::HostTensor& pos = m.runs.at(0).inputs.at("patch_pos");
-        bool same_positions = pos.numel() == static_cast<int64_t>(2 * ref_pos.size());
-        for (size_t i = 0; same_positions && i < ref_pos.size(); ++i) {
-            same_positions = pos.data<int32_t>()[2 * i] == ref_pos[i][0] && pos.data<int32_t>()[2 * i + 1] == ref_pos[i][1];
+        if (im.contains("positions")) {
+            const auto ref_pos = im["positions"].get<std::vector<std::vector<int32_t>>>();
+            const xs::HostTensor& pos = m.runs.at(0).inputs.at("patch_pos");
+            bool same_positions = pos.numel() == static_cast<int64_t>(2 * ref_pos.size());
+            for (size_t i = 0; same_positions && i < ref_pos.size(); ++i) {
+                same_positions =
+                    pos.data<int32_t>()[2 * i] == ref_pos[i][0] && pos.data<int32_t>()[2 * i + 1] == ref_pos[i][1];
+            }
+            CHECK(same_positions);
         }
-        CHECK(same_positions);
 
         xs::TensorMap out;
         vision_session->run(m.runs.at(0).program, m.runs.at(0).inputs, out);
@@ -200,7 +206,9 @@ TEST_CASE("gemma4 vision matches Hugging Face preprocessing, tower, logits and g
     }
 
     // The prefix cache tells images apart by their pixels: the same prompt with a different image key reuses only the
-    // text before the image; the same request again reuses everything but the last token.
+    // text before the image; the same request again reuses everything but the last token. Not for a model whose
+    // sessions cannot be cut back to a prefix.
+    if (!manifest.value("prefix_reuse", true)) return;
     const Case& k = cases.front();
     const auto first_image =
         std::find(k.prompt.begin(), k.prompt.end(), engine.model().vision()->soft_token()) - k.prompt.begin();

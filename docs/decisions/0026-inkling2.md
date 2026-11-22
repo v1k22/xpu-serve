@@ -106,6 +106,25 @@ another. It is not DFlash's shape, so it is a drafter of its own (`src/models/dr
 In a GGUF repository the drafter is a file of its own (`dflash` with `dflash.dspark.markov_rank`); `-hf` fetches it
 with the model file and the import puts its tensors beside the model's, as a pack of the checkpoint holds them.
 
+## Images
+
+The vision tower (transformers' Inkling2VisionModel; `src/models/inkling2/inkling2_vision.cpp`) is a plain pre-norm
+encoder: patches of 20 pixels through a linear layer, a position table interpolated to the image's grid, 2-D rotary
+attention, layer scale, and a two-layer projection of each square of four patches to one row of the decoder. Its
+processor does not resize: an image is padded to whole squares of 40 pixels, one token each. Two things were
+particular:
+
+- **A class token beside the patches.** The other towers run over an image's tokens with their patches as rows, and
+  a class token is no token's patch. It is one more block of rows, the class token in its first and padding in the
+  rest, which no query sees: attention over rows of several a token takes a key bias a row. The block comes last, so
+  the program's leading rows are the image's.
+- **Rotary pairs as neighbours.** The tower rotates channels (2 i, 2 i + 1); the graph's Rope pairs c with c + D / 2.
+  Queries and keys go through it with their channels in that order, which their products do not see.
+
+An image's rows stand in place of its tokens' embeddings after the embedding norm, as the reference scatters them.
+On a tiny checkpoint the processor's pixels are equal, the tower's rows and the prompt's logits match at cosine 1
+(cpu-ref and the GPU), and greedy output is the reference's.
+
 ## KV memory
 
 Forty of the 48 layer applications attend within 1,024 tokens, yet their KV slots grew with the context. A session
@@ -148,5 +167,5 @@ model (below), so the multiple-choice read-out the other GGUF files were scored 
   model writing its own `<|message_model|>` and content tag, so `--readout` reads a structural token, not a letter.
 - A verify of several rows, and the drafter's block, read the whole KV cache once per row at long contexts: DSpark
   gains at 32k tokens and loses at 128k.
-- Images (the vision tower; a GGUF repository keeps it in an mmproj file), and the files in mainline llama.cpp's
-  layout (`inkling2_loop`), which are other names for the same tensors.
+- Images from a GGUF file (the repository keeps the vision tower in an mmproj file), and the files in mainline
+  llama.cpp's layout (`inkling2_loop`), which are other names for the same tensors.

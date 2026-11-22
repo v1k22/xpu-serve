@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reference outputs for Gemma 4 image input from Hugging Face transformers (test-only).
+"""Reference outputs for image input from Hugging Face transformers (test-only): Gemma 4 and Inkling 2.
 
     python -I tests/parity/model/hf_vision_reference.py --model-dir <hf dir> \\
         [--out tests/fixtures/generated/gemma4_vision] [--gen 32] [--image photo.jpg ...]
@@ -14,6 +14,11 @@ and for each chat case (one or two images and a question):
 
 The model runs in float32 on the CPU with eager attention, with the text embedding scale rounded to bfloat16 as in
 hf_reference.py.
+
+Inkling 2 (model_type inkling2_loop) differs where its processor does: the pixel values are written as the tower
+reads them, [tokens, patches a token, values] in [-1, 1] (the manifest's pixel_range "signed"), a patch as (y, x,
+channel); there are no patch positions; and its sessions keep convolution state, so the manifest says the prefix of a
+prompt is not reused across requests (prefix_reuse false).
 """
 
 import argparse
@@ -89,8 +94,10 @@ def main():
     processor = AutoProcessor.from_pretrained(args.model_dir)
     model = AutoModelForImageTextToText.from_pretrained(args.model_dir, dtype=torch.float32, attn_implementation="eager")
     model.eval()
-    hidden = model.config.text_config.hidden_size
-    model.model.language_model.embed_tokens.embed_scale.fill_(bf16(math.sqrt(hidden)))
+    inkling = model.config.model_type.startswith("inkling2")
+    if not inkling:
+        hidden = model.config.text_config.hidden_size
+        model.model.language_model.embed_tokens.embed_scale.fill_(bf16(math.sqrt(hidden)))
     eos = model.generation_config.eos_token_id
     eos = eos if isinstance(eos, list) else [eos]
 
@@ -108,7 +115,9 @@ def main():
         pil[name] = Image.open(os.path.join(args.out, f)).convert("RGB")
 
     manifest = {"model_dir": os.path.abspath(args.model_dir), "dtype": "float32", "images": [], "cases": []}
-    for name in files:
+    if inkling:
+        manifest.update(pixel_range="signed", prefix_reuse=False)
+    for name in files if not inkling else []:
         feats = processor.image_processor(images=[pil[name]], return_tensors="pt")
         pos = feats["image_position_ids"][0]
         real = int((pos[:, 0] >= 0).sum())
@@ -124,6 +133,24 @@ def main():
         })
         print(f"{name}: {pil[name].width}x{pil[name].height} -> {real} patches, {features.shape[0]} soft tokens",
               flush=True)
+    for name in files if inkling else []:
+        feats = processor.image_processor(images=[pil[name]], return_tensors="pt")
+        vision = model.config.vision_config
+        merge, patch = vision.spatial_merge_size, vision.patch_size
+        tokens = int(feats["image_grid_thw"][0].prod())
+        by_token = feats["pixel_values"].reshape(tokens, merge, patch, merge, patch, -1).transpose(2, 3)
+        by_token.reshape(tokens, merge * merge, -1).numpy().astype(np.float32).tofile(
+            os.path.join(args.out, f"{name}.pixels.bin"))
+        with torch.no_grad():
+            out = model.model.get_image_features(feats["pixel_values"], feats["image_grid_thw"], return_dict=True)
+        features = out.pooler_output[0].float().numpy().astype(np.float32)
+        features.tofile(os.path.join(args.out, f"{name}.features.bin"))
+        manifest["images"].append({
+            "name": name, "file": files[name], "width": pil[name].width, "height": pil[name].height,
+            "patches": tokens * merge * merge, "soft_tokens": tokens, "pixels": f"{name}.pixels.bin",
+            "features": f"{name}.features.bin",
+        })
+        print(f"{name}: {pil[name].width}x{pil[name].height} -> {tokens} image tokens", flush=True)
 
     for case, (images, messages) in chat_cases(photos).items():
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)

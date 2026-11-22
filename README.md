@@ -38,7 +38,7 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3, Inkling 2 Mini (a
   looped mixture of experts without rotary positions)
-- ✅ **Image input** (Gemma 4 E2B / E4B, Qwen3-Omni), as base64 `data:` URLs
+- ✅ **Image input** (Gemma 4 E2B / E4B, Qwen3-Omni, Inkling 2 Mini), as base64 `data:` URLs
 - ✅ **Audio and images in chat**: Qwen3-Omni-30B-A3B's thinker (text, audio and images in, text and tool calls
   out), as `input_audio` and `image_url` parts
 - ✅ **Speech recognition** (Qwen3-ASR) behind `/v1/audio/transcriptions` (json, text or streamed), OpenAI's
@@ -467,7 +467,7 @@ Every layer is tested against a reference:
 | Image resize | torchvision's antialiased bicubic, bit-exact | `tests/unit/image/` |
 | Every graph op, on cpu-ref and on the GPU | fp64 references, with planted-bug controls | `tests/unit/backend/` |
 | Whole model (Gemma 4, Qwen3.5, LFM3, SenseNova Loop) | Hugging Face fp32 logits and greedy output (SenseNova Loop: its own modeling code) | `tests/unit/model/model_parity.cpp` |
-| Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/gemma4_vision_parity.cpp` |
+| Image input | Hugging Face fp32 pixels, vision features, logits and greedy output | `tests/unit/model/vision_parity.cpp` |
 | Audio decoding, resampling and log-mel features | libsndfile, torchaudio and transformers' feature extractor | `tests/unit/audio/` |
 | Speech recognition (Qwen3-ASR) | transformers fp32 log-mel, encoder rows, prompt, logits and greedy text | `tests/unit/model/audio_parity.cpp` |
 | Realtime transcription | OpenAI's GA event shapes over a real WebSocket; turns at the samples the VAD should find | `tests/unit/server/test_realtime_*.cpp`, `tests/unit/audio/test_vad.cpp` |
