@@ -322,7 +322,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Inkling 2 Mini: the router's and the block residual's small kernels (some 13 launches a layer)
 - [x] Inkling 2 Mini: `--readout`: the prompt ends with the model's own `<|message_model|><|content_text|>` and no
       thinking effort (`chat::direct_answer`), so the letter is the next token
-- [ ] Inkling 2 Mini: a self-contained tiny GGUF for the importer's tests (the real lossless file is the check today)
+- [x] Inkling 2 Mini: a self-contained tiny GGUF for the importer's tests: one tiny model in either converter's
+      layout, imported as the same model (`tests/unit/convert/tiny_inkling2_gguf.h`)
 - [ ] LFM3: the vision and audio variants (`lfm3_vl`, `lfm3_audio`, `lfm3_omni`; `lfm3_vl`'s text decoder is read
       for d1 only); conv-window snapshots for prefix
       reuse after a turn with reasoning; the small ops of a q4 decode step (119 norms and 48 residual adds rank
