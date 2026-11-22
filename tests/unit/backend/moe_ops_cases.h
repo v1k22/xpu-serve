@@ -6,6 +6,7 @@
 
 #include <doctest/doctest.h>
 
+#include <array>
 #include <cmath>
 #include <functional>
 #include <memory>
@@ -87,6 +88,30 @@ inline void topk_rows(const Env& env) {
     CHECK(to_ints(out.at("indices")) == ref_indices);
     CHECK(to_ints(out.at("indices"))[0] == 3);
     CHECK(to_ints(out.at("indices"))[1] == 11);
+
+    // Narrow rows by the count: a decode step's router, rows no whole load divides, and a prefill's routers (more
+    // than a backend may rank element by element), each with ties and a pick past them.
+    for (const auto& [rows, width, k] : {std::array<int64_t, 3>{1, 128, 8}, std::array<int64_t, 3>{3, 60, 5},
+                                         std::array<int64_t, 3>{300, 128, 8}}) {
+        CAPTURE(rows);
+        CAPTURE(width);
+        HostTensor narrow = rng.uniform(DType::F32, {rows, width});
+        for (int64_t r = 0; r < rows; r += 2) {
+            float* row = narrow.data<float>() + r * width;
+            row[width - 1] = row[7] = row[width / 2] = 2.0f + static_cast<float>(r % 3);
+        }
+        Graph gn;
+        const auto [nv, ni] = gn.topk(gn.input("x", DType::F32, {kT, width}), k);
+        gn.output("values", nv);
+        gn.output("indices", ni);
+        const TensorMap nout = run(env, gn, MemoryWeights{}, {{"x", narrow}});
+        const auto [nref_values, nref_indices] = ref::topk(to_f64(narrow), k);
+        CHECK(all_close(nout.at("values"), nref_values, 0, 0));
+        const std::vector<int64_t> narrow_idx = to_ints(nout.at("indices"));
+        CHECK(narrow_idx == nref_indices);
+        CHECK(std::vector<int64_t>(narrow_idx.begin(), narrow_idx.begin() + 3) ==
+              std::vector<int64_t>{7, width / 2, width - 1});
+    }
 
     // Few wide rows (a drafter's 32 of 2048 centroids), ties included.
     HostTensor wide = rng.uniform(DType::F32, {2, 2048});

@@ -1094,6 +1094,10 @@ void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t wid
 // one per token) a work-item each. Very wide rows (a shortlist of a vocabulary) first keep the best of each block of
 // kTopkBlock elements, and one sub-group then picks among the blocks, replacing a picked block's best by its next: a
 // pick reads the block bests and one block instead of the row, and reduces within the sub-group (no barrier).
+// Few narrow rows (a decode step's routers) take a work-item an element: its place among the picks is how many of
+// its row come before it, which it counts in one pass over the row, where a work-item a row reads its row k times,
+// one element after another.
+constexpr int64_t kTopkRankItems = 4096;  // rows x width up to which an element counts its own place
 constexpr int64_t kTopkGroupWidth = 512;
 constexpr int kTopkGroup = 256;
 constexpr int64_t kTopkWideWidth = 16384;
@@ -1225,6 +1229,51 @@ void topk(sycl::queue& q, const float* x, float* values, int32_t* indices, int64
                 }
                 prev_v = v;
                 prev_i = i;
+            }
+        });
+        return;
+    }
+    if (rows * width <= kTopkRankItems) {
+        // Whole loads where every row starts on one (the arena aligns its values).
+        const bool loads = width % kTopkLoad == 0 && reinterpret_cast<uintptr_t>(x) % (kTopkLoad * sizeof(float)) == 0;
+        const sycl::range<2> elements(static_cast<size_t>(rows), static_cast<size_t>(width));
+        syclex::parallel_for(q, elements, [=](sycl::item<2> it) {
+            using Load = sycl::vec<float, kTopkLoad>;
+            using Count = sycl::vec<int32_t, kTopkLoad>;
+            constexpr float kLowest = -std::numeric_limits<float>::infinity();
+            const auto r = static_cast<int64_t>(it[0]);
+            const auto i = static_cast<int32_t>(it[1]);
+            const float* xr = x + r * width;
+            // An element comes before this one with a larger value, or the same at a lower index; a NaN counts as the
+            // lowest value, so every element has a place of its own.
+            const float mine = xr[i];
+            const float v = mine == mine ? mine : kLowest;
+            int32_t place = 0;
+            if (loads) {  // a load's elements compared as one vector: none is read back one by one
+                Count before(0);
+                Count index(0);
+                #pragma unroll
+                for (int e = 0; e < kTopkLoad; ++e) index[e] = e;
+                for (int32_t c = 0; c < static_cast<int32_t>(width); c += kTopkLoad) {
+                    const Load read = *reinterpret_cast<const Load*>(xr + c);
+                    const Load o = sycl::select(Load(kLowest), read, read == read);
+                    before -= (o > Load(v)) | ((o == Load(v)) & ((index + Count(c)) < Count(i)));
+                }
+                static_assert(kTopkLoad == 16, "the sum below halves a load of 16");
+                const sycl::vec<int32_t, 8> s8 = before.lo() + before.hi();
+                const sycl::vec<int32_t, 4> s4 = s8.lo() + s8.hi();
+                const sycl::vec<int32_t, 2> s2 = s4.lo() + s4.hi();
+                place = s2[0] + s2[1];
+            } else {
+                for (int32_t j = 0; j < static_cast<int32_t>(width); ++j) {
+                    const float read = xr[j];
+                    const float o = read == read ? read : kLowest;
+                    place += (o > v || (o == v && j < i)) ? 1 : 0;
+                }
+            }
+            if (place < k) {
+                values[r * k + place] = mine;
+                indices[r * k + place] = i;
             }
         });
         return;
@@ -1543,6 +1592,31 @@ template void expert_matmul<float, int64_t>(sycl::queue&, const float*, bool, co
 template <typename Y>
 void rms_norm(sycl::queue& q, const float* x, const float* w, const float* bias, Y* y, int64_t rows, int64_t width,
               float eps) {
+    // Rows a load divides, on memory that aligns one (the arena's, a weight's): a lane reads its elements in one
+    // load and keeps them from the sum to the scaling, where a lane striding the row reads each twice, one after
+    // another. A work-group is a row.
+    constexpr int kLoad = 8;
+    const auto aligned = [](const void* p, size_t to) { return reinterpret_cast<uintptr_t>(p) % to == 0; };
+    if (width % kLoad == 0 && width / kLoad <= 1024 && aligned(x, kLoad * sizeof(float)) &&
+        aligned(y, kLoad * sizeof(Y)) && aligned(w, kLoad * sizeof(float)) && aligned(bias, kLoad * sizeof(float))) {
+        const auto lanes = static_cast<size_t>(width / kLoad);
+        syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * lanes, lanes), [=](sycl::nd_item<1> it) {
+            using Load = sycl::vec<float, kLoad>;
+            const auto in_row = static_cast<int64_t>(it.get_local_id(0)) * kLoad;
+            const auto at = static_cast<int64_t>(it.get_group(0)) * width + in_row;
+            const Load v = *reinterpret_cast<const Load*>(x + at);
+            const Load sq = v * v;
+            const sycl::vec<float, 4> s4 = sq.lo() + sq.hi();
+            const sycl::vec<float, 2> s2 = s4.lo() + s4.hi();
+            const float sum = sycl::reduce_over_group(it.get_group(), s2[0] + s2[1], sycl::plus<float>());
+            const float inv = 1.0f / sycl::sqrt(sum / static_cast<float>(width) + eps);
+            Load out = v * inv;
+            if (w != nullptr) out *= *reinterpret_cast<const Load*>(w + in_row);
+            if (bias != nullptr) out += *reinterpret_cast<const Load*>(bias + in_row);
+            *reinterpret_cast<sycl::vec<Y, kLoad>*>(y + at) = out.template convert<Y>();
+        });
+        return;
+    }
     const size_t wg = width >= 1024 ? 512 : (width >= 256 ? 256 : 128);
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * wg, wg), [=](sycl::nd_item<1> it) {
         const int64_t r = static_cast<int64_t>(it.get_group(0));
