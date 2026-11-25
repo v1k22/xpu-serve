@@ -495,14 +495,7 @@ public:
                 if (few) profile_kinds(plan, step, live);
                 ++(few ? decode_profile_ : prefill_profile_).steps;
             }
-            if (log::level() <= log::Level::Debug) {  // host-bound when submitting takes about as long as the run
-                const auto submitted = std::chrono::steady_clock::now();
-                q_.wait();
-                log::debug("sycl: T=", step.tokens, " ops submitted in ",
-                           std::chrono::duration<double, std::milli>(submitted - submit_start).count(), " ms, done after ",
-                           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_start).count(),
-                           " ms");
-            }
+            if (log::level() <= log::Level::Debug) log_submitted(step, submit_start, 1);
             download_outputs(plan, step, only, outputs);
         } catch (...) {
             try {
@@ -552,6 +545,7 @@ public:
             shared_.ensure_arena(plan.arena_bytes);
             upload_inputs(plan, inputs, keep_alive);
             const auto& nodes = graph_.nodes();
+            const auto submit_start = std::chrono::steady_clock::now();
             for (size_t i = 0; i < nodes.size(); ++i) {
                 if (!launches(i, plan, live)) continue;
                 const OpKind kind = nodes[i].kind;
@@ -573,6 +567,7 @@ public:
                 }
                 shared_.use(current);
             }
+            if (log::level() <= log::Level::Debug) log_submitted(step, submit_start, segments.size());
             download_outputs(plan, step, only, outputs);
         } catch (...) {
             rows_ = nullptr;
@@ -589,6 +584,15 @@ public:
             commit(steps[j]);
         }
         shared_.use(current);
+    }
+
+    // How long submitting a step's launches took beside the step: host-bound when about as long.
+    void log_submitted(const Step& step, std::chrono::steady_clock::time_point start, size_t segments) {
+        const auto submitted = std::chrono::steady_clock::now();
+        q_.wait();
+        const auto ms = [&](auto end) { return std::chrono::duration<double, std::milli>(end - start).count(); };
+        log::debug("sycl: T=", step.tokens, segments > 1 ? str_cat(" in ", segments, " segments") : "",
+                   " ops submitted in ", ms(submitted), " ms, done after ", ms(std::chrono::steady_clock::now()), " ms");
     }
 
     // The graph's inputs into the plan's memory (`keep_alive`: their host copies, until the copies are done).

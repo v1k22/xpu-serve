@@ -8,8 +8,10 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "backend/backend.h"
@@ -31,6 +33,7 @@
 #include "server/decision_handlers.h"
 #include "server/server.h"
 #include "service/engine_service.h"
+#include "util/timer.h"
 #include "tokenizer/tokenizer.h"
 #include "util/error.h"
 #include "util/log.h"
@@ -90,8 +93,9 @@ void add_engine_options(Args& a) {
         .value("ctx", "context length in tokens (prompt + output)", "8192")
         .value("prefill-chunk", "tokens per prefill step", "1024")
         .value("sequences",
-               "requests in flight at once, each its own cached prompt and its KV cache of --ctx tokens (a long "
-               "prefill gives way to the others at the end of each chunk)",
+               "requests in flight at once, each its own cached prompt and its KV cache of --ctx tokens, their "
+               "decode steps run as one (in turn with --spec; a long prefill gives way at the end of each chunk); "
+               "bench --prompts: that many at a time",
                "1")
         .value("backend-opt", "backend options as key=value[,key=value]")
         .value("spec",
@@ -864,7 +868,10 @@ int bench_embedding(const Args& a, const std::string& dir) {
 }
 
 // Greedy decode speed over real prompts (what speculative decoding is measured on: its acceptance depends on the text).
-int bench_prompts(EngineService& service, const std::string& path, int n_gen, int runs) {
+// `lanes` > 1 (--sequences): the prompts N at a time, cycled to at least N requests, from N threads (the engine
+// decodes the requests in flight together): each request's decode speed, and the tokens of all over the run's wall
+// time.
+int bench_prompts(EngineService& service, const std::string& path, int n_gen, int runs, int64_t lanes) {
     std::ifstream in(path);
     XS_CHECK(in.good(), "cannot read '", path, "'");
     std::vector<std::vector<int32_t>> prompts;
@@ -876,30 +883,56 @@ int bench_prompts(EngineService& service, const std::string& path, int n_gen, in
         prompts.push_back(service.tokenizer().encode(text));
     }
     XS_CHECK(!prompts.empty(), "'", path, "' holds no prompt");
+    std::vector<size_t> order(std::max(prompts.size(), static_cast<size_t>(lanes)));
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i % prompts.size();
     for (int run = 0; run < runs; ++run) {
         GenerateStats total;
-        for (const auto& prompt : prompts) {
-            GenerateRequest req;
-            req.prompt = prompt;
-            req.sampling.temperature = 0.0f;
-            req.max_new_tokens = n_gen;
-            req.stop_token_ids = service.model().stop_token_ids;
-            const GenerateResult r = service.generate(req, {});
-            if (r.finish == FinishReason::Error) fail("generation failed: ", r.error);
-            const GenerateStats& s = r.stats;
-            total.prompt_tokens += s.prompt_tokens - s.cached_tokens;
-            total.prefill_ms += s.prefill_ms;
-            total.generated_tokens += s.generated_tokens - 1;  // decode speed counts the tokens after the first
-            total.decode_ms += s.decode_ms;
-            total.spec_rounds += s.spec_rounds;
-            total.spec_drafted += s.spec_drafted;
-            total.spec_accepted += s.spec_accepted;
-            total.spec_draft_ms += s.spec_draft_ms;
-            total.spec_verify_ms += s.spec_verify_ms;
-        }
+        std::mutex mutex;
+        std::string error;
+        size_t next = 0;
+        int generated = 0;  // every token, the first included: what the run's wall time produced
+        const auto lane = [&] {
+            for (;;) {
+                size_t at = 0;
+                {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    if (next == order.size() || !error.empty()) return;
+                    at = next++;
+                }
+                GenerateRequest req;
+                req.prompt = prompts[order[at]];
+                req.sampling.temperature = 0.0f;
+                req.max_new_tokens = n_gen;
+                req.stop_token_ids = service.model().stop_token_ids;
+                const GenerateResult r = service.generate(req, {});
+                std::lock_guard<std::mutex> lock(mutex);
+                if (r.finish == FinishReason::Error) error = r.error;
+                const GenerateStats& s = r.stats;
+                total.prompt_tokens += s.prompt_tokens - s.cached_tokens;
+                total.prefill_ms += s.prefill_ms;
+                total.generated_tokens += s.generated_tokens - 1;  // decode speed counts the tokens after the first
+                total.decode_ms += s.decode_ms;
+                total.spec_rounds += s.spec_rounds;
+                total.spec_drafted += s.spec_drafted;
+                total.spec_accepted += s.spec_accepted;
+                total.spec_draft_ms += s.spec_draft_ms;
+                total.spec_verify_ms += s.spec_verify_ms;
+                generated += s.generated_tokens;
+            }
+        };
+        Timer wall;
+        std::vector<std::thread> threads;
+        for (int64_t k = 1; k < lanes; ++k) threads.emplace_back(lane);
+        lane();
+        for (std::thread& t : threads) t.join();
+        if (!error.empty()) fail("generation failed: ", error);
         std::printf("run %d: %zu prompts, %d prompt tok, prefill %.1f tok/s | %d tok after the first, decode %.1f tok/s",
-                    run, prompts.size(), total.prompt_tokens, total.prefill_tok_per_s(), total.generated_tokens,
+                    run, order.size(), total.prompt_tokens, total.prefill_tok_per_s(), total.generated_tokens,
                     total.decode_ms > 0 ? total.generated_tokens * 1000.0 / total.decode_ms : 0.0);
+        if (lanes > 1) {
+            std::printf(" each, %lld at a time: %.1f tok/s in all", static_cast<long long>(lanes),
+                        generated * 1000.0 / wall.elapsed_ms());
+        }
         if (total.spec_rounds > 0) {
             std::printf(" | %.2f tok per verify, %d of %d drafts accepted | a draft %.2f ms, a verify %.1f ms, a round %.1f ms",
                         total.tokens_per_round(), total.spec_accepted, total.spec_drafted,
@@ -942,7 +975,9 @@ int cmd_bench(const std::vector<std::string>& argv) {
     refuse_flags(a, {"set-size"}, "a language model");
     auto service = EngineService::create(dir, service_options(a));
     const int n_gen = a.get_int("gen-tokens");
-    if (!a.get("prompts").empty()) return bench_prompts(*service, a.get("prompts"), n_gen, a.get_int("runs"));
+    if (!a.get("prompts").empty()) {
+        return bench_prompts(*service, a.get("prompts"), n_gen, a.get_int("runs"), a.get_int("sequences"));
+    }
     const int n_prompt = a.get_int("prompt-tokens");
     // Doubled, not grown a sentence at a time: each check encodes the whole text.
     std::string text =
