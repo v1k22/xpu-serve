@@ -15,14 +15,18 @@ using graph::Value;
 
 class Lfm3Model final : public Model {
 public:
-    Lfm3Model(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights)
+    // `batch`: build batch_graph().
+    Lfm3Model(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights, bool batch)
         : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)), dec_(cfg_, *weights_) {
-        build(step_);
+        build(step_, false);
+        if (batch) build(batch_, true);
+        batched_ = batch;
     }
 
     const ModelInfo& info() const override { return info_; }
     const graph::Graph& graph() const override { return step_; }
     const WeightStore& weights() const override { return *weights_; }
+    const graph::Graph* batch_graph() const override { return batched_ ? &batch_ : nullptr; }
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
                         TensorMap& inputs) const override {
@@ -31,11 +35,13 @@ public:
     }
 
 private:
-    void build(Graph& g) const {
+    // `all_rows`: logits of every row (batch_graph), else of the last.
+    void build(Graph& g, bool all_rows) const {
+        if (all_rows) g.allow_segments();
         const Value h = dec_.layers(g, dec_.inputs(g));
         Graph::Scope scope(g, "head");
-        const Value last = dec_.final_norm(g, g.slice(h, 0, -1));
-        const Value logits = g.matmul(last, dec_.embedding(g));  // the head is the embedding table
+        const Value rows = dec_.final_norm(g, all_rows ? h : g.slice(h, 0, -1));
+        const Value logits = g.matmul(rows, dec_.embedding(g));  // the head is the embedding table
         g.output("logits", logits);
         g.output("argmax", blocks::argmax_rows(g, logits));
         g.validate();
@@ -47,13 +53,14 @@ private:
     ModelInfo info_;
     std::unique_ptr<WeightStore> weights_;
     Decoder dec_;
-    graph::Graph step_;
+    graph::Graph step_, batch_;
+    bool batched_ = false;
 };
 
 }  // namespace
 
 std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
-                            const LoadOptions& /*options*/) {
+                            const LoadOptions& options) {
     Config cfg = parse_config(config_json);
 
     ModelInfo info;
@@ -76,7 +83,8 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     XS_CHECK(!stops.empty(), "lfm3: no end-of-sequence token in config.json or generation_config.json");
     info.stop_token_ids = std::move(stops);
 
-    return std::make_unique<Lfm3Model>(std::move(cfg), std::move(info), SafetensorsWeights::open_dir(dir));
+    return std::make_unique<Lfm3Model>(std::move(cfg), std::move(info), SafetensorsWeights::open_dir(dir),
+                                       options.batch);
 }
 
 }  // namespace xs::lfm3

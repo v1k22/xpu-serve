@@ -51,6 +51,8 @@ public:
                 std::optional<dflash::Config> drafter)
         : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)), dec_(cfg_, *weights_) {
         build_target(step_, Head::LastLogits);
+        if (options.batch) build_target(batch_, Head::AllLogits);
+        batched_ = options.batch;
         if (!options.speculation) return;
         if (drafter) {
             if (cfg_.looped()) {
@@ -84,6 +86,7 @@ public:
     const graph::Graph& graph() const override { return step_; }
     const WeightStore& weights() const override { return *weights_; }
     const Speculation* speculation() const override { return has_mtp_ || block_ ? this : nullptr; }
+    const graph::Graph* batch_graph() const override { return batched_ ? &batch_ : nullptr; }
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
                         TensorMap& inputs) const override {
@@ -114,17 +117,20 @@ public:
 private:
     enum class Head {
         LastLogits,           // the step graph
+        AllLogits,            // a decode step of several requests (batch_graph)
         LastLogitsAllHidden,  // prefill with speculation
         AllLogitsAllHidden,   // verify
     };
 
     void build_target(Graph& g, Head head) const {
+        if (head == Head::AllLogits) g.allow_segments();
         const Decoder::Inputs in = dec_.inputs(g);
         const std::vector<Value> after = dec_.layers(g, in);  // the state after each layer
         const Value h = after.back();
-        if (head == Head::LastLogits) {
+        if (head == Head::LastLogits || head == Head::AllLogits) {
             Graph::Scope scope(g, "head");
-            const Value logits = g.matmul(dec_.final_norm(g, g.slice(h, 0, -1)), dec_.lm_head(g));
+            const Value rows = head == Head::AllLogits ? h : g.slice(h, 0, -1);
+            const Value logits = g.matmul(dec_.final_norm(g, rows), dec_.lm_head(g));
             g.output("logits", logits);
             g.output("argmax", blocks::argmax_rows(g, logits));
         } else {
@@ -181,7 +187,8 @@ private:
     ModelInfo info_;
     std::unique_ptr<WeightStore> weights_;
     Decoder dec_;
-    graph::Graph step_, prefill_, verify_, draft_;
+    graph::Graph step_, batch_, prefill_, verify_, draft_;
+    bool batched_ = false;
     bool has_mtp_ = false;
     std::unique_ptr<dflash::Drafter> block_;  // a block drafter instead of the MTP head
 };

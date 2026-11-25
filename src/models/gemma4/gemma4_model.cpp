@@ -63,9 +63,10 @@ class Gemma4Model final : public Model, public Speculation, public ChainDrafting
 public:
     // `vision`: the vision config when the encoder should be loaded (the checkpoint has one and it was asked for).
     // `assistant`: the drafter's config and weights (under "assistant." in weights()), built when `speculation`.
+    // `batch`: build batch_graph().
     Gemma4Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> target, int32_t pad_token_id,
                 const std::optional<VisionConfig>& vision, std::optional<AssistantConfig> assistant,
-                std::unique_ptr<SafetensorsWeights> assistant_weights)
+                std::unique_ptr<SafetensorsWeights> assistant_weights, bool batch)
         : cfg_(std::move(cfg)),
           info_(std::move(info)),
           prefix_(probe_prefix(*target)),
@@ -86,6 +87,8 @@ public:
         }
         if (vision) load_vision(*vision);
         build_target(step_, Head::LastLogits);
+        if (batch) build_target(batch_, Head::AllLogits);
+        batched_ = batch;
         if (assistant_) {
             build_target(prefill_, Head::LastLogitsAllHidden);
             build_target(verify_, Head::AllLogitsAllHidden);
@@ -102,6 +105,7 @@ public:
     }
     const VisionEncoder* vision() const override { return vision_.get(); }
     const Speculation* speculation() const override { return assistant_ ? this : nullptr; }
+    const graph::Graph* batch_graph() const override { return batched_ ? &batch_ : nullptr; }
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
                         TensorMap& inputs) const override {
@@ -145,6 +149,7 @@ public:
 private:
     enum class Head {
         LastLogits,           // the step graph
+        AllLogits,            // a decode step of several requests (batch_graph)
         LastLogitsAllHidden,  // prefill with speculation
         AllLogitsAllHidden,   // verify
     };
@@ -254,6 +259,7 @@ private:
     }
 
     void build_target(Graph& g, Head head) const {
+        if (head == Head::AllLogits) g.allow_segments();
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
         Value h = g.scale(g.gather(weight(g, w("embed_tokens.weight")), ids), embed_scale_);
@@ -273,8 +279,9 @@ private:
         }
 
         Graph::Scope scope(g, "head");
-        if (head == Head::LastLogits) {
-            const Value logits = lm_logits(g, g.rms_norm(g.slice(h, 0, -1), weight(g, w("norm.weight")), eps()));
+        if (head == Head::LastLogits || head == Head::AllLogits) {
+            const Value rows = head == Head::AllLogits ? h : g.slice(h, 0, -1);
+            const Value logits = lm_logits(g, g.rms_norm(rows, weight(g, w("norm.weight")), eps()));
             g.output("logits", logits);
             g.output("argmax", blocks::argmax_rows(g, logits));
         } else {
@@ -454,7 +461,8 @@ private:
     std::optional<AssistantConfig> assistant_;
     HostTensor ordering_;  // the assistant's tokens per centroid, [centroids, vocab / centroids] i32
     std::unique_ptr<VisionEncoder> vision_;
-    graph::Graph step_, prefill_, verify_, draft_;
+    graph::Graph step_, batch_, prefill_, verify_, draft_;
+    bool batched_ = false;
     const TensorView* ple_table_ = nullptr;
     float ple_scale_ = 1.0f;
     float embed_scale_ = 1.0f;
@@ -508,7 +516,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     }
     auto weights = SafetensorsWeights::open_dir(dir);
     return std::make_unique<Gemma4Model>(std::move(cfg), std::move(info), std::move(weights), pad_token_id, vision,
-                                         std::move(assistant), std::move(assistant_weights));
+                                         std::move(assistant), std::move(assistant_weights), options.batch);
 }
 
 }  // namespace xs::gemma4

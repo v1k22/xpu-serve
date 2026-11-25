@@ -22,8 +22,9 @@ int64_t media_width(const Config& cfg) {
 
 class Qwen3OmniModel final : public Model {
 public:
+    // `batch`: build batch_graph().
     Qwen3OmniModel(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights, audio::MelParams mel,
-                   std::optional<qwen3_vision::Processor> processor)
+                   std::optional<qwen3_vision::Processor> processor, bool batch)
         : cfg_(std::move(cfg)),
           info_(std::move(info)),
           weights_(std::move(weights)),
@@ -35,29 +36,14 @@ public:
             vision_ = qwen3_vision::make_encoder(*cfg_.vision, *processor, *weights_, "thinker.visual.",
                                                  cfg_.image_token);
         }
-        Graph& g = graph_;
-        const int64_t hidden = cfg_.text.hidden_size, width = media_width(cfg_);
-        const qwen3::Decoder::Inputs in = decoder_.inputs(g);
-        const Value media = g.input("media", DType::F32, {graph::kT, width});
-        const Value keep = g.input("media_keep", DType::F32, {graph::kT, 1});
-        const auto rows = [&](int64_t k) {
-            return width == hidden ? media : g.slice(media, 1, k * hidden, (k + 1) * hidden);
-        };
-        Value h = g.add(g.mul(decoder_.embed(g, in.ids), keep), rows(0));
-        const auto deepstack = static_cast<int64_t>(width / hidden - 1);
-        h = decoder_.layers(g, h, in.pos, [&](int64_t layer, Value x) {
-            return layer < deepstack ? g.add(x, rows(layer + 1)) : x;
-        });
-        Graph::Scope scope(g, "head");
-        const Value last = decoder_.final_norm(g, g.slice(h, 0, -1));
-        const Value logits = g.matmul(last, decoder_.lm_head(g));
-        g.output("logits", logits);
-        g.output("argmax", blocks::argmax_rows(g, logits));
-        g.validate();
+        build(graph_, false);
+        if (batch) build(batch_, true);
+        batched_ = batch;
     }
 
     const ModelInfo& info() const override { return info_; }
     const graph::Graph& graph() const override { return graph_; }
+    const graph::Graph* batch_graph() const override { return batched_ ? &batch_ : nullptr; }
     const WeightStore& weights() const override { return *weights_; }
     const AudioEncoder* audio() const override { return audio_.get(); }
     const VisionEncoder* vision() const override { return vision_.get(); }
@@ -79,13 +65,38 @@ public:
     }
 
 private:
+    // The thinker's decoder over text and media rows (deepstack); `all_rows`: logits of every row (batch_graph), else
+    // of the last.
+    void build(Graph& g, bool all_rows) const {
+        if (all_rows) g.allow_segments();
+        const int64_t hidden = cfg_.text.hidden_size, width = media_width(cfg_);
+        const qwen3::Decoder::Inputs in = decoder_.inputs(g);
+        const Value media = g.input("media", DType::F32, {graph::kT, width});
+        const Value keep = g.input("media_keep", DType::F32, {graph::kT, 1});
+        const auto rows = [&](int64_t k) {
+            return width == hidden ? media : g.slice(media, 1, k * hidden, (k + 1) * hidden);
+        };
+        Value h = g.add(g.mul(decoder_.embed(g, in.ids), keep), rows(0));
+        const auto deepstack = static_cast<int64_t>(width / hidden - 1);
+        h = decoder_.layers(g, h, in.pos, [&](int64_t layer, Value x) {
+            return layer < deepstack ? g.add(x, rows(layer + 1)) : x;
+        });
+        Graph::Scope scope(g, "head");
+        const Value normed = decoder_.final_norm(g, all_rows ? h : g.slice(h, 0, -1));
+        const Value logits = g.matmul(normed, decoder_.lm_head(g));
+        g.output("logits", logits);
+        g.output("argmax", blocks::argmax_rows(g, logits));
+        g.validate();
+    }
+
     Config cfg_;
     ModelInfo info_;
     std::unique_ptr<WeightStore> weights_;
     qwen3::Decoder decoder_;
     std::unique_ptr<AudioEncoder> audio_;
     std::unique_ptr<VisionEncoder> vision_;
-    Graph graph_;
+    Graph graph_, batch_;
+    bool batched_ = false;
 };
 
 }  // namespace
@@ -119,7 +130,8 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     mel.min_length = 0;
     std::optional<qwen3_vision::Processor> processor;
     if (cfg.vision) processor = qwen3_vision::processor_spec(dir, *cfg.vision, options.image_max_pixels);
-    return std::make_unique<Qwen3OmniModel>(std::move(cfg), std::move(info), std::move(weights), mel, processor);
+    return std::make_unique<Qwen3OmniModel>(std::move(cfg), std::move(info), std::move(weights), mel, processor,
+                                            options.batch);
 }
 
 }  // namespace xs::qwen3_omni

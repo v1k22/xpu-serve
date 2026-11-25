@@ -398,6 +398,8 @@ public:
             block_ = std::make_unique<dspark::Drafter>(std::move(*drafter), *weights_, kDrafterPrefix, options.drafts);
         }
         build_target(step_, Head::LastLogits);
+        if (options.batch) build_target(batch_, Head::AllLogits);
+        batched_ = options.batch;
         log::debug("inkling2: graph has ", step_.nodes().size(), " nodes, ", step_.kv_slots().size(), " kv and ",
                    step_.conv_slots().size(), " conv slots over ", cfg_.applications(), " layer applications");
         if (block_ == nullptr) return;
@@ -410,6 +412,7 @@ public:
     const graph::Graph& graph() const override { return step_; }
     const WeightStore& weights() const override { return *weights_; }
     const Speculation* speculation() const override { return block_ ? this : nullptr; }
+    const graph::Graph* batch_graph() const override { return batched_ ? &batch_ : nullptr; }
     const VisionEncoder* vision() const override { return vision_.get(); }
 
     const graph::Graph& prefill_graph() const override { return prefill_; }
@@ -449,18 +452,20 @@ public:
 private:
     enum class Head {
         LastLogits,         // the step graph
+        AllLogits,          // a decode step of several requests (batch_graph)
         LastLogitsContext,  // prefill with the drafter
         AllLogitsContext,   // verify
     };
 
     void build_target(Graph& g, Head head) const {
+        if (head == Head::AllLogits) g.allow_segments();
         Builder b(g, cfg_, *weights_, vision_ != nullptr);
         const Value h = b.decoder();
         // With a drafter every program takes the positions prepare_inputs gives, the step graph without reading them.
         const Value positions = block_ != nullptr ? b.positions() : Value{};
         Value logits;
-        if (head == Head::LastLogits) {
-            logits = b.logits(b.final_norm(g.slice(h, 0, -1)));
+        if (head == Head::LastLogits || head == Head::AllLogits) {
+            logits = b.logits(b.final_norm(head == Head::AllLogits ? h : g.slice(h, 0, -1)));
         } else {
             const bool all = head == Head::AllLogitsContext;
             const Value normed = b.final_norm(h);
@@ -492,7 +497,8 @@ private:
     Config cfg_;
     ModelInfo info_;
     std::unique_ptr<WeightStore> weights_;
-    graph::Graph step_, prefill_, verify_, draft_;
+    graph::Graph step_, batch_, prefill_, verify_, draft_;
+    bool batched_ = false;
     std::unique_ptr<dspark::Drafter> block_;
     std::unique_ptr<VisionEncoder> vision_;
 };

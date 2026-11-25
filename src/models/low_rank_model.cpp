@@ -25,6 +25,10 @@ public:
         }
         std::set<std::string> used;
         step_ = graph::with_low_rank(model_->graph(), weights_, named, &used);
+        if (const graph::Graph* batch = model_->batch_graph()) {
+            batch_ = graph::with_low_rank(*batch, weights_, named, &used);
+            batched_ = true;
+        }
         if (const Speculation* s = model_->speculation()) {
             prefill_ = graph::with_low_rank(s->prefill_graph(), weights_, named, &used);
             verify_ = graph::with_low_rank(s->verify_graph(), weights_, named, &used);
@@ -52,6 +56,7 @@ public:
     const Transcription* transcription() const override { return model_->transcription(); }
     std::vector<std::string> host_tables() const override { return model_->host_tables(); }
     const Speculation* speculation() const override { return model_->speculation() ? this : nullptr; }
+    const graph::Graph* batch_graph() const override { return batched_ ? &batch_ : nullptr; }
 
     const graph::Graph& prefill_graph() const override { return prefill_; }
     const graph::Graph& verify_graph() const override { return verify_; }
@@ -64,7 +69,8 @@ public:
 private:
     std::unique_ptr<Model> model_;
     JoinedWeights weights_;
-    graph::Graph step_, prefill_, verify_, draft_;
+    graph::Graph step_, batch_, prefill_, verify_, draft_;
+    bool batched_ = false;
 };
 
 }  // namespace

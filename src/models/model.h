@@ -189,6 +189,9 @@ public:
     virtual std::vector<std::string> host_tables() const { return {}; }
     // Null unless the model was loaded with LoadOptions::speculation and has a drafter.
     virtual const Speculation* speculation() const { return nullptr; }
+    // The step graph with "logits" and "argmax" of every row, allowing segments (Graph::allow_segments): one decode
+    // step of several requests at once. Null unless the model was loaded with LoadOptions::batch.
+    virtual const graph::Graph* batch_graph() const { return nullptr; }
 };
 
 struct LoadOptions {
@@ -197,6 +200,7 @@ struct LoadOptions {
     // processor that sizes by pixel count (Qwen3-VL's); a model whose processor does not is refused it by name.
     int64_t image_max_pixels = 0;
     bool speculation = false;  // build the speculative decoding programs when the model has a drafter
+    bool batch = false;        // build batch_graph(): serving several requests at once
     // A drafter checkpoint beside the model, for speculation: a Gemma 4 assistant, a block drafter (DFlash, DSpine).
     std::filesystem::path drafter;
     // A drafter that reads the target's head (an MTP head) picks among this many of its rows, chosen by a one-bit
