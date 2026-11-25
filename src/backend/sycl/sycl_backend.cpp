@@ -536,15 +536,12 @@ public:
         const std::vector<char>* live = only.empty() ? nullptr : &live_for(only);
         std::vector<HostTensor> keep_alive;
         try {
-            bool rewinds = false;
             for (size_t j = 0; j < segments.size(); ++j) {
                 shared_.use(segments[j].sequence);
                 ensure_kv_capacity(steps[j].kv_len);
-                rewinds = rewinds || steps[j].tokens <= shared_.rewind_tokens;
             }
             shared_.use(current);
-            // A step that keeps its inputs for truncate runs every stateful op a segment at a time.
-            segment_tables(segments, steps, current, rewinds);
+            segment_tables(segments, steps, current);
             const Plan& plan = plan_for(step);
             shared_.ensure_arena(plan.arena_bytes);
             upload_inputs(plan, inputs, keep_alive);
@@ -664,10 +661,10 @@ public:
     // seg_kv_at_, seg_attn_at_: where its entries start, -1 for a node that runs a segment at a time): the
     // convolutions, the gated delta rule where its lanes kernel takes the shape, the KV appends of an f16 or a
     // quantized cache, and attention where the per-row kernel takes a segment (decode). Each entry holds its
-    // sequence's buffers (read with that sequence current), and the tables reach the device in one copy. `rewinds`:
-    // none, every stateful node runs a segment at a time (keeping its inputs for truncate).
-    void segment_tables(std::span<const Segment> segments, std::span<const Step> steps, int64_t current,
-                        bool rewinds) {
+    // sequence's buffers (read with that sequence current), and the tables reach the device in one copy. A segment of
+    // up to rewind_tokens tokens (a verify) also keeps its conv and recurrent inputs in its sequence's slot, for a
+    // truncate inside it (StateSegment::keep).
+    void segment_tables(std::span<const Segment> segments, std::span<const Step> steps, int64_t current) {
         const auto& nodes = graph_.nodes();
         const auto count = static_cast<int64_t>(segments.size());
         seg_state_at_.assign(nodes.size(), -1);
@@ -675,8 +672,11 @@ public:
         seg_attn_at_.assign(nodes.size(), -1);
         seg_count_ = count;
         seg_max_tokens_ = 0;
-        for (const Step& s : steps) seg_max_tokens_ = std::max(seg_max_tokens_, s.tokens);
-        if (rewinds) return;
+        seg_keeps_ = false;
+        for (const Step& s : steps) {
+            seg_max_tokens_ = std::max(seg_max_tokens_, s.tokens);
+            seg_keeps_ = seg_keeps_ || s.tokens <= shared_.rewind_tokens;
+        }
         int64_t states = 0, kvs = 0, attns = 0;
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
@@ -713,10 +713,12 @@ public:
                     const auto& a = std::get<graph::StateAttrs>(n.attrs);
                     const size_t slot = n.kind == OpKind::GatedDelta ? conv_states_ + static_cast<size_t>(a.slot)
                                                                      : static_cast<size_t>(a.slot);
-                    StateBuffers& b = shared_.fixed[fixed_slot_[slot]].state;
-                    seg_states_host_[static_cast<size_t>(seg_state_at_[i] + j)] = {
-                        reinterpret_cast<const float*>(b.buf[b.cur].get()),
-                        reinterpret_cast<float*>(b.buf[1 - b.cur].get()), first, st.tokens};
+                    SharedFixed& f = shared_.fixed[fixed_slot_[slot]];
+                    StateBuffers& b = f.state;
+                    sycl_be::StateSegment& e = seg_states_host_[static_cast<size_t>(seg_state_at_[i] + j)];
+                    e = {reinterpret_cast<const float*>(b.buf[b.cur].get()),
+                         reinterpret_cast<float*>(b.buf[1 - b.cur].get()), first, st.tokens};
+                    if (st.tokens <= shared_.rewind_tokens) keep_place(n, f, e);
                 }
                 if (seg_attn_at_[i] >= 0) {  // its keys and values: the cache of the KvCache its inputs are
                     const Value cache = n.inputs[1];
@@ -932,14 +934,9 @@ private:
 
     // Keeps a short step's per-token inputs of a conv or recurrent op for rewind (SharedFixed).
     void keep_inputs(SharedFixed& f, std::initializer_list<std::pair<const float*, int64_t>> inputs, int64_t tokens) {
-        if (f.inputs.size() != inputs.size()) {
-            f.inputs.clear();
-            f.input_row.clear();
-            for (const auto& [ptr, row] : inputs) {
-                f.inputs.emplace_back(q_, static_cast<size_t>(shared_.rewind_tokens * row) * sizeof(float));
-                f.input_row.push_back(row);
-            }
-        }
+        std::vector<int64_t> rows;
+        for (const auto& [ptr, row] : inputs) rows.push_back(row);
+        hold_inputs(f, rows);
         sycl_be::CopyPart parts[sycl_be::kCopyParts];
         int count = 0;
         for (const auto& [ptr, row] : inputs) {
@@ -947,6 +944,46 @@ private:
             ++count;
         }
         sycl_be::copy_parts(q_, parts, count);  // one launch a slot: a verify step keeps the inputs of every layer
+    }
+
+    // Room in `f` for a short step's per-token inputs of `rows` values each.
+    void hold_inputs(SharedFixed& f, const std::vector<int64_t>& rows) {
+        if (f.input_row == rows) return;
+        f.inputs.clear();
+        for (const int64_t row : rows) {
+            f.inputs.emplace_back(q_, static_cast<size_t>(shared_.rewind_tokens * row) * sizeof(float));
+        }
+        f.input_row = rows;
+    }
+
+    // A segment that may be cut back inside: what its sequence's slot `f` needs to replay node `n` (the op's sizes,
+    // room for its inputs), and where in it the segment's inputs go (e.keep), as the launch's keep_inputs would.
+    void keep_place(const Node& n, SharedFixed& f, sycl_be::StateSegment& e) {
+        const auto dims = [&](size_t k) -> const Dims& { return graph_.type(n.inputs[k]).shape; };
+        if (n.kind == OpKind::GatedDelta) {
+            f.k_heads = dims(0)[1];
+            f.v_heads = dims(2)[1];
+            f.key_dim = dims(0)[2];
+            f.value_dim = dims(2)[2];
+            f.eps = std::get<graph::StateAttrs>(n.attrs).qk_l2norm_eps;
+            hold_inputs(f, {f.k_heads * f.key_dim, f.v_heads * f.value_dim, f.v_heads, f.v_heads});
+        } else {
+            f.channels = dims(0)[1];
+            f.kernel = n.kind == OpKind::CausalConv ? dims(1)[1] : dims(2)[2];
+            hold_inputs(f, {f.channels});
+        }
+        for (size_t t = 0; t < f.inputs.size(); ++t) e.keep[t] = reinterpret_cast<float*>(f.inputs[t].get());
+    }
+
+    // After a stateful node's launch over the segments: the inputs of those that may be cut back (keep_place).
+    void keep_segment_inputs(std::initializer_list<std::pair<const float*, int64_t>> inputs) {
+        if (!seg_keeps_) return;
+        sycl_be::SegmentInputs in;
+        for (const auto& [ptr, row] : inputs) {
+            in.src[in.count] = ptr;
+            in.row[in.count++] = row;
+        }
+        sycl_be::keep_segment_inputs(q_, in, seg_state_, seg_count_, seg_max_tokens_);
     }
 
     size_t shared_kv(const graph::KvSlot& spec) {
@@ -2901,6 +2938,7 @@ private:
                 if (seg_state_ != nullptr) {
                     sycl_be::causal_conv_segments(q_, in_f32(0), in_f32(1), seg_state_, seg_count_, seg_max_tokens_,
                                                   out, in_shape(0)[1], in_shape(1)[1], conv_silu_[i] != 0);
+                    keep_segment_inputs({{in_f32(0), in_shape(0)[1]}});
                     return;
                 }
                 const auto slot = static_cast<size_t>(std::get<graph::StateAttrs>(n.attrs).slot);
@@ -2922,6 +2960,7 @@ private:
                     const Dims& taps = in_shape(2);
                     sycl_be::dynamic_conv_segments(q_, in_f32(0), in_f32(1), in_f32(2), seg_state_, seg_count_,
                                                    seg_max_tokens_, out, in_shape(0)[1], taps[2], taps[1]);
+                    keep_segment_inputs({{in_f32(0), in_shape(0)[1]}});
                     return;
                 }
                 const auto slot = static_cast<size_t>(std::get<graph::StateAttrs>(n.attrs).slot);
@@ -2949,6 +2988,8 @@ private:
                                                            seg_state_, seg_count_, seg_max_tokens_, out, qs[1], vs[1],
                                                            qs[2], vs[2], a.qk_l2norm_eps),
                              where(i), ": no gated delta kernel over segments for this shape");
+                    keep_segment_inputs({{in_f32(1), qs[1] * qs[2]}, {in_f32(2), vs[1] * vs[2]}, {in_f32(3), vs[1]},
+                                         {in_f32(4), vs[1]}});
                     return;
                 }
                 SharedFixed& f = shared_.fixed[fixed_slot_[conv_states_ + static_cast<size_t>(a.slot)]];
@@ -3109,6 +3150,7 @@ private:
     const sycl_be::KvSegment* seg_kv_ = nullptr;
     const sycl_be::AttentionSegment* seg_attn_ = nullptr;
     int64_t seg_count_ = 0, seg_max_tokens_ = 0;
+    bool seg_keeps_ = false;  // a segment of the step keeps its conv and recurrent inputs (StateSegment::keep)
     DeviceBuffer seg_tables_;
     const sycl_be::StateSegment* seg_states_dev_ = nullptr;
     const sycl_be::KvSegment* seg_kv_dev_ = nullptr;

@@ -146,8 +146,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       (`Session::run_segments`, the stateful ops acting on each segment's sequence; decision 0028)
 - [x] Batched speculative rounds: the verifies of the requests in flight as one step, a segment of k + 1 rows each,
       sharing a budget of rows (decision 0028)
-- [ ] The drafters' steps of several sequences as one; a verify's stateful ops as one launch over the segments (a
-      step that keeps its inputs for rollback)
+- [x] A verify's stateful ops as one launch over the segments, each keeping its inputs for the truncate
+- [ ] The drafters' steps of several sequences as one (a draft program of every row's outputs; a block drafter's
+      attention within each segment's block)
 - [x] One launch over a batched step's segments for its stateful ops: the convolutions, the gated delta rule, the KV
       appends and decode attention, each segment reading and writing its sequence's cache in any format (decision 0028)
 - [ ] Prefix cache: hash-chained full blocks, refcounts, LRU; validity rule for sliding layers (DESIGN.md 9.4). Today

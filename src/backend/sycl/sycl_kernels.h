@@ -153,7 +153,19 @@ struct StateSegment {
     float* out = nullptr;
     int64_t first = 0;
     int64_t tokens = 0;
+    // A step a truncate may cut back inside: where each per-token input of the op goes in the sequence's slot (its
+    // replay, keep_segment_inputs); null otherwise.
+    float* keep[4] = {};
 };
+// The per-token inputs of a stateful op over `count` segments, copied in one launch to each segment's keep[t]: input t
+// is src[t] [T, row[t]].
+struct SegmentInputs {
+    const float* src[4] = {};
+    int64_t row[4] = {};
+    int count = 0;
+};
+void keep_segment_inputs(sycl::queue& q, const SegmentInputs& in, const StateSegment* segs, int64_t count,
+                         int64_t max_tokens);
 // causal_conv, dynamic_conv and gated_delta over `count` segments in one launch: `segs` in device memory, `max_tokens`
 // the most rows a segment has. gated_delta_segments returns false, launching nothing, for a shape it does not take
 // (Dk other than 64 or 128, Dv not a multiple of 16).

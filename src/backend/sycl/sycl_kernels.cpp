@@ -1958,6 +1958,20 @@ void causal_conv_segments(sycl::queue& q, const float* x, const float* w, const 
     });
 }
 
+void keep_segment_inputs(sycl::queue& q, const SegmentInputs& in, const StateSegment* segs, int64_t count,
+                         int64_t max_tokens) {
+    XS_CHECK(in.count >= 1 && in.count <= 4, "sycl keep_segment_inputs: ", in.count, " inputs");
+    const int64_t widest = *std::max_element(in.row, in.row + in.count);
+    const sycl::range<2> range(static_cast<size_t>(count * in.count), static_cast<size_t>(max_tokens * widest));
+    syclex::parallel_for(q, range, [=](sycl::item<2> it) {
+        const auto t = static_cast<int>(it[0] % static_cast<size_t>(in.count));
+        const StateSegment s = segs[it[0] / static_cast<size_t>(in.count)];
+        const auto e = static_cast<int64_t>(it[1]);
+        if (s.keep[t] == nullptr || e >= s.tokens * in.row[t]) return;
+        s.keep[t][e] = in.src[t][s.first * in.row[t] + e];
+    });
+}
+
 void append_kv_segments(sycl::queue& q, const float* k, const float* v, const KvSegment* segs, int64_t count,
                         int64_t max_tokens, int64_t row) {
     const sycl::range<2> range(static_cast<size_t>(count), static_cast<size_t>(max_tokens * row));

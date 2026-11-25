@@ -68,20 +68,22 @@ Speculating (`--spec`, the same requests; MTP's three drafts a round, DSpark's t
 
 | Model, drafter | N = 1 | N = 2 | N = 4 | N = 8 |
 |---|---|---|---|---|
-| Qwen3.8-27B, Q4_0 pack, its MTP head | 58.3 (60.2 decoding) | 78.5 in all, 44.7 each | 91.3 in all, 25.3 each | 103.6 in all, 14.1 each |
-| Inkling-2-Mini, AD-Q4_K, DSpark | 50.0 (54.7 decoding) | 60.6 in all, 32.8 each | 68.3 in all, 19.6 each | 84.8 in all, 12.8 each |
+| Qwen3.8-27B, Q4_0 pack, its MTP head | 58.2 (60.0 decoding) | 76.8 in all, 44.0 each | 92.2 in all, 25.3 each | 109.4 in all, 15.0 each |
+| Inkling-2-Mini, AD-Q4_K, DSpark | 50.1 (54.8 decoding) | 60.6 in all, 32.8 each | 69.7 in all, 20.2 each | 92.7 in all, 14.3 each |
 
-The dense model gains over plain batching at two and four requests (2.1 and 1.4 times) and loses 7 % at eight, where
-no draft fits and the verify's stateful ops still run a launch a segment (a step that keeps its inputs for rollback
-does). The mixture of experts loses from two requests on: each draft's row reads experts of its own.
+The dense model gains over plain batching at two and four requests (2.0 and 1.4 times) and loses 2 % at eight, where
+no draft fits. The mixture of experts loses 4 to 11 % from two requests on: each draft's row reads experts of its own.
+A verify's stateful ops run as one launch over the segments too, each segment keeping its inputs in its sequence's
+slot for the truncate (`StateSegment::keep`); with a launch a segment, eight requests gave 103.6 and 84.8.
 
 ## Consequences
 
 - No new flag: `--sequences N` now buys throughput, not only turns. Its KV cache is billed per sequence (0027), and
   the batch graph's step is billed at N tokens.
-- Speculating, the drafters still run a request at a time (a chain drafter's k runs, a block drafter's one), and a
-  verify's stateful ops a launch a segment (it keeps its inputs for rollback): both are next, then KV blocks shared
-  between sequences (a prefix cache across them, DESIGN.md 9.4).
+- Speculating, the drafters still run a request at a time (a chain drafter's k runs, a block drafter's one): one
+  draft program over the segments needs every row's outputs (a chain drafter's gives its last pair's) and, for a block
+  drafter, attention within each segment's block. Then KV blocks shared between sequences (a prefix cache across
+  them, DESIGN.md 9.4).
 - With several requests on a mixture of experts, speculation costs more than it gains: serve it without `--spec`.
 - A stateful op without a kernel over the segments still costs a launch a segment, its share of a step growing with
   N; none of the served models meets one in a batched decode at f16.

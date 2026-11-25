@@ -300,12 +300,12 @@ Speculating (`--spec`; MTP's three drafts a round, DSpark's two, fewer as more r
 
 | Model, drafter | N = 1 | N = 2 | N = 4 | N = 8 |
 |---|---|---|---|---|
-| Qwen3.8-27B, Q4_0 pack, its MTP head (`--spec mtp`) | 58.3 (60.2 decoding) | 78.5 in all, 44.7 each | 91.3 in all, 25.3 each | 103.6 in all, 14.1 each |
-| Inkling-2-Mini, AD-Q4_K, DSpark (`--spec dspark`) | 50.0 (54.7 decoding) | 60.6 in all, 32.8 each | 68.3 in all, 19.6 each | 84.8 in all, 12.8 each |
+| Qwen3.8-27B, Q4_0 pack, its MTP head (`--spec mtp`) | 58.2 (60.0 decoding) | 76.8 in all, 44.0 each | 92.2 in all, 25.3 each | 109.4 in all, 15.0 each |
+| Inkling-2-Mini, AD-Q4_K, DSpark (`--spec dspark`) | 50.1 (54.8 decoding) | 60.6 in all, 32.8 each | 69.7 in all, 20.2 each | 92.7 in all, 14.3 each |
 
-For the dense model speculation pays up to four requests (78.5 against 37.7 for two, 91.3 against 66.4 for four) and
-costs 7 % at eight; for the mixture of experts it costs from two requests on, so serve several users of Inkling-2-Mini
-without `--spec`.
+For the dense model speculation pays up to four requests (76.8 against 37.7 for two, 92.2 against 66.4 for four) and
+costs 2 % at eight; for the mixture of experts it costs 4 to 11 % from two requests on, so serve several users of
+Inkling-2-Mini without `--spec`.
 
 ## Language models
 
@@ -675,7 +675,7 @@ xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4 --kv-
 - Faster still on prose: a DFlash 2 drafter
   ([DFlash 2 and DSpine drafters](#dflash-2-and-dspine-drafters-for-qwen38-27b)).
 - Several users: `--sequences 8 --ctx 8192` decodes eight requests at once at 111.6 tok/s in all, 15.2 each, on the
-  Arc Pro B60 (the Q4_0 GGUF pack); with `--spec mtp` two or four users get more (78.5 and 91.3 tok/s in all, against
+  Arc Pro B60 (the Q4_0 GGUF pack); with `--spec mtp` two or four users get more (76.8 and 92.2 tok/s in all, against
   37.7 and 66.4), eight a little less ([Several requests at once](#several-requests-at-once)).
 - Its GGUF files, 6 to 23 GB: [Qwen3.8-27B GGUF](#qwen38-27b-gguf).
 
