@@ -226,6 +226,8 @@ constexpr int64_t kScoreCacheBytes = int64_t{4} << 20;
 // GEMV's grows with them (Arc Pro B60, Qwen3.8-27B q4 decode steps of 1 to 6 tokens: 44.7, 48.0, 52.4, 62.0, 68.5,
 // 78.1 ms; with it from 4 rows 56.0, 56.5, 56.8).
 constexpr int64_t kXmxGemvRows = 4;
+// The same for q8, whose GEMV keeps up with the matrix engines for a row less than q4's does.
+constexpr int64_t kXmxQ8Rows = 3;
 // The same for the GGUF block formats (gemv_block_xmx), whose GEMV costs more with every row than the q4 one.
 constexpr int64_t kXmxBlockRows = 2;
 // A step of up to this many tokens (a decode step, a speculative verify, a drafter's block) is profiled kind by kind
@@ -242,6 +244,7 @@ sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::Attent
     p.compute_units = attention.compute_units;
     if (attention.xmx && !p.f32 && gemv != "vector") {
         p.xmx_gemv_rows = gemv == "xmx" ? 1 : kXmxGemvRows;
+        p.xmx_q8_rows = gemv == "xmx" ? 1 : kXmxQ8Rows;
         p.xmx_block_rows = gemv == "xmx" ? 1 : kXmxBlockRows;
     }
     if (attention.xmx) {
@@ -2892,12 +2895,13 @@ private:
                     auto* grouping = pairs > sycl_be::kExpertPairsDirect
                                          ? static_cast<int32_t*>(get(sycl_be::expert_grouping_bytes(pairs, ws[0])))
                                          : nullptr;
+                    const int64_t xmx_units = quant_.xmx_block_rows > 0 ? quant_.compute_units : 0;
                     if (in_dt(2) == DType::I32) {
                         sycl_be::expert_matmul_quant(q_, in_f32(0), per_slot, w, reinterpret_cast<const int32_t*>(in_ptr(2)),
-                                                     out, is[0], is[1], ws[0], ws[1], ws[2], grouping);
+                                                     out, is[0], is[1], ws[0], ws[1], ws[2], grouping, xmx_units);
                     } else {
                         sycl_be::expert_matmul_quant(q_, in_f32(0), per_slot, w, reinterpret_cast<const int64_t*>(in_ptr(2)),
-                                                     out, is[0], is[1], ws[0], ws[1], ws[2], grouping);
+                                                     out, is[0], is[1], ws[0], ws[1], ws[2], grouping, xmx_units);
                     }
                     return;
                 }

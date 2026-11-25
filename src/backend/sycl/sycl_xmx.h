@@ -12,7 +12,11 @@
 namespace xs::sycl_be {
 
 typedef float float8_v __attribute__((ext_vector_type(8)));
+typedef float float4_v __attribute__((ext_vector_type(4)));
+typedef float float2_v __attribute__((ext_vector_type(2)));
 typedef short short8_v __attribute__((ext_vector_type(8)));
+typedef short short4_v __attribute__((ext_vector_type(4)));
+typedef short short2_v __attribute__((ext_vector_type(2)));
 typedef int int8_v __attribute__((ext_vector_type(8)));
 typedef int int2_v __attribute__((ext_vector_type(2)));
 typedef unsigned short ushort8_v __attribute__((ext_vector_type(8)));
@@ -25,6 +29,14 @@ typedef _Float16 h2_v __attribute__((ext_vector_type(2)));
 // acc + A (8 x 16 f16: lane l holds column l of each row) * B (16 x 16 f16: lane l holds column l, K in pairs).
 SYCL_EXTERNAL extern "C" xs::sycl_be::float8_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(
     xs::sycl_be::float8_v acc, xs::sycl_be::short8_v a, xs::sycl_be::int8_v b);
+// The same over 1, 2 or 4 rows of A.
+SYCL_EXTERNAL extern "C" float __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_1(float acc, short a, xs::sycl_be::int8_v b);
+SYCL_EXTERNAL extern "C" xs::sycl_be::float2_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_2(
+    xs::sycl_be::float2_v acc, xs::sycl_be::short2_v a, xs::sycl_be::int8_v b);
+SYCL_EXTERNAL extern "C" xs::sycl_be::float4_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_4(
+    xs::sycl_be::float4_v acc, xs::sycl_be::short4_v a, xs::sycl_be::int8_v b);
+// The sub-group's 16 consecutive 32-bit elements at p, lane l reading p[l], as one load.
+SYCL_EXTERNAL extern "C" unsigned __builtin_IB_simd_block_read_1_global(const unsigned* p);
 // An 8 x 16 tile of 16-bit elements at (coord.x, coord.y) of a surface (width and pitch in bytes, minus one), in the
 // DPAS A layout; elements past the surface read as zero.
 SYCL_EXTERNAL extern "C" xs::sycl_be::ushort8_v __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(
@@ -36,6 +48,20 @@ SYCL_EXTERNAL extern "C" xs::sycl_be::ushort32_v __builtin_IB_subgroup_block_rea
 inline xs::sycl_be::float8_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(xs::sycl_be::float8_v acc,
                                                                           xs::sycl_be::short8_v, xs::sycl_be::int8_v) {
     return acc;
+}
+inline float __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_1(float acc, short, xs::sycl_be::int8_v) {
+    return acc;
+}
+inline xs::sycl_be::float2_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_2(xs::sycl_be::float2_v acc,
+                                                                          xs::sycl_be::short2_v, xs::sycl_be::int8_v) {
+    return acc;
+}
+inline xs::sycl_be::float4_v __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_4(xs::sycl_be::float4_v acc,
+                                                                          xs::sycl_be::short4_v, xs::sycl_be::int8_v) {
+    return acc;
+}
+inline unsigned __builtin_IB_simd_block_read_1_global(const unsigned* p) {
+    return *p;
 }
 inline xs::sycl_be::ushort8_v __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(long, int, int, int,
                                                                                 xs::sycl_be::int2_v) {

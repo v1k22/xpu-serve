@@ -8,6 +8,7 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -46,11 +47,12 @@ struct Mode {
     std::string gemv;
 };
 
-// From how many rows a matmul reads x in f16 (the matrix-engine GEMVs: a pack's from four rows, the block formats'
-// from two, both from one with gemv=xmx; and past 8 rows, the GEMM).
+// From how many rows a matmul reads x in f16 (the matrix-engine GEMVs: a pack's q4 from four rows, its q8 from three,
+// the block formats' from two, all from one with gemv=xmx; and past 8 rows, the GEMM).
 int64_t f16_x_from(BlockFormat f, const Mode& mode) {
     if (mode.gemv == "vector") return 9;
     if (mode.gemv == "xmx") return 1;
+    if (f == BlockFormat::Q8_0) return 3;
     return pack_kernels(f) ? 4 : 2;
 }
 
@@ -87,7 +89,9 @@ TEST_SUITE("device ops") {
                     SessionOptions o = dev::options();
                     o.extra["block"] = mode.block;
                     o.extra["gemv"] = mode.gemv;
-                    for (const int64_t m : {1, 2, 3, 5, 8, 12, 70}) {
+                    // up to 8 rows the GEMVs, 9 to 64 the matrix engines' kernel over tiles of 8 rows (2 or 4 a
+                    // pass, 32 rows a pass), beyond the GEMM
+                    for (const int64_t m : {1, 2, 3, 5, 8, 9, 12, 16, 32, 38, 64, 70}) {
                         CAPTURE(m);
                         const HostTensor x = rng.uniform(DType::F32, {m, k});
                         Graph g;
@@ -161,16 +165,21 @@ TEST_SUITE("device ops") {
                 w.add_block("bank", f, {experts, n, k}, blocks(f, {experts, n, k}, 31));
                 const Tensor64 w64 = to_f64(w.tensor("bank"));
                 const double scale = max_abs(w64) * std::sqrt(static_cast<double>(k));
-                for (const std::string& mode : {"auto", "f16"}) {
-                    CAPTURE(mode);
+                for (const Mode& mode : {Mode{"auto", "auto"}, Mode{"f16", "auto"}, Mode{"auto", "vector"}}) {
+                    CAPTURE(mode.block);
+                    CAPTURE(mode.gemv);
                     SessionOptions o = dev::options();
-                    o.extra["block"] = mode;
-                    // 6 pairs: a GEMV each; 80: grouped by expert; 280: a GEMM per expert
-                    for (const int64_t tokens : {3, 40, 140}) {
-                        CAPTURE(tokens);
+                    o.extra["block"] = mode.block;
+                    o.extra["gemv"] = mode.gemv;
+                    // up to 64 pairs: an expert's pairs as the rows of a GEMV on the matrix engines, 1, 2 or 4 at a
+                    // time by the tokens (-3: every pair on one expert, more than the rows of a GEMV), or with
+                    // gemv=vector a GEMV a pair; 80: grouped by expert; 280: a GEMM per expert
+                    for (const int64_t step : {1, 2, 3, -3, 8, 40, 140}) {
+                        CAPTURE(step);
+                        const int64_t tokens = std::abs(step);
                         std::vector<int32_t> idx;
                         for (int64_t i = 0; i < tokens * slots; ++i)
-                            idx.push_back(static_cast<int32_t>((i * 3 + 1 + i / 7) % experts));
+                            idx.push_back(static_cast<int32_t>(step < 0 ? 2 : (i * 3 + 1 + i / 7) % experts));
                         idx[1] = static_cast<int32_t>(experts + 2);  // outside the bank: expert 0
                         std::vector<int64_t> idx64(idx.begin(), idx.end());
                         idx64[1] = 0;
@@ -184,9 +193,10 @@ TEST_SUITE("device ops") {
                         const TensorMap out =
                             dev::run(g, w, {{"idx", test::make_tensor(DType::I32, {tokens, slots}, idx)}, {"x2", x2},
                                             {"x3", x3}}, o);
-                        // the GEMVs read the exact values and x in f32; a GEMM, or block=f16, the weight rounded to
-                        // the session's precision
-                        const bool exact = mode == "auto" && tokens * slots < 256;
+                        // the GEMVs read the exact values, and but for the one on the matrix engines x in f32; a
+                        // GEMM, or block=f16, the weight rounded to the session's precision
+                        const bool f16_x = mode.gemv == "auto" && tokens * slots <= 64 && !pack_kernels(f);
+                        const bool exact = mode.block == "auto" && tokens * slots < 256 && !f16_x;
                         const dev::Tolerance tol = exact ? dev::Tolerance{2e-5 * scale, 2e-5}
                                                          : dev::tolerance({2e-5 * scale, 2e-5}, {3e-3 * scale, 3e-3});
                         CHECK(dev::close(str_cat("expert_matmul ", block_format_name(f)), out.at("shared"),

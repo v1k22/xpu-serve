@@ -382,11 +382,15 @@ void quant_dispatch(const QuantWeight& w, F&& f) {
     }
 }
 bool quant_gemv_parts_match(const QuantWeight& a, const QuantWeight& b);
+// Under this many output rows in all (and a K of at least two lane strides a sub-group) the sub-groups of a
+// work-group split K instead of taking rows of their own, which would leave most of the device idle.
+inline constexpr int64_t kQuantSplitRows = 512;
 void gemv_quant_parts(sycl::queue& q, const float* x, const QuantGemvPart* parts, int count, int64_t m, int64_t k);
 // The same on the matrix engines (sycl_quant_gemm.cpp; needs xmx_device): streaming the weight costs about the same
-// at any M up to kGemvMaxRows, where the GEMV's arithmetic grows with M (it stays ahead at one or two rows). Q4 parts
-// of one group size (32, 64 or 128) and AWQ-ness, N a multiple of 16 and K of 256 (gemv_quant_xmx_fits). `scratch`
-// (gemv_quant_xmx_scratch bytes, 64-byte aligned) holds x in f16 and its group sums while the launch runs.
+// at any M up to kGemvMaxRows, where the GEMV's arithmetic grows with M (it stays ahead at one or two rows). Parts
+// all q4 or all q8, of one group size (32, 64 or 128) and AWQ-ness, N a multiple of 16 and K of 256
+// (gemv_quant_xmx_fits). `scratch` (gemv_quant_xmx_scratch bytes, 64-byte aligned) holds x in f16 and its group sums
+// while the launch runs.
 bool gemv_quant_xmx_fits(const QuantGemvPart* parts, int count, int64_t k);
 size_t gemv_quant_xmx_scratch(const QuantGemvPart* parts, int count, int64_t m, int64_t k);
 void gemv_quant_xmx(sycl::queue& q, const float* x, const QuantGemvPart* parts, int count, int64_t m, int64_t k,
@@ -419,11 +423,13 @@ void quant_gemm_tiled(sycl::queue& q, const half* x, const QuantWeight& w, Y* y,
                       bool add = false);
 // ExpertMatMul over a quantized expert bank (rows = E * N of K columns; a pack's q8 / q4, or a GGUF block format
 // through expert_matmul_block): out [T, S, N], x [T, K] or (per_slot) [T, S, K], expert ids outside [0, E) read
-// expert 0. Up to kExpertPairsDirect (token, slot) pairs run one GEMV each;
-// more are grouped by expert on the device in `grouping` (expert_grouping_bytes) so an expert's rows are read once
-// per kGemvMaxRows of its pairs. The direct path covers a speculative verify (up to kGemvMaxRows tokens with eight
-// experts each): its tokens share few experts, and the grouped path's 8-row GEMV streams a weight at well under half
-// the one-row GEMV's rate.
+// expert 0. Up to kExpertPairsDirect (token, slot) pairs run in one launch with no grouping pass before it: a GEMV
+// each, or for a block format on the matrix engines (`xmx_units`: the device's compute units, 0 without them or in
+// f32 precision) a GEMV per expert over its pairs, up to four at a time, x read in f16. More pairs are grouped by
+// expert on the device in `grouping` (expert_grouping_bytes) so an expert's rows are read once per kGemvMaxRows of
+// its pairs. The direct path covers a decode step of several requests and a speculative verify (up to kGemvMaxRows
+// tokens with eight experts each): the grouped path's 8-row GEMV streams a weight at well under half the one-row
+// GEMV's rate.
 inline constexpr int64_t kExpertPairsDirect = 64;
 size_t expert_grouping_bytes(int64_t pairs, int64_t experts);
 // The expert pair `pair` reads: its id, or 0 when that is outside [0, E).
@@ -449,7 +455,8 @@ void expert_gather_rows(sycl::queue& q, const float* x, bool per_slot, int64_t s
 void expert_scatter_rows(sycl::queue& q, const float* rows, const int32_t* order, int64_t pairs, int64_t n, float* out);
 template <typename I>
 void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const QuantWeight& w, const I* idx, float* out,
-                         int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping);
+                         int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping,
+                         int64_t xmx_units);
 // out [N, K] = dequant(w) as f16 or f32, for the GEMM path.
 template <typename T>
 void dequantize(sycl::queue& q, const QuantWeight& w, T* out, int64_t n, int64_t k);

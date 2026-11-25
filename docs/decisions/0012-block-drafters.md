@@ -39,8 +39,8 @@ checkpoint was trained for.
   its whole block. A block that sees itself whole (DFlash, DFlash 2) then sees fewer rows: z-lab's own generation loop
   does the same when it is given a block below the checkpoint's (`dflash_generate(block_size=...)`), so the
   references still apply (`block_drafter_reference.py --block-size`). Rows past the drafts cost the drafter's layers
-  and its head, and past 8 rows the head leaves the GEMV: with a GGUF target whose head is Q6_K that is the whole head
-  dequantized for a GEMM every round.
+  and its head, and past 8 rows the head leaves the GEMV: with a GGUF target whose head is Q6_K that was the whole head
+  dequantized for a GEMM every round, until 9 to 64 rows got a kernel of their own (gemm_block_xmx, 2026-11-25).
 - **Each layer's attention is its own** (2026-11-15), as z-lab's `Qwen3DFlashAttention` reads `layer_types`: a
   sliding layer sees a window of keys and is causal unless `is_causal` says otherwise, a full layer sees every key,
   the rest of its block included. Ornith-1.5-35B-A3B's DFlash drafter has five sliding causal layers under a full one;

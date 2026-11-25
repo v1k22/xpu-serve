@@ -116,16 +116,21 @@ template void matmul_half_y<float>(sycl::queue&, Scratch&, const float*, const h
 template void matmul_half_y<half>(sycl::queue&, Scratch&, const half*, const half*, half*, int64_t, int64_t, int64_t);
 
 bool xmx_gemv(int64_t m, const QuantGemvPart* parts, int count, int64_t k, const QuantMatmulPlan& plan) {
-    return !plan.f32 && plan.xmx_gemv_rows > 0 && m >= plan.xmx_gemv_rows && m <= kGemvMaxRows &&
-           gemv_quant_xmx_fits(parts, count, k);
+    const int64_t from = parts[0].w.q4 ? plan.xmx_gemv_rows : plan.xmx_q8_rows;
+    if (plan.f32 || from <= 0 || m < from || m > kGemvMaxRows || !gemv_quant_xmx_fits(parts, count, k)) return false;
+    // Few output rows give the matrix-engine kernel few work-groups, where the GEMV splits K between its sub-groups
+    // (kQuantSplitRows) and stays ahead. gemv=xmx, from one row, takes it wherever it fits.
+    int64_t rows = 0;
+    for (int j = 0; j < count; ++j)
+        rows += parts[j].n;
+    return rows >= kQuantSplitRows || from == 1;
 }
 
 QuantPath quant_path(int64_t m, int64_t n, int64_t k, const QuantWeight& w, const QuantMatmulPlan& plan) {
     if (w.block != nullptr) {
-        if (m > kGemvMaxRows) return QuantPath::Dequant;
-        const bool xmx = !plan.f32 && plan.xmx_block_rows > 0 && m >= plan.xmx_block_rows &&
-                         gemv_block_xmx_fits(*w.block, k);
-        return xmx ? QuantPath::GemvXmx : QuantPath::Gemv;
+        const bool fits = !plan.f32 && gemv_block_xmx_fits(*w.block, k);
+        if (m > kGemvMaxRows) return fits && m <= plan.few_rows ? QuantPath::FewRows : QuantPath::Dequant;
+        return fits && plan.xmx_block_rows > 0 && m >= plan.xmx_block_rows ? QuantPath::GemvXmx : QuantPath::Gemv;
     }
     if (m <= kGemvMaxRows) {
         const QuantGemvPart part{w, nullptr, n};
@@ -195,7 +200,11 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeigh
     }
     switch (path) {
         case QuantPath::FewRows:
-            quant_gemm(q, xh, w, y, m, n, k, quant_gemm_slices(n, k, plan.compute_units), add);
+            if (w.block != nullptr) {
+                gemm_block_xmx(q, xh, *w.block, y, m, n, k, plan.compute_units, add);
+            } else {
+                quant_gemm(q, xh, w, y, m, n, k, quant_gemm_slices(n, k, plan.compute_units), add);
+            }
             return;
         case QuantPath::Tiled:
             quant_gemm_tiled(q, xh, w, y, m, n, k, add);

@@ -771,10 +771,11 @@ inline float q4_unit(uint32_t word, int j) {  // 1 + (nibble j of word) / 16
     return sycl::bit_cast<float>((m & 0x00780000u) | 0x3F800000u);
 }
 
-// acc[r][m] += dequant(row rows[r] of w) . xs[m] over this lane's chunks.
+// acc[r][m] += dequant(row rows[r] of w) . xs[m] over this lane's chunks of columns [k_lo, k_hi) of the K = k (k_lo
+// a whole number of chunks).
 template <bool Q4, bool AWQ, int M, int R, int CB>
 inline void quant_rows_dot(const QuantWeight& w, const int64_t (&rows)[R], const float* const (&xs)[M], int lane,
-                           int64_t k, float (&acc)[R][M]) {
+                           int64_t k, int64_t k_lo, int64_t k_hi, float (&acc)[R][M]) {
     constexpr int kWords = CB / 4;
     constexpr int kChunk = Q4 ? 2 * CB : CB;
     const int64_t groups = k / w.group;
@@ -784,7 +785,7 @@ inline void quant_rows_dot(const QuantWeight& w, const int64_t (&rows)[R], const
     const auto group = static_cast<int32_t>(w.group);
     const bool pow2 = (group & (group - 1)) == 0;
     const int shift = sycl::ctz(group);
-    for (int64_t k0 = static_cast<int64_t>(lane) * kChunk; k0 < k; k0 += kSubGroup * kChunk) {
+    for (int64_t k0 = k_lo + static_cast<int64_t>(lane) * kChunk; k0 < k_hi; k0 += kSubGroup * kChunk) {
         const int64_t g = pow2 ? static_cast<int32_t>(k0) >> shift : static_cast<int32_t>(k0) / group;
         float wv[R][kChunk];
         float s[R];
@@ -844,48 +845,80 @@ struct QuantParts {
     int count = 0;
 };
 
+// Under kQuantSplitRows rows in all a work-group takes R rows, its sub-groups split K (in whole strides of the lanes)
+// and add up in local memory, as gemv_t does.
 template <bool Q4, bool AWQ, int M>
 void gemv_quant_t(sycl::queue& q, const float* x, QuantParts parts, int64_t k) {
     using Shape = QuantGemvShape<Q4, M, AWQ>;
     constexpr int R = Shape::kRows;
+    constexpr int kStride = kSubGroup * (Q4 ? 2 : 1) * Shape::kBytes;
+    int64_t rows = 0;
+    for (int j = 0; j < parts.count; ++j)
+        rows += parts.n[j];
+    const bool split = rows < kQuantSplitRows && k >= 2 * kQSgPerWg * kStride;
+    const int64_t wg_rows = split ? R : kQSgPerWg * R;
+    const int64_t k_slice = split ? ceil_div(ceil_div(k, kQSgPerWg), kStride) * kStride : k;
     for (int j = 0; j < kQuantGemvParts; ++j)
-        parts.wg_begin[j + 1] = parts.wg_begin[j] + (j < parts.count ? ceil_div(parts.n[j], kQSgPerWg * R) : 0);
+        parts.wg_begin[j + 1] = parts.wg_begin[j] + (j < parts.count ? ceil_div(parts.n[j], wg_rows) : 0);
     const int64_t wgs = parts.wg_begin[parts.count];
-    syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(wgs * kQSgPerWg * kSubGroup), kQSgPerWg * kSubGroup),
-                      [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int lane = static_cast<int>(sg.get_local_linear_id());
-        const auto wg = static_cast<int64_t>(it.get_group(0));
-        int part = 0;  // uniform across the work-group; selected without indexing the argument arrays
-        for (int j = 1; j < kQuantGemvParts; ++j)
-            part += j < parts.count && wg >= parts.wg_begin[j] ? 1 : 0;
-        QuantWeight w = parts.w[0];
-        float* y = parts.y[0];
-        int64_t n = parts.n[0];
-        int64_t begin = 0;
-        for (int j = 1; j < kQuantGemvParts; ++j) {
-            if (part == j) {
-                w = parts.w[j];
-                y = parts.y[j];
-                n = parts.n[j];
-                begin = parts.wg_begin[j];
+    syclex::submit(q, [&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> partial(sycl::range<1>(split ? kQSgPerWg * R * M : 1), h);
+        syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(wgs * kQSgPerWg * kSubGroup),
+                                               kQSgPerWg * kSubGroup),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSubGroup)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = static_cast<int>(sg.get_local_linear_id());
+            const int sgid = static_cast<int>(sg.get_group_linear_id());
+            const auto wg = static_cast<int64_t>(it.get_group(0));
+            int part = 0;  // uniform across the work-group; selected without indexing the argument arrays
+            for (int j = 1; j < kQuantGemvParts; ++j)
+                part += j < parts.count && wg >= parts.wg_begin[j] ? 1 : 0;
+            QuantWeight w = parts.w[0];
+            float* y = parts.y[0];
+            int64_t n = parts.n[0];
+            int64_t begin = 0;
+            for (int j = 1; j < kQuantGemvParts; ++j) {
+                if (part == j) {
+                    w = parts.w[j];
+                    y = parts.y[j];
+                    n = parts.n[j];
+                    begin = parts.wg_begin[j];
+                }
             }
-        }
-        const int64_t row0 = ((wg - begin) * kQSgPerWg + sg.get_group_linear_id()) * R;
-        int64_t rows[R];
-        for (int r = 0; r < R; ++r)
-            rows[r] = std::min<int64_t>(row0 + r, n - 1);
-        const float* xs[M];
-        for (int mm = 0; mm < M; ++mm)
-            xs[mm] = x + mm * k;
-        float acc[R][M] = {};
-        quant_rows_dot<Q4, AWQ, M, R, Shape::kBytes>(w, rows, xs, lane, k, acc);
-        for (int r = 0; r < R; ++r) {
-            for (int mm = 0; mm < M; ++mm) {
-                const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
-                if (lane == 0 && row0 + r < n) y[mm * n + row0 + r] = sum;
+            const int64_t row0 = split ? (wg - begin) * R : ((wg - begin) * kQSgPerWg + sgid) * R;
+            const int64_t k_lo = split ? std::min(k, sgid * k_slice) : 0;
+            const int64_t k_hi = std::min(k, k_lo + k_slice);
+            int64_t rows[R];
+            for (int r = 0; r < R; ++r)
+                rows[r] = std::min<int64_t>(row0 + r, n - 1);
+            const float* xs[M];
+            for (int mm = 0; mm < M; ++mm)
+                xs[mm] = x + mm * k;
+            float acc[R][M] = {};
+            quant_rows_dot<Q4, AWQ, M, R, Shape::kBytes>(w, rows, xs, lane, k, k_lo, k_hi, acc);
+            for (int r = 0; r < R; ++r) {
+                for (int mm = 0; mm < M; ++mm) {
+                    const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
+                    if (lane != 0) continue;
+                    if (split) {
+                        partial[(sgid * R + r) * M + mm] = sum;
+                    } else if (row0 + r < n) {
+                        y[mm * n + row0 + r] = sum;
+                    }
+                }
             }
-        }
+            if (split) {
+                sycl::group_barrier(it.get_group());
+                if (sgid == 0 && lane < R * M) {  // a lane per (row, input): R * M <= 16
+                    const int r = lane / M;
+                    const int mm = lane % M;
+                    float sum = 0.0f;
+                    for (int j = 0; j < kQSgPerWg; ++j)
+                        sum += partial[(j * R + r) * M + mm];
+                    if (row0 + r < n) y[mm * n + row0 + r] = sum;
+                }
+            }
+        });
     });
 }
 
@@ -925,7 +958,7 @@ void expert_quant_pairs_t(sycl::queue& q, const float* x, bool per_slot, QuantWe
             rows[r] = base + std::min<int64_t>(row0 + r, n - 1);
         const float* const xs[1] = {x + (per_slot ? p : p / slots) * k};
         float acc[kQRows][1] = {};
-        quant_rows_dot<Q4, AWQ, 1, kQRows, Shape::kBytes>(w, rows, xs, lane, k, acc);
+        quant_rows_dot<Q4, AWQ, 1, kQRows, Shape::kBytes>(w, rows, xs, lane, k, 0, k, acc);
         for (int r = 0; r < kQRows; ++r) {
             const float sum = sycl::reduce_over_group(sg, acc[r][0], sycl::plus<float>());
             if (lane == 0 && row0 + r < n) out[p * n + row0 + r] = sum;
@@ -1013,7 +1046,7 @@ void expert_quant_grouped_t(sycl::queue& q, const float* x, bool per_slot, Quant
                 xs[mm] = x + (per_slot ? ps[mm] : ps[mm] / slots) * k;
             }
             float acc[kQRows][M] = {};
-            quant_rows_dot<Q4, AWQ, M, kQRows, Shape::kBytes>(w, rows, xs, lane, k, acc);
+            quant_rows_dot<Q4, AWQ, M, kQRows, Shape::kBytes>(w, rows, xs, lane, k, 0, k, acc);
             for (int r = 0; r < kQRows; ++r) {
                 for (int mm = 0; mm < M; ++mm) {
                     const float sum = sycl::reduce_over_group(sg, acc[r][mm], sycl::plus<float>());
@@ -2121,9 +2154,11 @@ size_t expert_grouping_bytes(int64_t pairs, int64_t experts) {
 
 template <typename I>
 void expert_matmul_quant(sycl::queue& q, const float* x, bool per_slot, const QuantWeight& w, const I* idx, float* out,
-                         int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping) {
+                         int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping,
+                         int64_t xmx_units) {
     if (w.block != nullptr) {
-        return expert_matmul_block(q, x, per_slot, *w.block, idx, out, tokens, slots, experts, n, k, grouping);
+        return expert_matmul_block(q, x, per_slot, *w.block, idx, out, tokens, slots, experts, n, k, grouping,
+                                   xmx_units);
     }
     const int64_t pairs = tokens * slots;
     if (pairs <= kExpertPairsDirect || grouping == nullptr) {
@@ -2171,9 +2206,9 @@ template void expert_gather_rows<float>(sycl::queue&, const float*, bool, int64_
                                         float*);
 
 template void expert_matmul_quant<int32_t>(sycl::queue&, const float*, bool, const QuantWeight&, const int32_t*, float*,
-                                           int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*);
+                                           int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*, int64_t);
 template void expert_matmul_quant<int64_t>(sycl::queue&, const float*, bool, const QuantWeight&, const int64_t*, float*,
-                                           int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*);
+                                           int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*, int64_t);
 
 void attention_combine(sycl::queue& q, const float* part, float* out, int64_t rows, int64_t split, int64_t head_dim) {
     const int64_t d_n = head_dim;
