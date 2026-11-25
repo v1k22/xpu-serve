@@ -24,6 +24,8 @@ struct TinyInkling2 {
     int64_t experts = 4, experts_per_token = 2, expert_width = 8, gate_rank = 2, block_layers = 2;
     int64_t layers = 8, loop_start = 2, loop_end = 6, passes = 2;
     std::vector<bool> sliding{true, true, true, true, true, false, true, true};
+    // The loop's message gates: F32, Q8_0 blocks (as AtomicChat's files store them), or F32 of what those blocks hold.
+    enum class Gates { F32, Q8_0, Q8_0Values } gates = Gates::F32;
 };
 
 // Deterministic values of the tensor a checkpoint names `name`, in its own order: small, so the model stays finite.
@@ -176,11 +178,21 @@ inline GgufWriter tiny_inkling2_gguf(bool mainline, const TinyInkling2& m = {}) 
         put(B + "ffn_gate_up_exps.weight", {m.experts, 2 * m.expert_width, h}, L + "mlp.experts.w13_weight");
         put(B + "ffn_down_exps.weight", {m.experts, h, m.expert_width}, L + "mlp.experts.w2_weight");
         if (i < m.loop_start || i >= m.loop_end) continue;
+        const auto put_gate = [&](const std::string& file, const Dims& stored, const std::string& name) {
+            if (m.gates == TinyInkling2::Gates::F32) return put(file, stored, name);
+            std::vector<float> v = tiny_inkling2_values(name, numel(stored), 0.0f, 0.3f), decoded(v.size());
+            const std::string blocks = encode_q8_0(v.data(), numel(stored), decoded.data());
+            if (m.gates == TinyInkling2::Gates::Q8_0) {
+                w.tensor(file, {stored[1], stored[0]}, kGgmlQ8_0, blocks);
+            } else {
+                w.f32_tensor(file, {stored[1], stored[0]}, decoded);
+            }
+        };
         for (size_t g = 0; g < gates.size(); ++g) {
             const std::string C = L + "controllers." + checkpoint_gates[g] + ".";
-            put(B + "loop_" + gates[g] + "down.weight", {m.gate_rank, 2 * h}, C + "down_weight");
-            put(B + "loop_" + gates[g] + "forget.weight", {h, m.gate_rank}, C + "forget_weight");
-            put(B + "loop_" + gates[g] + "gain.weight", {h, m.gate_rank}, C + "gain_weight");
+            put_gate(B + "loop_" + gates[g] + "down.weight", {m.gate_rank, 2 * h}, C + "down_weight");
+            put_gate(B + "loop_" + gates[g] + "forget.weight", {h, m.gate_rank}, C + "forget_weight");
+            put_gate(B + "loop_" + gates[g] + "gain.weight", {h, m.gate_rank}, C + "gain_weight");
         }
         if (mainline) {  // the layer's queries of its query, key, value and MLP messages
             const int64_t j = i - m.loop_start;

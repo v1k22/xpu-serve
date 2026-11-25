@@ -47,3 +47,21 @@ TEST_CASE("tiny inkling2 GGUF: Unsloth's layout and mainline llama.cpp's import 
     test::import_into(work.path / "swapped.gguf", work.path / "s");
     CHECK(test::relative_gap(test::step_logits(*load_model(work.path / "s"), prompt, {11, 12}), reference) > 1e-3);
 }
+
+TEST_CASE("tiny inkling2 GGUF: the loop's message gates as Q8_0 blocks, as AtomicChat's files hold them, run") {
+    const test::TempDir work("xs_gguf_inkling2_q8_gates");
+    fs::create_directories(work.path);
+    test::TinyInkling2 m;
+    m.gate_rank = 32;  // a row of whole blocks
+    m.gates = test::TinyInkling2::Gates::Q8_0Values;
+    test::tiny_inkling2_gguf(true, m).write(work.path / "f32.gguf");
+    m.gates = test::TinyInkling2::Gates::Q8_0;
+    test::tiny_inkling2_gguf(true, m).write(work.path / "q8.gguf");
+    test::import_into(work.path / "f32.gguf", work.path / "f");
+    test::import_into(work.path / "q8.gguf", work.path / "q");
+    const std::vector<int32_t> prompt = {5, 77, 266, 3, 40, 9, 120};
+    const auto reference = test::step_logits(*load_model(work.path / "f"), prompt, {11, 12});
+    const double gap = test::relative_gap(test::step_logits(*load_model(work.path / "q"), prompt, {11, 12}), reference);
+    MESSAGE("Q8_0 gates against F32 of their values: largest difference " << gap << " of the largest logit");
+    CHECK(gap < 1e-5);
+}

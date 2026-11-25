@@ -219,15 +219,24 @@ void SafetensorsWeights::join_rows(const std::string& name, const std::vector<st
     XS_CHECK(shape.size() >= 2 && !parts.empty(), "join_rows: '", name, "' needs parts and at least 2 dims");
     const int64_t cols = shape.back();
     DType dtype = DType::F8;
+    BlockFormat block = BlockFormat::Q4_0;
     int64_t rows = 0;
+    // A part's format: its dtype, and a block format's name.
+    const auto format = [](DType d, BlockFormat b) {
+        return d == DType::Block ? std::string(block_format_name(b)) : std::string(dtype_name(d));
+    };
     for (const std::string& part : parts) {
         const TensorView* v = find(part);
         if (v == nullptr) fail("join_rows: '", part, "', a part of '", name, "', is missing");
-        if (&part == &parts.front()) dtype = v->dtype;
-        if (v->dtype != dtype || (dtype != DType::F8 && !is_float(dtype))) {
-            fail("join_rows: '", part, "', a part of '", name, "', is ", dtype_name(v->dtype),
-                 "; the parts of a weight are all fp8, or all floats of one dtype (the first is ", dtype_name(dtype),
-                 ")");
+        if (&part == &parts.front()) {
+            dtype = v->dtype;
+            block = v->block;
+        }
+        const bool same = v->dtype == dtype && (dtype != DType::Block || v->block == block);
+        if (!same || (dtype != DType::F8 && dtype != DType::Block && !is_float(dtype))) {
+            fail("join_rows: '", part, "', a part of '", name, "', is ", format(v->dtype, v->block),
+                 "; the parts of a weight are all fp8, all of one block format, or all floats of one dtype (the ",
+                 "first is ", format(dtype, block), ")");
         }
         XS_CHECK(v->shape.size() >= 2 && v->shape.back() == cols, "join_rows: '", part, "' ",
                  dims_to_string(v->shape), " does not have the ", cols, " columns of '", name, "'");
@@ -237,6 +246,7 @@ void SafetensorsWeights::join_rows(const std::string& name, const std::vector<st
              ", not the shape ", dims_to_string(shape));
     TensorView joined;
     joined.dtype = dtype;
+    joined.block = block;
     joined.shape = std::move(shape);
     if (dtype == DType::F8) {
         std::vector<Fp8Run> runs;

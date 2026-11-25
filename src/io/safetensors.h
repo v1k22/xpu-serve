@@ -68,7 +68,7 @@ public:
     // Shows the matrices `parts` (the same number of columns each) as one weight `name` of `shape`, whose matrix is
     // their rows one after another, and drops their own names: for a checkpoint that stores in pieces what the model
     // reads as one tensor (an expert bank, expert by expert). F8 parts are shown where they are; float parts of one
-    // dtype are copied into a buffer the store keeps.
+    // dtype, and parts of one block format (whose rows are whole blocks), are copied into a buffer the store keeps.
     void join_rows(const std::string& name, const std::vector<std::string>& parts, Dims shape);
 
     // Shows `name`, F8_E4M3 codes [..., cols] of an MXFP8 weight, as one F8 weight with the powers of two of
@@ -94,7 +94,7 @@ private:
     // F4 weights: the views and the runs they point at.
     std::map<std::string, TensorView> fp4_views_;
     std::map<std::string, std::vector<Fp4Run>> fp4_runs_;
-    // Float weights join_rows copied together.
+    // Float and block weights join_rows copied together.
     std::map<std::string, TensorView> joined_views_;
     std::vector<std::unique_ptr<char[]>> joined_data_;
     bool is_pack_ = false;
