@@ -128,7 +128,8 @@ TEST_CASE("anthropic format: a stream of blocks, each opened, filled and closed 
     text.content = "Hi";
     more.content = " there";
     call.tool_calls.push_back({"call_1", "look", R"({"q":1})"});
-    std::string stream = f->opening() + f->delta(think) + f->delta(text) + f->delta(more) + f->delta(call);
+    std::string stream = f->opening();  // one call after another: the order of a + b's operands is unspecified
+    for (const auto* d : {&think, &text, &more, &call}) stream += f->delta(*d);
     xs::server::GenerationOutcome o;
     o.result.finish = xs::FinishReason::Stop;
     o.result.stats.prompt_tokens = 12;
