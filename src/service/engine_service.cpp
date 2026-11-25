@@ -40,9 +40,12 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     int spec_k = options.engine.spec_k;
     const bool block_drafter = options.spec == "dflash" || options.spec == "dspine";
     if (own_count) spec_k = options.spec == "dspark" ? kDsparkDrafts : block_drafter ? kBlockDrafts : kChainDrafts;
+    // Several requests in flight decode a step together, unless they speculate (rounds of their own).
+    const bool batch = options.engine.sequences > 1 && !speculate;
     auto model = load_model(model_dir, LoadOptions{.vision = options.vision,
                                                    .image_max_pixels = options.image_max_pixels,
                                                    .speculation = speculate,
+                                                   .batch = batch,
                                                    .drafter = options.drafter,
                                                    .draft_shortlist = options.draft_shortlist,
                                                    .drafts = spec_k});
@@ -93,6 +96,17 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
         session_options.rewind_tokens = engine_options.spec_k + 1;
         log::info("speculative decoding: ", name, ", ", engine_options.spec_k, " drafts per round, drafter graph of ",
                   spec->draft_graph().nodes().size(), " nodes");
+        if (engine_options.sequences > 1) {
+            log::info("speculating, the ", engine_options.sequences, " requests in flight decode a round each in turn");
+        }
+    }
+    // Batching, the session also runs the batch graph (kBatchProgram) over the decode tokens of every sequence.
+    if (const graph::Graph* g = model->batch_graph()) {
+        programs.push_back(g);
+        engine_options.batch = true;
+        log::info("the decode steps of up to ", engine_options.sequences, " requests in flight run as one");
+    } else if (batch) {
+        log::info(info.id, " has no batch graph: the ", engine_options.sequences, " requests in flight decode in turn");
     }
     auto backend = make_backend(options.backend);
     // The media encoders first: what they hold of the device is then part of the bill the decoder's session checks.
@@ -119,10 +133,11 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     }
     // The cache of the whole context and the largest steps reserved at load: --ctx is refused now, not halfway into
     // a long prompt. Speculating, prefill chunks run the prefill program and verifies the verify program
-    // (spec::Program); a drafter's own steps are small.
+    // (spec::Program); a drafter's own steps are small. Batching, a batch step is a token of each sequence.
     const int64_t chunk = engine_options.prefill_chunk;
-    session_options.max_step_tokens =
-        speculate ? std::vector<int64_t>{0, chunk, engine_options.spec_k + 1, 0} : std::vector<int64_t>{chunk};
+    session_options.max_step_tokens = {chunk};
+    if (speculate) session_options.max_step_tokens = {0, chunk, engine_options.spec_k + 1, 0};
+    if (engine_options.batch) session_options.max_step_tokens.push_back(engine_options.sequences);
     Timer compile_timer;
     std::unique_ptr<Session> session;
     try {
@@ -313,20 +328,33 @@ void EngineService::worker_loop() {
             had[k] = has;
         }
         const int k = side[0].empty() ? 1 : side[1].empty() ? 0 : spent[1] <= spent[0] ? 1 : 0;
-        const size_t at = side[k][turn[k]++ % side[k].size()];
-        InFlight& f = active[at];
+        // A turn: one request's step, or with batching one step of every request that decodes.
+        std::vector<size_t> turn_of{side[k][turn[k]++ % side[k].size()]};
+        if (k == 1 && engine_->options().batch) turn_of = side[1];
         // Anything a request throws past the engine (which turns its errors into a result) reaches its caller,
         // rather than ending the process from this thread.
-        bool done = true;
+        std::vector<bool> done(turn_of.size(), true);
         Timer timer;
         try {
-            done = engine_->advance(f.handle);
-            if (done) f.job->done.set_value(engine_->finish(f.handle));
+            std::vector<Engine::Handle> handles;
+            for (const size_t at : turn_of) handles.push_back(active[at].handle);
+            done = k == 1 ? engine_->advance_decoding(handles) : std::vector<bool>{engine_->advance(handles[0])};
+            for (size_t j = 0; j < turn_of.size(); ++j) {
+                if (done[j]) active[turn_of[j]].job->done.set_value(engine_->finish(active[turn_of[j]].handle));
+            }
         } catch (...) {
-            f.job->done.set_exception(std::current_exception());
+            for (const size_t at : turn_of) {
+                try {
+                    active[at].job->done.set_exception(std::current_exception());
+                } catch (const std::future_error&) {  // its result was already set
+                }
+            }
+            std::fill(done.begin(), done.end(), true);
         }
         spent[k] += timer.elapsed_ms();
-        if (done) active.erase(active.begin() + static_cast<std::ptrdiff_t>(at));
+        for (size_t j = turn_of.size(); j-- > 0;) {
+            if (done[j]) active.erase(active.begin() + static_cast<std::ptrdiff_t>(turn_of[j]));
+        }
     }
 }
 

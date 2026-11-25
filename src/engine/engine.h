@@ -27,7 +27,13 @@ struct EngineOptions {
     int spec_k = 0;
     // Requests in flight at once: the session's sequences (SessionOptions::sequences), each its own cached prompt.
     int64_t sequences = 1;
+    // The decode steps of the requests in flight run as one (advance_decoding): the session's program kBatchProgram
+    // is the model's batch_graph(). Not with speculative decoding.
+    bool batch = false;
 };
+
+// The session's program that runs Model::batch_graph() (EngineOptions::batch), after the step graph.
+inline constexpr size_t kBatchProgram = 1;
 
 // The stateless sessions of a model's media encoders, by modality: null where the model has none (or it is not
 // loaded).
@@ -37,7 +43,7 @@ using EncoderSessions = std::array<std::unique_ptr<Session>, kModalities>;
 // engine thread) owns it. A request runs on a free sequence, the one whose cached prompt it shares the longest prefix
 // with (a media item's soft tokens count as shared only when the item's content is the same), and reuses that KV;
 // the steps of the requests in flight interleave as the caller advances them, so a long prefill gives way to the
-// others at the end of each of its chunks.
+// others at the end of each of its chunks; with EngineOptions::batch the decode steps of all that decode run as one.
 class Engine {
 public:
     using Handle = int64_t;  // a request in flight
@@ -52,6 +58,9 @@ public:
     // One step of the request: a prefill chunk (with its first token once the prompt is in), or its next token (or a
     // speculative round's). True when it is done: finish() then gives its result, and its sequence is free.
     bool advance(Handle h);
+    // A step of each of `hs`, requests past their prompts (decoding): with EngineOptions::batch, the next tokens of all
+    // that go on run as one step; otherwise one request after another. Whether each is done, in order.
+    std::vector<bool> advance_decoding(std::span<const Handle> hs);
     GenerateResult finish(Handle h);
     bool has_free_sequence() const;
     // Whether the request is past its prompt (its steps are decode tokens).
@@ -76,14 +85,22 @@ private:
         bool busy = false;
         uint64_t used = 0;                        // when it last ran a request (the oldest free one is taken first)
     };
-    // Makes sequence `s` the one the session, cached_, drafter_ and rotary_delta_ are.
+    // Makes sequence `s` the one the session's runs act on and seq() is.
     void select(size_t s);
+    Sequence& seq() { return sequences_[current_]; }
+    const Sequence& seq() const { return sequences_[current_]; }
     // The sequence a request with these prompt positions runs on: the free one sharing the longest prefix.
     size_t pick_sequence(const std::vector<PositionKey>& keys) const;
     // The steps of advance(): the rest of the prompt's next chunk, and the next token.
     void prefill_chunk(Generation& g);
     void begin_decode(Generation& g);
     void decode_step(Generation& g);
+    // Emits the request's pending token: false when that ends it (a stop token, a cancel, its last token).
+    bool emit(Generation& g);
+    // The next token of each of `gs` (decoding, nothing ready), their steps as one (EngineOptions::batch).
+    void decode_together(std::span<Generation* const> gs);
+    // Frees the sequence of a request that is done.
+    void release(Generation& g);
     void fail_generation(Generation& g, const std::exception& e);
 
     // Runs a target program over `tokens` (appended after the cached ones); the outputs the round reads are in
@@ -93,8 +110,8 @@ private:
     // Feeds `tokens` (appended after the cached ones); target_token(sampler, 0, ...) is then the token after them.
     void forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
                  std::span<const RotaryPosition> positions, std::span<const float* const> embeddings);
-    // The rotary positions of `count` text tokens from cached position `index` on, past the prompt.
-    std::vector<RotaryPosition> text_positions(int64_t index, size_t count) const;
+    // The rotary positions of `count` text tokens from cached position `index` of sequence `q` on, past the prompt.
+    static std::vector<RotaryPosition> text_positions(const Sequence& q, int64_t index, size_t count);
     // Width of the rows a media item's encoder runs give (ModelInfo::media_width, or the hidden size).
     int64_t media_width() const;
     // The target's token after row `row` of the last run: sampled from the row's logits (checked against `draft`
@@ -120,11 +137,7 @@ private:
     EncoderSessions encoders_;
     EngineOptions options_;
     std::vector<Sequence> sequences_;
-    size_t current_ = 0;  // the selected sequence: cached_, drafter_ and rotary_delta_ are its
-    // The selected sequence's: kept here while it runs (select() swaps them with its Sequence).
-    std::unique_ptr<spec::Drafter> drafter_;
-    std::vector<PositionKey> cached_;
-    int64_t rotary_delta_ = 0;
+    size_t current_ = 0;  // the selected sequence (select)
     std::map<Handle, std::unique_ptr<Generation>> active_;
     Handle next_handle_ = 0;
     uint64_t clock_ = 0;

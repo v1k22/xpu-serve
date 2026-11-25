@@ -48,11 +48,17 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
     if (options_.spec_k > 0) {
         const Speculation* spec = model_->speculation();
         XS_CHECK(spec != nullptr, "model ", model_->info().id, " has no drafter for speculative decoding");
-        drafter_ = spec::make_drafter(*spec, *session_);
-        XS_CHECK(options_.spec_k <= drafter_->max_drafts(), "spec_k ", options_.spec_k, " is more than the ",
-                 drafter_->max_drafts(), " drafts a round of ", spec->drafter_name(), " proposes");
-        for (size_t q = 1; q < sequences_.size(); ++q) sequences_[q].drafter = spec::make_drafter(*spec, *session_);
+        for (Sequence& q : sequences_) q.drafter = spec::make_drafter(*spec, *session_);
+        const int most = sequences_[0].drafter->max_drafts();
+        XS_CHECK(options_.spec_k <= most, "spec_k ", options_.spec_k, " is more than the ", most, " drafts a round of ",
+                 spec->drafter_name(), " proposes");
         has_argmax_ = has_argmax_ && offers_argmax(spec->prefill_graph()) && offers_argmax(spec->verify_graph());
+    }
+    if (options_.batch) {
+        XS_CHECK(options_.spec_k == 0, "decode steps run as one without speculative decoding only");
+        const graph::Graph* batch = model_->batch_graph();
+        XS_CHECK(batch != nullptr, "model ", model_->info().id, " was loaded without a batch graph");
+        has_argmax_ = has_argmax_ && offers_argmax(*batch);
     }
 }
 
@@ -83,14 +89,6 @@ struct Engine::Generation {
 
 void Engine::select(size_t s) {
     if (s == current_) return;
-    Sequence& was = sequences_[current_];
-    was.cached = std::move(cached_);
-    was.drafter = std::move(drafter_);
-    was.rotary_delta = rotary_delta_;
-    Sequence& now = sequences_[s];
-    cached_ = std::move(now.cached);
-    drafter_ = std::move(now.drafter);
-    rotary_delta_ = now.rotary_delta;
     session_->use(static_cast<int64_t>(s));
     current_ = s;
 }
@@ -104,7 +102,7 @@ size_t Engine::pick_sequence(const std::vector<PositionKey>& keys) const {
     int64_t best_common = -1;
     for (size_t q = 0; q < sequences_.size(); ++q) {
         if (sequences_[q].busy) continue;
-        const std::vector<PositionKey>& cached = q == current_ ? cached_ : sequences_[q].cached;
+        const std::vector<PositionKey>& cached = sequences_[q].cached;
         const auto common = static_cast<int64_t>(
             std::mismatch(cached.begin(), cached.end(), keys.begin(), keys.end()).first - cached.begin());
         if (common > best_common || (common == best_common && sequences_[q].used < sequences_[best].used)) {
@@ -117,13 +115,13 @@ size_t Engine::pick_sequence(const std::vector<PositionKey>& keys) const {
 }
 
 size_t Engine::state_program() const {
-    return drafter_ ? spec::kVerify : spec::kStep;
+    return seq().drafter ? spec::kVerify : spec::kStep;
 }
 
 void Engine::reset_sequence() {
     session_->reset();
-    cached_.clear();
-    if (drafter_) drafter_->reset();
+    seq().cached.clear();
+    if (seq().drafter) seq().drafter->reset();
 }
 
 void Engine::set_prefill_chunk(int64_t tokens) {
@@ -135,27 +133,30 @@ void Engine::run_target(size_t program, std::span<const int32_t> tokens, std::sp
                         std::span<const RotaryPosition> positions, std::span<const float* const> embeddings) {
     XS_CHECK(!tokens.empty() && keys.size() == tokens.size() && positions.size() == tokens.size(),
              "forward without tokens");
-    const auto start = static_cast<int64_t>(cached_.size());
+    std::vector<PositionKey>& cached = seq().cached;
+    const auto start = static_cast<int64_t>(cached.size());
     XS_CHECK(start + static_cast<int64_t>(tokens.size()) <= options_.max_context, "sequence of ",
              start + static_cast<int64_t>(tokens.size()), " tokens exceeds the context limit of ", options_.max_context);
     inputs_.clear();
     model_->prepare_positioned_inputs(tokens, positions, embeddings, inputs_);
     std::vector<std::string> wanted{argmax_only_ ? "argmax" : "logits"};
-    if (drafter_) wanted.insert(wanted.end(), drafter_->target_outputs().begin(), drafter_->target_outputs().end());
+    const std::unique_ptr<spec::Drafter>& drafter = seq().drafter;
+    if (drafter) wanted.insert(wanted.end(), drafter->target_outputs().begin(), drafter->target_outputs().end());
     outputs_.clear();
     session_->run(program, inputs_, outputs_, wanted);
-    cached_.insert(cached_.end(), keys.begin(), keys.end());
-    XS_CHECK(session_->num_cached() == static_cast<int64_t>(cached_.size()), "backend holds ", session_->num_cached(),
-             " cached tokens, engine expected ", cached_.size());
+    cached.insert(cached.end(), keys.begin(), keys.end());
+    XS_CHECK(session_->num_cached() == static_cast<int64_t>(cached.size()), "backend holds ", session_->num_cached(),
+             " cached tokens, engine expected ", cached.size());
 }
 
 void Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKey> keys,
                      std::span<const RotaryPosition> positions, std::span<const float* const> embeddings) {
-    const auto start = static_cast<int64_t>(cached_.size());
-    run_target(drafter_ ? spec::kPrefill : spec::kStep, tokens, keys, positions, embeddings);
-    if (drafter_) {
-        drafter_->add(outputs_, static_cast<int64_t>(tokens.size()), start, tokens);
-        drafter_->flush();
+    const auto start = static_cast<int64_t>(seq().cached.size());
+    const std::unique_ptr<spec::Drafter>& drafter = seq().drafter;
+    run_target(drafter ? spec::kPrefill : spec::kStep, tokens, keys, positions, embeddings);
+    if (drafter) {
+        drafter->add(outputs_, static_cast<int64_t>(tokens.size()), start, tokens);
+        drafter->flush();
     }
 }
 
@@ -180,16 +181,18 @@ int32_t Engine::target_token(Sampler& sampler, int64_t row, std::span<const int3
 std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
                                         std::span<const int32_t> generated, GenerateStats& stats) {
     std::vector<int32_t> fed{token};
+    spec::Drafter& drafter = *seq().drafter;
+    std::vector<PositionKey>& cached = seq().cached;
     Timer timer;
     if (k > 0) {
-        const std::vector<int32_t> drafts = drafter_->propose(token, k);
+        const std::vector<int32_t> drafts = drafter.propose(token, k);
         fed.insert(fed.end(), drafts.begin(), drafts.end());
     }
     const double draft_ms = timer.elapsed_ms();
     std::vector<PositionKey> keys(fed.size());
     std::transform(fed.begin(), fed.end(), keys.begin(), text_key);
-    const auto start = static_cast<int64_t>(cached_.size());
-    run_target(spec::kVerify, fed, keys, text_positions(start, fed.size()), {});
+    const auto start = static_cast<int64_t>(cached.size());
+    run_target(spec::kVerify, fed, keys, text_positions(seq(), start, fed.size()), {});
     stats.spec_draft_ms += draft_ms;
     stats.spec_verify_ms += timer.elapsed_ms() - draft_ms;
 
@@ -205,11 +208,11 @@ std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, 
     }
     const auto accepted = static_cast<int64_t>(out.size()) - 1;
     const int64_t keep = start + accepted + 1;  // the token and the accepted drafts
-    if (keep < static_cast<int64_t>(cached_.size())) {
+    if (keep < static_cast<int64_t>(cached.size())) {
         session_->truncate(state_program(), keep);
-        cached_.resize(static_cast<size_t>(keep));
+        cached.resize(static_cast<size_t>(keep));
     }
-    drafter_->add(outputs_, accepted + 1, start, fed);
+    drafter.add(outputs_, accepted + 1, start, fed);
     ++stats.spec_rounds;
     stats.spec_drafted += k;
     stats.spec_accepted += static_cast<int>(accepted);
@@ -217,31 +220,32 @@ std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, 
 }
 
 int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
+    std::vector<PositionKey>& cached = seq().cached;
     const auto common = static_cast<int64_t>(
-        std::mismatch(cached_.begin(), cached_.end(), prompt_keys.begin(), prompt_keys.end()).first - cached_.begin());
+        std::mismatch(cached.begin(), cached.end(), prompt_keys.begin(), prompt_keys.end()).first - cached.begin());
     // At least the last prompt token must run, because its logits pick the first new token.
     const int64_t keep = std::min<int64_t>(common, static_cast<int64_t>(prompt_keys.size()) - 1);
     if (keep <= 0) {
         reset_sequence();
         return 0;
     }
-    if (keep < static_cast<int64_t>(cached_.size())) {
+    if (keep < static_cast<int64_t>(cached.size())) {
         if (model_->graph().has_fixed_state()) {
             // Conv and recurrent state cannot be cut back into the sequence; start over.
             reset_sequence();
             return 0;
         }
         session_->truncate(state_program(), keep);
-        cached_.resize(static_cast<size_t>(keep));
-        if (drafter_) drafter_->truncate(keep);
+        cached.resize(static_cast<size_t>(keep));
+        if (seq().drafter) seq().drafter->truncate(keep);
     }
     return keep;
 }
 
-std::vector<RotaryPosition> Engine::text_positions(int64_t index, size_t count) const {
+std::vector<RotaryPosition> Engine::text_positions(const Sequence& q, int64_t index, size_t count) {
     std::vector<RotaryPosition> out(count);
     for (size_t i = 0; i < count; ++i) {
-        const auto p = static_cast<int32_t>(index + static_cast<int64_t>(i) + rotary_delta_);
+        const auto p = static_cast<int32_t>(index + static_cast<int64_t>(i) + q.rotary_delta);
         out[i] = {p, p, p};
     }
     return out;
@@ -359,7 +363,7 @@ std::optional<Engine::Handle> Engine::start(const GenerateRequest& request, Toke
         sequences_[g.sequence].used = ++clock_;
         g.holds_sequence = true;
         select(g.sequence);
-        rotary_delta_ = rotary.next - static_cast<int64_t>(n);
+        seq().rotary_delta = rotary.next - static_cast<int64_t>(n);
         g.sampler = std::make_unique<Sampler>(g.request.sampling);
         g.argmax_only = has_argmax_ && !g.sampler->needs_logits();
         argmax_only_ = g.argmax_only;
@@ -391,10 +395,7 @@ bool Engine::advance(Handle h) {
     } catch (const std::exception& e) {
         fail_generation(g, e);
     }
-    if (g.done && g.holds_sequence) {
-        sequences_[g.sequence].busy = false;
-        g.holds_sequence = false;
-    }
+    release(g);
     return g.done;
 }
 
@@ -472,13 +473,13 @@ void Engine::begin_decode(Generation& g) {
     g.token = target_token(*g.sampler, 0, g.request.prompt, g.result.tokens, nullptr);
 }
 
-void Engine::decode_step(Generation& g) {
+bool Engine::emit(Generation& g) {
     GenerateResult& result = g.result;
     const std::vector<int32_t>& stops = g.request.stop_token_ids;
     if (std::find(stops.begin(), stops.end(), g.token) != stops.end()) {
         result.finish = FinishReason::Stop;
         g.done = true;
-        return;
+        return false;
     }
     // Decode speed is measured between the first and the last emitted token.
     if (result.tokens.empty()) g.decode_timer.reset();
@@ -487,16 +488,22 @@ void Engine::decode_step(Generation& g) {
     if (g.on_token && !g.on_token(g.token)) {
         result.finish = FinishReason::Cancelled;
         g.done = true;
-        return;
+        return false;
     }
-    const auto emitted = static_cast<int64_t>(result.tokens.size());
-    if (emitted >= g.max_new) {
+    if (static_cast<int64_t>(result.tokens.size()) >= g.max_new) {
         g.done = true;
-        return;
+        return false;
     }
-    if (g.ready.empty() && drafter_) {
+    return true;
+}
+
+void Engine::decode_step(Generation& g) {
+    if (!emit(g)) return;
+    GenerateResult& result = g.result;
+    const auto emitted = static_cast<int64_t>(result.tokens.size());
+    if (g.ready.empty() && seq().drafter) {
         // Drafts past the last token wanted, or past the context, are never verified.
-        const int64_t fits = options_.max_context - static_cast<int64_t>(cached_.size()) - 1;
+        const int64_t fits = options_.max_context - static_cast<int64_t>(seq().cached.size()) - 1;
         const auto k = static_cast<int>(std::min<int64_t>({options_.spec_k, g.max_new - emitted - 1, fits}));
         const std::vector<int32_t> round =
             spec_round(g.token, k, *g.sampler, g.request.prompt, result.tokens, result.stats);
@@ -504,11 +511,81 @@ void Engine::decode_step(Generation& g) {
     } else if (g.ready.empty()) {
         const int32_t fed[] = {g.token};
         const PositionKey fed_key[] = {text_key(g.token)};
-        forward(fed, fed_key, text_positions(static_cast<int64_t>(cached_.size()), 1), {});
+        forward(fed, fed_key, text_positions(seq(), static_cast<int64_t>(seq().cached.size()), 1), {});
         g.ready.push_back(target_token(*g.sampler, 0, g.request.prompt, result.tokens, nullptr));
     }
     g.token = g.ready.front();
     g.ready.pop_front();
+}
+
+std::vector<bool> Engine::advance_decoding(std::span<const Handle> hs) {
+    std::vector<bool> done;
+    if (!options_.batch) {
+        for (const Handle h : hs) done.push_back(advance(h));
+        return done;
+    }
+    std::vector<Generation*> gs, step;
+    for (const Handle h : hs) {
+        const auto it = active_.find(h);
+        XS_CHECK(it != active_.end() && it->second->decoding, "request ", h, " is not decoding");
+        gs.push_back(it->second.get());
+    }
+    for (Generation* g : gs) {
+        if (g->done) continue;
+        try {
+            if (emit(*g)) step.push_back(g);
+        } catch (const std::exception& e) {
+            fail_generation(*g, e);
+        }
+    }
+    if (!step.empty()) {
+        try {
+            decode_together(step);
+        } catch (const std::exception& e) {
+            for (Generation* g : step) fail_generation(*g, e);
+        }
+    }
+    for (Generation* g : gs) {
+        release(*g);
+        done.push_back(g->done);
+    }
+    return done;
+}
+
+void Engine::decode_together(std::span<Generation* const> gs) {
+    std::vector<Segment> segments;
+    std::map<std::string, std::vector<HostTensor>> rows;
+    bool logits = false;
+    for (Generation* g : gs) {
+        const Sequence& q = sequences_[g->sequence];
+        const auto at = static_cast<int64_t>(q.cached.size());
+        XS_CHECK(at < options_.max_context, "sequence of ", at + 1, " tokens exceeds the context limit of ",
+                 options_.max_context);
+        const int32_t token[] = {g->token};
+        TensorMap in;
+        model_->prepare_positioned_inputs(token, text_positions(q, at, 1), {}, in);
+        for (auto& [name, t] : in) rows[name].push_back(std::move(t));
+        segments.push_back({static_cast<int64_t>(g->sequence), 1});
+        logits = logits || !g->argmax_only;
+    }
+    inputs_.clear();
+    for (auto& [name, list] : rows) inputs_[name] = concat_rows(list);
+    outputs_.clear();
+    const std::string wanted[] = {logits ? "logits" : "argmax"};
+    session_->run_segments(kBatchProgram, segments, inputs_, outputs_, wanted);
+    argmax_only_ = !logits;
+    for (size_t r = 0; r < gs.size(); ++r) {
+        Generation& g = *gs[r];
+        sequences_[g.sequence].cached.push_back(text_key(g.token));
+        g.token = target_token(*g.sampler, static_cast<int64_t>(r), g.request.prompt, g.result.tokens, nullptr);
+    }
+}
+
+void Engine::release(Generation& g) {
+    if (g.done && g.holds_sequence) {
+        sequences_[g.sequence].busy = false;
+        g.holds_sequence = false;
+    }
 }
 
 }  // namespace xs
