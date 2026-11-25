@@ -473,4 +473,55 @@ inline void segments(const Env& env, int64_t d = HybridLayer::kD) {
     CHECK_THROWS_AS(refused->run_segments(0, two, in, got, {}), xs::Error);
 }
 
+// Speculative rounds of several sequences at once: a step of segments of up to rewind_tokens tokens each, then each
+// sequence cut back inside its own segment (truncate with it selected), gives each sequence what a session of its own
+// gives over the same steps and cuts; a cut that keeps nothing of the step and one that keeps all of it included.
+inline void segments_truncate(const Env& env, int64_t d = HybridLayer::kD) {
+    const HybridLayer layer(6, true, 64, d);
+    const Graph* programs[] = {&layer.graph};
+    const auto shared = env.compile(programs, layer.weights, 4, 3);
+    std::vector<std::unique_ptr<Session>> alone;
+    for (int s = 0; s < 3; ++s) alone.push_back(env.compile(programs, layer.weights, 4, 1));
+    TensorRng rng(29);
+    for (int s = 0; s < 3; ++s) {
+        const TensorMap in = HybridLayer::inputs(rng, 2 + 3 * s, 64, d);
+        TensorMap got, want;
+        shared->use(s);
+        shared->run(in, got);
+        alone[static_cast<size_t>(s)]->run(in, want);
+    }
+    // One step of `segs`, then each sequence keeps the first `keep` tokens of its segment.
+    const auto round = [&](std::vector<Segment> segs, std::vector<int64_t> keep) {
+        CAPTURE(segs.size());
+        std::vector<TensorMap> parts;
+        for (const Segment& s : segs) parts.push_back(HybridLayer::inputs(rng, s.tokens, 64, d));
+        TensorMap in, got;
+        for (const auto& [name, t] : parts[0]) {
+            std::vector<HostTensor> rows;
+            for (const TensorMap& p : parts) rows.push_back(p.at(name));
+            in[name] = concat_rows(rows);
+        }
+        shared->run_segments(0, segs, in, got, {});
+        int64_t row = 0;
+        for (size_t i = 0; i < segs.size(); ++i) {
+            CAPTURE(i);
+            Session& own = *alone[static_cast<size_t>(segs[i].sequence)];
+            TensorMap want, mine;
+            own.run(parts[i], want);
+            for (const char* name : {"conv", "gdn", "attn"}) mine[name] = rows_of(got.at(name), row, segs[i].tokens);
+            CHECK(outputs_close(mine, want, env));
+            row += segs[i].tokens;
+            shared->use(segs[i].sequence);
+            const int64_t start = shared->num_cached() - segs[i].tokens;
+            shared->truncate(start + keep[i]);
+            own.truncate(start + keep[i]);
+            CHECK(shared->num_cached() == own.num_cached());
+        }
+    };
+    round({{0, 3}, {1, 1}, {2, 4}}, {1, 1, 2});
+    round({{2, 2}, {0, 4}, {1, 3}}, {2, 0, 3});
+    round({{1, 4}, {2, 1}}, {4, 1});
+    for (int k = 0; k < 3; ++k) round({{1, 1}, {0, 1}, {2, 1}}, {1, 1, 1});
+}
+
 }  // namespace xs::test::session

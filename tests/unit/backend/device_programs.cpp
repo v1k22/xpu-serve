@@ -48,6 +48,13 @@ TEST_SUITE("device programs" * doctest::skip(!dev::enabled())) {
     TEST_CASE("segments: steps of several sequences at once give what each sequence's own steps give") {
         xs::test::session::segments(device_env());
     }
+    TEST_CASE("segments cut back inside each sequence's segment: speculative rounds of several sequences") {
+        xs::test::session::segments_truncate(device_env());
+        for (const char* kv : {"i8", "turbo4"}) {
+            CAPTURE(kv);
+            xs::test::session::segments_truncate(device_env(xs::quant::parse_kv_formats(kv)), 128);
+        }
+    }
     TEST_CASE("segments over an int8 and a TurboQuant KV cache, and int8 keys with TurboQuant values") {
         for (const char* kv : {"i8", "turbo4", "i8:turbo3"}) {
             CAPTURE(kv);
