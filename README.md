@@ -47,8 +47,9 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Quantized packs**: q8 and q4 from `xpu-serve convert` (round to nearest; AWQ calibration opt-in)
 - ✅ **FP8 checkpoints** (Qwen3.8-27B-FP8, Qwen3.6-35B-A3B-FP8, Ornith-1.5-35B-A3B-FP8: a scale per 128 x 128 block,
   or compressed-tensors' scale per channel), served as they are or converted to a pack
-- ✅ **GGUF import**: `qwen35`, `qwen35moe`, `gemma4`, `gemma4-assistant`, `inkling2` (with its DSpark drafter's
-  and vision tower's files) and `inkling2_loop` (mainline llama.cpp's layout of it), `clef` and the `modern-bert`
+- ✅ **GGUF import**: `qwen35`, `qwen35moe`, `gemma4`, `gemma4-assistant`, `inkling2_loop` and `inkling2` (Inkling 2
+  in mainline llama.cpp's layout and Unsloth's, with its DSpark drafter's file in either format and its vision
+  tower's), `clef` and the `modern-bert`
   files of Laya and Julia-1, in all 19 of GGUF's block formats and Unsloth's
   NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them
 - ✅ **Speculative decoding**: Qwen's MTP heads, Gemma 4's assistants, DFlash 2 and DSpine block drafters
@@ -222,9 +223,10 @@ xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
 - The architecture comes from the file (`general.architecture`). Supported: `qwen35` and `qwen35moe`, the Qwen3.5 /
   Qwen3.6 / Qwen3.8 text models, dense and mixture of experts (Ornith-1.5-35B-A3B's files are `qwen35moe`); `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
   images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
-  drafter; `inkling2`, Inkling 2 Mini (Unsloth's files), with its drafter's file (`dspark-*.gguf`) and its vision tower's (`mmproj-*.gguf`), both fetched by `-hf`;
-  `inkling2_loop`, the same model in mainline llama.cpp's layout (AtomicChat's uncensored files, with their vision
-  tower's; its LoRA adapter file applies with `--lora`);
+  drafter; `inkling2_loop`, Inkling 2 Mini in mainline llama.cpp's layout (Unsloth's files, and AtomicChat's
+  uncensored ones), with its drafter's file (`dspark-*.gguf`, in mainline's format or Unsloth's earlier one) and its
+  vision tower's (`mmproj-*.gguf`), both fetched by `-hf`, and AtomicChat's LoRA adapter file with `--lora`;
+  `inkling2`, the same model in Unsloth's earlier layout (the `Old_Support/` copies of its repository);
   `clef`, the Clef decision models; and `modern-bert` with a Laya read-out, the files of Laya and Julia-1. Others
   are refused by name.
 - A Qwen3.5-family file that comes without its MTP head (the smallest files of Qwen3.8-27B) takes the head from its

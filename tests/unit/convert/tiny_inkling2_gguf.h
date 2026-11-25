@@ -206,4 +206,124 @@ inline GgufWriter tiny_inkling2_gguf(bool mainline, const TinyInkling2& m = {}) 
     return w;
 }
 
+// The tiny model's DSpark drafter in the file of Unsloth's builds or of mainline llama.cpp's (conversion/inkling2.py,
+// Inkling2DSparkModel): two layers, the first local; the same drafter in both, its values from the checkpoint's
+// names. Mainline's: fuse_weight's rows through their softmax, a tensor per reader; the head's hidden_out folded
+// through the model's output layer over the tokens' rows (in double, as the converter does); markov_w1 without its
+// padding rows; mask_embed copied to each draft's row; the window one longer; the target's embedding norm copied in.
+inline GgufWriter tiny_inkling2_drafter_gguf(bool mainline, const TinyInkling2& m = {}) {
+    const int64_t layers = 2, width = 8, rank = 4, block = 4, window = 4;
+    const auto visits = static_cast<int32_t>(m.layers + (m.passes - 1) * (m.loop_end - m.loop_start));
+    const std::vector<int32_t> taps = {1, 5, visits};
+    const auto ntaps = static_cast<int64_t>(taps.size());
+    const nlohmann::json tokenizer = tiny_tokenizer_json();
+    const auto tokens = static_cast<int64_t>(tokenizer["model"]["vocab"].size() + tokenizer["added_tokens"].size());
+    const int64_t vocab = tokens + 4, h = m.hidden, q = m.heads * m.head_dim, kv = m.kv_heads * m.head_dim;
+    const auto k = [](const std::string& rest) { return "dflash." + rest; };
+
+    GgufWriter w;
+    w.string("general.architecture", "dflash").string("general.name", "Tiny Inkling 2 DSpark");
+    w.u32(k("block_count"), layers).u32(k("context_length"), 64).u32(k("embedding_length"), static_cast<uint32_t>(h));
+    w.u32(k("feed_forward_length"), width).u32(k("attention.head_count"), static_cast<uint32_t>(m.heads));
+    w.u32(k("attention.head_count_kv"), static_cast<uint32_t>(m.kv_heads));
+    w.u32(k("attention.key_length"), static_cast<uint32_t>(m.head_dim));
+    w.u32(k("attention.value_length"), static_cast<uint32_t>(m.head_dim));
+    w.u32(k("rope.dimension_count"), static_cast<uint32_t>(m.head_dim)).f32(k("rope.freq_base"), 10000.0f);
+    w.f32(k("attention.layer_norm_rms_epsilon"), 1e-6f);
+    w.u32(k("attention.sliding_window"), static_cast<uint32_t>(window + (mainline ? 1 : 0)));
+    w.bools(k("attention.sliding_window_pattern"), {true, false});
+    w.f32(k("final_logit_softcapping"), 15.0f).u32(k("block_size"), block).i32s(k("target_layers"), taps);
+    w.boolean(k("sample_from_anchor"), false).boolean(k("has_confidence_head"), false);
+    if (mainline) {
+        w.boolean(k("has_markov_context"), true);
+    } else {
+        w.u32(k("vocab_size"), static_cast<uint32_t>(vocab));
+        w.u32(k("vocab_size_unpadded"), static_cast<uint32_t>(tokens));
+        w.u32(k("dspark.markov_rank"), rank).boolean(k("attention.causal"), false);
+    }
+
+    const std::string P = "mtp.", H = "mtp.markov_head.";
+    const auto values = [](const std::string& name, int64_t n, float center = 0.0f, float amplitude = 0.3f) {
+        return tiny_inkling2_values(name, n, center, amplitude);
+    };
+    const auto put = [&](const std::string& file, const Dims& stored, const std::vector<float>& v) {
+        w.f32_tensor(file, std::vector<int64_t>(stored.rbegin(), stored.rend()), v);
+    };
+    // A norm's weight.
+    const auto norm = [&](const std::string& file, int64_t n, const std::string& name) {
+        put(file, {n}, values(name, n, 1.0f, 0.1f));
+    };
+    const std::vector<float> fuse = values(P + "fuse_weight", (layers + 1) * ntaps, 0.0f, 1.0f);
+    // A row of fuse_weight through its softmax.
+    const auto mix = [&](int64_t r) {
+        std::vector<float> row(fuse.begin() + r * ntaps, fuse.begin() + (r + 1) * ntaps);
+        double sum = 0;
+        for (const float x : row) sum += std::exp(static_cast<double>(x));
+        for (float& x : row) x = static_cast<float>(std::exp(static_cast<double>(x)) / sum);
+        return row;
+    };
+    // A large correction, so that the drafts depend on it.
+    const std::vector<float> out_w = values(H + "hidden_out.weight", h * rank, 0.0f, 2.0f);
+    const std::vector<float> out_b = values(H + "hidden_out.bias", h, 0.0f, 2.0f);
+    std::vector<float> table = values(H + "markov_w1.weight", vocab * rank);
+    const std::vector<float> mask = values(P + "mask_embed", h);
+
+    put("output_norm.weight", {h}, values(P + "norm.weight", h, 1.0f, 0.1f));
+    const int64_t step_in = 2 * rank + 2 * h;
+    put("joint_proj.weight", {3 * rank, step_in}, values(H + "rnn_proj.weight", 3 * rank * step_in));
+    put("joint_proj.bias", {3 * rank}, values(H + "rnn_proj.bias", 3 * rank));
+    if (mainline) {
+        put("markov_ctx_mix.weight", {ntaps}, mix(layers));
+        norm("markov_ctx_norm.weight", h, H + "dflare_norm.weight");
+        table.resize(static_cast<size_t>(tokens * rank));
+        put("markov_w1.weight", {tokens, rank}, table);
+        const std::vector<float> unembed = values("model.llm.unembed.weight", vocab * h);
+        std::vector<float> fold(static_cast<size_t>(tokens * rank)), fold_b(static_cast<size_t>(tokens));
+        for (int64_t t = 0; t < tokens; ++t) {
+            double b = 0;
+            for (int64_t j = 0; j < h; ++j) b += static_cast<double>(unembed[t * h + j]) * out_b[j];
+            fold_b[t] = static_cast<float>(b);
+            for (int64_t r = 0; r < rank; ++r) {
+                double s = 0;
+                for (int64_t j = 0; j < h; ++j) s += static_cast<double>(unembed[t * h + j]) * out_w[j * rank + r];
+                fold[t * rank + r] = static_cast<float>(s);
+            }
+        }
+        put("markov_w2.weight", {tokens, rank}, fold);
+        put("markov_w2.bias", {tokens}, fold_b);
+        std::vector<float> masks;
+        for (int64_t i = 0; i < block - 1; ++i) masks.insert(masks.end(), mask.begin(), mask.end());
+        put("mask_embd.weight", {block - 1, h}, masks);
+        norm("token_embd_norm.weight", h, "model.llm.embed_norm.weight");
+    } else {
+        put("dspark_fuse.weight", {layers + 1, ntaps}, fuse);
+        norm("dspark_norm.weight", h, H + "dflare_norm.weight");
+        put("markov_w1.weight", {vocab, rank}, table);
+        put("dspark_hidden_out.weight", {h, rank}, out_w);
+        put("dspark_hidden_out.bias", {h}, out_b);
+        put("mask_embd.weight", {h}, mask);
+    }
+    for (int64_t i = 0; i < layers; ++i) {
+        const std::string B = "blk." + std::to_string(i) + ".", L = P + "layers." + std::to_string(i) + ".";
+        const std::string A = L + "self_attn.";
+        norm(B + "attn_norm.weight", h, L + "input_layernorm.weight");
+        put(B + "attn_q.weight", {q, h}, values(A + "q_proj.weight", q * h));
+        put(B + "attn_k.weight", {kv, h}, values(A + "k_proj.weight", kv * h));
+        put(B + "attn_v.weight", {kv, h}, values(A + "v_proj.weight", kv * h));
+        put(B + "attn_output.weight", {h, q}, values(A + "o_proj.weight", h * q));
+        norm(B + "attn_q_norm.weight", m.head_dim, A + "q_norm.weight");
+        norm(B + "attn_k_norm.weight", m.head_dim, A + "k_norm.weight");
+        put(B + "attn_k_ctx.weight", {kv, h}, values(A + "k_proj_ctx.weight", kv * h));
+        put(B + "attn_v_ctx.weight", {kv, h}, values(A + "v_proj_ctx.weight", kv * h));
+        norm(B + "attn_k_ctx_norm.weight", m.head_dim, A + "k_norm_ctx.weight");
+        norm(B + (mainline ? "ctx_norm.weight" : "dflare_norm.weight"), h, L + "dflare_norm.weight");
+        if (mainline) put(B + "ctx_mix.weight", {ntaps}, mix(i));
+        norm(B + "ffn_norm.weight", h, L + "post_attention_layernorm.weight");
+        put(B + "ffn_gate.weight", {width, h}, values(L + "mlp.gate_proj.weight", width * h));
+        put(B + "ffn_up.weight", {width, h}, values(L + "mlp.up_proj.weight", width * h));
+        put(B + "ffn_down.weight", {h, width}, values(L + "mlp.down_proj.weight", h * width));
+    }
+    return w;
+}
+
 }  // namespace xs::test

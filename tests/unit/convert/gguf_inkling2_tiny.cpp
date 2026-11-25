@@ -1,5 +1,5 @@
 // A tiny Inkling 2 GGUF in either converter's layout (tiny_inkling2_gguf.h): it imports, and the two layouts of one
-// model import as the same model, on cpu-ref.
+// model import as the same model, on cpu-ref; so do the two layouts of its drafter's file.
 #include <doctest/doctest.h>
 
 #include <fstream>
@@ -8,6 +8,8 @@
 
 #include "convert/import_test_util.h"
 #include "convert/tiny_inkling2_gguf.h"
+#include "engine/spec/drafter.h"
+#include "io/gguf.h"
 #include "model/tiny_checkpoints.h"
 
 namespace fs = std::filesystem;
@@ -64,4 +66,71 @@ TEST_CASE("tiny inkling2 GGUF: the loop's message gates as Q8_0 blocks, as Atomi
     const double gap = test::relative_gap(test::step_logits(*load_model(work.path / "q"), prompt, {11, 12}), reference);
     MESSAGE("Q8_0 gates against F32 of their values: largest difference " << gap << " of the largest logit");
     CHECK(gap < 1e-5);
+}
+
+namespace {
+
+// The drafts of a round after a prefill of each prompt, on cpu-ref.
+std::vector<std::vector<int32_t>> block_drafts(const fs::path& pack, const std::vector<std::vector<int32_t>>& prompts) {
+    const auto model = load_model(pack, {.vision = false, .speculation = true, .draft_shortlist = 0});
+    const Speculation* spec = model->speculation();
+    REQUIRE(spec != nullptr);
+    REQUIRE(spec->block() != nullptr);
+    const graph::Graph* programs[] = {&model->graph(), &spec->prefill_graph(), &spec->verify_graph(),
+                                      &spec->draft_graph()};
+    SessionOptions options = test::f32_session();
+    options.rewind_tokens = spec->block()->block_drafts() + 1;
+    const auto session = make_cpu_ref_backend()->compile(programs, model->weights(), options);
+    const auto drafter = spec::make_drafter(*spec, *session);
+    std::vector<std::vector<int32_t>> out;
+    for (const std::vector<int32_t>& ids : prompts) {
+        session->reset();
+        drafter->reset();
+        TensorMap inputs, outputs;
+        model->prepare_inputs(ids, 0, {}, inputs);
+        session->run(spec::kPrefill, inputs, outputs);
+        drafter->add(outputs, static_cast<int64_t>(ids.size()), 0, ids);
+        out.push_back(drafter->propose(ids.back(), spec->block()->block_drafts()));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("tiny inkling2 drafter: Unsloth's file and mainline llama.cpp's, its head folded, draft the same") {
+    const test::TempDir work("xs_gguf_inkling2_drafter");
+    fs::create_directories(work.path);
+    test::tiny_inkling2_gguf(true).write(work.path / "model.gguf");
+    test::tiny_inkling2_drafter_gguf(false).write(work.path / "unsloth.gguf");
+    test::tiny_inkling2_drafter_gguf(true).write(work.path / "mainline.gguf");
+    test::import_into(work.path / "model.gguf", work.path / "u", work.path / "unsloth.gguf");
+    test::import_into(work.path / "model.gguf", work.path / "m", work.path / "mainline.gguf");
+    const auto config = [&](const char* pack) {
+        return nlohmann::json::parse(std::ifstream(work.path / pack / "config.json"))["mtp_config"];
+    };
+    CHECK(config("m") == config("u"));
+    CHECK(config("m")["sliding_window_size"] == 4);
+
+    const std::vector<std::vector<int32_t>> prompts = {{5, 77, 266, 3, 40, 9, 120}, {12, 8, 30}, {200, 1, 2, 3, 4, 5}};
+    const auto drafts = block_drafts(work.path / "u", prompts);
+    CHECK(block_drafts(work.path / "m", prompts) == drafts);
+
+    // Planted: without its folded correction the head drafts otherwise; mask rows that differ are refused by name.
+    test::GgufWriter unfolded = test::tiny_inkling2_drafter_gguf(true);
+    const gguf::File mainline(work.path / "mainline.gguf");
+    const int64_t tokens = mainline.find_tensor("markov_w2.bias")->numel();
+    unfolded.drop_tensor("markov_w2.weight").f32_tensor("markov_w2.weight", {4, tokens},
+                                                        std::vector<float>(static_cast<size_t>(4 * tokens), 0.0f));
+    unfolded.write(work.path / "unfolded.gguf");
+    test::import_into(work.path / "model.gguf", work.path / "z", work.path / "unfolded.gguf");
+    CHECK(block_drafts(work.path / "z", prompts) != drafts);
+
+    test::GgufWriter masks = test::tiny_inkling2_drafter_gguf(true);
+    std::vector<float> rows(3 * 16, 0.5f);
+    rows.back() = 0.25f;
+    masks.drop_tensor("mask_embd.weight").f32_tensor("mask_embd.weight", {16, 3}, rows);
+    masks.write(work.path / "masks.gguf");
+    test::import_into(work.path / "model.gguf", work.path / "k", work.path / "masks.gguf");
+    CHECK_THROWS_WITH_AS(block_drafts(work.path / "k", prompts), doctest::Contains("mask_embed's rows differ"),
+                         xs::Error);
 }

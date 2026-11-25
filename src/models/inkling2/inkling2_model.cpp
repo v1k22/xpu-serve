@@ -534,7 +534,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
                                                       kDrafterPrefix);
         }
         const bool has_config = config_json.contains("mtp_config") && !config_json.at("mtp_config").is_null();
-        if (has_config && weights->contains(std::string(kDrafterPrefix) + "fuse_weight")) {
+        if (has_config && weights->contains(std::string(kDrafterPrefix) + "norm.weight")) {  // its final norm
             drafter = dspark::parse_config(config_json.at("mtp_config"), cfg.hidden_size, cfg.applications());
         } else {
             log::warn("inkling2: the checkpoint has no drafter (", kDrafterFile, " and config.json's mtp_config); ",

@@ -57,23 +57,75 @@ Config parse_config(const nlohmann::json& m, int64_t hidden, int64_t visits) {
 Drafter::Drafter(Config config, const WeightStore& weights, std::string prefix, int64_t drafts)
     : cfg_(std::move(config)), weights_(weights), prefix_(std::move(prefix)) {
     drafts_ = drafts > 0 ? std::min(cfg_.block_size - 1, drafts) : cfg_.block_size - 1;
-    const TensorView& fuse = weights_.get(prefix_ + "fuse_weight");
-    const Dims want{cfg_.num_layers + 1, static_cast<int64_t>(cfg_.target_ids.size())};
-    XS_CHECK(fuse.shape == want, "dspark: fuse_weight is ", dims_to_string(fuse.shape), ", expected ",
-             dims_to_string(want), " (a row per layer and the head's, a column per target state)");
+    alpha_ = mixing_weights();
+    folded_ = weights_.contains(prefix_ + "markov_head.fold.weight");
+    XS_CHECK(folded_ != weights_.contains(prefix_ + "markov_head.hidden_out.weight"),
+             "dspark: the head needs one of markov_head.hidden_out (the checkpoint's) and markov_head.fold (its fold ",
+             "through the output layer, llama.cpp's)");
 }
 
 Value Drafter::weight(Graph& g, const std::string& name) const {
     return g.weight(weights_, prefix_ + name);
 }
 
+std::vector<float> Drafter::values(const std::string& name, Dims& shape) const {
+    const TensorView& t = weights_.get(prefix_ + name);
+    XS_CHECK(is_float(t.dtype), "dspark: ", name, " is ", dtype_name(t.dtype), ", expected floats");
+    shape = t.shape;
+    return HostTensor::borrow(t.dtype, t.shape, const_cast<void*>(t.data)).to_f32();
+}
+
 // A bias, read on the host: [1, n].
 Value Drafter::bias(Graph& g, const std::string& name) const {
-    const TensorView& t = weights_.get(prefix_ + name);
-    XS_CHECK(is_float(t.dtype) && t.shape.size() == 1, "dspark: ", name, " is ", dtype_name(t.dtype), " ",
-             dims_to_string(t.shape), ", expected a float vector");
-    const std::vector<float> values = HostTensor::borrow(t.dtype, t.shape, const_cast<void*>(t.data)).to_f32();
-    return g.constant(HostTensor::from_vector(DType::F32, {1, t.shape[0]}, values));
+    Dims shape;
+    std::vector<float> v = values(name, shape);
+    XS_CHECK(shape.size() == 1, "dspark: ", name, " is ", dims_to_string(shape), ", expected a vector");
+    return g.constant(HostTensor::from_vector(DType::F32, {1, shape[0]}, std::move(v)));
+}
+
+std::vector<float> Drafter::mixing_weights() const {
+    const auto taps = static_cast<int64_t>(cfg_.target_ids.size());
+    std::vector<float> alpha;
+    Dims shape;
+    if (weights_.contains(prefix_ + "fuse_weight")) {
+        alpha = values("fuse_weight", shape);
+        const Dims want{cfg_.num_layers + 1, taps};
+        XS_CHECK(shape == want, "dspark: fuse_weight is ", dims_to_string(shape), ", expected ", dims_to_string(want),
+                 " (a row per layer and the head's, a column per target state)");
+    } else {  // a row per reader
+        for (int64_t r = 0; r <= cfg_.num_layers; ++r) {
+            const std::string name =
+                r < cfg_.num_layers ? "layers." + std::to_string(r) + ".fuse_weight" : "markov_head.fuse_weight";
+            const std::vector<float> row = values(name, shape);
+            XS_CHECK(shape == Dims{taps}, "dspark: ", name, " is ", dims_to_string(shape), ", expected [", taps,
+                     "] (a column per target state)");
+            alpha.insert(alpha.end(), row.begin(), row.end());
+        }
+    }
+    for (int64_t r = 0; r <= cfg_.num_layers; ++r) {
+        float* row = alpha.data() + r * taps;
+        const float top = *std::max_element(row, row + taps);
+        double sum = 0;
+        for (int64_t j = 0; j < taps; ++j) sum += std::exp(static_cast<double>(row[j] - top));
+        for (int64_t j = 0; j < taps; ++j) {
+            row[j] = static_cast<float>(std::exp(static_cast<double>(row[j] - top)) / sum);
+        }
+    }
+    return alpha;
+}
+
+std::vector<float> Drafter::mask_vector() const {
+    Dims shape;
+    std::vector<float> v = values("mask_embed", shape);
+    const int64_t h = cfg_.hidden_size;
+    XS_CHECK(shape == Dims{h} || shape == (Dims{cfg_.block_size - 1, h}), "dspark: mask_embed is ",
+             dims_to_string(shape), ", expected [", h, "] or a copy per draft, [", cfg_.block_size - 1, ", ", h, "]");
+    for (size_t i = static_cast<size_t>(h); i < v.size(); ++i) {
+        XS_CHECK(v[i] == v[i % static_cast<size_t>(h)], "dspark: mask_embed's rows differ (row ", i / h,
+                 "): a mask vector per draft is not supported");
+    }
+    v.resize(static_cast<size_t>(h));
+    return v;
 }
 
 Value Drafter::norm(Graph& g, Value x, const std::string& name) const {
@@ -92,22 +144,11 @@ std::vector<Value> Drafter::mixes(Graph& g, std::span<const Value> taps) const {
     const auto count = static_cast<int64_t>(taps.size());
     XS_CHECK(count == static_cast<int64_t>(cfg_.target_ids.size()), "dspark: ", count, " target states for ",
              cfg_.target_ids.size(), " ids");
-    // Each row of fuse_weight through a softmax, on the host: the mixing weights of one reader.
-    const TensorView& stored = weights_.get(prefix_ + "fuse_weight");
-    std::vector<float> alpha = HostTensor::borrow(stored.dtype, stored.shape, const_cast<void*>(stored.data)).to_f32();
-    for (int64_t r = 0; r <= cfg_.num_layers; ++r) {
-        float* row = alpha.data() + r * count;
-        const float top = *std::max_element(row, row + count);
-        double sum = 0;
-        for (int64_t j = 0; j < count; ++j) sum += std::exp(static_cast<double>(row[j] - top));
-        for (int64_t j = 0; j < count; ++j) {
-            row[j] = static_cast<float>(std::exp(static_cast<double>(row[j] - top)) / sum);
-        }
-    }
     std::vector<Value> stack;
     for (const Value tap : taps) stack.push_back(g.reshape(tap, {kT, 1, cfg_.hidden_size}));
     const Value by_state = g.transpose(g.concat(stack, 1), {0, 2, 1});  // [T, hidden, states]
-    const Value mixed = g.matmul(by_state, g.constant(HostTensor::from_vector(DType::F32, stored.shape, alpha)));
+    const Value mixed =
+        g.matmul(by_state, g.constant(HostTensor::from_vector(DType::F32, {cfg_.num_layers + 1, count}, alpha_)));
     std::vector<Value> out;
     for (int64_t r = 0; r <= cfg_.num_layers; ++r) {
         out.push_back(g.reshape(g.slice(mixed, 2, r, r + 1), {kT, cfg_.hidden_size}));
@@ -148,7 +189,8 @@ void Drafter::build_block(Graph& g, const Target& target) const {
         g.rms_norm(g.gather(target.embed, ids), target.embed_norm, static_cast<float>(cfg_.rms_norm_eps));
     const Value rest = g.prev_row(g.add(g.scale(g.slice(embedded, 1, 0, 1), 0.0f), one()));  // 0 on the first row
     const Value first = g.add(g.scale(rest, -1.0f), one());
-    Value h = g.add(g.mul(embedded, first), g.mul(g.reshape(weight(g, "mask_embed"), {1, hidden}), rest));
+    const Value mask = g.constant(HostTensor::from_vector(DType::F32, {1, hidden}, mask_vector()));
+    Value h = g.add(g.mul(embedded, first), g.mul(mask, rest));
 
     for (int64_t l = 0; l < cfg_.num_layers; ++l) {
         const std::string name = "layers." + std::to_string(l);
@@ -185,19 +227,26 @@ void Drafter::build_block(Graph& g, const Target& target) const {
     // The head: a gated recurrent step per draft over (its state, the token before, the slot's row, the target's
     // context), whose latent corrects the row before the target's output layer reads it. The softcap the target
     // puts on its logits keeps their order, so the picks do not need it. Each pick reads the whole output layer: a
-    // draft that follows a wrong one is lost, and a round is a few drafts beside a verify that costs far more.
+    // draft that follows a wrong one is lost, and a round is a few drafts beside a verify that costs far more. With
+    // the correction folded through the output layer, the output layer reads the rows once and each pick adds its
+    // latent's logits (logits of the row + fold x latent + fold's bias: the same sum).
     Graph::Scope scope(g, "drafter.head");
     const Value slots = g.slice(norm(g, h, "norm.weight"), 0, -(rows - 1));  // [rows - 1, hidden]: the masks' rows
     const Value table = weight(g, "markov_head.markov_w1.weight");
     const Value step_w = weight(g, "markov_head.rnn_proj.weight");
     const Value step_b = bias(g, "markov_head.rnn_proj.bias");
-    const Value out_w = weight(g, "markov_head.hidden_out.weight");
-    const Value out_b = bias(g, "markov_head.hidden_out.bias");
-    XS_CHECK(g.type(step_w).shape == (Dims{3 * rank, 2 * rank + 2 * hidden}) &&
-                 g.type(out_w).shape == (Dims{hidden, rank}) && g.type(table).shape.back() == rank,
-             "dspark: the head's rnn_proj, hidden_out and markov_w1 are ", dims_to_string(g.type(step_w).shape), ", ",
-             dims_to_string(g.type(out_w).shape), " and ", dims_to_string(g.type(table).shape), " for rank ", rank,
-             " and hidden ", hidden);
+    const std::string out = folded_ ? "markov_head.fold." : "markov_head.hidden_out.";
+    const Value out_w = weight(g, out + "weight");
+    const Value out_b = bias(g, out + "bias");
+    const Dims out_shape = folded_ ? Dims{target.tokens, rank} : Dims{hidden, rank};
+    XS_CHECK(g.type(step_w).shape == (Dims{3 * rank, 2 * rank + 2 * hidden}) && g.type(out_w).shape == out_shape &&
+                 g.type(table).shape.back() == rank,
+             "dspark: the head's rnn_proj, ", out, "weight and markov_w1 are ", dims_to_string(g.type(step_w).shape),
+             ", ", dims_to_string(g.type(out_w).shape), " and ", dims_to_string(g.type(table).shape), " for rank ",
+             rank, ", hidden ", hidden, " and ", target.tokens, " tokens");
+    const Value row_logits = folded_ ? g.slice(g.matmul(g.slice(slots, 0, 0, drafts_), target.head), 1, 0,
+                                               target.tokens)
+                                     : Value{};
     Value previous = g.slice(g.slice(ids, 0, -rows), 0, 0, 1);  // the pending token
     Value state = g.constant(HostTensor(DType::F32, {1, rank}));
     std::vector<Value> drafts;
@@ -208,8 +257,10 @@ void Drafter::build_block(Graph& g, const Target& target) const {
         const Value candidate = g.tanh(g.slice(z, 1, rank, 2 * rank));
         const Value latent = g.tanh(g.slice(z, 1, 2 * rank, 3 * rank));
         state = g.add(candidate, g.mul(gate, g.add(state, g.scale(candidate, -1.0f))));  // gate s + (1 - gate) n
-        const Value corrected = g.add(row, g.add(g.matmul(latent, out_w), out_b));
-        previous = blocks::argmax_rows(g, g.slice(g.matmul(corrected, target.head), 1, 0, target.tokens));
+        const Value correction = g.add(g.matmul(latent, out_w), out_b);
+        const Value logits = folded_ ? g.add(g.slice(row_logits, 0, i, i + 1), correction)
+                                     : g.slice(g.matmul(g.add(row, correction), target.head), 1, 0, target.tokens);
+        previous = blocks::argmax_rows(g, logits);
         drafts.push_back(previous);
     }
     g.output("drafts", drafts.size() == 1 ? drafts[0] : g.concat(drafts, 0));

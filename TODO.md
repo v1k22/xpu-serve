@@ -318,6 +318,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Inkling 2 Mini: GGUF files in mainline llama.cpp's layout (`inkling2_loop`: AtomicChat's uncensored files,
       Unsloth's `Mainline_Support` copies), each looped layer's message queries read from the file; the same pack as
       Unsloth's layout from the same model
+- [x] Inkling 2 Mini: mainline llama.cpp's DSpark drafter file (llama.cpp #32218; the drafter of Unsloth's and
+      AtomicChat's repositories since 2026-11-23): its mixes a row per reader, its mask a copy per draft, its head
+      folded through the output layer and kept so (`markov_head.fold`)
 - [x] Inkling 2 Mini: a GGUF LoRA adapter (AtomicChat's rank-1 edit, for any GGUF of the model): `--lora`, any model
       and any weight format, each change read beside the weight it changes (`graph/low_rank.h`)
 - [x] Inkling 2 Mini: its small kernels fused: elementwise trees as one kernel, the residual's scale in its queries,

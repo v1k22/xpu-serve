@@ -14,6 +14,11 @@
 //
 // A block sees all of itself and, in a local layer, the window of context before its start. Its rows are always the
 // trained block's: the layers are bidirectional, so a shorter block would be other hidden states.
+//
+// A pack imported from mainline llama.cpp's file of the drafter (convert/gguf/inkling2.cpp) holds a few tensors in
+// that file's forms: fuse_weight a row per reader (layers.<i>.fuse_weight, markov_head.fuse_weight), mask_embed a
+// copy per draft, and in place of the head's hidden_out its fold through the target's output layer
+// (markov_head.fold.weight = unembed x hidden_out, [tokens, rank], and its bias): the same drafter.
 // Reference: llama.cpp's DSpark for Inkling 2 (common/dspark.cpp, as Unsloth's builds carry it) and vLLM's port.
 
 #include <cstdint>
@@ -82,7 +87,14 @@ public:
 
 private:
     graph::Value weight(graph::Graph& g, const std::string& name) const;
+    // A float tensor's values, read on the host, and its shape.
+    std::vector<float> values(const std::string& name, Dims& shape) const;
     graph::Value bias(graph::Graph& g, const std::string& name) const;
+    // Each reader's mixing weights (the softmax of its row of fuse_weight), the head's row last: [num_layers + 1,
+    // taps], row-major.
+    std::vector<float> mixing_weights() const;
+    // The mask vector, [hidden].
+    std::vector<float> mask_vector() const;
     graph::Value norm(graph::Graph& g, graph::Value x, const std::string& name) const;
     graph::Value inv_freq(graph::Graph& g) const;
     std::string slot_label(int64_t layer) const;
@@ -93,6 +105,8 @@ private:
     const WeightStore& weights_;
     std::string prefix_;
     int64_t drafts_ = 0;
+    std::vector<float> alpha_;  // mixing_weights()
+    bool folded_ = false;       // the head's hidden_out folded through the output layer (markov_head.fold.*)
     std::vector<std::string> target_rows_{kContextRow};
 };
 

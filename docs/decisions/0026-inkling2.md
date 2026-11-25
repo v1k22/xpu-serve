@@ -111,8 +111,21 @@ another. It is not DFlash's shape, so it is a drafter of its own (`src/models/dr
   vLLM's ports (`tests/parity/model/dspark_reference.py`) over transformers' target; on the released weights the
   check is the acceptance rate.
 
-In a GGUF repository the drafter is a file of its own (`dflash` with `dflash.dspark.markov_rank`); `-hf` fetches it
-with the model file and the import puts its tensors beside the model's, as a pack of the checkpoint holds them.
+In a GGUF repository the drafter is a file of its own (`dflash`); `-hf` fetches it with the model file and the import
+puts its tensors beside the model's, as a pack of the checkpoint holds them. It comes in two layouts:
+
+- **Unsloth's** (`dflash.dspark.markov_rank`) keeps the checkpoint's tensors.
+- **Mainline llama.cpp's** (`dflash.has_markov_context`; llama.cpp #32218, the root drafter of both GGUF
+  repositories since 2026-11-23) changed four of them. Three go back exactly: `fuse_weight`'s rows were stored
+  through their softmax, a tensor per reader, and their logs are rows of `fuse_weight` again (the softmax of a row's
+  logs is the row), kept per reader; `mask_embed` is copied to each draft's row, and the drafter checks the rows are
+  one vector; `markov_w1` lost its padding rows, which no draft reads. The fourth cannot: the head's `hidden_out` is
+  folded through the target's output layer, `markov_w2 = unembed x hidden_out` over the tokens' rows (and its bias
+  `unembed x bias`), computed in float64 from the release's bf16 output layer. Undoing it would need that layer, and a
+  file's output layer is quantized, so the pack keeps the fold (`markov_head.fold.*`) and the head adds `fold x
+  latent` to the logits of its row: the same sum, `unembed x (row + hidden_out x latent)`. The output layer then
+  reads the block's rows once and each draft reads the fold (rank 256 by the tokens), not the whole layer. Its window
+  key is the checkpoint's plus one (a window of n in llama.cpp sees the n - 1 positions before a row).
 
 ## Images
 
