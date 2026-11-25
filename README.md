@@ -71,8 +71,8 @@ optimized one) and what was measured**; this page says what is supported and how
 
 Not yet:
 
-- Batching with `--spec`: requests that speculate decode a round each in turn; KV blocks shared between requests (a
-  prefix cache across sequences).
+- KV blocks shared between requests (a prefix cache across sequences); with `--spec`, the drafts of several requests
+  in one step (their verifies already are).
 - One model across two GPUs.
 - Timestamps and translation of speech; speech output; video input; images for Qwen3.5 (its vision tower is not
   loaded) and Gemma 4 26B-A4B; images from remote URLs.

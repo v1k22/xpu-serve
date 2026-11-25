@@ -200,7 +200,9 @@ struct LoadOptions {
     // processor that sizes by pixel count (Qwen3-VL's); a model whose processor does not is refused it by name.
     int64_t image_max_pixels = 0;
     bool speculation = false;  // build the speculative decoding programs when the model has a drafter
-    bool batch = false;        // build batch_graph(): serving several requests at once
+    // Serving several requests at once: build batch_graph(), and let the verify graph take segments (the speculative
+    // rounds of several requests verified as one step).
+    bool batch = false;
     // A drafter checkpoint beside the model, for speculation: a Gemma 4 assistant, a block drafter (DFlash, DSpine).
     std::filesystem::path drafter;
     // A drafter that reads the target's head (an MTP head) picks among this many of its rows, chosen by a one-bit

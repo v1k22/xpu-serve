@@ -28,8 +28,13 @@ struct EngineOptions {
     // Requests in flight at once: the session's sequences (SessionOptions::sequences), each its own cached prompt.
     int64_t sequences = 1;
     // The decode steps of the requests in flight run as one (advance_decoding): the session's program kBatchProgram
-    // is the model's batch_graph(). Not with speculative decoding.
+    // is the model's batch_graph(); speculating, each request drafts and the verifies of all run as one step of the
+    // verify graph, which then allows segments (LoadOptions::batch).
     bool batch = false;
+    // Speculating in batched steps: the rows a verify of several requests aims at, which they share (each drafts up to
+    // verify_rows / requests - 1, none when more requests decode than that). A step of up to 8 rows costs about one
+    // row's on a discrete GPU (each weight read once); past it the rows add up, a mixture of experts' most.
+    int64_t verify_rows = 8;
 };
 
 // The session's program that runs Model::batch_graph() (EngineOptions::batch), after the step graph.
@@ -59,7 +64,8 @@ public:
     // speculative round's). True when it is done: finish() then gives its result, and its sequence is free.
     bool advance(Handle h);
     // A step of each of `hs`, requests past their prompts (decoding): with EngineOptions::batch, the next tokens of all
-    // that go on run as one step; otherwise one request after another. Whether each is done, in order.
+    // that go on run as one step (speculating, each first emits every token its last round gave, then all run their
+    // next rounds together); otherwise one request after another. Whether each is done, in order.
     std::vector<bool> advance_decoding(std::span<const Handle> hs);
     GenerateResult finish(Handle h);
     bool has_free_sequence() const;
@@ -97,8 +103,11 @@ private:
     void decode_step(Generation& g);
     // Emits the request's pending token: false when that ends it (a stop token, a cancel, its last token).
     bool emit(Generation& g);
-    // The next token of each of `gs` (decoding, nothing ready), their steps as one (EngineOptions::batch).
+    // The next tokens of each of `gs` (decoding, nothing ready), their steps as one (EngineOptions::batch): a token
+    // each through the batch graph, or speculating, a round each (its drafts, one verify of all, its acceptance).
     void decode_together(std::span<Generation* const> gs);
+    // The drafts a round of `g` asks for: up to spec_k, none past its last token or past the context.
+    int round_drafts(const Generation& g) const;
     // Frees the sequence of a request that is done.
     void release(Generation& g);
     void fail_generation(Generation& g, const std::exception& e);
@@ -122,6 +131,13 @@ private:
     // and rollback. Returns the accepted drafts and the target's next token.
     std::vector<int32_t> spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
                                     std::span<const int32_t> generated, GenerateStats& stats);
+    // The end of a round of the selected sequence, which ran `fed` (the pending token and its drafts) from cached
+    // position `start` as rows `row`, `row` + 1, ... of the last run: the target's token after each row while the
+    // drafts agree, the sequence cut back past the last draft kept, and the kept rows handed to the drafter (`target`:
+    // its outputs of the round's rows, from row 0). Returns the accepted drafts and the target's next token.
+    std::vector<int32_t> accept_round(std::span<const int32_t> fed, int64_t row, int64_t start, const TensorMap& target,
+                                      Sampler& sampler, std::span<const int32_t> prompt,
+                                      std::span<const int32_t> generated, GenerateStats& stats);
     // The program whose state slots are the sequence's: the step graph's, and speculating the verify graph's, which
     // also writes what a block drafter reads of the target.
     size_t state_program() const;

@@ -41,7 +41,7 @@ public:
     // `block`: the drafter proposes a block a run instead of a token (BlockDrafting): the target's prefill and verify
     // programs append a context row per token to its KV slot, and its program attends over them and its own block.
     // It is handed its guesses, right except after every third token, and gives them back unless its state is off.
-    // `batch`: a batch graph too (Model::batch_graph).
+    // `batch`: a batch graph too (Model::batch_graph), and a verify graph that allows segments.
     explicit TinySpecModel(bool argmax = false, bool block = false, bool batch = false)
         : argmax_(argmax), block_(block), batch_(batch) {
         test::TensorRng rng(7);
@@ -87,7 +87,9 @@ public:
             batch_graph_.validate();
         }
         build_target(prefill_, false, true);
+        if (batch_) verify_.allow_segments();  // speculating, the rounds of several requests verify as one step
         build_target(verify_, true, true);
+        verify_.validate();
         block_ ? build_block() : build_draft();
     }
 
@@ -201,13 +203,14 @@ private:
     Graph step_, batch_graph_, prefill_, verify_, draft_;
 };
 
-// `batch`: the decode steps of the sequences in flight run as one (EngineOptions::batch).
+// `batch`: the decode steps of the sequences in flight run as one (EngineOptions::batch): speculating, their
+// verifies, of up to `verify_rows` rows (EngineOptions::verify_rows).
 inline std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argmax = false, bool block = false,
-                                           int64_t sequences = 1, bool batch = false) {
+                                           int64_t sequences = 1, bool batch = false, int64_t verify_rows = 64) {
     static const auto backend = make_cpu_ref_backend();
     auto model = std::make_unique<TinySpecModel>(argmax, block, batch);
     std::vector<const Graph*> programs{&model->graph()};
-    if (batch) programs.push_back(model->batch_graph());
+    if (batch && spec_k == 0) programs.push_back(model->batch_graph());
     SessionOptions options;
     options.precision = DType::F32;
     options.max_context = 256;
@@ -223,6 +226,7 @@ inline std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bo
     engine.spec_k = spec_k;
     engine.sequences = sequences;
     engine.batch = batch;
+    engine.verify_rows = verify_rows;
     return std::make_unique<Engine>(std::move(model), std::move(session), EncoderSessions{}, engine);
 }
 

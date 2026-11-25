@@ -276,7 +276,8 @@ prompt kept for its next turn), and runs the decode steps of all that decode as 
 for the next token of each ([docs/decisions/0028](docs/decisions/0028-batched-decode.md)). Prefill chunks run a request
 at a time between those steps. The KV cache is billed for each sequence at load, so `--ctx` is a sequence's context
 (on a 24 GB card, Qwen3.8-27B in Q4_0 takes eight of 8,192 tokens in f16; `--kv-dtype i8` about doubles that). With
-`--spec` the requests decode a round each in turn instead.
+`--spec` the verifies of their speculative rounds run as one step, which they share: 8 rows, so each drafts fewer as
+more requests decode (the second table).
 
 ```bash
 xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --sequences 8 --ctx 8192
@@ -288,13 +289,23 @@ and the server's decode speed of each request:
 
 | Model | N = 1 | N = 2 | N = 4 | N = 8 |
 |---|---|---|---|---|
-| Qwen3.8-27B, Q4_0 pack (dense) | 21.6 tok/s | 37.4 in all, 19.0 each | 64.1 in all, 16.9 each | 106.8 in all, 14.6 each |
-| Inkling-2-Mini, AtomicChat's AD-Q4_K (mixture of experts) | 42.6 (45.9 decoding) | 61.5 in all, 32.9 each | 74.0 in all, 21.0 each | 88.2 in all, 13.0 each |
+| Qwen3.8-27B, Q4_0 pack (dense) | 21.6 tok/s | 37.7 in all, 19.1 each | 66.4 in all, 17.4 each | 111.6 in all, 15.2 each |
+| Inkling-2-Mini, AtomicChat's AD-Q4_K (mixture of experts) | 42.4 (45.7 decoding) | 63.8 in all, 34.3 each | 78.3 in all, 22.5 each | 96.1 in all, 14.5 each |
 
-A dense model reads the same weights for every token, so eight requests cost little more than one: 4.9 times the
-tokens. A mixture of experts reads the experts each token picks, more of them as requests are added, and its steps
-hold more stateful ops (Inkling 2: a convolution beside every sublayer and attention in each of 48 layer runs), each a
-launch a request: 2.1 times at eight.
+A dense model reads the same weights for every token, so eight requests cost little more than one: 5.2 times the
+tokens. A mixture of experts reads the experts each token picks, more of them as requests are added: 2.3 times at
+eight.
+
+Speculating (`--spec`; MTP's three drafts a round, DSpark's two, fewer as more requests share a verify):
+
+| Model, drafter | N = 1 | N = 2 | N = 4 | N = 8 |
+|---|---|---|---|---|
+| Qwen3.8-27B, Q4_0 pack, its MTP head (`--spec mtp`) | 58.3 (60.2 decoding) | 78.5 in all, 44.7 each | 91.3 in all, 25.3 each | 103.6 in all, 14.1 each |
+| Inkling-2-Mini, AD-Q4_K, DSpark (`--spec dspark`) | 50.0 (54.7 decoding) | 60.6 in all, 32.8 each | 68.3 in all, 19.6 each | 84.8 in all, 12.8 each |
+
+For the dense model speculation pays up to four requests (78.5 against 37.7 for two, 91.3 against 66.4 for four) and
+costs 7 % at eight; for the mixture of experts it costs from two requests on, so serve several users of Inkling-2-Mini
+without `--spec`.
 
 ## Language models
 
@@ -663,8 +674,9 @@ xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4 --kv-
 - On the Arc B390, `--spec-k 5`.
 - Faster still on prose: a DFlash 2 drafter
   ([DFlash 2 and DSpine drafters](#dflash-2-and-dspine-drafters-for-qwen38-27b)).
-- Several users: `--sequences 8 --ctx 8192` (without `--spec`) decodes eight requests at once at 106.8 tok/s in all,
-  14.6 each, on the Arc Pro B60 (the Q4_0 GGUF pack; [Several requests at once](#several-requests-at-once)).
+- Several users: `--sequences 8 --ctx 8192` decodes eight requests at once at 111.6 tok/s in all, 15.2 each, on the
+  Arc Pro B60 (the Q4_0 GGUF pack); with `--spec mtp` two or four users get more (78.5 and 91.3 tok/s in all, against
+  37.7 and 66.4), eight a little less ([Several requests at once](#several-requests-at-once)).
 - Its GGUF files, 6 to 23 GB: [Qwen3.8-27B GGUF](#qwen38-27b-gguf).
 
 Measured, at q4:
@@ -790,8 +802,8 @@ xpu-serve serve ~/models/Inkling-2-Mini-q4 --device GPU --spec dspark --spec-k 1
   release's NVFP4 experts) fits the Arc B390 only, where it decodes at 16.5 tok/s.
 - The drafter gains about a tenth: every draft verified reads the experts of its own token, and the first draft is
   accepted 63 % of the time, so one draft a round is the best.
-- Several users: `--sequences N` (without `--spec`) decodes N requests at once; on the Arc Pro B60, AtomicChat's
-  AD-Q4_K gives 61.5 tok/s in all for two, 74.0 for four, 88.2 for eight (13.0 each), against 42.6 for one
+- Several users: `--sequences N` (best without `--spec`) decodes N requests at once; on the Arc Pro B60, AtomicChat's
+  AD-Q4_K gives 63.8 tok/s in all for two, 78.3 for four, 96.1 for eight (14.5 each), against 42.4 for one
   ([Several requests at once](#several-requests-at-once)): a mixture of experts reads the experts each token picks.
 
 Measured over six chat prompts (greedy; 256 tokens each on the B60, 128 on the B390). Perplexity over 4,096 positions of

@@ -151,7 +151,7 @@ private:
         LastLogits,           // the step graph
         AllLogits,            // a decode step of several requests (batch_graph)
         LastLogitsAllHidden,  // prefill with speculation
-        AllLogitsAllHidden,   // verify
+        AllLogitsAllHidden,   // verify: of several requests at once when batching
     };
 
     std::string w(const std::string& suffix) const { return prefix_ + suffix; }
@@ -259,7 +259,7 @@ private:
     }
 
     void build_target(Graph& g, Head head) const {
-        if (head == Head::AllLogits) g.allow_segments();
+        if (head == Head::AllLogits || (head == Head::AllLogitsAllHidden && batched_)) g.allow_segments();
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
         Value h = g.scale(g.gather(weight(g, w("embed_tokens.weight")), ids), embed_scale_);

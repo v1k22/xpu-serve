@@ -119,11 +119,11 @@ private:
         LastLogits,           // the step graph
         AllLogits,            // a decode step of several requests (batch_graph)
         LastLogitsAllHidden,  // prefill with speculation
-        AllLogitsAllHidden,   // verify
+        AllLogitsAllHidden,   // verify: of several requests at once when batching
     };
 
     void build_target(Graph& g, Head head) const {
-        if (head == Head::AllLogits) g.allow_segments();
+        if (head == Head::AllLogits || (head == Head::AllLogitsAllHidden && batched_)) g.allow_segments();
         const Decoder::Inputs in = dec_.inputs(g);
         const std::vector<Value> after = dec_.layers(g, in);  // the state after each layer
         const Value h = after.back();

@@ -454,11 +454,11 @@ private:
         LastLogits,         // the step graph
         AllLogits,          // a decode step of several requests (batch_graph)
         LastLogitsContext,  // prefill with the drafter
-        AllLogitsContext,   // verify
+        AllLogitsContext,   // verify: of several requests at once when batching
     };
 
     void build_target(Graph& g, Head head) const {
-        if (head == Head::AllLogits) g.allow_segments();
+        if (head == Head::AllLogits || (head == Head::AllLogitsContext && batched_)) g.allow_segments();
         Builder b(g, cfg_, *weights_, vision_ != nullptr);
         const Value h = b.decoder();
         // With a drafter every program takes the positions prepare_inputs gives, the step graph without reading them.

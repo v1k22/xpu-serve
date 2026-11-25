@@ -144,7 +144,10 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       sequence of the session, advanced in turn (decision 0027)
 - [x] Continuous batching: the decode steps of the sequences in flight as one step, a segment of rows a sequence
       (`Session::run_segments`, the stateful ops acting on each segment's sequence; decision 0028)
-- [ ] Batched speculative rounds: a verify as a segment of k + 1 rows, the drafters' steps of several sequences as one
+- [x] Batched speculative rounds: the verifies of the requests in flight as one step, a segment of k + 1 rows each,
+      sharing a budget of rows (decision 0028)
+- [ ] The drafters' steps of several sequences as one; a verify's stateful ops as one launch over the segments (a
+      step that keeps its inputs for rollback)
 - [x] One launch over a batched step's segments for its stateful ops: the convolutions, the gated delta rule, the KV
       appends and decode attention, each segment reading and writing its sequence's cache in any format (decision 0028)
 - [ ] Prefix cache: hash-chained full blocks, refcounts, LRU; validity rule for sliding layers (DESIGN.md 9.4). Today
