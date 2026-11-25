@@ -92,7 +92,7 @@ Each model's recipe has its commands and numbers.
 | Ornith-1.5-35B-A3B | language, MoE | `ornith-ai/Ornith-1.5-35B-A3B`, `-FP8`, `-GGUF` | q4 pack, GGUF Q4_K_M | [recipe](model_recipes.md#ornith-15-35b-a3b), [GGUF](model_recipes.md#ornith-15-35b-a3b-gguf) |
 | LFM3-1.7B | language | `LiquidAI/LFM3-1.7B` | original, q8 / q4 pack | [recipe](model_recipes.md#lfm3-17b) |
 | Inkling-2-Mini | language, MoE | `thinkingmachines/Inkling-2-Mini`, `unsloth/Inkling-2-Mini-GGUF` | q8 / q4 pack, GGUF | [recipe](model_recipes.md#inkling-2-mini), [GGUF](model_recipes.md#inkling-2-mini-gguf) |
-| Inkling-2-Mini Uncensored | language, MoE | `AtomicChat/Inkling-2-Mini-Uncensored-GGUF` | GGUF IQ3_S, IQ2_M | [GGUF](model_recipes.md#inkling-2-mini-uncensored-gguf) |
+| Inkling-2-Mini Uncensored | language, MoE | `AtomicChat/Inkling-2-Mini-Uncensored-GGUF` | GGUF Q4_K, IQ3_S, IQ2_M | [GGUF](model_recipes.md#inkling-2-mini-uncensored-gguf) |
 | Clef-Flash | decision | `Cloudflare/clef-flash` | original, q8 / q4 pack, GGUF | [recipe](model_recipes.md#clef-flash) |
 | Clef | decision | `ggml-org/Clef-GGUF` (of `Cloudflare/clef`) | GGUF Q4_K_M | [recipe](model_recipes.md#clef) |
 | pplx-decider-flash-v1.2 | decision | `perplexity-ai/pplx-decider-flash-v1.2` | original, q8 / q4 pack | [recipe](model_recipes.md#pplx-decider-flash-v12) |

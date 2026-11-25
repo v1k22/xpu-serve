@@ -704,14 +704,14 @@ accuracy, speed and context. UD-Q4_K_M scores within 0.3 % of the lossless file'
 
 | | Best accuracy: UD-Q8_K_XL | Balanced: UD-Q4_K_M |
 |---|---|---|
-| Arc Pro B60 (24 GB) | 35.5 tok/s, 39.7 with DSpark; text only: 63,488 tokens with an `i8` cache, 186,368 in `turbo3` | 43.2 tok/s, 47.7 with DSpark; 369,664 tokens in `i8`, 993,280 in `turbo3` (all 1,048,576 text only) |
+| Arc Pro B60 (24 GB) | 35.5 tok/s, 39.3 with DSpark; text only: 63,488 tokens with an `i8` cache, 186,368 in `turbo3` | 43.2 tok/s, 47.1 with DSpark; 369,664 tokens in `i8`, 993,280 in `turbo3` (all 1,048,576 text only) |
 | Arc B390 (30 GB of system memory) | 16.3 tok/s, 18.1 with DSpark; 262,144 tokens in `i8`, 524,288 in `turbo3` | 23.1 tok/s, 24.9 with DSpark; 524,288 tokens in `i8`, all 1,048,576 in `turbo3` |
 
 Arc Pro B60:
 
 ```bash
 xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q8_K_XL --device GPU --spec dspark --spec-k 1 \
-    --kv-dtype i8 --ctx 32768 --no-vision                                            # best accuracy
+    --kv-dtype i8 --ctx 28672 --no-vision                                            # best accuracy
 xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M --device GPU --spec dspark --spec-k 1 \
     --kv-dtype i8 --ctx 262144                                                       # balanced
 ```
@@ -731,13 +731,14 @@ tower's arena):
 
 | File, KV cache | Text and images | With DSpark | Text only (`--no-vision`) | Text only, with DSpark |
 |---|---|---|---|---|
-| UD-Q8_K_XL, `i8` | 1,024 | none | 63,488 | 33,792 |
-| UD-Q8_K_XL, `turbo3` | 7,168 | none | 186,368 | 105,472 |
-| UD-Q4_K_M, `i8` | 369,664 | 305,152 | 437,248 | 365,568 |
-| UD-Q4_K_M, `turbo3` | 993,280 | 823,296 | all 1,048,576 | 982,016 |
+| UD-Q8_K_XL, `i8` | 1,024 | none | 63,488 | 28,672 |
+| UD-Q8_K_XL, `turbo3` | 7,168 | none | 186,368 | 91,136 |
+| UD-Q4_K_M, `i8` | 369,664 | 300,032 | 437,248 | 360,448 |
+| UD-Q4_K_M, `turbo3` | 993,280 | 808,960 | all 1,048,576 | 967,680 |
 
 The vision tower's arena holds a whole image's patches, which the lossless file cannot spare beside the drafter: its
-best-accuracy setting on the B60 is text only. The drafter adds its weights (0.4 GiB), a ninth KV slot that grows
+best-accuracy setting on the B60 is text only. The drafter adds its weights (0.45 GiB from the repository's file, whose
+head is folded through the output layer: [DSpark](#dspark-inkling-2s-drafter)), a ninth KV slot that grows
 with the context and a verify's step; a long document decodes faster without it (below). The B390's contexts are the
 longest run there, its memory shared with the system, before the load-time reservation: not yet checked against it.
 
@@ -751,7 +752,7 @@ xpu-serve serve ~/models/Inkling-2-Mini-q4 --device GPU --spec dspark --spec-k 1
 
 - Long contexts: forty of the 48 layer runs attend within 1,024 tokens and keep only that window, so the KV cache
   grows by 32 KiB a token at f16 (16.5 KiB in `i8`, 8.25 KiB in `turbo4`, 6.25 KiB in `turbo3`;
-  [KV cache formats](#kv-cache-formats)). `i8` costs next to nothing here (perplexity +0.15 % on the lossless file),
+  [KV cache formats](#kv-cache-formats)). `i8` costs next to nothing here (perplexity +0.23 % on the lossless file),
   `turbo4` +0.28 % and `turbo3` +2.0 % (on UD-Q4_K_M, KL 0.010 and 0.024), more than the file's own +0.29 %: past
   65,536 tokens on the B60 the balanced file in `i8` or `turbo4` keeps more of the model than the lossless one in
   `turbo3`.
@@ -767,8 +768,8 @@ Hugging Face fp32 (transformers' `Inkling2Loop`), the last-token logits' cosine 
 
 | | GPU memory | Decode | With DSpark | Prefill (512 tokens) | Perplexity | Logits cosine | Greedy tokens kept |
 |---|---|---|---|---|---|---|---|
-| Arc Pro B60, GGUF UD-Q8_K_XL | 21.3 GiB | 35.5 tok/s | 39.7 tok/s | 612 tok/s | 8.108 | 0.9999 / 1.0000 | 32 on all six |
-| Arc Pro B60, GGUF UD-Q4_K_M | 15.4 GiB | 43.2 tok/s | 47.7 tok/s | 589 tok/s | 8.131 (+0.29 %) | 0.9995 / 0.9999 | 32, 31, 32, 26, 32, 32 |
+| Arc Pro B60, GGUF UD-Q8_K_XL | 21.3 GiB | 35.5 tok/s | 39.3 tok/s | 612 tok/s | 8.108 | 0.9999 / 1.0000 | 32 on all six |
+| Arc Pro B60, GGUF UD-Q4_K_M | 15.4 GiB | 43.2 tok/s | 47.1 tok/s | 589 tok/s | 8.131 (+0.29 %) | 0.9995 / 0.9999 | 32, 31, 32, 26, 32, 32 |
 | Arc Pro B60, q4 pack | 15.4 GiB | 51.9 tok/s | 57.7 tok/s | 604 tok/s | 8.240 (+1.63 %) | 0.9981 / 0.9991 | 32, 31, 22, 26, 4, 32 |
 | Arc B390, GGUF UD-Q8_K_XL | 21.3 GiB | 16.3 tok/s | 18.1 tok/s | 216 tok/s | | 0.9999 / 1.0000 | 32, 31, 32, 32, 4, 32 |
 | Arc B390, GGUF UD-Q4_K_M | 15.4 GiB | 23.1 tok/s | 24.9 tok/s | 220 tok/s | | 0.9997 / 0.9999 | 32, 32, 32, 26, 32, 32 |
@@ -1071,23 +1072,27 @@ minutes).
 
 ### Inkling-2-Mini GGUF
 
-[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (`inkling2`): all ten files of the
-model (UD-IQ1_S to UD-Q8_K_XL, 7.8 to 22.9 GB) and the drafter's (`dspark-Inkling-2-Mini-Q8_0.gguf`, 402 MB; a BF16
-copy in `dspark/`). `-hf` fetches the drafter's file with the model's and imports both into one pack, so
-`--spec dspark` works on every file. The 4-bit and larger files keep the release's NVFP4 expert banks of 20 layers
-as they are (77 % of the weights) and differ in the rest; the smaller ones quantize more of the banks further (NVFP4
-is 57 % of UD-Q3_K_XL, 1 % of UD-IQ1_S). `-hf` also fetches the vision tower's file (`mmproj-BF16.gguf`), so images
-work from every file. The copies in mainline llama.cpp's layout (`Mainline_Support/*.gguf_file`) import too, as
-`inkling2_loop` (as [AtomicChat's files](#inkling-2-mini-uncensored-gguf) do), but not through `-hf`: downloaded and
-renamed to `.gguf`, `convert <file.gguf> <pack-dir> --mmproj <mmproj.gguf>`. Unsloth's UD-Q4_K_M in that layout is
-the same model (16.6 GB, perplexity 8.131, greedy text equal to its twin's).
+[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) (`inkling2_loop`): all ten files of
+the model (UD-IQ1_S to UD-Q8_K_XL, 7.8 to 22.9 GB) and the drafter's (`dspark-Inkling-2-Mini-Q8_0.gguf`, 500 MB).
+`-hf` fetches the drafter's file with the model's and imports both into one pack, so `--spec dspark` works on every
+file. The 4-bit and larger files keep the release's NVFP4 expert banks of 20 layers as they are (77 % of the weights)
+and differ in the rest; the smaller ones quantize more of the banks further (NVFP4 is 57 % of UD-Q3_K_XL, 1 % of
+UD-IQ1_S). `-hf` also fetches the vision tower's file (`mmproj-BF16.gguf`), so images
+work from every file. Since 2026-11-23 the repository's files are in mainline llama.cpp's layout (`inkling2_loop`, as
+[AtomicChat's](#inkling-2-mini-uncensored-gguf) are: the same tensors, byte for byte, under other names) and its
+drafter in mainline's format (its head folded through the output layer; [DSpark](#dspark-inkling-2s-drafter)). The
+earlier files, in Unsloth's layout (`inkling2`), are in `Old_Support/` as `.gguf_file` (the drafter also as
+`dspark-Inkling-2-Mini-Q8_0_Old.gguf`) and import too, but not through `-hf`: downloaded and renamed to `.gguf`,
+`convert <file.gguf> <pack-dir> --mtp <drafter.gguf> --mmproj <mmproj.gguf>`, with either drafter. The two layouts
+of a file are the same model: every file measured again from the repository's new layout gave the perplexity below
+within 0.13 % (f16's rounding) and the speeds below.
 
 Closest to the reference, on either device (the release's own values; on a 24 GB card text only, with the drafter
-33,792 tokens of context, 63,488 without; [what fits](#inkling-2-mini)):
+28,672 tokens of context, 63,488 without; [what fits](#inkling-2-mini)):
 
 ```bash
 xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q8_K_XL --device GPU --spec dspark --spec-k 1 --kv-dtype i8 \
-    --ctx 32768 --no-vision
+    --ctx 28672 --no-vision
 ```
 
 Balanced (perplexity +0.29 %, two thirds of the memory; long contexts in [Inkling-2-Mini](#inkling-2-mini)):
@@ -1102,20 +1107,20 @@ six chat prompts without and with the drafter (k = 1, the best of 1 to 3 on ever
 
 | Variant | File | GPU memory | Perplexity | Logits cosine | Greedy kept (192) | B60 decode | With DSpark | B390 decode | With DSpark |
 |---|---|---|---|---|---|---|---|---|---|
-| UD-Q8_K_XL | 22.9 GB | 21.27 GiB | 8.108 | 0.9999 / 1.0000 | 192 | 35.5 tok/s | 39.7 tok/s | 16.3 tok/s | 18.1 tok/s |
-| UD-Q4_K_XL | 17.6 GB | 16.34 GiB | 8.129 (+0.27 %) | 0.9994 / 0.9999 | 163 | 35.5 † | 41.8 † | 20.7 † | 23.4 † |
-| UD-Q4_K_M | 16.6 GB | 15.39 GiB | 8.131 (+0.29 %) | 0.9995 / 0.9999 | 185 | 43.2 | 47.7 | 23.1 | 24.9 |
-| UD-IQ4_XS | 15.7 GB | 14.57 GiB | 8.136 (+0.34 %) | 0.9997 / 0.9999 | 163 | 35.4 † | 40.2 † | 21.6 † | 24.5 † |
-| UD-Q3_K_XL | 13.6 GB | 12.62 GiB | 8.176 (+0.84 %) | 0.9908 / 0.9964 | 131 | 35.3 † | 40.5 † | 22.4 † | 25.3 † |
-| UD-IQ3_XXS | 11.7 GB | 10.78 GiB | 8.306 (+2.44 %) | 0.9937 / 0.9965 | 128 | 35.7 † | 41.0 † | 23.6 † | 26.3 † |
-| UD-Q2_K_XL | 9.14 GB | 8.43 GiB | 8.551 (+5.47 %) | 0.9766 / 0.9879 | 98 | 36.9 † | 42.8 † | 24.9 † | 28.6 † |
-| UD-IQ2_XXS | 8.49 GB | 7.82 GiB | 8.724 (+7.60 %) | 0.9636 / 0.9851 | 100 | 36.5 † | 42.8 † | 25.6 † | 29.3 † |
-| UD-IQ1_M | 8.02 GB | 7.39 GiB | 8.799 (+8.53 %) | 0.9952 / 0.9973 | 139 | 36.7 † | 41.7 † | 26.0 † | 29.9 † |
-| UD-IQ1_S | 7.76 GB | 7.15 GiB | 8.862 (+9.31 %) | 0.9815 / 0.9882 | 48 | 37.1 † | 42.5 † | 26.1 † | 30.4 † |
+| UD-Q8_K_XL | 22.9 GB | 21.27 GiB | 8.108 | 0.9999 / 1.0000 | 192 | 35.5 tok/s | 39.3 tok/s | 16.3 tok/s | 18.1 tok/s |
+| UD-Q4_K_XL | 17.6 GB | 16.34 GiB | 8.129 (+0.27 %) | 0.9994 / 0.9999 | 163 | 43.1 | 47.3 | 20.7 † | 23.4 † |
+| UD-Q4_K_M | 16.6 GB | 15.39 GiB | 8.131 (+0.29 %) | 0.9995 / 0.9999 | 185 | 43.2 | 47.1 | 23.1 | 24.9 |
+| UD-IQ4_XS | 15.7 GB | 14.57 GiB | 8.136 (+0.34 %) | 0.9997 / 0.9999 | 163 | 43.3 | 46.2 | 21.6 † | 24.5 † |
+| UD-Q3_K_XL | 13.6 GB | 12.62 GiB | 8.176 (+0.84 %) | 0.9908 / 0.9964 | 131 | 43.1 | 45.4 | 22.4 † | 25.3 † |
+| UD-IQ3_XXS | 11.7 GB | 10.78 GiB | 8.306 (+2.44 %) | 0.9937 / 0.9965 | 128 | 43.5 | 45.8 | 23.6 † | 26.3 † |
+| UD-Q2_K_XL | 9.14 GB | 8.43 GiB | 8.551 (+5.47 %) | 0.9766 / 0.9879 | 98 | 45.4 | 48.4 | 24.9 † | 28.6 † |
+| UD-IQ2_XXS | 8.49 GB | 7.82 GiB | 8.724 (+7.60 %) | 0.9636 / 0.9851 | 100 | 44.8 | 48.8 | 25.6 † | 29.3 † |
+| UD-IQ1_M | 8.02 GB | 7.39 GiB | 8.799 (+8.53 %) | 0.9952 / 0.9973 | 139 | 44.9 | 48.1 | 26.0 † | 29.9 † |
+| UD-IQ1_S | 7.76 GB | 7.15 GiB | 8.862 (+9.31 %) | 0.9815 / 0.9882 | 48 | 45.6 | 48.8 | 26.1 † | 30.4 † |
 | *our q4 pack* | | 15.44 GiB | 8.240 (+1.63 %) | 0.9981 / 0.9991 | 147 | 51.9 | 57.7 | 24.1 † | 26.7 † |
 
-† Measured before the decode fixes of [Inkling-2-Mini](#inkling-2-mini), which made the files measured again 15 to
-18 % faster on the B60 and 8 to 11 % on the B390.
+† Measured before the decode fixes of [Inkling-2-Mini](#inkling-2-mini), which made the files measured again 8 to 11 %
+faster on the B390. The B60's columns are the files of the repository's new layout, with its new drafter.
 
 Prefill of 512 tokens: 568 to 596 tok/s on the B60 and 215 to 232 on the B390 for every file (UD-Q8_K_XL: 590 on the
 B60 and 216 on the B390, its four layers of bf16 experts read by the grouped GEMM). Perplexity is the sharper
@@ -1126,8 +1131,9 @@ order alone moved the lossless file's by 0.1 %); an `i8` KV cache moves each fil
 - **Speed.** A decode step is bound by the device, not by its launches: on the B60 two thirds of it reads the
   weights a token goes through, the rest is some 3,400 small kernels of 1 to 3 us
   ([docs/decisions/0026](docs/decisions/0026-inkling2.md)). So a smaller file is faster by less than its size: 35.5
-  tok/s for UD-Q8_K_XL, 43.2 for UD-Q4_K_M. On the B390, whose memory is slower, size counts for more.
-- **Memory is the file's**, the drafter included (0.4 GB), and the vision tower's when it is loaded; the contexts each
+  tok/s for UD-Q8_K_XL, 43.2 for UD-Q4_K_M, 45.6 for UD-IQ1_S at a third of the lossless file's size. On the B390,
+  whose memory is slower, size counts for more.
+- **Memory is the file's**, the drafter's (0.45 GiB) and the vision tower's when they are loaded; the contexts each
   file takes are in [Inkling-2-Mini](#inkling-2-mini).
 
 ### Inkling-2-Mini Uncensored GGUF
@@ -1135,39 +1141,45 @@ order alone moved the lossless file's by 0.1 %); an `i8` KV cache moves each fil
 [AtomicChat/Inkling-2-Mini-Uncensored-GGUF](https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF)
 (`inkling2_loop`, mainline llama.cpp's layout; Apache 2.0): Inkling-2-Mini with a rank-1 edit that removes each
 layer's refusal direction (attention outputs, routed experts and the embedding), merged into the weights, so it
-answers requests the original refuses. Three files (AD-Q4_K 16.5 GB, AD-IQ3_S 13.3 GB, AD-IQ2_M 8.67 GB) and the
-vision tower's, which `-hf` fetches with any of them: images work. The repository has no drafter, so `--spec dspark`
-is refused. Its adapter file (`Inkling-2-Mini-Uncensored-LoRA.gguf`, 44 MB: the same edit for any GGUF of the model)
-applies with `--lora`, each change added where the model reads the weight it changes, which stays as the file stores
-it: Unsloth's files then keep their NVFP4 experts and DSpark.
+answers requests the original refuses. Three files (AD-Q4_K 16.5 GB, AD-IQ3_S 13.3 GB, AD-IQ2_M 8.67 GB), the
+drafter's (`dspark-Inkling-2-Mini-Q8_0.gguf`, in mainline llama.cpp's format) and the vision tower's, which `-hf`
+fetches with any of them: images and `--spec dspark` work. Its adapter file (`Inkling-2-Mini-Uncensored-LoRA.gguf`,
+44 MB: the same edit for any GGUF of the model) applies with `--lora`, each change added where the model reads the
+weight it changes, which stays as the file stores it: Unsloth's files then keep their NVFP4 experts.
 
 Arc Pro B60:
 
 ```bash
-xpu-serve serve -hf AtomicChat/Inkling-2-Mini-Uncensored-GGUF:IQ3_S --device GPU --kv-dtype i8   # closer to the model
-xpu-serve serve -hf AtomicChat/Inkling-2-Mini-Uncensored-GGUF:IQ2_M --device GPU --kv-dtype i8   # smallest, fastest
+xpu-serve serve -hf AtomicChat/Inkling-2-Mini-Uncensored-GGUF:Q4_K --device GPU --spec dspark --spec-k 1 \
+    --ctx 131072                                                                     # closest to the model
+xpu-serve serve -hf AtomicChat/Inkling-2-Mini-Uncensored-GGUF:IQ2_M --device GPU --spec dspark --spec-k 1 \
+    --kv-dtype i8                                                                    # smallest
 ```
 
 Measured on the Arc Pro B60: perplexity over 4,096 positions of wikitext-2 as for [Inkling-2-Mini](#inkling-2-mini),
 against the original's lossless file (8.108), so it holds the edit's change and the file's rounding together; what an
-`i8` KV cache changes in it; greedy decode over six chat prompts of 256 tokens; prefill of 512 tokens:
+`i8` KV cache changes in it; greedy decode over six chat prompts of 256 tokens without and with the drafter (k = 1);
+prefill of 512 tokens:
 
-| File | Size | GPU memory | Perplexity | With an `i8` cache | Decode | Prefill (512 tokens) |
-|---|---|---|---|---|---|---|
-| AD-IQ3_S | 13.3 GB | 12.40 GiB | 8.321 (+2.6 %) | −0.16 %, KL 0.003 | 39.1 tok/s | 597 tok/s |
-| AD-IQ2_M | 8.67 GB | 8.04 GiB | 9.014 (+11.2 %) | +0.10 %, KL 0.003 | 44.9 tok/s | 630 tok/s |
+| File | Size | GPU memory | Perplexity | With an `i8` cache | Decode | With DSpark | Prefill (512 tokens) |
+|---|---|---|---|---|---|---|---|
+| AD-Q4_K | 16.5 GB | 15.36 GiB | 8.177 (+0.85 %) | +0.09 %, KL 0.003 | 45.8 tok/s | 51.9 tok/s | 600 tok/s |
+| AD-IQ3_S | 13.3 GB | 12.40 GiB | 8.321 (+2.6 %) | −0.16 %, KL 0.003 | 39.8 tok/s | 42.2 tok/s | 597 tok/s |
+| AD-IQ2_M | 8.67 GB | 8.04 GiB | 9.014 (+11.2 %) | +0.10 %, KL 0.003 | 46.0 tok/s | 50.1 tok/s | 630 tok/s |
 
-- **Answers.** Through the server on both files: 17 x 23, why Canberra and not Sydney, a tool call and the answer
-  from its result, the shapes and colours of a picture and the text in another, a 150-word story. Every answer was
-  right, the tool calls well formed and the stories coherent.
+- **Answers.** Through the server on AD-IQ3_S and AD-IQ2_M: 17 x 23, why Canberra and not Sydney, a tool call and the
+  answer from its result, the shapes and colours of a picture and the text in another, a 150-word story; on AD-Q4_K
+  with the drafter, 17 x 23, a picture, a tool call and the story. Every answer was right, the tool calls well formed
+  and the stories coherent (a story thinks long at the default effort: give it room, 6,000 tokens or so).
 - **Their experts are i-quants.** The edit changes every routed expert, and these files store them as IQ3_S and
   IQ4_NL (AD-IQ3_S) or IQ2_XXS, Q2_0 and IQ4_NL (AD-IQ2_M), where Unsloth's files keep the release's NVFP4. AD-IQ3_S
   scores below UD-Q3_K_XL (13.6 GB, +0.84 %, its experts mostly NVFP4); how much of that is the edit's own change
   these measurements cannot tell.
-- **Contexts** were not measured on these files: they take less memory than UD-Q4_K_M (15.4 GiB), which takes 262,144
-  tokens in `i8` on the B60. AD-Q4_K imports the same way and was not measured.
-- **The adapter** on Unsloth's UD-Q4_K_M (Arc Pro B60, 512 + 128 tokens): decode 38.8 to 37.2 tok/s, prefill 589 to
-  514 tok/s; the model then answers what it declined without it.
+- **Contexts.** AD-Q4_K with images and the drafter holds 131,072 tokens in f16 on the B60 (0.7 GiB to spare); the
+  smaller files take less memory than UD-Q4_K_M, so they hold at least its [contexts](#inkling-2-mini).
+- **The adapter** on Unsloth's UD-Q4_K_M (Arc Pro B60, 512 + 128 tokens): decode 40.8 to 39.1 tok/s, prefill 588 to
+  515 tok/s (in the repository's new layout, the one the adapter was written for; 38.8 to 37.2 and 589 to 514 on the
+  earlier one, where the model then answered what it declined without it).
 
 ```bash
 curl -LO https://huggingface.co/AtomicChat/Inkling-2-Mini-Uncensored-GGUF/resolve/main/Inkling-2-Mini-Uncensored-LoRA.gguf
@@ -1211,7 +1223,7 @@ without → with that technique, and the `--spec-k` (drafts per round) that gave
 | LFM3-1.7B | | – | – | – | – |
 | Inkling-2-Mini | q4, Arc Pro B60 | – | – | – | 51.9 → 57.7, k = 1 |
 | Inkling-2-Mini | q4, Arc B390 | – | – | – | 24.1 → 26.7, k = 1 (before the decode fixes) |
-| Inkling-2-Mini | GGUF UD-Q8_K_XL, Arc Pro B60 | – | – | – | 35.5 → 39.7, k = 1 |
+| Inkling-2-Mini | GGUF UD-Q8_K_XL, Arc Pro B60 | – | – | – | 35.5 → 39.3, k = 1 |
 | Inkling-2-Mini | GGUF UD-Q8_K_XL, Arc B390 | – | – | – | 16.3 → 18.1, k = 1 |
 
 Greedy decode over six chat prompts of up to 256 new tokens (`bench --prompts`); the drafters as q4 packs, the Gemma 4
@@ -1288,7 +1300,10 @@ engine 2.87 over the q4 target, and the drafter proposes 74 to 80 % of the refer
 Inkling-2-Mini's own block drafter: three decoder layers that read four of the target's hidden states fill a block of
 8 rows in one pass, and a recurrent head picks the drafts from it one after another, each from the token before it
 ([docs/decisions/0026](docs/decisions/0026-inkling2.md)). It is inside the checkpoint (`mtp.safetensors`) and every
-pack `convert` makes of it, and a file of its own in the GGUF repository, which `-hf` imports with any model file:
+pack `convert` makes of it, and a file of its own in the GGUF repositories, which `-hf` imports with any model file. The
+file is in mainline llama.cpp's format since 2026-11-23 (its head's correction folded through the output layer:
+`dspark-Inkling-2-Mini-Q8_0.gguf` of Unsloth's and AtomicChat's repositories), or Unsloth's earlier one
+(`dspark-Inkling-2-Mini-Q8_0_Old.gguf`); both import:
 
 ```bash
 xpu-serve serve ~/models/Inkling-2-Mini-q4 --device GPU --spec dspark --spec-k 1
@@ -1310,7 +1325,9 @@ Each row of a verify costs about 5.4 ms more: its token picks 8 experts of its o
 too, where a dense model's rows share every weight. Past the second draft, a draft is accepted less often than its
 row costs; the default is 2 drafts, one is as fast and the better choice on the B390 and the GGUF files. The head
 reads the whole output layer for each draft: the MTP heads' shortlist of 64 rows lowered the first draft's acceptance
-from 63 % to 56 %.
+from 63 % to 56 %. With the folded head of mainline's file, the output layer reads the block's rows once and each
+draft reads the fold (98 MiB): on UD-Q4_K_M (Arc Pro B60, the same target, two runs each) one draft gives 47.6 tok/s
+against 48.0 with the earlier file, two 45.0 against 44.4, the drafts accepted the same (612 of 917 at one).
 
 Checked against a float64 port of the drafter's math over transformers' target on a tiny checkpoint: the same drafts
 on all 1,050 of them on cpu-ref and the GPU in f32 (no public module exists to compare with). On the released weights
