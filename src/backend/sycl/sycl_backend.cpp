@@ -117,6 +117,12 @@ private:
     size_t bytes_ = 0;
 };
 
+// A segment's rows of a step over several sequences (SyclProgram::run_segments): the first, and how many.
+struct Rows {
+    int64_t first = 0;
+    int64_t count = 0;
+};
+
 // Sizes of the symbolic dims in one run.
 struct Step {
     int64_t tokens = 0;  // kT
@@ -454,21 +460,7 @@ public:
             if (!reads_kv_) ensure_kv_capacity(step.kv_len);
             const Plan& plan = plan_for(step);
             shared_.ensure_arena(plan.arena_bytes);
-            for (const Value& v : graph_.inputs()) {
-                const HostTensor& t = inputs.at(input_name(v));
-                const HostTensor& src = keep_alive.emplace_back(
-                    is_float(t.dtype()) && t.dtype() != DType::F32
-                        ? HostTensor::from_vector(DType::F32, t.shape(), t.to_f32())
-                        : t);
-                q_.memcpy(ptr(plan, v), src.raw(), src.nbytes());
-                if (trace_) {
-                    const Loc& l = plan.locs[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
-                    std::fprintf(stderr, "sycl: input %s %zu bytes at arena offset %lld of %zu (store %d)\n",
-                                 input_name(v).c_str(), src.nbytes(), static_cast<long long>(l.offset), shared_.arena.bytes(),
-                                 static_cast<int>(l.store));
-                    q_.wait_and_throw();
-                }
-            }
+            upload_inputs(plan, inputs, keep_alive);
             const auto& nodes = graph_.nodes();
             const auto submit_start = std::chrono::steady_clock::now();
             // The first run of a step shape compiles kernels (JIT, oneMKL): not part of the profile. A step of a few
@@ -511,18 +503,7 @@ public:
                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_start).count(),
                            " ms");
             }
-            std::vector<std::pair<std::string, HostTensor>> results;
-            for (const auto& out : graph_.outputs()) {
-                if (!only.empty() && std::find(only.begin(), only.end(), out.name) == only.end()) continue;
-                const Value v = out.value;
-                const DType dt = dtype_[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
-                HostTensor t(dt, resolve(plan.shapes[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)], step));
-                q_.memcpy(t.raw(), ptr(plan, v), t.nbytes());
-                results.emplace_back(out.name, std::move(t));
-            }
-            q_.wait_and_throw();
-            for (auto& [name, t] : results)
-                outputs[name] = std::move(t);
+            download_outputs(plan, step, only, outputs);
         } catch (...) {
             try {
                 q_.wait();
@@ -530,6 +511,121 @@ public:
             }
             throw;
         }
+        commit(step);
+    }
+
+    // One step over the segments of several sequences (Session::run_segments): every op once over all the rows, but
+    // the stateful ones (the KV caches, attention over them, convolutions, the gated delta rule), which run a segment
+    // at a time over its rows (rows_) and its sequence's state.
+    void run_segments(std::span<const Segment> segments, const TensorMap& inputs, TensorMap& outputs,
+                      std::span<const std::string> only) {
+        XS_CHECK(graph_.segmented(), "sycl: the program does not allow segments");
+        const int64_t current = shared_.current;
+        std::vector<Step> steps;  // each segment's: its tokens, its sequence's tokens after it
+        int64_t rows = 0, longest = 0;
+        try {
+            for (const Segment& s : segments) {
+                shared_.use(s.sequence);
+                steps.push_back(Step{s.tokens, cached() + s.tokens});
+                const int64_t len = steps.back().kv_len;
+                XS_CHECK(len <= max_context_, "sycl: ", len, " tokens exceed max_context ", max_context_);
+                rows += s.tokens;
+                longest = std::max(longest, steps.back().kv_len);
+            }
+        } catch (...) {
+            shared_.use(current);
+            throw;
+        }
+        shared_.use(current);
+        Step step = check_inputs(inputs);
+        XS_CHECK(step.tokens == rows, "sycl: the inputs have ", step.tokens, " rows; the segments have ", rows);
+        step.kv_len = longest;  // what the plan bills: no step of a segment reads more
+        const std::vector<char>* live = only.empty() ? nullptr : &live_for(only);
+        std::vector<HostTensor> keep_alive;
+        try {
+            for (size_t j = 0; j < segments.size(); ++j) {
+                shared_.use(segments[j].sequence);
+                ensure_kv_capacity(steps[j].kv_len);
+            }
+            shared_.use(current);
+            const Plan& plan = plan_for(step);
+            shared_.ensure_arena(plan.arena_bytes);
+            upload_inputs(plan, inputs, keep_alive);
+            const auto& nodes = graph_.nodes();
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                if (!launches(i, plan, live)) continue;
+                const OpKind kind = nodes[i].kind;
+                if (kind != OpKind::KvCache && kind != OpKind::Attention && kind != OpKind::CausalConv &&
+                    kind != OpKind::DynamicConv && kind != OpKind::GatedDelta) {
+                    launch(i, plan, step);
+                    continue;
+                }
+                Rows r;
+                for (size_t j = 0; j < segments.size(); ++j) {
+                    shared_.use(segments[j].sequence);
+                    rewinding_ = steps[j].tokens <= shared_.rewind_tokens;
+                    r.count = steps[j].tokens;
+                    segment_shapes(i, plan, r);
+                    rows_ = &r;
+                    launch(i, plan, steps[j]);
+                    rows_ = nullptr;
+                    r.first += r.count;
+                }
+                shared_.use(current);
+            }
+            download_outputs(plan, step, only, outputs);
+        } catch (...) {
+            rows_ = nullptr;
+            shared_.use(current);
+            try {
+                q_.wait();
+            } catch (...) {
+            }
+            throw;
+        }
+        for (size_t j = 0; j < segments.size(); ++j) {
+            shared_.use(segments[j].sequence);
+            rewinding_ = steps[j].tokens <= shared_.rewind_tokens;
+            commit(steps[j]);
+        }
+        shared_.use(current);
+    }
+
+    // The graph's inputs into the plan's memory (`keep_alive`: their host copies, until the copies are done).
+    void upload_inputs(const Plan& plan, const TensorMap& inputs, std::vector<HostTensor>& keep_alive) {
+        for (const Value& v : graph_.inputs()) {
+            const HostTensor& t = inputs.at(input_name(v));
+            const bool narrow = is_float(t.dtype()) && t.dtype() != DType::F32;
+            const HostTensor& src =
+                keep_alive.emplace_back(narrow ? HostTensor::from_vector(DType::F32, t.shape(), t.to_f32()) : t);
+            q_.memcpy(ptr(plan, v), src.raw(), src.nbytes());
+            if (trace_) {
+                const Loc& l = plan.locs[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
+                std::fprintf(stderr, "sycl: input %s %zu bytes at arena offset %lld of %zu (store %d)\n",
+                             input_name(v).c_str(), src.nbytes(), static_cast<long long>(l.offset),
+                             shared_.arena.bytes(), static_cast<int>(l.store));
+                q_.wait_and_throw();
+            }
+        }
+    }
+
+    // The outputs a run asked for (all of them when `only` is empty), waiting for the step.
+    void download_outputs(const Plan& plan, const Step& step, std::span<const std::string> only, TensorMap& outputs) {
+        std::vector<std::pair<std::string, HostTensor>> results;
+        for (const auto& out : graph_.outputs()) {
+            if (!only.empty() && std::find(only.begin(), only.end(), out.name) == only.end()) continue;
+            const Value v = out.value;
+            const DType dt = dtype_[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
+            HostTensor t(dt, resolve(plan.shapes[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)], step));
+            q_.memcpy(t.raw(), ptr(plan, v), t.nbytes());
+            results.emplace_back(out.name, std::move(t));
+        }
+        q_.wait_and_throw();
+        for (auto& [name, t] : results) outputs[name] = std::move(t);
+    }
+
+    // The current sequence's slots after a step of `step` that succeeded.
+    void commit(const Step& step) {
         if (!reads_kv_) {
             for (size_t k : kv_slot_) shared_.kv[k].len = step.kv_len;
         }
@@ -540,6 +636,29 @@ public:
             st.replay = rewinding_;  // the step's inputs went to st.inputs
             st.tokens += step.tokens;
         }
+    }
+
+    // The shapes node i's launch reads over a segment's rows `r` (launch with rows_): each value with the token axis
+    // first, `r.count` rows of it.
+    void segment_shapes(size_t i, const Plan& p, const Rows& r) {
+        const Node& n = graph_.nodes()[i];
+        const auto rows_of = [&](const Value& v) {
+            Dims d = p.shapes[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
+            if (graph_.type(v).shape[0] == kT) d[0] = r.count;
+            return d;
+        };
+        seg_in_.clear();
+        for (const Value& v : n.inputs) seg_in_.push_back(rows_of(v));
+        seg_out_ = rows_of(Value{static_cast<int32_t>(i), 0});
+    }
+
+    // Where a value's rows start in a launch over a segment (rows_): a value with the token axis first, at the
+    // segment's first row.
+    char* at_rows(const Plan& p, const Value& v) const {
+        char* base = ptr(p, v);
+        if (graph_.type(v).shape.empty() || graph_.type(v).shape[0] != kT) return base;
+        const Dims& d = p.shapes[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
+        return base + rows_->first * (numel(d) / d[0]) * static_cast<int64_t>(dtype_size(dt(v)));
     }
 
     // The nodes a run asked for the outputs `only` launches: what those outputs and the state slots read, and every
@@ -2047,18 +2166,21 @@ private:
         return nullptr;
     }
 
+    // Launches node i; with rows_, over one segment's rows (run_segments), its shapes from segment_shapes.
     void launch(size_t i, const Plan& p, const Step& step) {
         if (ew_group_[i] >= 0) return run_elementwise(i, p);
         const Node& n = graph_.nodes()[i];
-        const auto in_ptr = [&](size_t k) { return ptr(p, n.inputs[k]); };
+        const auto at = [&](const Value& v) { return rows_ != nullptr ? at_rows(p, v) : ptr(p, v); };
+        const auto in_ptr = [&](size_t k) { return at(n.inputs[k]); };
         const auto in_f32 = [&](size_t k) { return reinterpret_cast<const float*>(in_ptr(k)); };
         const auto in_shape = [&](size_t k) -> const Dims& {
-            return p.shapes[static_cast<size_t>(n.inputs[k].node)][static_cast<size_t>(n.inputs[k].index)];
+            const Value& v = n.inputs[k];
+            return rows_ != nullptr ? seg_in_[k] : p.shapes[static_cast<size_t>(v.node)][static_cast<size_t>(v.index)];
         };
         const auto in_dt = [&](size_t k) { return dt(n.inputs[k]); };
-        char* out_raw = ptr(p, Value{static_cast<int32_t>(i), 0});
+        char* out_raw = at(Value{static_cast<int32_t>(i), 0});
         auto* out = reinterpret_cast<float*>(out_raw);
-        const Dims& out_shape = p.shapes[i][0];
+        const Dims& out_shape = rows_ != nullptr ? seg_out_ : p.shapes[i][0];
         const int64_t out_n = n.kind == OpKind::KvCache || n.kind == OpKind::KvRead ? 0 : numel(out_shape);  // may keep kL
         using sycl_be::UnaryOp;
         // Kernels that may write f16 (plan_half_values) get the output as float* or half*.
@@ -2069,13 +2191,13 @@ private:
                 fn(out);
             }
         };
-        const auto read_f32 = [&](size_t k) { return reinterpret_cast<const float*>(ptr(p, reads_[i][k])); };
+        const auto read_f32 = [&](size_t k) { return reinterpret_cast<const float*>(at(reads_[i][k])); };
         // A value that may be f16 (plan_half_values) as const float* or const half*.
         const auto with_value = [&](const Value& v, auto&& fn) {
             if (dt(v) == DType::F16) {
-                fn(reinterpret_cast<const half*>(ptr(p, v)));
+                fn(reinterpret_cast<const half*>(at(v)));
             } else {
-                fn(reinterpret_cast<const float*>(ptr(p, v)));
+                fn(reinterpret_cast<const float*>(at(v)));
             }
         };
         const auto unary = [&](UnaryOp op, float a = 0.0f, float b = 0.0f) {
@@ -2805,6 +2927,10 @@ private:
     bool reads_kv_ = false;   // the program reads its KV slots (KvRead) instead of appending
     std::map<std::string, std::vector<char>> live_;  // live_for, by the requested outputs
     bool rewinding_ = false;  // the running step keeps its conv and recurrent inputs (SharedFixed)
+    // A launch over one segment's rows (run_segments): its rows, and the shapes its node reads (segment_shapes).
+    const Rows* rows_ = nullptr;
+    std::vector<Dims> seg_in_;
+    Dims seg_out_;
     std::map<std::pair<int64_t, int64_t>, Plan> plans_;
     Profile decode_profile_, prefill_profile_;  // XS_SYCL_PROFILE=1: steps of a few tokens, longer ones
     std::set<int64_t> profiled_shapes_;         // step token counts seen (their first run is not profiled)
@@ -2900,6 +3026,16 @@ public:
     void truncate(size_t program, int64_t n) override { at(program).truncate(n); }
     void use(int64_t sequence) override { shared_->use(sequence); }
     int64_t current_sequence() const override { return shared_->current; }
+    void run_segments(size_t program, std::span<const Segment> segments, const TensorMap& inputs, TensorMap& outputs,
+                      std::span<const std::string> only) override {
+        std::set<int64_t> seen;
+        for (const Segment& s : segments) {
+            XS_CHECK(s.tokens > 0 && seen.insert(s.sequence).second,
+                     "sycl: segments must each be tokens of another sequence");
+        }
+        XS_CHECK(!segments.empty(), "sycl: a step of no segment");
+        at(program).run_segments(segments, inputs, outputs, only);
+    }
 
     // Once the programs have declared their slots: the slots of `count` sequences, each empty, its conv and
     // recurrent state in buffers of its own.
