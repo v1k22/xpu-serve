@@ -663,6 +663,8 @@ xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4 --kv-
 - On the Arc B390, `--spec-k 5`.
 - Faster still on prose: a DFlash 2 drafter
   ([DFlash 2 and DSpine drafters](#dflash-2-and-dspine-drafters-for-qwen38-27b)).
+- Several users: `--sequences 8 --ctx 8192` (without `--spec`) decodes eight requests at once at 106.8 tok/s in all,
+  14.6 each, on the Arc Pro B60 (the Q4_0 GGUF pack; [Several requests at once](#several-requests-at-once)).
 - Its GGUF files, 6 to 23 GB: [Qwen3.8-27B GGUF](#qwen38-27b-gguf).
 
 Measured, at q4:
@@ -788,6 +790,9 @@ xpu-serve serve ~/models/Inkling-2-Mini-q4 --device GPU --spec dspark --spec-k 1
   release's NVFP4 experts) fits the Arc B390 only, where it decodes at 16.5 tok/s.
 - The drafter gains about a tenth: every draft verified reads the experts of its own token, and the first draft is
   accepted 63 % of the time, so one draft a round is the best.
+- Several users: `--sequences N` (without `--spec`) decodes N requests at once; on the Arc Pro B60, AtomicChat's
+  AD-Q4_K gives 61.5 tok/s in all for two, 74.0 for four, 88.2 for eight (13.0 each), against 42.6 for one
+  ([Several requests at once](#several-requests-at-once)): a mixture of experts reads the experts each token picks.
 
 Measured over six chat prompts (greedy; 256 tokens each on the B60, 128 on the B390). Perplexity over 4,096 positions of
 wikitext-2 (16 windows of 512 tokens, the last 256 of each scored; `tests/unit/model/kv_format_quality.cpp`); against
