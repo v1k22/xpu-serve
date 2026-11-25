@@ -146,6 +146,37 @@ void gated_delta(sycl::queue& q, const float* qp, const float* kp, const float* 
                  const float* state_in, float* state_out, float* out, int64_t tokens, int64_t k_heads,
                  int64_t v_heads, int64_t dk, int64_t dv, float qk_l2norm_eps);
 
+// A segment of a step over several sequences (Session::run_segments) for an op with state: its rows of the op's
+// inputs and outputs, and its sequence's state, read from `in` and written to `out`.
+struct StateSegment {
+    const float* in = nullptr;
+    float* out = nullptr;
+    int64_t first = 0;
+    int64_t tokens = 0;
+};
+// causal_conv, dynamic_conv and gated_delta over `count` segments in one launch: `segs` in device memory, `max_tokens`
+// the most rows a segment has. gated_delta_segments returns false, launching nothing, for a shape it does not take
+// (Dk other than 64 or 128, Dv not a multiple of 16).
+void causal_conv_segments(sycl::queue& q, const float* x, const float* w, const StateSegment* segs, int64_t count,
+                          int64_t max_tokens, float* y, int64_t channels, int64_t kernel, bool silu);
+void dynamic_conv_segments(sycl::queue& q, const float* x, const float* w, const float* taps, const StateSegment* segs,
+                           int64_t count, int64_t max_tokens, float* y, int64_t channels, int64_t kernel,
+                           int64_t groups);
+bool gated_delta_segments(sycl::queue& q, const float* qp, const float* kp, const float* vp, const float* g,
+                          const float* beta, const StateSegment* segs, int64_t count, int64_t max_tokens, float* out,
+                          int64_t k_heads, int64_t v_heads, int64_t dk, int64_t dv, float qk_l2norm_eps);
+
+// A segment's rows of k and v, and where they go in its sequence's f16 cache.
+struct KvSegment {
+    half* k = nullptr;
+    half* v = nullptr;
+    int64_t first = 0;
+    int64_t tokens = 0;
+};
+// The KV appends of `count` segments in one launch: k and v [T, row] as f16 at each segment's place.
+void append_kv_segments(sycl::queue& q, const float* k, const float* v, const KvSegment* segs, int64_t count,
+                        int64_t max_tokens, int64_t row);
+
 struct AttentionShape {
     int64_t tokens = 0;    // T, queries
     int64_t q_heads = 0;

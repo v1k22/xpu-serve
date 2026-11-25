@@ -38,17 +38,18 @@ struct HybridLayer {
     MemoryWeights weights;
     Graph graph;
 
-    // `segments`: the graph allows them (Graph::allow_segments).
-    explicit HybridLayer(int64_t window = 0, bool segments = false) {
+    // `segments`: the graph allows them (Graph::allow_segments). `dk`: the gated delta rule's key width (64 and 128 take
+    // the GPU's lanes kernel).
+    explicit HybridLayer(int64_t window = 0, bool segments = false, int64_t dk = kDk) {
         TensorRng rng(41);
         if (segments) graph.allow_segments();
         weights.add("conv_w", rng.uniform(DType::BF16, {kChannels, kKernel}));
         const int conv = graph.add_conv_slot(kChannels, kKernel, "conv");
         graph.output("conv", graph.causal_conv(conv, graph.input("x", DType::F32, {kT, kChannels}),
                                                graph.weight(weights, "conv_w")));
-        const int gdn = graph.add_recurrent_slot(kHv, kDk, kDv, "gdn");
-        graph.output("gdn", graph.gated_delta(gdn, graph.input("q", DType::F32, {kT, kHk, kDk}),
-                                              graph.input("k", DType::F32, {kT, kHk, kDk}),
+        const int gdn = graph.add_recurrent_slot(kHv, dk, kDv, "gdn");
+        graph.output("gdn", graph.gated_delta(gdn, graph.input("q", DType::F32, {kT, kHk, dk}),
+                                              graph.input("k", DType::F32, {kT, kHk, dk}),
                                               graph.input("v", DType::F32, {kT, kHv, kDv}),
                                               graph.input("g", DType::F32, {kT, kHv}),
                                               graph.input("beta", DType::F32, {kT, kHv}), 1e-6f));
@@ -62,11 +63,11 @@ struct HybridLayer {
     }
 
     // `tokens` rows of every input.
-    static TensorMap inputs(TensorRng& rng, int64_t tokens) {
+    static TensorMap inputs(TensorRng& rng, int64_t tokens, int64_t dk = kDk) {
         TensorMap in;
         in["x"] = rng.uniform(DType::F32, {tokens, kChannels});
-        in["q"] = rng.uniform(DType::F32, {tokens, kHk, kDk});
-        in["k"] = rng.uniform(DType::F32, {tokens, kHk, kDk});
+        in["q"] = rng.uniform(DType::F32, {tokens, kHk, dk});
+        in["k"] = rng.uniform(DType::F32, {tokens, kHk, dk});
         in["v"] = rng.uniform(DType::F32, {tokens, kHv, kDv});
         HostTensor g = rng.uniform(DType::F32, {tokens, kHv}, 0.5f), beta = rng.uniform(DType::F32, {tokens, kHv}, 0.5f);
         for (int64_t i = 0; i < g.numel(); ++i) {
@@ -405,7 +406,7 @@ inline void sequences(const Env& env) {
 // that fails leaves every sequence as it was; a program that does not allow segments, and a sequence twice, are
 // refused.
 inline void segments(const Env& env) {
-    const HybridLayer layer(6, true);
+    const HybridLayer layer(6, true, 64);
     const Graph* programs[] = {&layer.graph};
     const auto shared = env.compile(programs, layer.weights, 0, 3);
     TensorRng rng(13);
@@ -417,7 +418,7 @@ inline void segments(const Env& env) {
         std::vector<TensorMap> parts;
         TensorMap want_all;
         for (const Segment& s : segs) {
-            parts.push_back(HybridLayer::inputs(rng, s.tokens));
+            parts.push_back(HybridLayer::inputs(rng, s.tokens, 64));
             TensorMap want;
             alone[static_cast<size_t>(s.sequence)]->run(parts.back(), want);
             for (const char* name : {"conv", "gdn", "attn"}) {
@@ -456,7 +457,7 @@ inline void segments(const Env& env) {
 
     // A step whose second segment fails: the first one's sequence is as it was, the next step agrees.
     shared->use(0);
-    const TensorMap in = HybridLayer::inputs(rng, 2);
+    const TensorMap in = HybridLayer::inputs(rng, 2, 64);
     TensorMap got;
     const Segment bad[] = {{2, 1}, {7, 1}};
     CHECK_THROWS_AS(shared->run_segments(0, bad, in, got, {}), xs::Error);
@@ -465,7 +466,7 @@ inline void segments(const Env& env) {
     const Segment twice[] = {{1, 1}, {1, 1}};
     CHECK_THROWS_AS(shared->run_segments(0, twice, in, got, {}), xs::Error);
 
-    const HybridLayer plain(6);
+    const HybridLayer plain(6, false, 64);
     const Graph* plain_programs[] = {&plain.graph};
     const auto refused = env.compile(plain_programs, plain.weights, 0, 2);
     const Segment two[] = {{0, 1}, {1, 1}};

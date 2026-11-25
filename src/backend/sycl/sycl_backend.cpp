@@ -536,11 +536,15 @@ public:
         const std::vector<char>* live = only.empty() ? nullptr : &live_for(only);
         std::vector<HostTensor> keep_alive;
         try {
+            bool rewinds = false;
             for (size_t j = 0; j < segments.size(); ++j) {
                 shared_.use(segments[j].sequence);
                 ensure_kv_capacity(steps[j].kv_len);
+                rewinds = rewinds || steps[j].tokens <= shared_.rewind_tokens;
             }
             shared_.use(current);
+            // A step that keeps its inputs for truncate runs every stateful op a segment at a time.
+            segment_tables(segments, steps, current, rewinds);
             const Plan& plan = plan_for(step);
             shared_.ensure_arena(plan.arena_bytes);
             upload_inputs(plan, inputs, keep_alive);
@@ -552,6 +556,15 @@ public:
                 if (kind != OpKind::KvCache && kind != OpKind::Attention && kind != OpKind::CausalConv &&
                     kind != OpKind::DynamicConv && kind != OpKind::GatedDelta) {
                     launch(i, plan, step);
+                    continue;
+                }
+                if (seg_state_at_[i] >= 0 || seg_kv_at_[i] >= 0) {  // one launch over the segments
+                    rewinding_ = false;
+                    seg_state_ = seg_state_at_[i] >= 0 ? seg_states_dev_ + seg_state_at_[i] : nullptr;
+                    seg_kv_ = seg_kv_at_[i] >= 0 ? seg_kv_dev_ + seg_kv_at_[i] : nullptr;
+                    launch(i, plan, step);
+                    seg_state_ = nullptr;
+                    seg_kv_ = nullptr;
                     continue;
                 }
                 Rows r;
@@ -571,6 +584,8 @@ public:
             download_outputs(plan, step, only, outputs);
         } catch (...) {
             rows_ = nullptr;
+            seg_state_ = nullptr;
+            seg_kv_ = nullptr;
             shared_.use(current);
             try {
                 q_.wait();
@@ -640,6 +655,74 @@ public:
             st.replay = rewinding_;  // the step's inputs went to st.inputs
             st.tokens += step.tokens;
         }
+    }
+
+    // The per-segment state of each stateful node that runs as one launch over a step's segments (seg_state_at_,
+    // seg_kv_at_: where its entries start, -1 for a node that runs a segment at a time): the convolutions, the gated
+    // delta rule where its lanes kernel takes the shape, the KV appends of an f16 cache. Each entry holds its
+    // sequence's buffers (read with that sequence current), and the tables reach the device in one copy. `rewinds`:
+    // none, every stateful node runs a segment at a time (keeping its inputs for truncate).
+    void segment_tables(std::span<const Segment> segments, std::span<const Step> steps, int64_t current,
+                        bool rewinds) {
+        const auto& nodes = graph_.nodes();
+        const auto count = static_cast<int64_t>(segments.size());
+        seg_state_at_.assign(nodes.size(), -1);
+        seg_kv_at_.assign(nodes.size(), -1);
+        seg_count_ = count;
+        seg_max_tokens_ = 0;
+        for (const Step& s : steps) seg_max_tokens_ = std::max(seg_max_tokens_, s.tokens);
+        if (rewinds) return;
+        int64_t states = 0, kvs = 0;
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            const Node& n = nodes[i];
+            const auto dims = [&](size_t k) -> const Dims& { return graph_.type(n.inputs[k]).shape; };
+            const bool lanes = n.kind == OpKind::GatedDelta && dims(2).back() % 16 == 0 &&
+                               (dims(0).back() == 64 || dims(0).back() == 128);
+            if (n.kind == OpKind::CausalConv || n.kind == OpKind::DynamicConv || lanes) {
+                seg_state_at_[i] = states;
+                states += count;
+            } else if (n.kind == OpKind::KvCache &&
+                       kv_buffers(std::get<graph::KvCacheAttrs>(n.attrs).slot).dtype == DType::F16) {
+                seg_kv_at_[i] = kvs;
+                kvs += count;
+            }
+        }
+        seg_states_host_.assign(static_cast<size_t>(states), {});
+        seg_kv_host_.assign(static_cast<size_t>(kvs), {});
+        int64_t first = 0;
+        for (int64_t j = 0; j < count; ++j) {
+            shared_.use(segments[static_cast<size_t>(j)].sequence);
+            const Step& st = steps[static_cast<size_t>(j)];
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                const Node& n = nodes[i];
+                if (seg_state_at_[i] >= 0) {
+                    const auto& a = std::get<graph::StateAttrs>(n.attrs);
+                    const size_t slot = n.kind == OpKind::GatedDelta ? conv_states_ + static_cast<size_t>(a.slot)
+                                                                     : static_cast<size_t>(a.slot);
+                    StateBuffers& b = shared_.fixed[fixed_slot_[slot]].state;
+                    seg_states_host_[static_cast<size_t>(seg_state_at_[i] + j)] = {
+                        reinterpret_cast<const float*>(b.buf[b.cur].get()),
+                        reinterpret_cast<float*>(b.buf[1 - b.cur].get()), first, st.tokens};
+                }
+                if (seg_kv_at_[i] >= 0) {
+                    const KvBuffers& b = kv_buffers(std::get<graph::KvCacheAttrs>(n.attrs).slot);
+                    const int64_t held = st.kv_len - st.tokens - kv_base(Value{static_cast<int32_t>(i), 0});
+                    auto* k = reinterpret_cast<half*>(b.k.get()) + held * b.row;
+                    auto* v = reinterpret_cast<half*>(b.v.get()) + held * b.row;
+                    seg_kv_host_[static_cast<size_t>(seg_kv_at_[i] + j)] = {k, v, first, st.tokens};
+                }
+            }
+            first += st.tokens;
+        }
+        shared_.use(current);
+        const size_t state_bytes = seg_states_host_.size() * sizeof(sycl_be::StateSegment);
+        const size_t kv_bytes = seg_kv_host_.size() * sizeof(sycl_be::KvSegment);
+        if (state_bytes + kv_bytes == 0) return;
+        if (seg_tables_.bytes() < state_bytes + kv_bytes) seg_tables_ = DeviceBuffer(q_, state_bytes + kv_bytes);
+        seg_states_dev_ = reinterpret_cast<const sycl_be::StateSegment*>(seg_tables_.get());
+        seg_kv_dev_ = reinterpret_cast<const sycl_be::KvSegment*>(seg_tables_.get() + state_bytes);
+        if (state_bytes > 0) q_.memcpy(seg_tables_.get(), seg_states_host_.data(), state_bytes);
+        if (kv_bytes > 0) q_.memcpy(seg_tables_.get() + state_bytes, seg_kv_host_.data(), kv_bytes);
     }
 
     // The shapes node i's launch reads over a segment's rows `r` (launch with rows_): each value with the token axis
@@ -2497,6 +2580,10 @@ private:
             case OpKind::KvCache: {
                 const int slot = std::get<graph::KvCacheAttrs>(n.attrs).slot;
                 KvBuffers& b = kv_buffers(slot);
+                if (seg_kv_ != nullptr) {
+                    sycl_be::append_kv_segments(q_, in_f32(0), in_f32(1), seg_kv_, seg_count_, seg_max_tokens_, b.row);
+                    return;
+                }
                 const int64_t count = step.tokens * b.row;
                 const int64_t held = step.kv_len - step.tokens - kv_base(Value{static_cast<int32_t>(i), 0});
                 const size_t offset = static_cast<size_t>(held * b.row);
@@ -2750,6 +2837,11 @@ private:
                 return;
             }
             case OpKind::CausalConv: {
+                if (seg_state_ != nullptr) {
+                    sycl_be::causal_conv_segments(q_, in_f32(0), in_f32(1), seg_state_, seg_count_, seg_max_tokens_,
+                                                  out, in_shape(0)[1], in_shape(1)[1], conv_silu_[i] != 0);
+                    return;
+                }
                 const auto slot = static_cast<size_t>(std::get<graph::StateAttrs>(n.attrs).slot);
                 SharedFixed& f = shared_.fixed[fixed_slot_[slot]];
                 StateBuffers& st = f.state;
@@ -2765,6 +2857,12 @@ private:
                 return;
             }
             case OpKind::DynamicConv: {
+                if (seg_state_ != nullptr) {
+                    const Dims& taps = in_shape(2);
+                    sycl_be::dynamic_conv_segments(q_, in_f32(0), in_f32(1), in_f32(2), seg_state_, seg_count_,
+                                                   seg_max_tokens_, out, in_shape(0)[1], taps[2], taps[1]);
+                    return;
+                }
                 const auto slot = static_cast<size_t>(std::get<graph::StateAttrs>(n.attrs).slot);
                 SharedFixed& f = shared_.fixed[fixed_slot_[slot]];
                 StateBuffers& st = f.state;
@@ -2783,6 +2881,15 @@ private:
             }
             case OpKind::GatedDelta: {
                 const auto& a = std::get<graph::StateAttrs>(n.attrs);
+                if (seg_state_ != nullptr) {
+                    const Dims& qs = in_shape(0);
+                    const Dims& vs = in_shape(2);
+                    XS_CHECK(sycl_be::gated_delta_segments(q_, in_f32(0), in_f32(1), in_f32(2), in_f32(3), in_f32(4),
+                                                           seg_state_, seg_count_, seg_max_tokens_, out, qs[1], vs[1],
+                                                           qs[2], vs[2], a.qk_l2norm_eps),
+                             where(i), ": no gated delta kernel over segments for this shape");
+                    return;
+                }
                 SharedFixed& f = shared_.fixed[fixed_slot_[conv_states_ + static_cast<size_t>(a.slot)]];
                 StateBuffers& st = f.state;
                 const Dims& qs = in_shape(0);
@@ -2935,6 +3042,17 @@ private:
     const Rows* rows_ = nullptr;
     std::vector<Dims> seg_in_;
     Dims seg_out_;
+    // A launch over every segment at once (segment_tables): the node's entries on the device, the step's segments and
+    // the most rows one has; the tables, their host copies and where each node's entries start.
+    const sycl_be::StateSegment* seg_state_ = nullptr;
+    const sycl_be::KvSegment* seg_kv_ = nullptr;
+    int64_t seg_count_ = 0, seg_max_tokens_ = 0;
+    DeviceBuffer seg_tables_;
+    const sycl_be::StateSegment* seg_states_dev_ = nullptr;
+    const sycl_be::KvSegment* seg_kv_dev_ = nullptr;
+    std::vector<sycl_be::StateSegment> seg_states_host_;
+    std::vector<sycl_be::KvSegment> seg_kv_host_;
+    std::vector<int64_t> seg_state_at_, seg_kv_at_;
     std::map<std::pair<int64_t, int64_t>, Plan> plans_;
     Profile decode_profile_, prefill_profile_;  // XS_SYCL_PROFILE=1: steps of a few tokens, longer ones
     std::set<int64_t> profiled_shapes_;         // step token counts seen (their first run is not profiled)

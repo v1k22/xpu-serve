@@ -220,6 +220,9 @@ struct GatedDeltaLanes {
     float* out;
     int64_t tokens, k_heads, v_heads, dv;
     float eps, q_scale;
+    // Not null: a launch over segments (gated_delta_segments), a group of v_heads * dv / 16 work-groups each; the
+    // fields above are then the first row's, and each segment's state and rows its own.
+    const StateSegment* segs = nullptr;
 
     auto get(syclex::properties_tag) const {
         return syclex::properties{syclex::sub_group_size<kSubGroup>, intelex::grf_size<256>};
@@ -229,20 +232,34 @@ struct GatedDeltaLanes {
         const sycl::sub_group sg = it.get_sub_group();
         const int lane = static_cast<int>(sg.get_local_linear_id());
         const int64_t blocks = dv / kSubGroup;
-        const int64_t hv = static_cast<int64_t>(it.get_group(0)) / blocks;
-        const int64_t col = (static_cast<int64_t>(it.get_group(0)) % blocks) * kSubGroup + lane;
+        int64_t group = static_cast<int64_t>(it.get_group(0));
+        // The rows and state this work-group reads: the launch's, or its segment's.
+        struct {
+            const float *q, *k, *v, *g, *beta, *in;
+            float *out, *state;
+            int64_t tokens;
+        } r{qp, kp, vp, g, beta, state_in, out, state_out, tokens};
+        if (segs != nullptr) {
+            const StateSegment seg = segs[group / (v_heads * blocks)];
+            group %= v_heads * blocks;
+            r = {qp + seg.first * k_heads * DK, kp + seg.first * k_heads * DK, vp + seg.first * v_heads * dv,
+                 g + seg.first * v_heads,      beta + seg.first * v_heads,     seg.in,
+                 out + seg.first * v_heads * dv, seg.out, seg.tokens};
+        }
+        const int64_t hv = group / blocks;
+        const int64_t col = (group % blocks) * kSubGroup + lane;
         const int64_t kh = hv / (v_heads / k_heads);
         constexpr int kAcc = 4;  // partial sums: the chains over rows run in parallel
         // every loop over rows unrolled: s stays in registers (a loop indexes it in scratch memory)
         float s[DK];
-        const float* s_in = state_in + hv * DK * dv;
+        const float* s_in = r.in + hv * DK * dv;
         #pragma unroll
-        for (int r = 0; r < DK; ++r) s[r] = s_in[r * dv + col];
-        for (int64_t t = 0; t < tokens; ++t) {
+        for (int i = 0; i < DK; ++i) s[i] = s_in[i * dv + col];
+        for (int64_t t = 0; t < r.tokens; ++t) {
             const sycl::vec<float, kSlice> kl =
-                *reinterpret_cast<const sycl::vec<float, kSlice>*>(kp + (t * k_heads + kh) * DK + lane * kSlice);
+                *reinterpret_cast<const sycl::vec<float, kSlice>*>(r.k + (t * k_heads + kh) * DK + lane * kSlice);
             const sycl::vec<float, kSlice> ql =
-                *reinterpret_cast<const sycl::vec<float, kSlice>*>(qp + (t * k_heads + kh) * DK + lane * kSlice);
+                *reinterpret_cast<const sycl::vec<float, kSlice>*>(r.q + (t * k_heads + kh) * DK + lane * kSlice);
             float q_norm = q_scale;
             float k_norm = 1.0f;
             if (eps > 0.0f) {
@@ -256,39 +273,41 @@ struct GatedDeltaLanes {
                 q_norm = q_scale / sycl::sqrt(sycl::reduce_over_group(sg, sq, sycl::plus<float>()) + eps);
                 k_norm = 1.0f / sycl::sqrt(sycl::reduce_over_group(sg, sk, sycl::plus<float>()) + eps);
             }
-            const float decay = sycl::exp(g[t * v_heads + hv]);
-            // row r of q and k lives in lane r / kSlice (broadcast where used: a register each, not 2 x DK more)
+            const float decay = sycl::exp(r.g[t * v_heads + hv]);
+            // row i of q and k lives in lane i / kSlice (broadcast where used: a register each, not 2 x DK more)
             float kv[kAcc] = {};
             #pragma unroll
-            for (int r = 0; r < DK; ++r) {
-                s[r] *= decay;
-                kv[r % kAcc] += s[r] * sycl::group_broadcast(sg, kl[r % kSlice], r / kSlice);
+            for (int i = 0; i < DK; ++i) {
+                s[i] *= decay;
+                kv[i % kAcc] += s[i] * sycl::group_broadcast(sg, kl[i % kSlice], i / kSlice);
             }
             const float kv_sum = (kv[0] + kv[1]) + (kv[2] + kv[3]);
-            const float delta = beta[t * v_heads + hv] * (vp[(t * v_heads + hv) * dv + col] - kv_sum * k_norm) * k_norm;
+            const float delta =
+                r.beta[t * v_heads + hv] * (r.v[(t * v_heads + hv) * dv + col] - kv_sum * k_norm) * k_norm;
             float o[kAcc] = {};
             #pragma unroll
-            for (int r = 0; r < DK; ++r) {
-                s[r] += sycl::group_broadcast(sg, kl[r % kSlice], r / kSlice) * delta;
-                o[r % kAcc] += s[r] * sycl::group_broadcast(sg, ql[r % kSlice], r / kSlice);
+            for (int i = 0; i < DK; ++i) {
+                s[i] += sycl::group_broadcast(sg, kl[i % kSlice], i / kSlice) * delta;
+                o[i % kAcc] += s[i] * sycl::group_broadcast(sg, ql[i % kSlice], i / kSlice);
             }
-            out[(t * v_heads + hv) * dv + col] = ((o[0] + o[1]) + (o[2] + o[3])) * q_norm;
+            r.out[(t * v_heads + hv) * dv + col] = ((o[0] + o[1]) + (o[2] + o[3])) * q_norm;
         }
-        float* s_out = state_out + hv * DK * dv;
+        float* s_out = r.state + hv * DK * dv;
         #pragma unroll
-        for (int r = 0; r < DK; ++r) s_out[r * dv + col] = s[r];
+        for (int i = 0; i < DK; ++i) s_out[i * dv + col] = s[i];
     }
 };
 
 template <int DK>
 void gated_delta_lanes_t(sycl::queue& q, const float* qp, const float* kp, const float* vp, const float* g,
                          const float* beta, const float* state_in, float* state_out, float* out, int64_t tokens,
-                         int64_t k_heads, int64_t v_heads, int64_t dv, float eps) {
+                         int64_t k_heads, int64_t v_heads, int64_t dv, float eps, const StateSegment* segs = nullptr,
+                         int64_t count = 1) {
     const float q_scale = 1.0f / std::sqrt(static_cast<float>(DK));
-    const auto sgs = static_cast<size_t>(v_heads * (dv / kSubGroup));
+    const auto sgs = static_cast<size_t>(count * v_heads * (dv / kSubGroup));
     syclex::nd_launch(q, sycl::nd_range<1>(sgs * kSubGroup, kSubGroup),
                       GatedDeltaLanes<DK>{qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dv,
-                                          eps, q_scale});
+                                          eps, q_scale, segs});
 }
 
 template <int P>
@@ -1824,47 +1843,100 @@ void l2_clip(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t wid
     });
 }
 
+namespace {
+
+// Row t of channel c of a dynamic conv over x' = [state_in; x]: an output (t < tokens) or a row of the state it
+// leaves (t - tokens).
+inline void dynamic_conv_at(int64_t t, int64_t c, const float* x, const float* w, const float* taps,
+                            const float* state_in, float* state_out, float* y, int64_t tokens, int64_t channels,
+                            int64_t kernel, int64_t groups) {
+    const int64_t past = kernel - 1;
+    // the input j tokens back from t is row past + t - j of x'
+    auto ext = [&](int64_t r) { return r < past ? state_in[r * channels + c] : x[(r - past) * channels + c]; };
+    if (t < tokens) {
+        const float* tap = taps + (t * groups + c / (channels / groups)) * kernel;
+        float acc = 0.0f;
+        for (int64_t j = 0; j < kernel; ++j)
+            acc += (w[j * channels + c] + tap[j]) * ext(past + t - j);
+        y[t * channels + c] = acc;
+    } else {
+        const int64_t r = t - tokens;
+        state_out[r * channels + c] = ext(tokens + r);
+    }
+}
+
+// The same for a causal conv.
+inline void causal_conv_at(int64_t t, int64_t c, const float* x, const float* w, const float* state_in,
+                           float* state_out, float* y, int64_t tokens, int64_t channels, int64_t kernel, bool silu) {
+    const int64_t past = kernel - 1;
+    auto ext = [&](int64_t r) { return r < past ? state_in[r * channels + c] : x[(r - past) * channels + c]; };
+    if (t < tokens) {
+        float acc = 0.0f;
+        for (int64_t j = 0; j < kernel; ++j)
+            acc += w[c * kernel + j] * ext(t + j);
+        y[t * channels + c] = silu ? apply_unary<UnaryOp::Silu>(acc, 0.0f, 0.0f) : acc;
+    } else {
+        const int64_t r = t - tokens;
+        state_out[r * channels + c] = ext(tokens + r);
+    }
+}
+
+}  // namespace
+
 void dynamic_conv(sycl::queue& q, const float* x, const float* w, const float* taps, const float* state_in,
                   float* state_out, float* y, int64_t tokens, int64_t channels, int64_t kernel, int64_t groups) {
-    const int64_t past = kernel - 1;
-    const int64_t per_group = channels / groups;
-    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(tokens + past), static_cast<size_t>(channels)),
-                   [=](sycl::item<2> it) {
-        const int64_t t = static_cast<int64_t>(it[0]);
-        const int64_t c = static_cast<int64_t>(it[1]);
-        // x' = [state_in; x]: the input j tokens back from t is row past + t - j
-        auto ext = [&](int64_t r) { return r < past ? state_in[r * channels + c] : x[(r - past) * channels + c]; };
-        if (t < tokens) {
-            const float* tap = taps + (t * groups + c / per_group) * kernel;
-            float acc = 0.0f;
-            for (int64_t j = 0; j < kernel; ++j)
-                acc += (w[j * channels + c] + tap[j]) * ext(past + t - j);
-            y[t * channels + c] = acc;
-        } else {
-            const int64_t r = t - tokens;
-            state_out[r * channels + c] = ext(tokens + r);
-        }
-    });
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(tokens + kernel - 1), static_cast<size_t>(channels)),
+                         [=](sycl::item<2> it) {
+                             dynamic_conv_at(static_cast<int64_t>(it[0]), static_cast<int64_t>(it[1]), x, w, taps,
+                                             state_in, state_out, y, tokens, channels, kernel, groups);
+                         });
 }
 
 void causal_conv(sycl::queue& q, const float* x, const float* w, const float* state_in, float* state_out, float* y,
                  int64_t tokens, int64_t channels, int64_t kernel, bool silu) {
-    const int64_t past = kernel - 1;
-    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(tokens + past), static_cast<size_t>(channels)),
-                   [=](sycl::item<2> it) {
-        const int64_t t = static_cast<int64_t>(it[0]);
-        const int64_t c = static_cast<int64_t>(it[1]);
-        // x' = [state_in; x]
-        auto ext = [&](int64_t r) { return r < past ? state_in[r * channels + c] : x[(r - past) * channels + c]; };
-        if (t < tokens) {
-            float acc = 0.0f;
-            for (int64_t j = 0; j < kernel; ++j)
-                acc += w[c * kernel + j] * ext(t + j);
-            y[t * channels + c] = silu ? apply_unary<UnaryOp::Silu>(acc, 0.0f, 0.0f) : acc;
-        } else {
-            const int64_t r = t - tokens;
-            state_out[r * channels + c] = ext(tokens + r);
-        }
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(tokens + kernel - 1), static_cast<size_t>(channels)),
+                         [=](sycl::item<2> it) {
+                             causal_conv_at(static_cast<int64_t>(it[0]), static_cast<int64_t>(it[1]), x, w, state_in,
+                                            state_out, y, tokens, channels, kernel, silu);
+                         });
+}
+
+void dynamic_conv_segments(sycl::queue& q, const float* x, const float* w, const float* taps, const StateSegment* segs,
+                           int64_t count, int64_t max_tokens, float* y, int64_t channels, int64_t kernel,
+                           int64_t groups) {
+    const sycl::range<3> range(static_cast<size_t>(count), static_cast<size_t>(max_tokens + kernel - 1),
+                               static_cast<size_t>(channels));
+    syclex::parallel_for(q, range, [=](sycl::item<3> it) {
+        const StateSegment s = segs[it[0]];
+        const auto t = static_cast<int64_t>(it[1]);
+        if (t >= s.tokens + kernel - 1) return;
+        dynamic_conv_at(t, static_cast<int64_t>(it[2]), x + s.first * channels, w, taps + s.first * groups * kernel,
+                        s.in, s.out, y + s.first * channels, s.tokens, channels, kernel, groups);
+    });
+}
+
+void causal_conv_segments(sycl::queue& q, const float* x, const float* w, const StateSegment* segs, int64_t count,
+                          int64_t max_tokens, float* y, int64_t channels, int64_t kernel, bool silu) {
+    const sycl::range<3> range(static_cast<size_t>(count), static_cast<size_t>(max_tokens + kernel - 1),
+                               static_cast<size_t>(channels));
+    syclex::parallel_for(q, range, [=](sycl::item<3> it) {
+        const StateSegment s = segs[it[0]];
+        const auto t = static_cast<int64_t>(it[1]);
+        if (t >= s.tokens + kernel - 1) return;
+        causal_conv_at(t, static_cast<int64_t>(it[2]), x + s.first * channels, w, s.in, s.out,
+                       y + s.first * channels, s.tokens, channels, kernel, silu);
+    });
+}
+
+void append_kv_segments(sycl::queue& q, const float* k, const float* v, const KvSegment* segs, int64_t count,
+                        int64_t max_tokens, int64_t row) {
+    const sycl::range<2> range(static_cast<size_t>(count), static_cast<size_t>(max_tokens * row));
+    syclex::parallel_for(q, range, [=](sycl::item<2> it) {
+        const KvSegment s = segs[it[0]];
+        const auto i = static_cast<int64_t>(it[1]);
+        if (i >= s.tokens * row) return;
+        s.k[i] = static_cast<half>(k[s.first * row + i]);
+        s.v[i] = static_cast<half>(v[s.first * row + i]);
     });
 }
 
@@ -1892,6 +1964,20 @@ void gated_delta(sycl::queue& q, const float* qp, const float* kp, const float* 
         case 8: return gated_delta_t<8>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dk, dv, qk_l2norm_eps);
         default: return gated_delta_t<16>(q, qp, kp, vp, g, beta, state_in, state_out, out, tokens, k_heads, v_heads, dk, dv, qk_l2norm_eps);
     }
+}
+
+bool gated_delta_segments(sycl::queue& q, const float* qp, const float* kp, const float* vp, const float* g,
+                          const float* beta, const StateSegment* segs, int64_t count, int64_t max_tokens, float* out,
+                          int64_t k_heads, int64_t v_heads, int64_t dk, int64_t dv, float qk_l2norm_eps) {
+    if (dv % kSubGroup != 0 || (dk != 64 && dk != 128)) return false;
+    if (dk == 64) {
+        gated_delta_lanes_t<64>(q, qp, kp, vp, g, beta, nullptr, nullptr, out, max_tokens, k_heads, v_heads, dv,
+                                qk_l2norm_eps, segs, count);
+    } else {
+        gated_delta_lanes_t<128>(q, qp, kp, vp, g, beta, nullptr, nullptr, out, max_tokens, k_heads, v_heads, dv,
+                                 qk_l2norm_eps, segs, count);
+    }
+    return true;
 }
 
 RowsLayout attention_rows_layout(const AttentionShape& s) {
