@@ -662,10 +662,10 @@ public:
 
     // The per-segment state of each stateful node that runs as one launch over a step's segments (seg_state_at_,
     // seg_kv_at_, seg_attn_at_: where its entries start, -1 for a node that runs a segment at a time): the
-    // convolutions, the gated delta rule where its lanes kernel takes the shape, the KV appends of an f16 cache, and
-    // attention where the per-row kernel takes a segment (decode). Each entry holds its sequence's buffers (read with
-    // that sequence current), and the tables reach the device in one copy. `rewinds`: none, every stateful node runs a
-    // segment at a time (keeping its inputs for truncate).
+    // convolutions, the gated delta rule where its lanes kernel takes the shape, the KV appends of an f16 or a
+    // quantized cache, and attention where the per-row kernel takes a segment (decode). Each entry holds its
+    // sequence's buffers (read with that sequence current), and the tables reach the device in one copy. `rewinds`:
+    // none, every stateful node runs a segment at a time (keeping its inputs for truncate).
     void segment_tables(std::span<const Segment> segments, std::span<const Step> steps, int64_t current,
                         bool rewinds) {
         const auto& nodes = graph_.nodes();
@@ -687,7 +687,7 @@ public:
                 seg_state_at_[i] = states;
                 states += count;
             } else if (n.kind == OpKind::KvCache &&
-                       kv_buffers(std::get<graph::KvCacheAttrs>(n.attrs).slot).dtype == DType::F16) {
+                       kv_buffers(std::get<graph::KvCacheAttrs>(n.attrs).slot).dtype != DType::F32) {
                 seg_kv_at_[i] = kvs;
                 kvs += count;
             } else if (n.kind == OpKind::Attention && attn_split_[i] < 0) {
@@ -733,9 +733,15 @@ public:
                 if (seg_kv_at_[i] >= 0) {
                     const KvBuffers& b = kv_buffers(std::get<graph::KvCacheAttrs>(n.attrs).slot);
                     const int64_t held = st.kv_len - st.tokens - kv_base(Value{static_cast<int32_t>(i), 0});
-                    auto* k = reinterpret_cast<half*>(b.k.get()) + held * b.row;
-                    auto* v = reinterpret_cast<half*>(b.v.get()) + held * b.row;
-                    seg_kv_host_[static_cast<size_t>(seg_kv_at_[i] + j)] = {k, v, first, st.tokens};
+                    sycl_be::KvSegment& e = seg_kv_host_[static_cast<size_t>(seg_kv_at_[i] + j)];
+                    if (b.dtype == kKvCodes) {
+                        const auto [kc, ks] = kv_codes_at(b, false, held * b.heads);
+                        const auto [vc, vs] = kv_codes_at(b, true, held * b.heads);
+                        e = {kc, vc, ks, vs, first, st.tokens};
+                    } else {
+                        e = {reinterpret_cast<half*>(b.k.get()) + held * b.row,
+                             reinterpret_cast<half*>(b.v.get()) + held * b.row, nullptr, nullptr, first, st.tokens};
+                    }
                 }
             }
             first += st.tokens;
@@ -1013,13 +1019,15 @@ private:
     }
     // A quantized slot's keys and values from row `first` (a token's head) on.
     sycl_be::KvQuantized kv_streams(const KvBuffers& b, int64_t first) const {
-        const quant::KvRowBytes k = quant::kv_row_bytes(kv_format_.k, b.row / b.heads);
-        const quant::KvRowBytes v = quant::kv_row_bytes(kv_format_.v, b.row / b.heads);
-        const auto at = [first](const DeviceBuffer& buf, int64_t row_bytes) {
-            return reinterpret_cast<const uint8_t*>(buf.get()) + first * row_bytes;
-        };
-        return {{kv_format_.k, at(b.k, k.codes), at(b.k_scale, k.scales)},
-                {kv_format_.v, at(b.v, v.codes), at(b.v_scale, v.scales)}};
+        const auto [kc, ks] = kv_codes_at(b, false, first);
+        const auto [vc, vs] = kv_codes_at(b, true, first);
+        return {{kv_format_.k, kc, ks}, {kv_format_.v, vc, vs}};
+    }
+    // Where row `first` of a quantized slot's keys (`values`: its values) sits: its codes and its scales.
+    std::pair<uint8_t*, uint8_t*> kv_codes_at(const KvBuffers& b, bool values, int64_t first) const {
+        const quant::KvRowBytes bytes = quant::kv_row_bytes(values ? kv_format_.v : kv_format_.k, b.row / b.heads);
+        return {reinterpret_cast<uint8_t*>((values ? b.v : b.k).get()) + first * bytes.codes,
+                reinterpret_cast<uint8_t*>((values ? b.v_scale : b.k_scale).get()) + first * bytes.scales};
     }
     StateBuffers& fixed_state(size_t index) { return shared_.fixed[fixed_slot_[index]].state; }
 
@@ -2611,6 +2619,14 @@ private:
             case OpKind::KvCache: {
                 const int slot = std::get<graph::KvCacheAttrs>(n.attrs).slot;
                 KvBuffers& b = kv_buffers(slot);
+                if (seg_kv_ != nullptr && b.dtype == kKvCodes) {
+                    const int64_t width = b.row / b.heads;
+                    sycl_be::quantize_kv_segments(q_, kv_format_.k, in_f32(0), seg_kv_, false, seg_count_,
+                                                  seg_max_tokens_, b.heads, width);
+                    sycl_be::quantize_kv_segments(q_, kv_format_.v, in_f32(1), seg_kv_, true, seg_count_,
+                                                  seg_max_tokens_, b.heads, width);
+                    return;
+                }
                 if (seg_kv_ != nullptr) {
                     sycl_be::append_kv_segments(q_, in_f32(0), in_f32(1), seg_kv_, seg_count_, seg_max_tokens_, b.row);
                     return;
@@ -2619,16 +2635,13 @@ private:
                 const int64_t held = step.kv_len - step.tokens - kv_base(Value{static_cast<int32_t>(i), 0});
                 const size_t offset = static_cast<size_t>(held * b.row);
                 if (b.dtype == kKvCodes) {
-                    const int64_t rows = step.tokens * b.heads;
-                    const int64_t width = b.row / b.heads;
-                    const int64_t first = held * b.heads;
-                    const auto append = [&](quant::KvFormat f, const float* x, DeviceBuffer& codes, DeviceBuffer& scales) {
-                        const quant::KvRowBytes bytes = quant::kv_row_bytes(f, width);
-                        sycl_be::quantize_kv(q_, f, x, reinterpret_cast<uint8_t*>(codes.get()) + first * bytes.codes,
-                                             reinterpret_cast<uint8_t*>(scales.get()) + first * bytes.scales, rows, width);
+                    const auto append = [&](bool values) {
+                        const auto [codes, scales] = kv_codes_at(b, values, held * b.heads);
+                        sycl_be::quantize_kv(q_, values ? kv_format_.v : kv_format_.k, in_f32(values ? 1 : 0), codes,
+                                             scales, step.tokens * b.heads, b.row / b.heads);
                     };
-                    append(kv_format_.k, in_f32(0), b.k, b.k_scale);
-                    append(kv_format_.v, in_f32(1), b.v, b.v_scale);
+                    append(false);
+                    append(true);
                 } else if (b.dtype == DType::F16) {
                     auto* k = reinterpret_cast<half*>(b.k.get()) + offset;
                     auto* v = reinterpret_cast<half*>(b.v.get()) + offset;

@@ -30,57 +30,76 @@ void launch_sub_groups(sycl::queue& q, int64_t units, F f) {
     });
 }
 
-// A row per sub-group, rounded as quant::quantize_kv_row_i8.
+// A row of `width` values by a sub-group, rounded as quant::quantize_kv_row_i8.
+void quantize_i8_row(sycl::sub_group sg, const float* xr, int8_t* cr, float* scale, int64_t width) {
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    float amax = 0.0f;
+    for (int64_t i = lane; i < width; i += kSubGroup)
+        amax = sycl::fmax(amax, sycl::fabs(xr[i]));
+    amax = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    for (int64_t i = lane; i < width; i += kSubGroup)
+        cr[i] = static_cast<int8_t>(sycl::clamp(sycl::rint(xr[i] * inv), -127.0f, 127.0f));
+    if (lane == 0) *scale = amax / 127.0f;
+}
+
+// A group of 128 values by a sub-group: quant::turbo::quantize_group's arithmetic, each lane on its 8 values.
+template <int Bits>
+void quantize_turbo_group(sycl::sub_group sg, const float* xg, uint8_t* cg, half* norm) {
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    const float* xl = xg + lane * turbo::kLaneValues;
+    float v[turbo::kLaneValues];
+    float n = 0.0f;
+    for (int e = 0; e < turbo::kLaneValues; ++e) {
+        v[e] = xl[e];
+        n = sycl::fma(v[e], v[e], n);
+    }
+    n = turbo::sum_lanes(sg, n);
+    turbo::flip(v, turbo::lane_signs(turbo::kSignsBefore[0], turbo::kSignsBefore[1], lane));
+    turbo::butterflies(sg, lane, v);
+    turbo::flip(v, turbo::lane_signs(turbo::kSignsAfter[0], turbo::kSignsAfter[1], lane));
+    turbo::LaneCodes<Bits> packed;
+    float r = 0.0f;
+    for (int e = 0; e < turbo::kLaneValues; ++e) {
+        const bool negative = v[e] < 0.0f;
+        const float sq = v[e] * v[e];
+        uint32_t m = 0;
+        for (int j = 0; j < turbo::kMagnitudes<Bits> - 1; ++j) {
+            const float edge = turbo::edge_sq<Bits>(j) * n;
+            m += (negative ? sq > edge : sq >= edge) ? 1u : 0u;
+        }
+        packed.set(e, turbo::code_of<Bits>(negative, m));
+        r += turbo::kTables<Bits>.mag_sq[m];
+    }
+    r = turbo::sum_lanes(sg, r);
+    packed.store(cg, lane);
+    if (lane == 0) *norm = static_cast<half>(n > 0.0f ? sycl::sqrt(n / r) : 0.0f);
+}
+
 void quantize_i8(sycl::queue& q, const float* x, int8_t* codes, float* scales, int64_t rows, int64_t width) {
     launch_sub_groups(q, rows, [=](sycl::nd_item<1> it, int64_t r) {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int lane = static_cast<int>(sg.get_local_linear_id());
-        const float* xr = x + r * width;
-        float amax = 0.0f;
-        for (int64_t i = lane; i < width; i += kSubGroup)
-            amax = sycl::fmax(amax, sycl::fabs(xr[i]));
-        amax = sycl::reduce_over_group(sg, amax, sycl::maximum<float>());
-        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
-        int8_t* cr = codes + r * width;
-        for (int64_t i = lane; i < width; i += kSubGroup)
-            cr[i] = static_cast<int8_t>(sycl::clamp(sycl::rint(xr[i] * inv), -127.0f, 127.0f));
-        if (lane == 0) scales[r] = amax / 127.0f;
+        quantize_i8_row(it.get_sub_group(), x + r * width, codes + r * width, scales + r, width);
     });
 }
 
-// A group of 128 values per sub-group: quant::turbo::quantize_group's arithmetic, each lane on its 8 values.
 template <int Bits>
 void quantize_turbo(sycl::queue& q, const float* x, uint8_t* codes, half* norms, int64_t groups) {
     launch_sub_groups(q, groups, [=](sycl::nd_item<1> it, int64_t g) {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int lane = static_cast<int>(sg.get_local_linear_id());
-        const float* xl = x + g * turbo::kGroup + lane * turbo::kLaneValues;
-        float v[turbo::kLaneValues];
-        float n = 0.0f;
-        for (int e = 0; e < turbo::kLaneValues; ++e) {
-            v[e] = xl[e];
-            n = sycl::fma(v[e], v[e], n);
-        }
-        n = turbo::sum_lanes(sg, n);
-        turbo::flip(v, turbo::lane_signs(turbo::kSignsBefore[0], turbo::kSignsBefore[1], lane));
-        turbo::butterflies(sg, lane, v);
-        turbo::flip(v, turbo::lane_signs(turbo::kSignsAfter[0], turbo::kSignsAfter[1], lane));
-        turbo::LaneCodes<Bits> packed;
-        float r = 0.0f;
-        for (int e = 0; e < turbo::kLaneValues; ++e) {
-            const bool negative = v[e] < 0.0f;
-            const float sq = v[e] * v[e];
-            uint32_t m = 0;
-            for (int j = 0; j < turbo::kMagnitudes<Bits> - 1; ++j) {
-                const float edge = turbo::edge_sq<Bits>(j) * n;
-                m += (negative ? sq > edge : sq >= edge) ? 1u : 0u;
-            }
-            packed.set(e, turbo::code_of<Bits>(negative, m));
-            r += turbo::kTables<Bits>.mag_sq[m];
-        }
-        r = turbo::sum_lanes(sg, r);
-        packed.store(codes + g * turbo::group_bytes(Bits), lane);
-        if (lane == 0) norms[g] = static_cast<half>(n > 0.0f ? sycl::sqrt(n / r) : 0.0f);
+        quantize_turbo_group<Bits>(it.get_sub_group(), x + g * turbo::kGroup, codes + g * turbo::group_bytes(Bits),
+                                   norms + g);
+    });
+}
+
+// The units (rows of int8, groups of a TurboQuant format) of `count` segments of up to `max_tokens` tokens of
+// `per_token` units each: f(nd_item, segment, its unit, the unit's index in x).
+template <typename F>
+void launch_segment_units(sycl::queue& q, const KvSegment* segs, int64_t count, int64_t max_tokens,
+                          int64_t per_token, F f) {
+    const int64_t units = max_tokens * per_token;
+    launch_sub_groups(q, count * units, [=](sycl::nd_item<1> it, int64_t u) {
+        const KvSegment s = segs[u / units];
+        const int64_t r = u % units;
+        if (r < s.tokens * per_token) f(it, s, r, s.first * per_token + r);
     });
 }
 
@@ -128,6 +147,32 @@ void quantize_kv(sycl::queue& q, KvFormat format, const float* x, uint8_t* codes
         case 4: return quantize_turbo<4>(q, x, codes, norms, groups);
         case 3: return quantize_turbo<3>(q, x, codes, norms, groups);
         case 2: return quantize_turbo<2>(q, x, codes, norms, groups);
+        default: fail("sycl quantize_kv: ", quant::kv_format_name(format), " is not a quantized KV format");
+    }
+}
+
+void quantize_kv_segments(sycl::queue& q, KvFormat format, const float* x, const KvSegment* segs, bool values,
+                          int64_t count, int64_t max_tokens, int64_t heads, int64_t width) {
+    if (format == KvFormat::I8) {
+        return launch_segment_units(q, segs, count, max_tokens, heads, [=](sycl::nd_item<1> it, const KvSegment& s,
+                                                                           int64_t r, int64_t xr) {
+            quantize_i8_row(it.get_sub_group(), x + xr * width, static_cast<int8_t*>(values ? s.v : s.k) + r * width,
+                            static_cast<float*>(values ? s.v_scales : s.k_scales) + r, width);
+        });
+    }
+    check_turbo_width(width);
+    const auto with_bits = [&]<int Bits>() {
+        launch_segment_units(q, segs, count, max_tokens, heads * (width / turbo::kGroup),
+                             [=](sycl::nd_item<1> it, const KvSegment& s, int64_t g, int64_t xg) {
+            quantize_turbo_group<Bits>(it.get_sub_group(), x + xg * turbo::kGroup,
+                                       static_cast<uint8_t*>(values ? s.v : s.k) + g * turbo::group_bytes(Bits),
+                                       static_cast<half*>(values ? s.v_scales : s.k_scales) + g);
+        });
+    };
+    switch (quant::turbo_bits(format)) {
+        case 4: return with_bits.template operator()<4>();
+        case 3: return with_bits.template operator()<3>();
+        case 2: return with_bits.template operator()<2>();
         default: fail("sycl quantize_kv: ", quant::kv_format_name(format), " is not a quantized KV format");
     }
 }

@@ -145,8 +145,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Continuous batching: the decode steps of the sequences in flight as one step, a segment of rows a sequence
       (`Session::run_segments`, the stateful ops acting on each segment's sequence; decision 0028)
 - [ ] Batched speculative rounds: a verify as a segment of k + 1 rows, the drafters' steps of several sequences as one
-- [ ] One attention launch over a batched step's segments, each reading its sequence's cache (a launch a segment
-      today)
+- [x] One launch over a batched step's segments for its stateful ops: the convolutions, the gated delta rule, the KV
+      appends and decode attention, each segment reading and writing its sequence's cache in any format (decision 0028)
 - [ ] Prefix cache: hash-chained full blocks, refcounts, LRU; validity rule for sliding layers (DESIGN.md 9.4). Today
       a request takes the sequence whose cached prompt it shares the longest prefix with
 - [x] Memory bill at load; refuse by name when it does not fit (the weights, the KV cache, the largest step; scratch

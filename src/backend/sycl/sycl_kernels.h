@@ -166,10 +166,13 @@ bool gated_delta_segments(sycl::queue& q, const float* qp, const float* kp, cons
                           const float* beta, const StateSegment* segs, int64_t count, int64_t max_tokens, float* out,
                           int64_t k_heads, int64_t v_heads, int64_t dk, int64_t dv, float qk_l2norm_eps);
 
-// A segment's rows of k and v, and where they go in its sequence's f16 cache.
+// A segment's rows of k and v, and where they go in its sequence's cache: f16 values, or a quantized format's codes
+// and their scales (quantize_kv_segments).
 struct KvSegment {
-    half* k = nullptr;
-    half* v = nullptr;
+    void* k = nullptr;
+    void* v = nullptr;
+    void* k_scales = nullptr;
+    void* v_scales = nullptr;
     int64_t first = 0;
     int64_t tokens = 0;
 };
@@ -234,6 +237,10 @@ bool kv_formats_supported(const quant::KvFormats& f);
 // The codes and scales of x [rows, width] in `format`: the bits quant::round_trip_kv decodes its values from.
 void quantize_kv(sycl::queue& q, quant::KvFormat format, const float* x, uint8_t* codes, uint8_t* scales, int64_t rows,
                  int64_t width);
+// quantize_kv of `count` segments in one launch: x [T, heads * width], each segment's rows to its place for the keys,
+// or with `values` for the values.
+void quantize_kv_segments(sycl::queue& q, quant::KvFormat format, const float* x, const KvSegment* segs, bool values,
+                          int64_t count, int64_t max_tokens, int64_t heads, int64_t width);
 // out [rows, width] = the values the rows store. A TurboQuant format's stay rotated (kv_rotate): a query rotated the
 // same way has the dot products of the originals, and a weighted sum of such rows is rotated back.
 template <typename CT>

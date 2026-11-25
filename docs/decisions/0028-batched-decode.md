@@ -23,10 +23,13 @@ several sequences, which the step graph's contract (one run advances one sequenc
   step's rows, and attention only causal over the keys and values of a KvCache of the graph, which feed nothing
   else. The stateful ops (the KV appends, attention over them, the convolutions, the gated delta rule) then act on
   each segment with its sequence's state; everything else is per row.
-- **The GPU runs every other op once over all the rows**, and a stateful op a segment at a time over the segment's
-  rows and its sequence's buffers, through the kernels it already has: the program's launch reads a segment's view
-  (its first row and count) for the values with the token axis first, and the sequence's slots are made current for
-  that launch. The weights are read once a step; attention and the state ops are a launch a segment.
+- **The GPU runs every op once over all the rows.** A stateful op reads each segment's rows and its sequence's state
+  through a table of the step's segments (an entry a segment: its first row, its tokens, its sequence's buffers),
+  uploaded once a step: the convolutions, the gated delta rule, the KV appends and decode attention, over a cache of
+  any format, are one launch each. What has no such kernel (the gated delta rule at a key width its lanes kernel does
+  not take, attention over more rows than the per-row kernel's, an f32 cache's appends, a step that keeps its inputs
+  for truncate) runs a segment at a time: the launch reads the segment's view (its first row and count) with the
+  sequence's slots made current. The weights are read once a step.
 - **A model gives a batch graph** (`Model::batch_graph`): its step graph with every row's logits and argmax instead
   of the last row's, built when the server holds several sequences (`LoadOptions::batch`). Every language model
   has one but Qwen3-ASR's (transcription runs a request at a time).
@@ -57,5 +60,5 @@ segment: 2.1 times.
 - With `--spec`, requests in flight still decode in turn: a round's verify is a segment of k + 1 rows, which the same
   mechanism runs once the drafters keep state per sequence in one step. That is the next step, then KV blocks shared
   between sequences (a prefix cache across them, DESIGN.md 9.4).
-- A stateful op costs a launch a segment, so attention's share of a step grows with N; one kernel over the segments'
-  rows (each reading its sequence's cache) would remove it.
+- A stateful op without a kernel over the segments still costs a launch a segment, its share of a step growing with
+  N; none of the served models meets one in a batched decode at f16.

@@ -1965,8 +1965,8 @@ void append_kv_segments(sycl::queue& q, const float* k, const float* v, const Kv
         const KvSegment s = segs[it[0]];
         const auto i = static_cast<int64_t>(it[1]);
         if (i >= s.tokens * row) return;
-        s.k[i] = static_cast<half>(k[s.first * row + i]);
-        s.v[i] = static_cast<half>(v[s.first * row + i]);
+        static_cast<half*>(s.k)[i] = static_cast<half>(k[s.first * row + i]);
+        static_cast<half*>(s.v)[i] = static_cast<half>(v[s.first * row + i]);
     });
 }
 
