@@ -114,6 +114,9 @@ SourceFiles fetch_source(const std::string& text, FileRole role, const SourceOpt
             fetch_files(listing, {tower}, o.hub);
             s.mmproj = s.snapshot / tower;
             log::info(sel.gguf, " reads images through the vision tower of ", tower);
+        } else {
+            log::warn(spec.repo, " publishes no vision tower (mmproj*.gguf): ", sel.gguf,
+                      " is imported without images");
         }
     }
     return s;
