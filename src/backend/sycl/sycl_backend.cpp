@@ -2899,6 +2899,7 @@ public:
     void reset() override { shared_->reset(); }
     void truncate(size_t program, int64_t n) override { at(program).truncate(n); }
     void use(int64_t sequence) override { shared_->use(sequence); }
+    int64_t current_sequence() const override { return shared_->current; }
 
     // Once the programs have declared their slots: the slots of `count` sequences, each empty, its conv and
     // recurrent state in buffers of its own.

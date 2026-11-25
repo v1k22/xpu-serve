@@ -43,4 +43,7 @@ TEST_SUITE("device programs" * doctest::skip(!dev::enabled())) {
     TEST_CASE("sequences: three in one session run in turns, each as a session of its own; reset touches one") {
         xs::test::session::sequences(device_env());
     }
+    TEST_CASE("segments: steps of several sequences at once give what each sequence's own steps give") {
+        xs::test::session::segments(device_env());
+    }
 }

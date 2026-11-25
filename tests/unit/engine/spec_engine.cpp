@@ -402,6 +402,7 @@ struct RecordingSession final : Session {
     void reset() override { cached = 0; }
     void truncate(size_t, int64_t n) override { cached = n; }
     void use(int64_t sequence) override { REQUIRE(sequence == 0); }
+    int64_t current_sequence() const override { return 0; }
 };
 
 // What a target's run of `rows` tokens gives the drafter: row r holds r + `first` in every column.

@@ -197,6 +197,8 @@ class CpuProgram {
         }
     }
 
+    bool segmented() const { return graph_.segmented(); }
+
     // Tokens in the slots this program writes (they agree after every run and truncate).
     int64_t cached() const {
         if (!kv_.empty() && !reads_kv_) return shared_.kv[kv_[0]].len;
@@ -590,6 +592,13 @@ class CpuSession final : public Session {
         }
     }
     void truncate(size_t program, int64_t n) override { at(program).truncate(n); }
+    int64_t current_sequence() const override { return current_; }
+    // A step over several sequences runs their segments one after another: the definition of such a step.
+    void run_segments(size_t program, std::span<const Segment> segments, const TensorMap& inputs, TensorMap& outputs,
+                      std::span<const std::string> only) override {
+        XS_CHECK(at(program).segmented(), "cpu-ref: program ", program, " does not allow segments");
+        Session::run_segments(program, segments, inputs, outputs, only);
+    }
     void use(int64_t sequence) override {
         XS_CHECK(sequence >= 0 && sequence < static_cast<int64_t>(stored_.size()), "cpu-ref: no sequence ", sequence,
                  " (", stored_.size(), " held)");
@@ -605,7 +614,7 @@ class CpuSession final : public Session {
     }
 
   private:
-    CpuProgram& at(size_t program) {
+    CpuProgram& at(size_t program) const {
         XS_CHECK(program < programs_.size(), "cpu-ref: no program ", program, " (", programs_.size(), " compiled)");
         return *programs_[program];
     }

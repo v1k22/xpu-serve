@@ -129,6 +129,7 @@ Graph Graph::rewritten(const Rewrite& after) const {
     out.kv_slots_ = kv_slots_;
     out.conv_slots_ = conv_slots_;
     out.recurrent_slots_ = recurrent_slots_;
+    out.segmented_ = segmented_;
     std::vector<std::vector<Value>> map(nodes_.size());  // each node's outputs in the copy
     for (size_t i = 0; i < nodes_.size(); ++i) {
         const Node& n = nodes_[i];
@@ -780,6 +781,76 @@ void Graph::validate() const {
     for (size_t s = 0; s < recurrents.size(); ++s) {
         XS_CHECK(recurrents[s] == 1, "recurrent slot ", s, " (", recurrent_slots_[s].label, ") is used ", recurrents[s],
                  " times");
+    }
+    if (segmented_) validate_segments();
+}
+
+void Graph::validate_segments() const {
+    const auto has_tokens = [](const Dims& d) { return std::find(d.begin(), d.end(), kT) != d.end(); };
+    const auto rows_first = [](const Dims& d) {  // the token axis first and nowhere else
+        return !d.empty() && d[0] == kT && std::find(d.begin() + 1, d.end(), kT) == d.end();
+    };
+    const auto refuse = [&](size_t i, const auto&... why) {
+        fail(where(Value{static_cast<int32_t>(i), 0}), ": a graph that allows segments ", why...);
+    };
+    std::vector<char> cache(nodes_.size(), 0);  // KvCache outputs: attention's keys and values only
+    for (size_t i = 0; i < nodes_.size(); ++i) {
+        const Node& n = nodes_[i];
+        cache[i] = n.kind == OpKind::KvCache;
+        const auto in = [&](size_t k) -> const Dims& { return type(n.inputs[k]).shape; };
+        for (const TensorType& t : n.outputs) {
+            if (has_tokens(t.shape) && !rows_first(t.shape)) {
+                refuse(i, "keeps the token axis first, not in ", shape_to_string(t.shape));
+            }
+        }
+        if (n.kind == OpKind::Input && !rows_first(n.outputs[0].shape)) {
+            refuse(i, "takes inputs of a row a token, not ", shape_to_string(n.outputs[0].shape));
+        }
+        for (size_t k = 0; k < n.inputs.size(); ++k) {
+            if (cache[static_cast<size_t>(n.inputs[k].node)] && (n.kind != OpKind::Attention || k == 0)) {
+                refuse(i, "reads a KV cache only through attention");
+            }
+        }
+        const auto axis = [&]() { return n.kind == OpKind::Slice ? std::get<SliceAttrs>(n.attrs).axis
+                                                                 : std::get<AxisAttrs>(n.attrs).axis; };
+        switch (n.kind) {
+            case OpKind::PrevRow:
+            case OpKind::KvRead:
+                refuse(i, "has no ", op_name(n.kind), ": it reads across the step's rows");
+                break;
+            case OpKind::Slice:
+            case OpKind::ReduceSum:
+                if (axis() == 0 && has_tokens(in(0))) refuse(i, "does not ", op_name(n.kind), " along the token axis");
+                break;
+            case OpKind::Softmax:
+            case OpKind::TopK:
+            case OpKind::RmsNorm:
+            case OpKind::LayerNorm:
+            case OpKind::L2Clip:
+            case OpKind::MhcRoute:
+                if (in(0).back() == kT) refuse(i, "does not reduce over the token axis");
+                break;
+            case OpKind::Gather:
+                if (has_tokens(in(0))) refuse(i, "gathers from no table of the step's rows");
+                break;
+            case OpKind::Conv2d:
+                if (has_tokens(in(0))) refuse(i, "has no Conv2d over the step's rows");
+                break;
+            case OpKind::Attention: {
+                const auto& a = std::get<AttentionAttrs>(n.attrs);
+                if (!a.causal || a.grouped || a.block != 0 || in(0).size() != 3 ||
+                    !cache[static_cast<size_t>(n.inputs[1].node)] || !cache[static_cast<size_t>(n.inputs[2].node)]) {
+                    refuse(i, "attends only causally over a KV cache it appends to");
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    for (const GraphOutput& o : outputs_) {
+        XS_CHECK(rows_first(type(o.value).shape), "output '", o.name, "' ", shape_to_string(type(o.value).shape),
+                 ": a graph that allows segments gives outputs of a row a token");
     }
 }
 

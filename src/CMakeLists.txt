@@ -22,6 +22,8 @@ endfunction()
 # Core: utilities, host tensors, safetensors I/O, images, audio, the step graph, model code and the engine.
 xs_add_library(xs_core DIRS util tensor io image audio graph quant models engine
                DEPS xs_json xs_stb_image xs_dr_libs xs_ggml_tables Threads::Threads)
+# The backend interface's own code (backend/backend.h), which every backend builds on.
+target_sources(xs_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backend/session.cpp)
 
 xs_add_library(xs_tokenizer DIRS tokenizer DEPS xs_core)
 

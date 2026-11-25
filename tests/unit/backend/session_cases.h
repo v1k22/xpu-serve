@@ -38,8 +38,10 @@ struct HybridLayer {
     MemoryWeights weights;
     Graph graph;
 
-    explicit HybridLayer(int64_t window = 0) {
+    // `segments`: the graph allows them (Graph::allow_segments).
+    explicit HybridLayer(int64_t window = 0, bool segments = false) {
         TensorRng rng(41);
+        if (segments) graph.allow_segments();
         weights.add("conv_w", rng.uniform(DType::BF16, {kChannels, kKernel}));
         const int conv = graph.add_conv_slot(kChannels, kKernel, "conv");
         graph.output("conv", graph.causal_conv(conv, graph.input("x", DType::F32, {kT, kChannels}),
@@ -56,6 +58,7 @@ struct HybridLayer {
         graph::AttentionAttrs attrs{0.2f};
         attrs.sliding_window = window;
         graph.output("attn", graph.attention(graph.input("aq", DType::F32, {kT, 2 * kHkv, kD}), k_all, v_all, attrs));
+        graph.validate();
     }
 
     // `tokens` rows of every input.
@@ -395,6 +398,78 @@ inline void sequences(const Env& env) {
     alone[2]->run(in, want);
     CHECK(outputs_close(got, want, env));
     CHECK_THROWS_AS(shared->use(3), xs::Error);
+}
+
+// Steps of several sequences at once (Session::run_segments), between steps of one: each segment gives what a session
+// of its own gives over the same steps, its rows in the segments' order; the current sequence stays current; a step
+// that fails leaves every sequence as it was; a program that does not allow segments, and a sequence twice, are
+// refused.
+inline void segments(const Env& env) {
+    const HybridLayer layer(6, true);
+    const Graph* programs[] = {&layer.graph};
+    const auto shared = env.compile(programs, layer.weights, 0, 3);
+    TensorRng rng(13);
+    std::vector<std::unique_ptr<Session>> alone;
+    for (int s = 0; s < 3; ++s) alone.push_back(env.compile(programs, layer.weights, 0, 1));
+    // One sequence's step; `segments` empty: several, in that order.
+    const auto step = [&](std::vector<Segment> segs) {
+        CAPTURE(segs.size());
+        std::vector<TensorMap> parts;
+        TensorMap want_all;
+        for (const Segment& s : segs) {
+            parts.push_back(HybridLayer::inputs(rng, s.tokens));
+            TensorMap want;
+            alone[static_cast<size_t>(s.sequence)]->run(parts.back(), want);
+            for (const char* name : {"conv", "gdn", "attn"}) {
+                want_all[name] = want_all.count(name) == 0 ? want.at(name)
+                                                           : concat_rows(std::vector{want_all.at(name), want.at(name)});
+            }
+        }
+        TensorMap in, got;
+        for (const auto& [name, t] : parts[0]) {
+            std::vector<HostTensor> rows;
+            for (const TensorMap& p : parts) rows.push_back(p.at(name));
+            in[name] = concat_rows(rows);
+        }
+        if (segs.size() == 1) {
+            shared->use(segs[0].sequence);
+            shared->run(in, got);
+        } else {
+            const int64_t current = shared->current_sequence();
+            shared->run_segments(0, segs, in, got, {});
+            CHECK(shared->current_sequence() == current);
+        }
+        CHECK(outputs_close(got, want_all, env));
+        for (const Segment& s : segs) {
+            shared->use(s.sequence);
+            CHECK(shared->num_cached() == alone[static_cast<size_t>(s.sequence)]->num_cached());
+        }
+    };
+    step({{0, 5}});
+    step({{1, 3}});
+    step({{2, 9}});
+    shared->use(1);
+    step({{0, 1}, {2, 1}, {1, 1}});
+    step({{2, 1}, {0, 2}});
+    step({{1, 4}});
+    for (int k = 0; k < 4; ++k) step({{1, 1}, {0, 1}, {2, 1}});
+
+    // A step whose second segment fails: the first one's sequence is as it was, the next step agrees.
+    shared->use(0);
+    const TensorMap in = HybridLayer::inputs(rng, 2);
+    TensorMap got;
+    const Segment bad[] = {{2, 1}, {7, 1}};
+    CHECK_THROWS_AS(shared->run_segments(0, bad, in, got, {}), xs::Error);
+    CHECK(shared->current_sequence() == 0);
+    step({{2, 1}, {1, 1}});
+    const Segment twice[] = {{1, 1}, {1, 1}};
+    CHECK_THROWS_AS(shared->run_segments(0, twice, in, got, {}), xs::Error);
+
+    const HybridLayer plain(6);
+    const Graph* plain_programs[] = {&plain.graph};
+    const auto refused = env.compile(plain_programs, plain.weights, 0, 2);
+    const Segment two[] = {{0, 1}, {1, 1}};
+    CHECK_THROWS_AS(refused->run_segments(0, two, in, got, {}), xs::Error);
 }
 
 }  // namespace xs::test::session

@@ -47,6 +47,12 @@ struct SessionOptions {
     std::map<std::string, std::string> extra;  // backend-specific options, refused by name when unknown
 };
 
+// A run's rows that are the next tokens of one sequence (Session::run with segments).
+struct Segment {
+    int64_t sequence = 0;
+    int64_t tokens = 0;
+};
+
 // The programs of a session run over one sequence. They share the weights (by name) and the state slots: a KV, conv
 // or recurrent slot that two programs declare with the same label is one state. Each slot counts the tokens it holds;
 // a program extends the slots it writes (KvCache, CausalConv, GatedDelta), which always hold the same count, and may
@@ -64,6 +70,13 @@ public:
     virtual void run(size_t program, const TensorMap& inputs, TensorMap& outputs, std::span<const std::string> only) = 0;
     void run(size_t program, const TensorMap& inputs, TensorMap& outputs) { run(program, inputs, outputs, {}); }
     void run(const TensorMap& inputs, TensorMap& outputs) { run(0, inputs, outputs, {}); }
+    // One step of a program whose graph allows segments (Graph::allow_segments) over several sequences: the inputs'
+    // rows are `segments` one after another, each the next tokens of its sequence (no sequence twice). Gives what
+    // running each segment alone on its sequence gives, the outputs' rows in the same order; every sequence advances by
+    // its tokens, and a failed step leaves them all as they were. The current sequence stays current. This
+    // implementation runs the segments one after another; a backend that runs them as one step overrides it.
+    virtual void run_segments(size_t program, std::span<const Segment> segments, const TensorMap& inputs,
+                              TensorMap& outputs, std::span<const std::string> only);
 
     // Tokens in the slots `program` writes (L of its last run, 0 after reset or for a program writing none).
     virtual int64_t num_cached(size_t program) const = 0;
@@ -73,6 +86,7 @@ public:
     // Makes `sequence` (0 to SessionOptions::sequences - 1) the one later runs, num_cached, reset and truncate act on;
     // the others keep their state. Sequence 0 is current after compile.
     virtual void use(int64_t sequence) = 0;
+    virtual int64_t current_sequence() const = 0;
     // Keeps the first `n` tokens of the slots `program` writes (n <= num_cached(program)). Conv and recurrent state
     // (Graph::has_fixed_state) summarize the sequence: it keeps 0 tokens, all of them, the tokens before the last
     // step (that step undone whole, whatever its size), or, after a step of at most SessionOptions::rewind_tokens

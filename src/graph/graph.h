@@ -6,7 +6,8 @@
 // Conventions (every backend must implement exactly these semantics; the OpKind comments are the op spec):
 //   * Two symbolic dims exist: kT = tokens fed in this step, kL = tokens in the KV cache after this step (past + T).
 //     All other dims are static.
-//   * Tensors carry no batch dim. One graph run advances one sequence.
+//   * Tensors carry no batch dim. One graph run advances one sequence; a graph that allows segments
+//     (Graph::allow_segments) may advance several, its rows then segments of the next tokens of one sequence each.
 //   * Weights are referenced by name from a WeightStore and keep their stored dtype (e.g. bf16); backends decide the
 //     compute precision. Computed values are logically f32 (DType::F32); backends may compute in f16 where noted.
 //   * Matmul weights use the Hugging Face layout [out, in]: matmul(x, w) = x @ w^T.
@@ -370,7 +371,19 @@ public:
     bool has_fixed_state() const { return !conv_slots_.empty() || !recurrent_slots_.empty(); }
     std::vector<Value> inputs() const;  // Input nodes in creation order
 
-    // Checks graph-level invariants (outputs exist, every slot appended exactly once, unique names). Throws.
+    // Runs may carry the next tokens of several sequences, a segment of rows each (Session::run with segments): one
+    // decode step of several requests. Such a run gives what running each segment alone on its sequence gives, its
+    // outputs' rows one segment after another, which holds when the rows stay independent. validate() checks it: every
+    // input and output has the token axis (kT) first, no value has it elsewhere (so no matmul reads across it), and no
+    // op reads across it otherwise: no PrevRow or KvRead; no Slice or ReduceSum on it, nor a reduction over a last
+    // axis that is it; no Gather from a table of the step's rows; attention only causal over the keys and values of a
+    // KvCache of the graph, which feed nothing else. The stateful ops then act on each segment with its sequence's
+    // state.
+    void allow_segments() { segmented_ = true; }
+    bool segmented() const { return segmented_; }
+
+    // Checks graph-level invariants (outputs exist, every slot appended exactly once, unique names; a graph that
+    // allows segments, the rules above). Throws.
     void validate() const;
 
     // A copy built node by node, with the same slots: after each node is copied, `after(copy, node, value)` gives the
@@ -387,6 +400,7 @@ private:
     Value elementwise_binary(OpKind kind, Value a, Value b);
     Value elementwise_unary(OpKind kind, Value x, Attrs attrs);
     std::string where(Value v) const;  // "node 12 (layers.3.attn.q_proj: MatMul)"
+    void validate_segments() const;    // the rules of allow_segments()
 
     std::vector<Node> nodes_;
     std::vector<GraphOutput> outputs_;
@@ -394,6 +408,7 @@ private:
     std::vector<ConvSlot> conv_slots_;
     std::vector<RecurrentSlot> recurrent_slots_;
     std::string scope_;
+    bool segmented_ = false;
 };
 
 }  // namespace xs::graph

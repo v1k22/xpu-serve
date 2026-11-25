@@ -1,5 +1,7 @@
 #include <doctest/doctest.h>
 
+#include <functional>
+
 #include "graph/graph.h"
 #include "util/error.h"
 
@@ -272,4 +274,63 @@ TEST_CASE("an anchored window is for attention that is not causal, over a cache"
     other.sliding_window = 0;
     CHECK_THROWS_AS(g.attention(q, ka, va, other), xs::Error);
     CHECK_THROWS_AS(g.attention(q, k, k, attrs), xs::Error);  // the step's own keys: no cache to anchor in
+}
+
+TEST_CASE("a graph that allows segments keeps its rows independent: what reads across them is refused by name") {
+    FakeWeights w;
+    w.add("embed", DType::BF16, {100, 16});
+    w.add("q", DType::BF16, {32, 16});
+    w.add("k", DType::BF16, {8, 16});
+    w.add("out", DType::BF16, {100, 32});
+    // A decode layer: embedding, causal attention over the cache it appends to, a conv, logits of every row. `bend`
+    // changes one thing.
+    const auto layer = [&](const std::function<Value(Graph&, Value h, Value ka, Value va)>& bend = {}) {
+        Graph g;
+        g.allow_segments();
+        const Value ids = g.input("token_ids", DType::I32, {kT});
+        const Value h = g.gather(g.weight(w, "embed"), ids);
+        const Value q = g.reshape(g.matmul(h, g.weight(w, "q")), {kT, 4, 8});
+        const Value k = g.reshape(g.matmul(h, g.weight(w, "k")), {kT, 1, 8});
+        const auto [ka, va] = g.kv_cache(g.add_kv_slot(1, 8, 0, "attn"), k, k);
+        const Value a = g.reshape(g.attention(q, ka, va, AttentionAttrs{0.5f}), {kT, 32});
+        const Value c = g.causal_conv(g.add_conv_slot(32, 3, "conv"), a, g.constant(HostTensor(DType::F32, {32, 3})));
+        g.output("logits", bend ? bend(g, h, ka, va) : g.matmul(c, g.weight(w, "out")));
+        return g;
+    };
+    CHECK_NOTHROW(layer().validate());
+    const auto refused = [&](const std::function<Value(Graph&, Value, Value, Value)>& bend, const char* why) {
+        CAPTURE(why);
+        CHECK_THROWS_WITH_AS(layer(bend).validate(), doctest::Contains(why), xs::Error);
+    };
+    refused([](Graph& g, Value h, Value, Value) { return g.prev_row(h); }, "it reads across the step's rows");
+    refused([](Graph& g, Value h, Value, Value) { return g.slice(h, 0, -1); }, "along the token axis");
+    refused([](Graph& g, Value h, Value, Value) { return g.reshape(g.reduce_sum(h, 0), {1, 16}); },
+            "along the token axis");
+    refused([](Graph& g, Value h, Value, Value) { return g.softmax(g.reshape(g.slice(h, 1, 0, 1), {kT})); },
+            "does not reduce over the token axis");
+    refused([](Graph& g, Value h, Value, Value) { return g.matmul(h, h); }, "token axis first");
+    refused([](Graph& g, Value h, Value, Value) { return g.gather(h, g.input("rows", DType::I32, {kT})); },
+            "no table of the step's rows");
+    refused([](Graph& g, Value h, Value, Value) { return g.transpose(h, {1, 0}); }, "token axis first");
+    refused(
+        [](Graph& g, Value h, Value ka, Value) {
+            (void)g.reshape(ka, {kL, 8});
+            return h;
+        },
+        "only through attention");
+    refused([](Graph& g, Value h, Value, Value) { return g.add(h, g.input("bias", DType::F32, {16})); },
+            "inputs of a row a token");
+    refused(
+        [](Graph& g, Value h, Value ka, Value va) {
+            AttentionAttrs a{0.5f};
+            a.causal = false;
+            return g.reshape(g.attention(g.reshape(h, {kT, 2, 8}), ka, va, a), {kT, 16});
+        },
+        "attends only causally");
+    refused([](Graph& g, Value h, Value, Value) { return g.constant(HostTensor(DType::F32, {1, 16})); },
+            "outputs of a row a token");
+    // The same graphs without segments are fine.
+    Graph g = layer([](Graph& g, Value h, Value, Value) { return g.slice(h, 0, -1); });
+    CHECK(g.segmented());
+    CHECK(g.rewritten([](Graph&, const Node&, Value v) { return v; }).segmented());
 }

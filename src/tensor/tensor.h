@@ -117,6 +117,11 @@ private:
 
 using TensorMap = std::map<std::string, HostTensor>;
 
+// Rows [first, first + count) of a tensor's leading axis, copied.
+HostTensor rows_of(const HostTensor& t, int64_t first, int64_t count);
+// Tensors of one dtype whose shapes agree past the leading axis, their rows one after another.
+HostTensor concat_rows(std::span<const HostTensor> parts);
+
 template <typename T>
 HostTensor HostTensor::from_vector(DType dtype, Dims shape, const std::vector<T>& values) {
     HostTensor t(dtype, std::move(shape));

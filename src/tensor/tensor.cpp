@@ -48,6 +48,37 @@ HostTensor HostTensor::clone() const {
     return t;
 }
 
+HostTensor rows_of(const HostTensor& t, int64_t first, int64_t count) {
+    XS_CHECK(t.rank() >= 1 && first >= 0 && count >= 0 && first + count <= t.dim(0), "rows ", first, " to ",
+             first + count, " of a tensor of shape ", dims_to_string(t.shape()));
+    Dims shape = t.shape();
+    shape[0] = count;
+    HostTensor out(t.dtype(), shape);
+    const size_t row = t.dim(0) > 0 ? t.nbytes() / static_cast<size_t>(t.dim(0)) : 0;
+    if (out.nbytes() > 0) std::memcpy(out.raw(), static_cast<const char*>(t.raw()) + first * row, out.nbytes());
+    return out;
+}
+
+HostTensor concat_rows(std::span<const HostTensor> parts) {
+    XS_CHECK(!parts.empty() && parts[0].rank() >= 1, "concat_rows of no tensor, or of a scalar");
+    Dims shape = parts[0].shape();
+    shape[0] = 0;
+    for (const HostTensor& p : parts) {
+        XS_CHECK(p.dtype() == parts[0].dtype() && p.rank() == parts[0].rank() &&
+                     std::equal(p.shape().begin() + 1, p.shape().end(), parts[0].shape().begin() + 1),
+                 "concat_rows: ", dtype_name(p.dtype()), dims_to_string(p.shape()), " beside ",
+                 dtype_name(parts[0].dtype()), dims_to_string(parts[0].shape()));
+        shape[0] += p.dim(0);
+    }
+    HostTensor out(parts[0].dtype(), shape);
+    char* at = static_cast<char*>(out.raw());
+    for (const HostTensor& p : parts) {
+        if (p.nbytes() > 0) std::memcpy(at, p.raw(), p.nbytes());
+        at += p.nbytes();
+    }
+    return out;
+}
+
 HostTensor HostTensor::reshaped(Dims shape) const {
     XS_CHECK(xs::numel(shape) == numel(), "reshape ", dims_to_string(shape_), " -> ", dims_to_string(shape));
     HostTensor t = *this;
