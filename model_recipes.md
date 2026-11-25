@@ -10,6 +10,7 @@ APIs look; the numbers live here.
 
 - [How to read a recipe](#how-to-read-a-recipe)
 - [KV cache formats](#kv-cache-formats)
+- [Several requests at once](#several-requests-at-once)
 - [Language models](#language-models)
   - [Gemma 4 E2B](#gemma-4-e2b)
   - [Gemma 4 E4B](#gemma-4-e4b)
@@ -267,6 +268,33 @@ The whole context on one 24 GB card:
 ```bash
 xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --spec mtp --spec-k 4 --ctx 262144 --kv-dtype turbo4
 ```
+
+## Several requests at once
+
+`--sequences N` (on `serve`) keeps up to N requests in flight, each on a sequence of its own (its own KV cache, its
+prompt kept for its next turn), and runs the decode steps of all that decode as one step: the weights are read once
+for the next token of each ([docs/decisions/0028](docs/decisions/0028-batched-decode.md)). Prefill chunks run a request
+at a time between those steps. The KV cache is billed for each sequence at load, so `--ctx` is a sequence's context
+(on a 24 GB card, Qwen3.8-27B in Q4_0 takes eight of 8,192 tokens in f16; `--kv-dtype i8` about doubles that). With
+`--spec` the requests decode a round each in turn instead.
+
+```bash
+xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --sequences 8 --ctx 8192
+```
+
+Arc Pro B60, N requests sent at once (the six chat prompts in turn, thinking off, 256 greedy tokens each at most):
+the tokens of all of them over the wall time from the first request to the last reply ("in all", prefills included),
+and the server's decode speed of each request:
+
+| Model | N = 1 | N = 2 | N = 4 | N = 8 |
+|---|---|---|---|---|
+| Qwen3.8-27B, Q4_0 pack (dense) | 21.6 tok/s | 37.4 in all, 19.0 each | 64.1 in all, 16.9 each | 106.8 in all, 14.6 each |
+| Inkling-2-Mini, AtomicChat's AD-Q4_K (mixture of experts) | 42.6 (45.9 decoding) | 61.5 in all, 32.9 each | 74.0 in all, 21.0 each | 88.2 in all, 13.0 each |
+
+A dense model reads the same weights for every token, so eight requests cost little more than one: 4.9 times the
+tokens. A mixture of experts reads the experts each token picks, more of them as requests are added, and its steps
+hold more stateful ops (Inkling 2: a convolution beside every sublayer and attention in each of 48 layer runs), each a
+launch a request: 2.1 times at eight.
 
 ## Language models
 

@@ -142,8 +142,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       compiles (`SessionOptions::max_step_tokens`); a refusal gives the bill and the most tokens that fit
 - [x] Chunked prefill that yields to decode at chunk boundaries: `--sequences N` requests in flight, each on a
       sequence of the session, advanced in turn (decision 0027)
-- [ ] Continuous batching: the decode steps of the sequences in flight as one step (the stateful ops reading rows of
-      several sequences)
+- [x] Continuous batching: the decode steps of the sequences in flight as one step, a segment of rows a sequence
+      (`Session::run_segments`, the stateful ops acting on each segment's sequence; decision 0028)
+- [ ] Batched speculative rounds: a verify as a segment of k + 1 rows, the drafters' steps of several sequences as one
+- [ ] One attention launch over a batched step's segments, each reading its sequence's cache (a launch a segment
+      today)
 - [ ] Prefix cache: hash-chained full blocks, refcounts, LRU; validity rule for sliding layers (DESIGN.md 9.4). Today
       a request takes the sequence whose cached prompt it shares the longest prefix with
 - [x] Memory bill at load; refuse by name when it does not fit (the weights, the KV cache, the largest step; scratch

@@ -63,13 +63,16 @@ optimized one) and what was measured**; this page says what is supported and how
   OpenJev, d1, Laya, Julia-1, or any chat model read at the option letters
 - ✅ **Embedding models** behind `/v1/embeddings`: all-MiniLM-L6-v2, bge-small-en-v1.5, nomic-embed-text-v1.5
 - ✅ **Robot policy** (π0.5) behind the policy API
-- ✅ **Prefix reuse**: a request keeps the KV cache of the longest prefix it shares with the one before
+- ✅ **Several requests at once** (`--sequences N`): each its own cached prompt, their decode steps run as one
+  ([how it scales](model_recipes.md#several-requests-at-once))
+- ✅ **Prefix reuse**: a request keeps the KV cache of the longest prefix it shares with the one before on its
+  sequence
 - ✅ **Intel Arc GPUs**, discrete (Arc Pro B60) and integrated (Arc B390), through SYCL
 
 Not yet:
 
-- Batching: `--sequences N` keeps several requests in flight, each its own cached prompt, their steps interleaved (a
-  long prefill gives way at the end of each chunk), but a step still runs one sequence.
+- Batching with `--spec`: requests that speculate decode a round each in turn; KV blocks shared between requests (a
+  prefix cache across sequences).
 - One model across two GPUs.
 - Timestamps and translation of speech; speech output; video input; images for Qwen3.5 (its vision tower is not
   loaded) and Gemma 4 26B-A4B; images from remote URLs.

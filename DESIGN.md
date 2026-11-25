@@ -554,7 +554,9 @@ seq A: [0, 2, 3, ...]   seq B: [1, ...]                      seq A: ring of ceil
   prompt.
 - **Admission:** a request is admitted when its KV blocks fit. Otherwise it waits, and the reason is visible in the log
   and `/metrics`.
-- v1 starts with batch 1 (the main laptop use case), then continuous batching.
+- Today: the decode steps of the requests in flight run as one (a segment of rows a request, the stateful ops reading
+  each segment's sequence; decision 0028), prefill chunks a request at a time between them; speculative rounds and
+  KV blocks shared between sequences are next.
 
 ### 9.4 Prefix cache
 
