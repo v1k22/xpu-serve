@@ -428,6 +428,8 @@ struct AttentionRowsKernel {
     int64_t rel_extent;
     const float* sink;
     bool anchored;
+    const AttentionSegment* segs;  // not null: segments of a step over several sequences (attention_rows_segments)
+    int64_t seg_units;             // a segment's units (attention_rows_units of the launch's shape)
 
     auto get(syclex::properties_tag) const {
         if constexpr (kLargeRegisterFile) {
@@ -439,7 +441,31 @@ struct AttentionRowsKernel {
 
     void operator()(sycl::nd_item<1> it) const {
         constexpr float kMasked = -std::numeric_limits<float>::infinity();
-        const int64_t wg = static_cast<int64_t>(it.get_group(0));
+        int64_t wg = static_cast<int64_t>(it.get_group(0));
+        // The queries, keys and outputs this work-group reads: the launch's, or its segment's (`segs`: a group of
+        // seg_units * split work-groups a segment).
+        K kr = k;
+        V vr = v;
+        const float* q_rows = qp;
+        float* out_rows = out;
+        float* part_rows = part;
+        const float* rel_rows = rel;
+        const float* sink_rows = sink;
+        int64_t keys = n, toks = tokens;
+        if (segs != nullptr) {
+            const AttentionSegment seg = segs[wg / (seg_units * split)];
+            wg %= seg_units * split;
+            kr = k.rebased(seg.k, seg.k_scales);
+            vr = v.rebased(seg.v, seg.v_scales);
+            const int64_t row0 = seg.first * hq_n;
+            q_rows += row0 * D;
+            out_rows += row0 * D;
+            if (part != nullptr) part_rows += row0 * split * kSlot;
+            if (rel != nullptr) rel_rows += row0 * rel_extent;
+            if (sink != nullptr) sink_rows += row0;
+            keys = seg.kv_len;
+            toks = seg.tokens;
+        }
         const int64_t unit = wg / split;  // G / heads tokens' chunk of `heads` heads
         const int64_t sp = wg % split;
         const int64_t chunks = hq_n / heads;
@@ -452,18 +478,18 @@ struct AttentionRowsKernel {
 
         // Each row's token, the keys it sees [first, last] (none past the step's tokens), and its row of the output.
         int64_t tk[G], pos[G], first[G], last[G], head_row[G];
-        int64_t lo_all = n, hi_all = -1;
+        int64_t lo_all = keys, hi_all = -1;
 #pragma unroll
         for (int g = 0; g < G; ++g) {
             tk[g] = t0 + g / heads;
-            pos[g] = n - tokens + tk[g];
+            pos[g] = keys - toks + tk[g];
             head_row[g] = tk[g] * hq_n + h0 + g % heads;
-            first[g] = anchored ? std::max<int64_t>(0, n - tokens - window)
+            first[g] = anchored ? std::max<int64_t>(0, keys - toks - window)
                                 : window > 0 ? std::max<int64_t>(0, pos[g] - window + 1) : 0;
-            last[g] = anchored ? n - 1
-                               : window > 0 ? std::min<int64_t>(causal ? pos[g] : n - 1, pos[g] + window - 1)
-                                            : (causal ? pos[g] : n - 1);
-            if (tk[g] >= tokens) last[g] = -1;
+            last[g] = anchored ? keys - 1
+                               : window > 0 ? std::min<int64_t>(causal ? pos[g] : keys - 1, pos[g] + window - 1)
+                                            : (causal ? pos[g] : keys - 1);
+            if (tk[g] >= toks) last[g] = -1;
             if (last[g] >= first[g]) {
                 lo_all = std::min(lo_all, first[g]);
                 hi_all = std::max(hi_all, last[g]);
@@ -481,7 +507,7 @@ struct AttentionRowsKernel {
         float l[G];
 #pragma unroll
         for (int g = 0; g < G; ++g) {
-            const float* qr = qp + std::min(head_row[g], tokens * hq_n - 1) * D;
+            const float* qr = q_rows + std::min(head_row[g], toks * hq_n - 1) * D;
             for (int e = 0; e < DPL; ++e) {
                 qv[g][e] = qr[K::dim(lane, e)];
                 o[g][e] = 0.0f;
@@ -495,7 +521,7 @@ struct AttentionRowsKernel {
             if (key_bias != nullptr && key_bias[j] == kMasked) continue;
             const int64_t row = j * hkv_n + kh;
             float x[DPL];
-            const float k_factor = k.load(row, lane, x) * scale;
+            const float k_factor = kr.load(row, lane, x) * scale;
             float p[G];
             float corr[G];
 #pragma unroll
@@ -512,14 +538,16 @@ struct AttentionRowsKernel {
                 }
                 if (softcap > 0.0f) sc = softcap * sycl::tanh(sc / softcap);
                 if (key_bias != nullptr) sc += key_bias[j];
-                if (rel != nullptr && pos[g] - j < rel_extent) sc += rel[head_row[g] * rel_extent + (pos[g] - j)];
+                if (rel_rows != nullptr && pos[g] - j < rel_extent) {
+                    sc += rel_rows[head_row[g] * rel_extent + (pos[g] - j)];
+                }
                 const float m_new = sycl::fmax(m[g], sc);
                 corr[g] = sycl::exp(m[g] - m_new);
                 p[g] = sycl::exp(sc - m_new);
                 l[g] = l[g] * corr[g] + p[g];
                 m[g] = m_new;
             }
-            const float v_factor = v.load(row, lane, x);
+            const float v_factor = vr.load(row, lane, x);
 #pragma unroll
             for (int g = 0; g < G; ++g) {
                 const float pv = p[g] * v_factor;
@@ -541,15 +569,15 @@ struct AttentionRowsKernel {
         sycl::group_barrier(it.get_group());
 #pragma unroll
         for (int g = 0; g < G; ++g) {
-            if (tk[g] >= tokens) continue;
+            if (tk[g] >= toks) continue;
             float m_all = kMasked;
             for (int sgi = 0; sgi < kSubGroups; ++sgi)
                 m_all = sycl::fmax(m_all, slm[(sgi * G + g) * kSlot + D]);
             // The sink is a logit without a value: it only adds to the denominator, in the first split's share.
             float sunk = 0.0f;
-            if (sink != nullptr && sp == 0) {
-                m_all = sycl::fmax(m_all, sink[head_row[g]]);
-                sunk = sycl::exp(sink[head_row[g]] - m_all);
+            if (sink_rows != nullptr && sp == 0) {
+                m_all = sycl::fmax(m_all, sink_rows[head_row[g]]);
+                sunk = sycl::exp(sink_rows[head_row[g]] - m_all);
             }
             for (int64_t d = static_cast<int64_t>(it.get_local_linear_id()); d < D; d += kWg) {
                 float acc = 0.0f;
@@ -562,10 +590,10 @@ struct AttentionRowsKernel {
                     denom += slm[base + D + 1] * w;
                     acc += slm[base + d] * w;
                 }
-                if (part == nullptr) {
-                    out[head_row[g] * D + d] = acc / denom;
+                if (part_rows == nullptr) {
+                    out_rows[head_row[g] * D + d] = acc / denom;
                 } else {  // unnormalized, relative to m_all; attention_combine merges the splits
-                    float* pr = part + (head_row[g] * split + sp) * kSlot;
+                    float* pr = part_rows + (head_row[g] * split + sp) * kSlot;
                     pr[d] = acc;
                     if (d == 0) {
                         pr[D] = m_all;
@@ -584,22 +612,23 @@ constexpr int kRowsCounts[] = {8, 6, 4, 3, 2, 1};
 
 template <typename K, typename V, int DPL, int G>
 void attention_rows_launch(sycl::queue& q, const float* qp, const K& k, const V& v, float* out, const AttentionShape& s,
-                           int64_t split, float* part, const RowsLayout& layout) {
+                           int64_t split, float* part, const RowsLayout& layout, const AttentionSegment* segs,
+                           int64_t count) {
     using Kernel = AttentionRowsKernel<K, V, DPL, G>;
     const int64_t units = attention_rows_units(s, layout);
     syclex::submit(q, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> slm(sycl::range<1>(Kernel::kSubGroups * G * Kernel::kSlot), h);
-        syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(units * split * Kernel::kWg), Kernel::kWg),
+        syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(count * units * split * Kernel::kWg), Kernel::kWg),
                           Kernel{qp, k, v, out, part, slm, s.q_heads, s.kv_heads, s.kv_len, s.tokens, s.window, split,
                                  layout.heads, s.scale, s.softcap, s.causal, s.key_bias, s.groups, s.rel, s.rel_extent,
-                                 s.sink, s.anchored});
+                                 s.sink, s.anchored, segs, units});
     });
 }
 
 // The kernel for this shape's head_dim and attention_rows_layout: K and V are templates over DPL.
 template <template <int> class K, template <int> class V, typename MakeK, typename MakeV>
 void attention_rows_dispatch(sycl::queue& q, const float* qp, float* out, const AttentionShape& s, int64_t split,
-                             float* part, MakeK make_k, MakeV make_v) {
+                             float* part, MakeK make_k, MakeV make_v, const AttentionSegment* segs, int64_t count) {
     const RowsLayout layout = attention_rows_layout(s);
     const auto run = [&]<int DPL>() {
         const K<DPL> k = make_k.template operator()<DPL>();
@@ -607,7 +636,8 @@ void attention_rows_dispatch(sycl::queue& q, const float* qp, float* out, const 
         const auto with = [&]<int G>() {
             if constexpr (G * DPL <= kRowsSharedValues) {
                 if (layout.rows == G) {
-                    attention_rows_launch<K<DPL>, V<DPL>, DPL, G>(q, qp, k, v, out, s, split, part, layout);
+                    attention_rows_launch<K<DPL>, V<DPL>, DPL, G>(q, qp, k, v, out, s, split, part, layout, segs,
+                                                                  count);
                     return true;
                 }
             }
@@ -2026,14 +2056,15 @@ int64_t attention_rows_units(const AttentionShape& s, const RowsLayout& layout) 
 
 template <typename KV>
 void attention_rows(sycl::queue& q, const float* qp, const KV* k, const KV* v, float* out, const AttentionShape& s,
-                    int64_t split, float* part) {
+                    int64_t split, float* part, const AttentionSegment* segs, int64_t count) {
     attention_rows_dispatch<FloatRowsOf<KV>::template Rows, FloatRowsOf<KV>::template Rows>(
         q, qp, out, s, split, part, [k]<int DPL>() { return FloatRows<KV, DPL>{k}; },
-        [v]<int DPL>() { return FloatRows<KV, DPL>{v}; });
+        [v]<int DPL>() { return FloatRows<KV, DPL>{v}; }, segs, count);
 }
 
 void attention_rows_quantized(sycl::queue& q, const float* qp, const KvQuantized& kv, float* out,
-                              const AttentionShape& s, int64_t split, float* part) {
+                              const AttentionShape& s, int64_t split, float* part, const AttentionSegment* segs,
+                              int64_t count) {
     XS_CHECK(kv_formats_supported({kv.k.format, kv.v.format}) && kv.k.format != quant::KvFormat::Float,
              "sycl attention_rows: keys in ", quant::kv_format_name(kv.k.format), " with values in ",
              quant::kv_format_name(kv.v.format));
@@ -2044,7 +2075,7 @@ void attention_rows_quantized(sycl::queue& q, const float* qp, const KvQuantized
         };
     };
     if (kv.v.format == quant::KvFormat::I8) {
-        return attention_rows_dispatch<I8Rows, I8Rows>(q, qp, out, s, split, part, i8(kv.k), i8(kv.v));
+        return attention_rows_dispatch<I8Rows, I8Rows>(q, qp, out, s, split, part, i8(kv.k), i8(kv.v), segs, count);
     }
     XS_CHECK(s.head_dim % turbo::kGroup == 0, "sycl attention_rows: a TurboQuant KV format needs a head_dim that is a ",
              "multiple of ", turbo::kGroup, ", got ", s.head_dim);
@@ -2057,10 +2088,10 @@ void attention_rows_quantized(sycl::queue& q, const float* qp, const KvQuantized
         };
         if (kv.k.format == kv.v.format) {
             attention_rows_dispatch<TurboRowsOf<Bits>::template Rows, TurboRowsOf<Bits>::template Rows>(
-                q, qp, out, s, split, part, turbo_rows(kv.k), turbo_rows(kv.v));
+                q, qp, out, s, split, part, turbo_rows(kv.k), turbo_rows(kv.v), segs, count);
         } else {
             attention_rows_dispatch<I8Rows, TurboRowsOf<Bits>::template Rows>(q, qp, out, s, split, part, i8(kv.k),
-                                                                               turbo_rows(kv.v));
+                                                                               turbo_rows(kv.v), segs, count);
         }
     };
     switch (quant::turbo_bits(kv.v.format)) {
@@ -2383,9 +2414,9 @@ XS_INSTANTIATE_ROPE(int32_t, half)
 XS_INSTANTIATE_ROPE(int64_t, half)
 #undef XS_INSTANTIATE_ROPE
 template void attention_rows<half>(sycl::queue&, const float*, const half*, const half*, float*, const AttentionShape&,
-                                   int64_t, float*);
+                                   int64_t, float*, const AttentionSegment*, int64_t);
 template void attention_rows<float>(sycl::queue&, const float*, const float*, const float*, float*,
-                                    const AttentionShape&, int64_t, float*);
+                                    const AttentionShape&, int64_t, float*, const AttentionSegment*, int64_t);
 template void attention_pack_q<half, float>(sycl::queue&, const float*, half*, const AttentionShape&, int64_t, int64_t);
 template void attention_pack_q<float, float>(sycl::queue&, const float*, float*, const AttentionShape&, int64_t, int64_t);
 template void attention_pack_q<half, half>(sycl::queue&, const half*, half*, const AttentionShape&, int64_t, int64_t);

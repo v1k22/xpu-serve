@@ -39,8 +39,8 @@ struct HybridLayer {
     Graph graph;
 
     // `segments`: the graph allows them (Graph::allow_segments). `dk`: the gated delta rule's key width (64 and 128 take
-    // the GPU's lanes kernel).
-    explicit HybridLayer(int64_t window = 0, bool segments = false, int64_t dk = kDk) {
+    // the GPU's lanes kernel); `d`: attention's head width (a TurboQuant cache takes multiples of 128).
+    explicit HybridLayer(int64_t window = 0, bool segments = false, int64_t dk = kDk, int64_t d = kD) {
         TensorRng rng(41);
         if (segments) graph.allow_segments();
         weights.add("conv_w", rng.uniform(DType::BF16, {kChannels, kKernel}));
@@ -53,17 +53,17 @@ struct HybridLayer {
                                               graph.input("v", DType::F32, {kT, kHv, kDv}),
                                               graph.input("g", DType::F32, {kT, kHv}),
                                               graph.input("beta", DType::F32, {kT, kHv}), 1e-6f));
-        const int kv = graph.add_kv_slot(kHkv, kD, window, "attn");
+        const int kv = graph.add_kv_slot(kHkv, d, window, "attn");
         const auto [k_all, v_all] =
-            graph.kv_cache(kv, graph.input("ak", DType::F32, {kT, kHkv, kD}), graph.input("av", DType::F32, {kT, kHkv, kD}));
+            graph.kv_cache(kv, graph.input("ak", DType::F32, {kT, kHkv, d}), graph.input("av", DType::F32, {kT, kHkv, d}));
         graph::AttentionAttrs attrs{0.2f};
         attrs.sliding_window = window;
-        graph.output("attn", graph.attention(graph.input("aq", DType::F32, {kT, 2 * kHkv, kD}), k_all, v_all, attrs));
+        graph.output("attn", graph.attention(graph.input("aq", DType::F32, {kT, 2 * kHkv, d}), k_all, v_all, attrs));
         graph.validate();
     }
 
     // `tokens` rows of every input.
-    static TensorMap inputs(TensorRng& rng, int64_t tokens, int64_t dk = kDk) {
+    static TensorMap inputs(TensorRng& rng, int64_t tokens, int64_t dk = kDk, int64_t d = kD) {
         TensorMap in;
         in["x"] = rng.uniform(DType::F32, {tokens, kChannels});
         in["q"] = rng.uniform(DType::F32, {tokens, kHk, dk});
@@ -76,9 +76,9 @@ struct HybridLayer {
         }
         in["g"] = std::move(g);
         in["beta"] = std::move(beta);
-        in["ak"] = rng.uniform(DType::F32, {tokens, kHkv, kD});
-        in["av"] = rng.uniform(DType::F32, {tokens, kHkv, kD});
-        in["aq"] = rng.uniform(DType::F32, {tokens, 2 * kHkv, kD});
+        in["ak"] = rng.uniform(DType::F32, {tokens, kHkv, d});
+        in["av"] = rng.uniform(DType::F32, {tokens, kHkv, d});
+        in["aq"] = rng.uniform(DType::F32, {tokens, 2 * kHkv, d});
         return in;
     }
 
@@ -404,9 +404,9 @@ inline void sequences(const Env& env) {
 // Steps of several sequences at once (Session::run_segments), between steps of one: each segment gives what a session
 // of its own gives over the same steps, its rows in the segments' order; the current sequence stays current; a step
 // that fails leaves every sequence as it was; a program that does not allow segments, and a sequence twice, are
-// refused.
-inline void segments(const Env& env) {
-    const HybridLayer layer(6, true, 64);
+// refused. `d`: attention's head width (128 for a TurboQuant cache).
+inline void segments(const Env& env, int64_t d = HybridLayer::kD) {
+    const HybridLayer layer(6, true, 64, d);
     const Graph* programs[] = {&layer.graph};
     const auto shared = env.compile(programs, layer.weights, 0, 3);
     TensorRng rng(13);
@@ -418,7 +418,7 @@ inline void segments(const Env& env) {
         std::vector<TensorMap> parts;
         TensorMap want_all;
         for (const Segment& s : segs) {
-            parts.push_back(HybridLayer::inputs(rng, s.tokens, 64));
+            parts.push_back(HybridLayer::inputs(rng, s.tokens, 64, d));
             TensorMap want;
             alone[static_cast<size_t>(s.sequence)]->run(parts.back(), want);
             for (const char* name : {"conv", "gdn", "attn"}) {
@@ -457,7 +457,7 @@ inline void segments(const Env& env) {
 
     // A step whose second segment fails: the first one's sequence is as it was, the next step agrees.
     shared->use(0);
-    const TensorMap in = HybridLayer::inputs(rng, 2, 64);
+    const TensorMap in = HybridLayer::inputs(rng, 2, 64, d);
     TensorMap got;
     const Segment bad[] = {{2, 1}, {7, 1}};
     CHECK_THROWS_AS(shared->run_segments(0, bad, in, got, {}), xs::Error);
@@ -466,7 +466,7 @@ inline void segments(const Env& env) {
     const Segment twice[] = {{1, 1}, {1, 1}};
     CHECK_THROWS_AS(shared->run_segments(0, twice, in, got, {}), xs::Error);
 
-    const HybridLayer plain(6, false, 64);
+    const HybridLayer plain(6, false, 64, d);
     const Graph* plain_programs[] = {&plain.graph};
     const auto refused = env.compile(plain_programs, plain.weights, 0, 2);
     const Segment two[] = {{0, 1}, {1, 1}};

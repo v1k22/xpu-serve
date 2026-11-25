@@ -298,6 +298,27 @@ void attention_by_rows(sycl::queue& q, Scratch& scratch, float* out, const Atten
 
 bool attention_matrix_path(const AttentionShape& s, AttentionPath path) { return !rows_path(s, path); }
 
+bool attention_segments_fit(const AttentionShape& s, const AttentionPlan& plan) { return rows_path(s, plan.path); }
+
+template <typename KV>
+void attention_segments(sycl::queue& q, Scratch& scratch, const float* qp, const AttentionSegment* segs, int64_t count,
+                        int64_t rows, float* out, const AttentionShape& s, const quant::KvFormats& formats) {
+    // attention_by_rows' split over every segment's work-groups; the partial rows are the step's
+    const RowsLayout layout = attention_rows_layout(s);
+    const int64_t sub_groups = count * attention_rows_units(s, layout) * layout.sub_groups;
+    const int64_t keys = attention_visible_keys(s);
+    const int64_t split = std::clamp<int64_t>(std::min(kTargetSubGroups / sub_groups, keys / kMinSplitKeys), 1, 64);
+    float* part = split == 1 ? nullptr
+                             : static_cast<float*>(scratch.get(
+                                   static_cast<size_t>(rows * s.q_heads * split * (s.head_dim + 2)) * sizeof(float)));
+    if constexpr (std::is_void_v<KV>) {
+        attention_rows_quantized(q, qp, KvQuantized{{formats.k}, {formats.v}}, out, s, split, part, segs, count);
+    } else {
+        attention_rows<KV>(q, qp, nullptr, nullptr, out, s, split, part, segs, count);
+    }
+    if (split > 1) attention_combine(q, part, out, rows * s.q_heads, split, s.head_dim);
+}
+
 template <typename KV, typename QT>
 void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, const KV* v, float* out,
                const AttentionShape& s, const AttentionPlan& plan, const KvSecond& second) {
@@ -670,5 +691,12 @@ template void attention_quantized<half>(sycl::queue&, Scratch&, Scratch&, const 
                                         const AttentionShape&, const AttentionPlan&);
 template void attention_quantized<float>(sycl::queue&, Scratch&, Scratch&, const float*, const KvQuantized&, float*,
                                          const AttentionShape&, const AttentionPlan&);
+#define XS_INSTANTIATE_SEGMENTS(KV)                                                                              \
+    template void attention_segments<KV>(sycl::queue&, Scratch&, const float*, const AttentionSegment*, int64_t, \
+                                         int64_t, float*, const AttentionShape&, const quant::KvFormats&);
+XS_INSTANTIATE_SEGMENTS(half)
+XS_INSTANTIATE_SEGMENTS(float)
+XS_INSTANTIATE_SEGMENTS(void)
+#undef XS_INSTANTIATE_SEGMENTS
 
 }  // namespace xs::sycl_be

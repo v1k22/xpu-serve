@@ -7,13 +7,15 @@ namespace dev = xs::test::device;
 
 namespace {
 
-xs::test::session::Env device_env() {
+// `kv`: how the KV cache stores its keys and values (the precision's float by default).
+xs::test::session::Env device_env(const xs::quant::KvFormats& kv = {}) {
     xs::test::session::Env env;
-    env.compile = [](std::span<const xs::graph::Graph* const> programs, const xs::WeightStore& w, int64_t rewind,
-                     int64_t sequences) {
+    env.compile = [kv](std::span<const xs::graph::Graph* const> programs, const xs::WeightStore& w, int64_t rewind,
+                       int64_t sequences) {
         xs::SessionOptions o = dev::options();
         o.rewind_tokens = rewind;
         o.sequences = sequences;
+        o.kv = kv;
         return dev::backend().compile(programs, w, o);
     };
     const dev::Tolerance tol = dev::tolerance({2e-5, 2e-5}, {5e-3, 5e-3});
@@ -45,5 +47,11 @@ TEST_SUITE("device programs" * doctest::skip(!dev::enabled())) {
     }
     TEST_CASE("segments: steps of several sequences at once give what each sequence's own steps give") {
         xs::test::session::segments(device_env());
+    }
+    TEST_CASE("segments over an int8 and a TurboQuant KV cache, and int8 keys with TurboQuant values") {
+        for (const char* kv : {"i8", "turbo4", "i8:turbo3"}) {
+            CAPTURE(kv);
+            xs::test::session::segments(device_env(xs::quant::parse_kv_formats(kv)), 128);
+        }
     }
 }

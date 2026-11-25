@@ -558,13 +558,15 @@ public:
                     launch(i, plan, step);
                     continue;
                 }
-                if (seg_state_at_[i] >= 0 || seg_kv_at_[i] >= 0) {  // one launch over the segments
+                if (seg_state_at_[i] >= 0 || seg_kv_at_[i] >= 0 || seg_attn_at_[i] >= 0) {  // one launch over all
                     rewinding_ = false;
                     seg_state_ = seg_state_at_[i] >= 0 ? seg_states_dev_ + seg_state_at_[i] : nullptr;
                     seg_kv_ = seg_kv_at_[i] >= 0 ? seg_kv_dev_ + seg_kv_at_[i] : nullptr;
+                    seg_attn_ = seg_attn_at_[i] >= 0 ? seg_attn_dev_ + seg_attn_at_[i] : nullptr;
                     launch(i, plan, step);
                     seg_state_ = nullptr;
                     seg_kv_ = nullptr;
+                    seg_attn_ = nullptr;
                     continue;
                 }
                 Rows r;
@@ -586,6 +588,7 @@ public:
             rows_ = nullptr;
             seg_state_ = nullptr;
             seg_kv_ = nullptr;
+            seg_attn_ = nullptr;
             shared_.use(current);
             try {
                 q_.wait();
@@ -658,21 +661,23 @@ public:
     }
 
     // The per-segment state of each stateful node that runs as one launch over a step's segments (seg_state_at_,
-    // seg_kv_at_: where its entries start, -1 for a node that runs a segment at a time): the convolutions, the gated
-    // delta rule where its lanes kernel takes the shape, the KV appends of an f16 cache. Each entry holds its
-    // sequence's buffers (read with that sequence current), and the tables reach the device in one copy. `rewinds`:
-    // none, every stateful node runs a segment at a time (keeping its inputs for truncate).
+    // seg_kv_at_, seg_attn_at_: where its entries start, -1 for a node that runs a segment at a time): the
+    // convolutions, the gated delta rule where its lanes kernel takes the shape, the KV appends of an f16 cache, and
+    // attention where the per-row kernel takes a segment (decode). Each entry holds its sequence's buffers (read with
+    // that sequence current), and the tables reach the device in one copy. `rewinds`: none, every stateful node runs a
+    // segment at a time (keeping its inputs for truncate).
     void segment_tables(std::span<const Segment> segments, std::span<const Step> steps, int64_t current,
                         bool rewinds) {
         const auto& nodes = graph_.nodes();
         const auto count = static_cast<int64_t>(segments.size());
         seg_state_at_.assign(nodes.size(), -1);
         seg_kv_at_.assign(nodes.size(), -1);
+        seg_attn_at_.assign(nodes.size(), -1);
         seg_count_ = count;
         seg_max_tokens_ = 0;
         for (const Step& s : steps) seg_max_tokens_ = std::max(seg_max_tokens_, s.tokens);
         if (rewinds) return;
-        int64_t states = 0, kvs = 0;
+        int64_t states = 0, kvs = 0, attns = 0;
         for (size_t i = 0; i < nodes.size(); ++i) {
             const Node& n = nodes[i];
             const auto dims = [&](size_t k) -> const Dims& { return graph_.type(n.inputs[k]).shape; };
@@ -685,10 +690,19 @@ public:
                        kv_buffers(std::get<graph::KvCacheAttrs>(n.attrs).slot).dtype == DType::F16) {
                 seg_kv_at_[i] = kvs;
                 kvs += count;
+            } else if (n.kind == OpKind::Attention && attn_split_[i] < 0) {
+                sycl_be::AttentionShape s;
+                s.tokens = seg_max_tokens_;
+                s.head_dim = dims(0).back();
+                if (sycl_be::attention_segments_fit(s, attention_)) {
+                    seg_attn_at_[i] = attns;
+                    attns += count;
+                }
             }
         }
         seg_states_host_.assign(static_cast<size_t>(states), {});
         seg_kv_host_.assign(static_cast<size_t>(kvs), {});
+        seg_attn_host_.assign(static_cast<size_t>(attns), {});
         int64_t first = 0;
         for (int64_t j = 0; j < count; ++j) {
             shared_.use(segments[static_cast<size_t>(j)].sequence);
@@ -704,6 +718,18 @@ public:
                         reinterpret_cast<const float*>(b.buf[b.cur].get()),
                         reinterpret_cast<float*>(b.buf[1 - b.cur].get()), first, st.tokens};
                 }
+                if (seg_attn_at_[i] >= 0) {  // its keys and values: the cache of the KvCache its inputs are
+                    const Value cache = n.inputs[1];
+                    const KvBuffers& b = kv_buffers(std::get<graph::KvCacheAttrs>(graph_.node(cache).attrs).slot);
+                    sycl_be::AttentionSegment& e = seg_attn_host_[static_cast<size_t>(seg_attn_at_[i] + j)];
+                    if (b.dtype == kKvCodes) {
+                        const sycl_be::KvQuantized kv = kv_streams(b, 0);
+                        e = {kv.k.codes, kv.k.scales, kv.v.codes, kv.v.scales, first, st.tokens, 0};
+                    } else {
+                        e = {b.k.get(), nullptr, b.v.get(), nullptr, first, st.tokens, 0};
+                    }
+                    e.kv_len = st.kv_len - kv_base(cache);
+                }
                 if (seg_kv_at_[i] >= 0) {
                     const KvBuffers& b = kv_buffers(std::get<graph::KvCacheAttrs>(n.attrs).slot);
                     const int64_t held = st.kv_len - st.tokens - kv_base(Value{static_cast<int32_t>(i), 0});
@@ -717,12 +743,17 @@ public:
         shared_.use(current);
         const size_t state_bytes = seg_states_host_.size() * sizeof(sycl_be::StateSegment);
         const size_t kv_bytes = seg_kv_host_.size() * sizeof(sycl_be::KvSegment);
-        if (state_bytes + kv_bytes == 0) return;
-        if (seg_tables_.bytes() < state_bytes + kv_bytes) seg_tables_ = DeviceBuffer(q_, state_bytes + kv_bytes);
-        seg_states_dev_ = reinterpret_cast<const sycl_be::StateSegment*>(seg_tables_.get());
-        seg_kv_dev_ = reinterpret_cast<const sycl_be::KvSegment*>(seg_tables_.get() + state_bytes);
-        if (state_bytes > 0) q_.memcpy(seg_tables_.get(), seg_states_host_.data(), state_bytes);
-        if (kv_bytes > 0) q_.memcpy(seg_tables_.get() + state_bytes, seg_kv_host_.data(), kv_bytes);
+        const size_t attn_bytes = seg_attn_host_.size() * sizeof(sycl_be::AttentionSegment);
+        const size_t total = state_bytes + kv_bytes + attn_bytes;
+        if (total == 0) return;
+        if (seg_tables_.bytes() < total) seg_tables_ = DeviceBuffer(q_, total);
+        char* at = seg_tables_.get();
+        seg_states_dev_ = reinterpret_cast<const sycl_be::StateSegment*>(at);
+        seg_kv_dev_ = reinterpret_cast<const sycl_be::KvSegment*>(at + state_bytes);
+        seg_attn_dev_ = reinterpret_cast<const sycl_be::AttentionSegment*>(at + state_bytes + kv_bytes);
+        if (state_bytes > 0) q_.memcpy(at, seg_states_host_.data(), state_bytes);
+        if (kv_bytes > 0) q_.memcpy(at + state_bytes, seg_kv_host_.data(), kv_bytes);
+        if (attn_bytes > 0) q_.memcpy(at + state_bytes + kv_bytes, seg_attn_host_.data(), attn_bytes);
     }
 
     // The shapes node i's launch reads over a segment's rows `r` (launch with rows_): each value with the token axis
@@ -2635,6 +2666,23 @@ private:
                 } else if (n.inputs.size() == 4) {
                     s.key_bias = in_f32(3);
                 }
+                if (seg_attn_ != nullptr) {  // every segment's queries over its sequence's cache (segment_tables)
+                    const int64_t step_rows = s.tokens;
+                    s.tokens = seg_max_tokens_;
+                    s.kv_len = step.kv_len;  // the most keys a segment's cache holds bound the split
+                    const auto run = [&]<typename KV>() {
+                        sycl_be::attention_segments<KV>(q_, *this, in_f32(0), seg_attn_, seg_count_, step_rows, out, s,
+                                                        kv_format_);
+                    };
+                    if (in_dt(1) == kKvCodes) {
+                        run.template operator()<void>();
+                    } else if (in_dt(1) == DType::F16) {
+                        run.template operator()<half>();
+                    } else {
+                        run.template operator()<float>();
+                    }
+                    return;
+                }
                 if (in_dt(1) == kKvCodes) {
                     const int slot = std::get<graph::KvCacheAttrs>(graph_.node(n.inputs[1]).attrs).slot;
                     const sycl_be::KvQuantized kv = kv_streams(kv_buffers(slot), 0);
@@ -3046,13 +3094,16 @@ private:
     // the most rows one has; the tables, their host copies and where each node's entries start.
     const sycl_be::StateSegment* seg_state_ = nullptr;
     const sycl_be::KvSegment* seg_kv_ = nullptr;
+    const sycl_be::AttentionSegment* seg_attn_ = nullptr;
     int64_t seg_count_ = 0, seg_max_tokens_ = 0;
     DeviceBuffer seg_tables_;
     const sycl_be::StateSegment* seg_states_dev_ = nullptr;
     const sycl_be::KvSegment* seg_kv_dev_ = nullptr;
+    const sycl_be::AttentionSegment* seg_attn_dev_ = nullptr;
     std::vector<sycl_be::StateSegment> seg_states_host_;
     std::vector<sycl_be::KvSegment> seg_kv_host_;
-    std::vector<int64_t> seg_state_at_, seg_kv_at_;
+    std::vector<sycl_be::AttentionSegment> seg_attn_host_;
+    std::vector<int64_t> seg_state_at_, seg_kv_at_, seg_attn_at_;
     std::map<std::pair<int64_t, int64_t>, Plan> plans_;
     Profile decode_profile_, prefill_profile_;  // XS_SYCL_PROFILE=1: steps of a few tokens, longer ones
     std::set<int64_t> profiled_shapes_;         // step token counts seen (their first run is not profiled)

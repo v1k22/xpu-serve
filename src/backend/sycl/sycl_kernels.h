@@ -242,6 +242,19 @@ void dequantize_kv(sycl::queue& q, const KvStream& s, CT* out, int64_t rows, int
 // (`inverse`); y may be x.
 void kv_rotate(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width, bool inverse);
 
+// A segment of a step over several sequences for attention_rows: its rows of the queries and the output, its
+// sequence's cache (the keys and the values as the cache's format stores them, with their scales where it has any)
+// and the keys that cache holds.
+struct AttentionSegment {
+    const void* k = nullptr;
+    const void* k_scales = nullptr;
+    const void* v = nullptr;
+    const void* v_scales = nullptr;
+    int64_t first = 0;
+    int64_t tokens = 0;
+    int64_t kv_len = 0;
+};
+
 // How attention_rows lays a shape out: `rows` (token, query head) rows a work-group, `heads` query heads of each of
 // rows / heads tokens, all sharing a KV head, so each key and value is read once for all of them; and its sub-groups.
 struct RowsLayout {
@@ -258,12 +271,16 @@ int64_t attention_rows_units(const AttentionShape& s, const RowsLayout& layout);
 // For few queries. split == 1 writes `out`; otherwise each work-group writes [D partial sums, max, denominator] per
 // row to `part` ([T * Hq * split, D + 2]) and attention_combine merges them into `out` (flash-decoding for long
 // contexts).
+// With `segs` (in device memory), `count` segments of a step over several sequences in one launch: `s` then is the
+// shape of a segment of the most rows and keys any has (its tokens, its kv_len), and each segment's queries, outputs,
+// cache and keys its own (k and v only give the reader's type); `part` holds the step's rows.
 template <typename KV>
 void attention_rows(sycl::queue& q, const float* qp, const KV* k, const KV* v, float* out, const AttentionShape& s,
-                    int64_t split, float* part);
+                    int64_t split, float* part, const AttentionSegment* segs = nullptr, int64_t count = 1);
 // attention_rows reading a quantized cache: the codes of each key and value, decoded in registers.
 void attention_rows_quantized(sycl::queue& q, const float* qp, const KvQuantized& kv, float* out,
-                              const AttentionShape& s, int64_t split, float* part);
+                              const AttentionShape& s, int64_t split, float* part,
+                              const AttentionSegment* segs = nullptr, int64_t count = 1);
 void attention_combine(sycl::queue& q, const float* part, float* out, int64_t rows, int64_t split, int64_t head_dim);
 // acc [rows, D + 2]: partial rows as attention_combine reads them, merged with the `split` partial rows each row has in
 // `part`; `first`: acc starts as their merge. attention_combine(acc, split 1) then gives the output.

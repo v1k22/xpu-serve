@@ -6,6 +6,7 @@
 //   load(row, lane, x)       reads the lane's values of a row into x and returns the factor they are still to be
 //                            multiplied by (a row's scale, applied once to what is computed from x)
 //   to_cache / from_cache    a query brought into the domain the rows are stored in, a sum of rows brought out of it
+//   rebased(data, scales)    the same format's reader over another cache (its codes or values, and their scales)
 // `row` counts (key, KV head) pairs.
 
 #include <cstdint>
@@ -23,6 +24,7 @@ template <typename T, int DPL>
 struct FloatRows {
     const T* data = nullptr;
 
+    FloatRows rebased(const void* d, const void*) const { return {static_cast<const T*>(d)}; }
     static int64_t dim(int lane, int e) { return lane + kRowLanes * e; }
     float load(int64_t row, int lane, float* x) const {
         const T* r = data + row * (DPL * kRowLanes) + lane;
@@ -42,6 +44,9 @@ struct I8Rows {
     const int8_t* codes = nullptr;
     const float* scales = nullptr;
 
+    I8Rows rebased(const void* c, const void* s) const {
+        return {static_cast<const int8_t*>(c), static_cast<const float*>(s)};
+    }
     static int64_t dim(int lane, int e) {
         if constexpr (kPacked) {
             return (e / 4) * (4 * kRowLanes) + lane * 4 + e % 4;
@@ -76,6 +81,9 @@ struct TurboRows {
     const uint8_t* codes = nullptr;
     const half* norms = nullptr;
 
+    TurboRows rebased(const void* c, const void* s) const {
+        return {static_cast<const uint8_t*>(c), static_cast<const half*>(s)};
+    }
     static int64_t dim(int lane, int e) {
         return (e / turbo::kLaneValues) * turbo::kGroup + lane * turbo::kLaneValues + e % turbo::kLaneValues;
     }

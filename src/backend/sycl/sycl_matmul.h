@@ -128,4 +128,12 @@ template <typename CT>
 void attention_quantized(sycl::queue& q, Scratch& scratch, Scratch& kv_scratch, const float* qp, const KvQuantized& kv,
                          float* out, const AttentionShape& s, const AttentionPlan& plan);
 
+// Attention of `count` segments of a step over several sequences in one launch of the per-row kernel (decode): `segs`
+// in device memory, `s` the shape of a segment of the most rows and keys any has, `rows` the step's tokens. A float
+// cache of KV, or with KV = void a quantized one of `formats`. attention_segments_fit: the shape takes that path.
+bool attention_segments_fit(const AttentionShape& s, const AttentionPlan& plan);
+template <typename KV>
+void attention_segments(sycl::queue& q, Scratch& scratch, const float* qp, const AttentionSegment* segs, int64_t count,
+                        int64_t rows, float* out, const AttentionShape& s, const quant::KvFormats& formats = {});
+
 }  // namespace xs::sycl_be
