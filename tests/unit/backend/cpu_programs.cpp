@@ -44,6 +44,13 @@ TEST_SUITE("cpu-ref programs") {
     TEST_CASE("segments: steps of several sequences at once give what each sequence's own steps give") {
         xs::test::session::segments(cpu_env());
     }
+    TEST_CASE("a snapshot of a sequence's state, restored after steps past its sliding window") {
+        xs::test::session::state_snapshot(cpu_env());
+        for (const char* kv : {"i8", "turbo4"}) {
+            CAPTURE(kv);
+            xs::test::session::state_snapshot(cpu_env(xs::quant::parse_kv_formats(kv)), 128);
+        }
+    }
     TEST_CASE("segments cut back inside each sequence's segment: speculative rounds of several sequences") {
         xs::test::session::segments_truncate(cpu_env());
         for (const char* kv : {"i8", "turbo4"}) {

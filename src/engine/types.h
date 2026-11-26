@@ -59,6 +59,10 @@ struct GenerateRequest {
     SamplingParams sampling;
     int max_new_tokens = 512;
     std::vector<int32_t> stop_token_ids;  // generation ends after emitting none of these (they are not passed on)
+    // Where the next request's prompt is likely to depart from this one: a chat's messages end there, before the
+    // generation prompt. A model with conv or recurrent state saves its state at that prompt position, so that a
+    // prompt sharing the tokens up to it starts from there (decision 0029). 0: nowhere.
+    int64_t snapshot_at = 0;
 };
 
 enum class FinishReason { Stop, Length, Cancelled, Error };

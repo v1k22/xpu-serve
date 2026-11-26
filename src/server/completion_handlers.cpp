@@ -111,10 +111,22 @@ CompletionHandlers::Prompt CompletionHandlers::chat_prompt(const ChatRequest& ch
             throw InvalidRequest(str_cat(part.param, ": ", e.what()), part.param);
         }
     }
+    size_t tail = 0;  // tokens of the generation prompt, at the prompt's end
     try {
         p.text = service_.chat_template().render(chat.messages, chat.tools, /*add_generation_prompt=*/true,
                                                  chat.template_kwargs);
         p.tokens = service_.tokenizer().encode(p.text, /*parse_special=*/true);
+        const std::string messages = service_.chat_template().render(chat.messages, chat.tools,
+                                                                     /*add_generation_prompt=*/false,
+                                                                     chat.template_kwargs);
+        if (messages.size() < p.text.size() && p.text.starts_with(messages)) {
+            const std::vector<int32_t> generation =
+                service_.tokenizer().encode(std::string_view(p.text).substr(messages.size()), /*parse_special=*/true);
+            if (generation.size() < p.tokens.size() &&
+                std::equal(generation.rbegin(), generation.rend(), p.tokens.rbegin())) {
+                tail = generation.size();
+            }
+        }
     } catch (const std::exception& e) {
         throw InvalidRequest(str_cat("could not render the chat template: ", e.what()), "messages");
     }
@@ -123,6 +135,7 @@ CompletionHandlers::Prompt CompletionHandlers::chat_prompt(const ChatRequest& ch
     } catch (const Error& e) {
         throw InvalidRequest(e.what(), "messages");
     }
+    if (tail > 0) p.messages_end = static_cast<int64_t>(p.tokens.size() - tail);  // media sit among the messages
     return p;
 }
 
@@ -132,6 +145,7 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
     Prompt p = chat_prompt(chat);
     GenerateRequest request = make_generate_request(std::move(p.tokens), chat.options, card, "messages");
     request.media = std::move(p.media);
+    request.snapshot_at = p.messages_end;
     const ResponseMeta meta{random_id("chatcmpl-"), card.id, unix_seconds_now()};
     const bool usage = chat.options.include_usage;
     Job job{.id = meta.id,
@@ -150,6 +164,7 @@ void CompletionHandlers::messages(const httplib::Request& req, httplib::Response
     const auto input_tokens = static_cast<int64_t>(p.tokens.size());
     GenerateRequest request = make_generate_request(std::move(p.tokens), chat.options, card, "messages");
     request.media = std::move(p.media);
+    request.snapshot_at = p.messages_end;
     const std::string id = random_id("msg_");
     Job job{.id = id,
             .format = [id, model = card.id, input_tokens] { return anthropic_format(id, model, input_tokens); },

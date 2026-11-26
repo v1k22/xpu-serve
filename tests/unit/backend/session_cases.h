@@ -473,6 +473,48 @@ inline void segments(const Env& env, int64_t d = HybridLayer::kD) {
     CHECK_THROWS_AS(refused->run_segments(0, two, in, got, {}), xs::Error);
 }
 
+// A snapshot of a sequence's state (Session::save_state) taken past the sliding window, and restored after steps that
+// went far past it again (one of them cut back): what follows is what a session that never ran those steps gives, and
+// a second restore after more steps too. With a KV slot that keeps every key, restoring a snapshot whose tokens the
+// slot no longer holds is refused and changes nothing.
+inline void state_snapshot(const Env& env, int64_t d = HybridLayer::kD) {
+    const HybridLayer layer(6, false, 64, d);
+    const Graph* programs[] = {&layer.graph};
+    const auto session = env.compile(programs, layer.weights, 4, 1);
+    TensorRng rng(5);
+    const TensorMap prefix = HybridLayer::inputs(rng, 9, 64, d);
+    TensorMap out;
+    session->run(prefix, out);
+    const StateSnapshot snapshot = session->save_state(0);
+    CHECK(snapshot.tokens == 9);
+    for (int restore = 0; restore < 2; ++restore) {
+        CAPTURE(restore);
+        for (const int64_t t : {5, 8, 3}) session->run(HybridLayer::inputs(rng, t, 64, d), out);
+        session->truncate(session->num_cached() - 2);
+        session->restore_state(0, snapshot);
+        CHECK(session->num_cached() == 9);
+        const auto plain = env.compile(programs, layer.weights, 0, 1);
+        TensorMap want;
+        plain->run(prefix, want);
+        for (const int64_t t : {2, 7, 1}) {
+            const TensorMap next = HybridLayer::inputs(rng, t, 64, d);
+            session->run(next, out);
+            plain->run(next, want);
+            CHECK(outputs_close(out, want, env));
+        }
+    }
+
+    const HybridLayer full(0, false, 64, d);  // its KV slot keeps every key
+    const Graph* full_programs[] = {&full.graph};
+    const auto cut = env.compile(full_programs, full.weights, 0, 1);
+    cut->run(prefix, out);
+    const StateSnapshot early = cut->save_state(0);
+    cut->run(HybridLayer::inputs(rng, 4, 64, d), out);
+    cut->truncate(0);
+    CHECK_THROWS_AS(cut->restore_state(0, early), xs::Error);
+    CHECK(cut->num_cached() == 0);
+}
+
 // Speculative rounds of several sequences at once: a step of segments of up to rewind_tokens tokens each, then each
 // sequence cut back inside its own segment (truncate with it selected), gives each sequence what a session of its own
 // gives over the same steps and cuts; a cut that keeps nothing of the step and one that keeps all of it included.

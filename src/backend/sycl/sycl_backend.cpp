@@ -899,6 +899,88 @@ public:
         q_.wait_and_throw();
     }
 
+    // Session::save_state: each conv and recurrent slot's state, then each KV slot's part (empty unless it keeps only
+    // its window: the rows of that window it holds, after their count, stream by stream).
+    StateSnapshot save_state() const {
+        StateSnapshot s;
+        s.tokens = cached();
+        for (size_t f : fixed_slot_) {
+            const StateBuffers& st = shared_.fixed[f].state;
+            std::vector<uint8_t>& part = s.parts.emplace_back(st.bytes);
+            q_.memcpy(part.data(), st.buf[st.cur].get(), st.bytes);
+        }
+        if (!reads_kv_) {
+            for (size_t k : kv_slot_) {
+                const SharedKv& kv = shared_.kv[k];
+                std::vector<uint8_t>& part = s.parts.emplace_back();
+                if (!keeps_window(kv)) continue;
+                const int64_t rows = std::min(kv.len - kv.base, kv.spec.sliding_window);
+                part.resize(sizeof rows + static_cast<size_t>(rows * kv_token_bytes(kv.buf).total()));
+                std::memcpy(part.data(), &rows, sizeof rows);
+                size_t at = sizeof rows;
+                for_each_stream(kv.buf, [&](const DeviceBuffer& buf, int64_t per_token) {
+                    const int64_t first = kv.len - rows - kv.base;  // the window's first row in the buffers
+                    q_.memcpy(part.data() + at, buf.get() + first * per_token, static_cast<size_t>(rows * per_token));
+                    at += static_cast<size_t>(rows * per_token);
+                });
+            }
+        }
+        q_.wait_and_throw();
+        return s;
+    }
+
+    void restore_state(const StateSnapshot& s) {
+        const size_t kvs = reads_kv_ ? 0 : kv_slot_.size();
+        XS_CHECK(s.parts.size() == fixed_slot_.size() + kvs, "sycl: a snapshot of ", s.parts.size(),
+                 " slots for a program of ", fixed_slot_.size() + kvs);
+        for (size_t i = 0; i < fixed_slot_.size(); ++i) {  // checked first: a refusal changes nothing
+            XS_CHECK(s.parts[i].size() == shared_.fixed[fixed_slot_[i]].state.bytes,
+                     "sycl: a snapshot of another program's slots");
+        }
+        const auto window_rows = [&](size_t j) {
+            int64_t rows = 0;
+            std::memcpy(&rows, s.parts[fixed_slot_.size() + j].data(), sizeof rows);
+            return rows;
+        };
+        for (size_t j = 0; j < kvs; ++j) {
+            const SharedKv& kv = shared_.kv[kv_slot_[j]];
+            const std::vector<uint8_t>& part = s.parts[fixed_slot_.size() + j];
+            if (keeps_window(kv)) {
+                XS_CHECK(part.size() >= sizeof(int64_t) && part.size() == sizeof(int64_t) +
+                             static_cast<size_t>(window_rows(j) * kv_token_bytes(kv.buf).total()),
+                         "sycl: kv slot '", kv.spec.label, "' is not the snapshot's");
+            } else {
+                XS_CHECK(part.empty() && kv.len >= s.tokens, "sycl: kv slot '", kv.spec.label, "' holds ", kv.len,
+                         " tokens, the snapshot ", s.tokens);
+            }
+        }
+        for (size_t i = 0; i < fixed_slot_.size(); ++i) {
+            SharedFixed& f = shared_.fixed[fixed_slot_[i]];
+            q_.memcpy(f.state.buf[f.state.cur].get(), s.parts[i].data(), f.state.bytes);
+            f.tokens = s.tokens;
+            f.base = -1;
+            f.replay = false;
+        }
+        for (size_t j = 0; j < kvs; ++j) {  // a windowed slot holds the snapshot's rows, from its buffers' start
+            SharedKv& kv = shared_.kv[kv_slot_[j]];
+            kv.len = s.tokens;
+            if (keeps_window(kv)) kv.base = s.tokens - window_rows(j);
+        }
+        ensure_kv_capacity(s.tokens);
+        for (size_t j = 0; j < kvs; ++j) {
+            SharedKv& kv = shared_.kv[kv_slot_[j]];
+            if (!keeps_window(kv)) continue;
+            const int64_t rows = window_rows(j);
+            size_t at = sizeof rows;
+            for_each_stream(kv.buf, [&](const DeviceBuffer& buf, int64_t per_token) {
+                q_.memcpy(buf.get(), s.parts[fixed_slot_.size() + j].data() + at,
+                          static_cast<size_t>(rows * per_token));
+                at += static_cast<size_t>(rows * per_token);
+            });
+        }
+        q_.wait_and_throw();
+    }
+
 private:
     // Brings a conv or recurrent slot to `n` tokens: kept, zeroed, or replayed from the state before the last step
     // (the other buffer) through the kept inputs, into the current buffer.
@@ -1047,7 +1129,17 @@ private:
     // Bytes a token takes in each buffer of a slot.
     struct KvTokenBytes {
         int64_t k = 0, v = 0, k_scale = 0, v_scale = 0;
+        int64_t total() const { return k + v + k_scale + v_scale; }
     };
+    // f(buffer, bytes a token) for each of a slot's streams that holds anything: keys, values, their scales.
+    template <typename F>
+    void for_each_stream(const KvBuffers& b, F f) const {
+        const KvTokenBytes bytes = kv_token_bytes(b);
+        if (bytes.k > 0) f(b.k, bytes.k);
+        if (bytes.v > 0) f(b.v, bytes.v);
+        if (bytes.k_scale > 0) f(b.k_scale, bytes.k_scale);
+        if (bytes.v_scale > 0) f(b.v_scale, bytes.v_scale);
+    }
     KvTokenBytes kv_token_bytes(const KvBuffers& b) const {
         if (b.dtype != kKvCodes) {
             const int64_t values = b.row * static_cast<int64_t>(dtype_size(b.dtype));
@@ -3256,6 +3348,10 @@ public:
     }
     void reset() override { shared_->reset(); }
     void truncate(size_t program, int64_t n) override { at(program).truncate(n); }
+    StateSnapshot save_state(size_t program) const override { return at(program).save_state(); }
+    void restore_state(size_t program, const StateSnapshot& snapshot) override {
+        at(program).restore_state(snapshot);
+    }
     void use(int64_t sequence) override { shared_->use(sequence); }
     int64_t current_sequence() const override { return shared_->current; }
     void run_segments(size_t program, std::span<const Segment> segments, const TensorMap& inputs, TensorMap& outputs,
@@ -3311,7 +3407,7 @@ public:
     }
 
 private:
-    SyclProgram& at(size_t program) {
+    SyclProgram& at(size_t program) const {
         XS_CHECK(program < programs_.size(), "sycl: no program ", program, " (", programs_.size(), " compiled)");
         return *programs_[program];
     }

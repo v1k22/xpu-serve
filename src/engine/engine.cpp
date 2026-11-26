@@ -43,6 +43,7 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
     XS_CHECK(options_.verify_rows >= 1, "verify_rows must be positive, got ", options_.verify_rows);
     XS_CHECK(options_.sequences >= 1, "an engine of ", options_.sequences, " sequences");
     sequences_.resize(static_cast<size_t>(options_.sequences));
+    fixed_state_ = model_->graph().has_fixed_state();
     const auto offers_argmax = [](const graph::Graph& g) {
         return std::any_of(g.outputs().begin(), g.outputs().end(), [](const auto& o) { return o.name == "argmax"; });
     };
@@ -106,9 +107,7 @@ size_t Engine::pick_sequence(const std::vector<PositionKey>& keys) const {
     int64_t best_common = -1;
     for (size_t q = 0; q < sequences_.size(); ++q) {
         if (sequences_[q].busy) continue;
-        const std::vector<PositionKey>& cached = sequences_[q].cached;
-        const auto common = static_cast<int64_t>(
-            std::mismatch(cached.begin(), cached.end(), keys.begin(), keys.end()).first - cached.begin());
+        const int64_t common = usable_prefix(sequences_[q], keys);
         if (common > best_common || (common == best_common && sequences_[q].used < sequences_[best].used)) {
             best = q;
             best_common = common;
@@ -125,6 +124,7 @@ size_t Engine::state_program() const {
 void Engine::reset_sequence() {
     session_->reset();
     seq().cached.clear();
+    seq().snapshot.reset();
     if (seq().drafter) seq().drafter->reset();
 }
 
@@ -238,23 +238,34 @@ int Engine::round_drafts(const Generation& g) const {
     return static_cast<int>(std::min<int64_t>({options_.spec_k, g.max_new - emitted - 1, fits}));
 }
 
+int64_t Engine::usable_prefix(const Sequence& q, const std::vector<PositionKey>& keys) const {
+    const std::vector<PositionKey>& cached = q.cached;
+    const auto common = static_cast<int64_t>(
+        std::mismatch(cached.begin(), cached.end(), keys.begin(), keys.end()).first - cached.begin());
+    // At least the last prompt token must run, because its logits pick the first new token.
+    const int64_t keep = std::min<int64_t>(common, static_cast<int64_t>(keys.size()) - 1);
+    if (keep <= 0) return 0;
+    if (keep == static_cast<int64_t>(cached.size()) || !fixed_state_) return keep;
+    // Conv and recurrent state cannot be cut back into the sequence: only to its snapshot.
+    return q.snapshot && q.snapshot->tokens <= keep ? q.snapshot->tokens : 0;
+}
+
 int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
     std::vector<PositionKey>& cached = seq().cached;
-    const auto common = static_cast<int64_t>(
-        std::mismatch(cached.begin(), cached.end(), prompt_keys.begin(), prompt_keys.end()).first - cached.begin());
-    // At least the last prompt token must run, because its logits pick the first new token.
-    const int64_t keep = std::min<int64_t>(common, static_cast<int64_t>(prompt_keys.size()) - 1);
-    if (keep <= 0) {
+    const int64_t keep = usable_prefix(seq(), prompt_keys);
+    if (keep == 0) {
         reset_sequence();
         return 0;
     }
     if (keep < static_cast<int64_t>(cached.size())) {
-        if (model_->graph().has_fixed_state()) {
-            // Conv and recurrent state cannot be cut back into the sequence; start over.
-            reset_sequence();
-            return 0;
+        if (fixed_state_) {
+            Timer restoring;
+            session_->restore_state(state_program(), *seq().snapshot);
+            log::debug("engine: restored sequence ", current_, "'s state at ", keep, " tokens in ",
+                       static_cast<int>(restoring.elapsed_ms()), " ms");
+        } else {
+            session_->truncate(state_program(), keep);
         }
-        session_->truncate(state_program(), keep);
         cached.resize(static_cast<size_t>(keep));
         if (seq().drafter) seq().drafter->truncate(keep);
     }
@@ -460,7 +471,9 @@ void Engine::prefill_chunk(Generation& g) {
     const std::vector<int32_t>& prompt = g.request.prompt;
     const size_t n = prompt.size();
     const size_t pos = g.fed;
-    const size_t len = std::min(n - pos, static_cast<size_t>(options_.prefill_chunk));
+    size_t len = std::min(n - pos, static_cast<size_t>(options_.prefill_chunk));
+    const auto snapshot_at = static_cast<size_t>(std::max<int64_t>(0, g.request.snapshot_at));
+    if (fixed_state_ && snapshot_at > pos && snapshot_at < pos + len) len = snapshot_at - pos;  // a chunk ends there
     const int64_t width = media_width();
     std::vector<const float*> rows(len, nullptr);
     bool any_rows = false;
@@ -476,6 +489,12 @@ void Engine::prefill_chunk(Generation& g) {
             std::span<const RotaryPosition>(g.positions).subspan(pos, len),
             any_rows ? std::span<const float* const>(rows) : std::span<const float* const>());
     g.fed += len;
+    if (fixed_state_ && g.fed == snapshot_at) {
+        Timer saving;
+        seq().snapshot = session_->save_state(state_program());
+        log::debug("engine: saved sequence ", g.sequence, "'s state at ", snapshot_at, " tokens (",
+                   seq().snapshot->bytes() >> 20, " MiB) in ", static_cast<int>(saving.elapsed_ms()), " ms");
+    }
     stats.prefill_ms += timer.elapsed_ms() - (stats.encode_ms - encode_before);
     if (g.fed == n) begin_decode(g);  // the last row's logits give the first token: before another request runs
 }

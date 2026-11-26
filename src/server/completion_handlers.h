@@ -29,6 +29,9 @@ private:
         std::vector<int32_t> tokens;
         std::string text;
         std::vector<MediaInput> media;
+        // Where the messages end in `tokens`, before the generation prompt (GenerateRequest::snapshot_at); 0 when the
+        // template's rendering without that prompt is not where the prompt's tokens split.
+        int64_t messages_end = 0;
     };
     Prompt chat_prompt(const ChatRequest& chat) const;
     void respond(const Job& job, const httplib::Request& req, httplib::Response& res) const;

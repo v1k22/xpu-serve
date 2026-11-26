@@ -86,6 +86,9 @@ private:
     // What a sequence of the session holds between requests.
     struct Sequence {
         std::vector<PositionKey> cached;          // positions whose KV the session holds, in order
+        // The state at the first snapshot->tokens of `cached` (GenerateRequest::snapshot_at), for a model whose conv
+        // or recurrent state cannot be cut back.
+        std::optional<StateSnapshot> snapshot;
         std::unique_ptr<spec::Drafter> drafter;   // speculating
         int64_t rotary_delta = 0;                 // a token past the prompt at cached position i is at i + delta
         bool busy = false;
@@ -95,8 +98,10 @@ private:
     void select(size_t s);
     Sequence& seq() { return sequences_[current_]; }
     const Sequence& seq() const { return sequences_[current_]; }
-    // The sequence a request with these prompt positions runs on: the free one sharing the longest prefix.
+    // The sequence a request with these prompt positions runs on: the free one with the longest usable prefix.
     size_t pick_sequence(const std::vector<PositionKey>& keys) const;
+    // The prompt positions a request with `keys` can keep of sequence `q`'s cache (reuse_prefix).
+    int64_t usable_prefix(const Sequence& q, const std::vector<PositionKey>& keys) const;
     // The steps of advance(): the rest of the prompt's next chunk, and the next token.
     void prefill_chunk(Generation& g);
     void begin_decode(Generation& g);
@@ -143,7 +148,9 @@ private:
     size_t state_program() const;
     // Drops the sequence: every slot of the session, and what waits for the drafter.
     void reset_sequence();
-    // Makes the session hold a prefix of the prompt and returns how many prompt positions are already cached.
+    // Makes the session hold a prefix of the prompt and returns how many prompt positions are already cached: the
+    // longest one it shares, or with conv or recurrent state the whole cache when the prompt extends it, else the
+    // sequence's snapshot when the prompt shares its tokens, else none.
     int64_t reuse_prefix(const std::vector<PositionKey>& prompt_keys);
     // The encoder rows of one media item ([num_tokens, hidden] f32), from the cache or its encoder's runs.
     std::shared_ptr<const HostTensor> encode(const MediaInput& media, GenerateStats& stats);
@@ -160,6 +167,9 @@ private:
     std::list<std::pair<uint64_t, std::shared_ptr<const HostTensor>>> encoded_;  // most recent first
     TensorMap inputs_;
     TensorMap outputs_;
+    // The model has conv or recurrent state: a prefix is kept whole or from the sequence's snapshot, taken at
+    // GenerateRequest::snapshot_at.
+    bool fixed_state_ = false;
     bool has_argmax_ = false;   // every target program outputs "argmax" beside "logits"
     bool argmax_only_ = false;  // the running request's sampler reads no more than a row's argmax, and programs give it
 };

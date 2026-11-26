@@ -560,6 +560,10 @@ seq A: [0, 2, 3, ...]   seq B: [1, ...]                      seq A: ring of ceil
 
 ### 9.4 Prefix cache
 
+Today (decision 0029): each sequence keeps its own prefix, and a model with conv or recurrent state a snapshot of its
+state where the last chat's messages ended; the blocks below are deferred while memory is not the limit (xpu-serve
+runs mostly on one machine for few users).
+
 Agent and chat workloads resend the same long prefix every turn. Full KV blocks are keyed by a hash chain over their
 tokens (`key = hash(previous key, tokens in block)`), reference-counted and evicted LRU.
 

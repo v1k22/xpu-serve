@@ -230,6 +230,56 @@ class CpuProgram {
         }
     }
 
+    // Backend::save_state: this backend keeps every key, so its snapshot is the conv and recurrent state, a part a
+    // slot in declaration order.
+    StateSnapshot save_state() const {
+        StateSnapshot s;
+        s.tokens = cached();
+        for (const std::vector<size_t>* slots : {&conv_, &recurrent_}) {
+            for (size_t i : *slots) {
+                const std::vector<float>& st = shared_.fixed[i].state;
+                const auto* bytes = reinterpret_cast<const uint8_t*>(st.data());
+                s.parts.emplace_back(bytes, bytes + st.size() * sizeof(float));
+            }
+        }
+        return s;
+    }
+
+    void restore_state(const StateSnapshot& s) {
+        XS_CHECK(s.parts.size() == conv_.size() + recurrent_.size(), "cpu-ref: a snapshot of ", s.parts.size(),
+                 " slots for a program of ", conv_.size() + recurrent_.size());
+        if (!reads_kv_) {
+            for (size_t k : kv_) {
+                XS_CHECK(shared_.kv[k].len >= s.tokens, "cpu-ref: kv slot '", shared_.kv[k].spec.label, "' holds ",
+                         shared_.kv[k].len, " tokens, the snapshot ", s.tokens);
+            }
+        }
+        size_t part = 0;
+        for (const std::vector<size_t>* slots : {&conv_, &recurrent_}) {
+            for (size_t i : *slots) {
+                XS_CHECK(s.parts[part].size() == shared_.fixed[i].state.size() * sizeof(float),
+                         "cpu-ref: a snapshot of another program's slots");
+                ++part;
+            }
+        }
+        if (!reads_kv_) {
+            for (size_t k : kv_) {
+                resize_kv(shared_.kv[k], s.tokens);
+                shared_.kv[k].len = s.tokens;
+            }
+        }
+        part = 0;
+        for (const std::vector<size_t>* slots : {&conv_, &recurrent_}) {
+            for (size_t i : *slots) {
+                FixedSlotState& f = shared_.fixed[i];
+                std::memcpy(f.state.data(), s.parts[part++].data(), f.state.size() * sizeof(float));
+                f.tokens = s.tokens;
+                f.base = -1;
+                f.replay = false;
+            }
+        }
+    }
+
   private:
     static bool is_leaf(OpKind kind) {
         return kind == OpKind::Input || kind == OpKind::Weight || kind == OpKind::Constant;
@@ -592,6 +642,10 @@ class CpuSession final : public Session {
         }
     }
     void truncate(size_t program, int64_t n) override { at(program).truncate(n); }
+    StateSnapshot save_state(size_t program) const override { return at(program).save_state(); }
+    void restore_state(size_t program, const StateSnapshot& snapshot) override {
+        at(program).restore_state(snapshot);
+    }
     int64_t current_sequence() const override { return current_; }
     // A step over several sequences runs their segments one after another: the definition of such a step.
     void run_segments(size_t program, std::span<const Segment> segments, const TensorMap& inputs, TensorMap& outputs,

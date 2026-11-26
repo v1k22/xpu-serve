@@ -53,6 +53,19 @@ struct Segment {
     int64_t tokens = 0;
 };
 
+// What a sequence's slots held at `tokens` tokens that cutting its KV back to them could not give back later
+// (Session::save_state): its conv and recurrent state, and the keys and values of a KV slot that keeps only its
+// sliding window. Host memory, in the backend's own layout, a part a slot.
+struct StateSnapshot {
+    int64_t tokens = 0;
+    std::vector<std::vector<uint8_t>> parts;
+    size_t bytes() const {
+        size_t n = 0;
+        for (const std::vector<uint8_t>& p : parts) n += p.size();
+        return n;
+    }
+};
+
 // The programs of a session run over one sequence. They share the weights (by name) and the state slots: a KV, conv
 // or recurrent slot that two programs declare with the same label is one state. Each slot counts the tokens it holds;
 // a program extends the slots it writes (KvCache, CausalConv, GatedDelta), which always hold the same count, and may
@@ -93,6 +106,13 @@ public:
     // tokens, any count from before that step on; anything else throws.
     virtual void truncate(size_t program, int64_t n) = 0;
     void truncate(int64_t n) { truncate(0, n); }
+    // A snapshot of the slots `program` writes, of the current sequence as it stands (StateSnapshot).
+    virtual StateSnapshot save_state(size_t program) const = 0;
+    // Brings the slots `program` writes back to `snapshot` (save_state of the same program): the KV slots cut back to
+    // snapshot.tokens, which they must hold, the tokens the snapshot was taken after; the conv and recurrent state
+    // and a windowed slot's keys as saved. The current sequence's KV holds those tokens when the snapshot is its own
+    // and nothing since cut it below them. Truncate cannot undo the restore (no step to undo into).
+    virtual void restore_state(size_t program, const StateSnapshot& snapshot) = 0;
 };
 
 class Backend {

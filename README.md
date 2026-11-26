@@ -71,8 +71,8 @@ optimized one) and what was measured**; this page says what is supported and how
 
 Not yet:
 
-- KV blocks shared between requests (a prefix cache across sequences); with `--spec`, the drafts of several requests
-  in one step (their verifies already are).
+- A prompt's prefix copied between requests' sequences (a sequence reuses its own, also for models with recurrent
+  state: decision 0029); with `--spec`, the drafts of several requests in one step (their verifies already are).
 - One model across two GPUs.
 - Timestamps and translation of speech; speech output; video input; images for Qwen3.5 (its vision tower is not
   loaded) and Gemma 4 26B-A4B; images from remote URLs.

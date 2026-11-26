@@ -151,8 +151,10 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       attention within each segment's block)
 - [x] One launch over a batched step's segments for its stateful ops: the convolutions, the gated delta rule, the KV
       appends and decode attention, each segment reading and writing its sequence's cache in any format (decision 0028)
-- [ ] Prefix cache: hash-chained full blocks, refcounts, LRU; validity rule for sliding layers (DESIGN.md 9.4). Today
-      a request takes the sequence whose cached prompt it shares the longest prefix with
+- [x] Prefix reuse for models with conv or recurrent state: a snapshot of the sequence's state where a chat's messages
+      end, restored when the next prompt shares the tokens up to it (decision 0029)
+- [ ] A prefix and its snapshot copied from another sequence (decision 0029)
+- [ ] Paged KV blocks shared between sequences (DESIGN.md 9.4): deferred while memory is not the limit (decision 0029)
 - [x] Memory bill at load; refuse by name when it does not fit (the weights, the KV cache, the largest step; scratch
       that grows with a kernel's needs is not billed)
 - [x] Sampling: temperature, top-k, top-p, min-p, penalties, seed; device-side argmax / top-k

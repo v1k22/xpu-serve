@@ -146,6 +146,22 @@ TEST_SUITE("server.http") {
         CHECK(req.max_new_tokens == 4096 - int(req.prompt.size()));
     }
 
+    TEST_CASE("a chat request names where its messages end, before the generation prompt (snapshot_at)") {
+        xs::test::FakeService service;
+        RunningServer server(service);
+        auto client = server.client();
+        post_json(client, "/v1/chat/completions", chat_body(json::object()));
+        CHECK(service.last_request().snapshot_at == int64_t(std::string("user: hi\n").size()));
+        const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}});
+        post_json(client, "/v1/chat/completions",
+                  chat_body({{"tools", tools}, {"chat_template_kwargs", {{"enable_thinking", true}}}}));
+        CHECK(service.last_request().snapshot_at == int64_t(std::string("user: hi\n[tools:1][think]").size()));
+        post_json(client, "/v1/messages",
+                  json{{"model", "fake-model"}, {"max_tokens", 4},
+                       {"messages", json::array({{{"role", "user"}, {"content", "hi"}}})}});
+        CHECK(service.last_request().snapshot_at == int64_t(std::string("user: hi\n").size()));
+    }
+
     TEST_CASE("tools and chat_template_kwargs reach the template; tool_choice none drops tools") {
         xs::test::FakeService service;
         RunningServer server(service);

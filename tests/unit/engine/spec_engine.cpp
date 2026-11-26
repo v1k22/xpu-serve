@@ -199,6 +199,8 @@ struct RecordingSession final : Session {
     int64_t num_cached(size_t) const override { return cached; }
     void reset() override { cached = 0; }
     void truncate(size_t, int64_t n) override { cached = n; }
+    StateSnapshot save_state(size_t) const override { return {cached, {}}; }
+    void restore_state(size_t, const StateSnapshot& s) override { cached = s.tokens; }
     void use(int64_t sequence) override { REQUIRE(sequence == 0); }
     int64_t current_sequence() const override { return 0; }
 };
