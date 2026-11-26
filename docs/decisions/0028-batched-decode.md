@@ -53,24 +53,24 @@ at most): the tokens of all of them over the wall time ("in all", prefills inclu
 
 | Model | N = 1 | N = 2 | N = 4 | N = 8 |
 |---|---|---|---|---|
-| Qwen3.8-27B, Q4_0 pack (dense) | 21.7 tok/s | 38.7 in all, 19.6 each | 67.4 in all, 17.5 each | 113.9 in all, 15.4 each |
-| Inkling-2-Mini, AD-Q4_K (mixture of experts) | 43.1 (46.6 decoding) | 64.9 in all, 34.8 each | 82.7 in all, 23.9 each | 103.0 in all, 15.9 each |
+| Qwen3.8-27B, Q4_0 pack (dense) | 21.7 tok/s | 39.6 in all, 20.1 each | 71.9 in all, 18.8 each | 124.4 in all, 16.7 each |
+| Inkling-2-Mini, AD-Q4_K (mixture of experts) | 46.5 (47.3 decoding) | 70.7 in all, 36.2 each | 93.5 in all, 24.4 each | 122.6 in all, 16.3 each |
 
-The dense model reads its weights once a step whatever the rows: 5.2 times the tokens at eight. The mixture of experts
-reads the experts each token picks, more as requests are added: 2.4 times. Measured with the stateful ops run as one
-launch over the segments and the matmul kernels of the same day (q8 and the GGUF block formats on the matrix engines,
-an expert's pairs as the rows of one GEMV); with a launch a segment the same sweep gave 106.8 and 88.2 tok/s at eight,
-before those kernels 111.6 and 96.1.
+The dense model reads its weights once a step whatever the rows: 5.7 times the tokens at eight. The mixture of experts
+reads the experts each token picks, more as requests are added: 2.6 times. Measured with the stateful ops run as one
+launch over the segments and the matmul kernels of 2026-11-26 (q8 and the GGUF block formats on the matrix engines, an
+expert's pairs as the rows of one GEMV, a long step's expert banks read in passes); with a launch a segment the same
+sweep gave 106.8 and 88.2 tok/s at eight, before those kernels 111.6 and 96.1.
 
 Speculating (`--spec`, the same requests; MTP's three drafts a round, DSpark's two, fewer as the budget asks):
 
 | Model, drafter | N = 1 | N = 2 | N = 4 | N = 8 |
 |---|---|---|---|---|
-| Qwen3.8-27B, Q4_0 pack, its MTP head | 59.2 (60.9 decoding) | 78.9 in all, 44.7 each | 94.2 in all, 25.6 each | 112.4 in all, 15.2 each |
-| Inkling-2-Mini, AD-Q4_K, DSpark | 52.4 (57.6 decoding) | 69.9 in all, 39.0 each | 77.8 in all, 23.1 each | 101.3 in all, 15.6 each |
+| Qwen3.8-27B, Q4_0 pack, its MTP head | 60.3 (61.6 decoding) | 81.0 in all, 45.8 each | 100.3 in all, 27.4 each | 121.2 in all, 16.2 each |
+| Inkling-2-Mini, AD-Q4_K, DSpark | 59.8 (61.3 decoding) | 76.0 in all, 40.0 each | 84.3 in all, 23.3 each | 120.1 in all, 16.0 each |
 
-The dense model gains over plain batching at two and four requests (2.0 and 1.4 times) and loses 1 % at eight, where
-no draft fits. The mixture of experts gains 8 % at two and loses 6 % at four and 2 % at eight: each draft's row reads
+The dense model gains over plain batching at two and four requests (2.0 and 1.4 times) and loses 3 % at eight, where
+no draft fits. The mixture of experts gains 7 % at two and loses 10 % at four and 2 % at eight: each draft's row reads
 experts of its own.
 A verify's stateful ops run as one launch over the segments too, each segment keeping its inputs in its sequence's
 slot for the truncate (`StateSegment::keep`); with a launch a segment, eight requests gave 103.6 and 84.8.

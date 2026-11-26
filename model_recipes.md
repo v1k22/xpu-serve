@@ -289,22 +289,22 @@ and the server's decode speed of each request:
 
 | Model | N = 1 | N = 2 | N = 4 | N = 8 |
 |---|---|---|---|---|
-| Qwen3.8-27B, Q4_0 pack (dense) | 21.7 tok/s | 38.7 in all, 19.6 each | 67.4 in all, 17.5 each | 113.9 in all, 15.4 each |
-| Inkling-2-Mini, AtomicChat's AD-Q4_K (mixture of experts) | 43.1 (46.6 decoding) | 64.9 in all, 34.8 each | 82.7 in all, 23.9 each | 103.0 in all, 15.9 each |
+| Qwen3.8-27B, Q4_0 pack (dense) | 21.7 tok/s | 39.6 in all, 20.1 each | 71.9 in all, 18.8 each | 124.4 in all, 16.7 each |
+| Inkling-2-Mini, AtomicChat's AD-Q4_K (mixture of experts) | 46.5 (47.3 decoding) | 70.7 in all, 36.2 each | 93.5 in all, 24.4 each | 122.6 in all, 16.3 each |
 
-A dense model reads the same weights for every token, so eight requests cost little more than one: 5.2 times the
-tokens. A mixture of experts reads the experts each token picks, more of them as requests are added: 2.4 times at
+A dense model reads the same weights for every token, so eight requests cost little more than one: 5.7 times the
+tokens. A mixture of experts reads the experts each token picks, more of them as requests are added: 2.6 times at
 eight.
 
 Speculating (`--spec`; MTP's three drafts a round, DSpark's two, fewer as more requests share a verify):
 
 | Model, drafter | N = 1 | N = 2 | N = 4 | N = 8 |
 |---|---|---|---|---|
-| Qwen3.8-27B, Q4_0 pack, its MTP head (`--spec mtp`) | 59.2 (60.9 decoding) | 78.9 in all, 44.7 each | 94.2 in all, 25.6 each | 112.4 in all, 15.2 each |
-| Inkling-2-Mini, AD-Q4_K, DSpark (`--spec dspark`) | 52.4 (57.6 decoding) | 69.9 in all, 39.0 each | 77.8 in all, 23.1 each | 101.3 in all, 15.6 each |
+| Qwen3.8-27B, Q4_0 pack, its MTP head (`--spec mtp`) | 60.3 (61.6 decoding) | 81.0 in all, 45.8 each | 100.3 in all, 27.4 each | 121.2 in all, 16.2 each |
+| Inkling-2-Mini, AD-Q4_K, DSpark (`--spec dspark`) | 59.8 (61.3 decoding) | 76.0 in all, 40.0 each | 84.3 in all, 23.3 each | 120.1 in all, 16.0 each |
 
-For the dense model speculation pays up to four requests (78.9 against 38.7 for two, 94.2 against 67.4 for four) and
-costs 1 % at eight; for the mixture of experts it pays up to two (69.9 against 64.9) and costs from four on, so serve
+For the dense model speculation pays up to four requests (81.0 against 39.6 for two, 100.3 against 71.9 for four) and
+costs 3 % at eight; for the mixture of experts it pays up to two (76.0 against 70.7) and costs from four on, so serve
 more than two users of Inkling-2-Mini without `--spec`.
 
 ## Language models
@@ -674,9 +674,9 @@ xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4 --kv-
 - On the Arc B390, `--spec-k 5`.
 - Faster still on prose: a DFlash 2 drafter
   ([DFlash 2 and DSpine drafters](#dflash-2-and-dspine-drafters-for-qwen38-27b)).
-- Several users: `--sequences 8 --ctx 8192` decodes eight requests at once at 113.9 tok/s in all, 15.4 each, on the
-  Arc Pro B60 (the Q4_0 GGUF pack); with `--spec mtp` two or four users get more (78.9 and 94.2 tok/s in all, against
-  38.7 and 67.4), eight a little less ([Several requests at once](#several-requests-at-once)).
+- Several users: `--sequences 8 --ctx 8192` decodes eight requests at once at 124.4 tok/s in all, 16.7 each, on the
+  Arc Pro B60 (the Q4_0 GGUF pack); with `--spec mtp` two or four users get more (81.0 and 100.3 tok/s in all, against
+  39.6 and 71.9), eight a little less ([Several requests at once](#several-requests-at-once)).
 - Its GGUF files, 6 to 23 GB: [Qwen3.8-27B GGUF](#qwen38-27b-gguf).
 
 Measured, at q4:
@@ -802,8 +802,8 @@ xpu-serve serve ~/models/Inkling-2-Mini-q4 --device GPU --spec dspark --spec-k 1
   release's NVFP4 experts) fits the Arc B390 only, where it decodes at 16.5 tok/s.
 - The drafter gains about a tenth: every draft verified reads the experts of its own token, and the first draft is
   accepted 63 % of the time, so one draft a round is the best.
-- Several users: `--sequences N` decodes N requests at once; on the Arc Pro B60, AtomicChat's AD-Q4_K gives 64.9
-  tok/s in all for two, 82.7 for four, 103.0 for eight (15.9 each), against 43.1 for one (with `--spec dspark` 69.9
+- Several users: `--sequences N` decodes N requests at once; on the Arc Pro B60, AtomicChat's AD-Q4_K gives 70.7
+  tok/s in all for two, 93.5 for four, 122.6 for eight (16.3 each), against 46.5 for one (with `--spec dspark` 76.0
   for two, less from four on)
   ([Several requests at once](#several-requests-at-once)): a mixture of experts reads the experts each token picks.
 
