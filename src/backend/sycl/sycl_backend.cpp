@@ -935,10 +935,11 @@ public:
         if (reads_kv_) return;
         for (size_t k : kv_slot_) {
             XS_CHECK(from[k].len >= tokens && (keeps_window(shared_.kv[k]) || from[k].base == 0), "sycl: kv slot '",
-                     from[k].spec.label, "' of the source holds tokens ", from[k].base, " to ", from[k].len, ", not its ",
-                     "first ", tokens);
+                     from[k].spec.label, "' of the source holds tokens ", from[k].base, " to ", from[k].len,
+                     ", not its first ", tokens);
         }
-        for (size_t k : kv_slot_) {  // a full slot emptied first, so growing it moves nothing; a windowed one holds none
+        // A full slot emptied first, so growing it moves nothing; a windowed one holds none.
+        for (size_t k : kv_slot_) {
             SharedKv& d = shared_.kv[k];
             d.len = keeps_window(d) ? tokens : 0;
             d.base = d.len;
