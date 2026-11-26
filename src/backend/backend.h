@@ -113,6 +113,11 @@ public:
     // and a windowed slot's keys as saved. The current sequence's KV holds those tokens when the snapshot is its own
     // and nothing since cut it below them. Truncate cannot undo the restore (no step to undo into).
     virtual void restore_state(size_t program, const StateSnapshot& snapshot) = 0;
+    // Makes the KV slots `program` writes of the current sequence hold the first `tokens` tokens of sequence `from`'s
+    // (another sequence, whose slots hold them), in place of their own. A slot that keeps only its window and the conv
+    // and recurrent state are left to restore_state of a snapshot `from` took at `tokens`, which must follow when the
+    // program has such state.
+    virtual void copy_prefix(size_t program, int64_t from, int64_t tokens) = 0;
 };
 
 class Backend {

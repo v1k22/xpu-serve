@@ -87,8 +87,8 @@ private:
     struct Sequence {
         std::vector<PositionKey> cached;          // positions whose KV the session holds, in order
         // The state at the first snapshot->tokens of `cached` (GenerateRequest::snapshot_at), for a model whose conv
-        // or recurrent state cannot be cut back.
-        std::optional<StateSnapshot> snapshot;
+        // or recurrent state cannot be cut back; shared by the sequences that copied that prefix (take_prefix).
+        std::shared_ptr<const StateSnapshot> snapshot;
         std::unique_ptr<spec::Drafter> drafter;   // speculating
         int64_t rotary_delta = 0;                 // a token past the prompt at cached position i is at i + delta
         bool busy = false;
@@ -102,6 +102,12 @@ private:
     size_t pick_sequence(const std::vector<PositionKey>& keys) const;
     // The prompt positions a request with `keys` can keep of sequence `q`'s cache (reuse_prefix).
     int64_t usable_prefix(const Sequence& q, const std::vector<PositionKey>& keys) const;
+    // The prompt positions a request with `keys` could copy of another sequence `q`'s cache: its common prefix, or for
+    // a model with conv or recurrent state, the prefix up to its snapshot.
+    int64_t copyable_prefix(const Sequence& q, const std::vector<PositionKey>& keys) const;
+    // Makes the selected sequence hold another sequence's prefix of the prompt when that one offers kCopyGain tokens
+    // more than its own does (Session::copy_prefix, and that sequence's snapshot for conv or recurrent state).
+    void take_prefix(const std::vector<PositionKey>& keys);
     // The steps of advance(): the rest of the prompt's next chunk, and the next token.
     void prefill_chunk(Generation& g);
     void begin_decode(Generation& g);

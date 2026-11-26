@@ -515,6 +515,47 @@ inline void state_snapshot(const Env& env, int64_t d = HybridLayer::kD) {
     CHECK(cut->num_cached() == 0);
 }
 
+// A sequence that takes another's prefix (Session::copy_prefix, then restore_state of the snapshot the other took
+// there) goes on as a session that ran that prefix itself, whatever it held before; the other goes on unchanged, past
+// the snapshot. With a sliding window (`window`) shorter than the prefix and without one. Copying from the current
+// sequence, or more tokens than the source holds, is refused.
+inline void copy_prefix(const Env& env, int64_t window, int64_t d = HybridLayer::kD) {
+    const HybridLayer layer(window, false, 64, d);
+    const Graph* programs[] = {&layer.graph};
+    const auto session = env.compile(programs, layer.weights, 0, 2);
+    TensorRng rng(17);
+    const TensorMap prefix = HybridLayer::inputs(rng, 9, 64, d), more = HybridLayer::inputs(rng, 4, 64, d);
+    TensorMap out;
+    session->use(0);
+    session->run(prefix, out);
+    const StateSnapshot snapshot = session->save_state(0);
+    session->run(more, out);
+    session->use(1);
+    session->run(HybridLayer::inputs(rng, 3, 64, d), out);
+    CHECK_THROWS_AS(session->copy_prefix(0, 1, 2), xs::Error);
+    CHECK_THROWS_AS(session->copy_prefix(0, 0, 14), xs::Error);
+    session->copy_prefix(0, 0, 9);
+    session->restore_state(0, snapshot);
+    CHECK(session->num_cached() == 9);
+    const auto own = env.compile(programs, layer.weights, 0, 1);
+    const auto source = env.compile(programs, layer.weights, 0, 1);
+    TensorMap want;
+    own->run(prefix, want);
+    source->run(prefix, want);
+    source->run(more, want);
+    for (const int64_t t : {2, 7, 1}) {
+        const TensorMap next = HybridLayer::inputs(rng, t, 64, d), other = HybridLayer::inputs(rng, t, 64, d);
+        session->use(1);
+        session->run(next, out);
+        own->run(next, want);
+        CHECK(outputs_close(out, want, env));
+        session->use(0);
+        session->run(other, out);
+        source->run(other, want);
+        CHECK(outputs_close(out, want, env));
+    }
+}
+
 // Speculative rounds of several sequences at once: a step of segments of up to rewind_tokens tokens each, then each
 // sequence cut back inside its own segment (truncate with it selected), gives each sequence what a session of its own
 // gives over the same steps and cuts; a cut that keeps nothing of the step and one that keeps all of it included.

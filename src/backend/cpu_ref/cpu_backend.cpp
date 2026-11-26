@@ -245,6 +245,23 @@ class CpuProgram {
         return s;
     }
 
+    // Backend::copy_prefix: `from` is the source sequence's slots (this backend keeps every key: all are copied).
+    void copy_prefix(const SharedState& from, int64_t tokens) {
+        if (reads_kv_) return;
+        for (size_t k : kv_) {
+            XS_CHECK(from.kv[k].len >= tokens, "cpu-ref: kv slot '", from.kv[k].spec.label, "' of the source holds ",
+                     from.kv[k].len, " tokens, ", tokens, " asked");
+        }
+        for (size_t k : kv_) {
+            const KvSlotState& s = from.kv[k];
+            KvSlotState& d = shared_.kv[k];
+            const auto values = static_cast<size_t>(tokens * s.spec.num_kv_heads * s.spec.head_dim);
+            d.k.assign(s.k.begin(), s.k.begin() + static_cast<std::ptrdiff_t>(std::min(values, s.k.size())));
+            d.v.assign(s.v.begin(), s.v.begin() + static_cast<std::ptrdiff_t>(std::min(values, s.v.size())));
+            d.len = tokens;
+        }
+    }
+
     void restore_state(const StateSnapshot& s) {
         XS_CHECK(s.parts.size() == conv_.size() + recurrent_.size(), "cpu-ref: a snapshot of ", s.parts.size(),
                  " slots for a program of ", conv_.size() + recurrent_.size());
@@ -645,6 +662,11 @@ class CpuSession final : public Session {
     StateSnapshot save_state(size_t program) const override { return at(program).save_state(); }
     void restore_state(size_t program, const StateSnapshot& snapshot) override {
         at(program).restore_state(snapshot);
+    }
+    void copy_prefix(size_t program, int64_t from, int64_t tokens) override {
+        XS_CHECK(from >= 0 && from < static_cast<int64_t>(stored_.size()) && from != current_, "cpu-ref: no sequence ",
+                 from, " to copy from (", stored_.size(), " held, ", current_, " current)");
+        at(program).copy_prefix(stored_[static_cast<size_t>(from)], tokens);
     }
     int64_t current_sequence() const override { return current_; }
     // A step over several sequences runs their segments one after another: the definition of such a step.

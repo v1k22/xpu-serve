@@ -929,6 +929,39 @@ public:
         return s;
     }
 
+    // Session::copy_prefix: `from` is the source sequence's slots; its full KV slots' first `tokens` rows, stream by
+    // stream (a slot that keeps only its window takes its rows from restore_state).
+    void copy_prefix(const std::vector<SharedKv>& from, int64_t tokens) {
+        if (reads_kv_) return;
+        for (size_t k : kv_slot_) {
+            XS_CHECK(from[k].len >= tokens && (keeps_window(shared_.kv[k]) || from[k].base == 0), "sycl: kv slot '",
+                     from[k].spec.label, "' of the source holds tokens ", from[k].base, " to ", from[k].len, ", not its ",
+                     "first ", tokens);
+        }
+        for (size_t k : kv_slot_) {  // a full slot emptied first, so growing it moves nothing; a windowed one holds none
+            SharedKv& d = shared_.kv[k];
+            d.len = keeps_window(d) ? tokens : 0;
+            d.base = d.len;
+        }
+        ensure_kv_capacity(tokens);
+        for (size_t k : kv_slot_) {
+            SharedKv& d = shared_.kv[k];
+            if (!keeps_window(d)) {
+                const KvBuffers& s = from[k].buf;
+                const KvTokenBytes bytes = kv_token_bytes(d.buf);
+                const auto copy = [&](DeviceBuffer& dst, const DeviceBuffer& src, int64_t per_token) {
+                    if (per_token > 0) q_.memcpy(dst.get(), src.get(), static_cast<size_t>(tokens * per_token));
+                };
+                copy(d.buf.k, s.k, bytes.k);
+                copy(d.buf.v, s.v, bytes.v);
+                copy(d.buf.k_scale, s.k_scale, bytes.k_scale);
+                copy(d.buf.v_scale, s.v_scale, bytes.v_scale);
+            }
+            d.len = tokens;
+        }
+        q_.wait_and_throw();
+    }
+
     void restore_state(const StateSnapshot& s) {
         const size_t kvs = reads_kv_ ? 0 : kv_slot_.size();
         XS_CHECK(s.parts.size() == fixed_slot_.size() + kvs, "sycl: a snapshot of ", s.parts.size(),
@@ -3351,6 +3384,12 @@ public:
     StateSnapshot save_state(size_t program) const override { return at(program).save_state(); }
     void restore_state(size_t program, const StateSnapshot& snapshot) override {
         at(program).restore_state(snapshot);
+    }
+    void copy_prefix(size_t program, int64_t from, int64_t tokens) override {
+        SyclShared& sh = *shared_;
+        XS_CHECK(from >= 0 && from < static_cast<int64_t>(sh.stored.size()) && from != sh.current,
+                 "sycl: no sequence ", from, " to copy from (", sh.stored.size(), " held, ", sh.current, " current)");
+        at(program).copy_prefix(sh.stored[static_cast<size_t>(from)].kv, tokens);
     }
     void use(int64_t sequence) override { shared_->use(sequence); }
     int64_t current_sequence() const override { return shared_->current; }

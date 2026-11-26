@@ -201,6 +201,7 @@ struct RecordingSession final : Session {
     void truncate(size_t, int64_t n) override { cached = n; }
     StateSnapshot save_state(size_t) const override { return {cached, {}}; }
     void restore_state(size_t, const StateSnapshot& s) override { cached = s.tokens; }
+    void copy_prefix(size_t, int64_t, int64_t tokens) override { cached = tokens; }
     void use(int64_t sequence) override { REQUIRE(sequence == 0); }
     int64_t current_sequence() const override { return 0; }
 };

@@ -55,6 +55,16 @@ TEST_SUITE("device programs" * doctest::skip(!dev::enabled())) {
             xs::test::session::state_snapshot(device_env(xs::quant::parse_kv_formats(kv)), 128);
         }
     }
+    TEST_CASE("a prefix copied from another sequence, with its snapshot") {
+        for (const int64_t window : {0, 6}) {
+            CAPTURE(window);
+            xs::test::session::copy_prefix(device_env(), window);
+            for (const char* kv : {"i8", "turbo4"}) {
+                CAPTURE(kv);
+                xs::test::session::copy_prefix(device_env(xs::quant::parse_kv_formats(kv)), window, 128);
+            }
+        }
+    }
     TEST_CASE("segments cut back inside each sequence's segment: speculative rounds of several sequences") {
         xs::test::session::segments_truncate(device_env());
         for (const char* kv : {"i8", "turbo4"}) {

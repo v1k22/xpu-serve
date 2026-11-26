@@ -250,6 +250,45 @@ int64_t Engine::usable_prefix(const Sequence& q, const std::vector<PositionKey>&
     return q.snapshot && q.snapshot->tokens <= keep ? q.snapshot->tokens : 0;
 }
 
+namespace {
+
+// A copy costs the prefix's KV copied on the device and, with conv or recurrent state, a snapshot restored from host
+// memory (tens of ms): worth it from this many tokens more than the request's own sequence keeps.
+constexpr int64_t kCopyGain = 64;
+
+}  // namespace
+
+int64_t Engine::copyable_prefix(const Sequence& q, const std::vector<PositionKey>& keys) const {
+    const std::vector<PositionKey>& cached = q.cached;
+    const auto common = static_cast<int64_t>(
+        std::mismatch(cached.begin(), cached.end(), keys.begin(), keys.end()).first - cached.begin());
+    const int64_t keep = std::min<int64_t>(common, static_cast<int64_t>(keys.size()) - 1);
+    if (!fixed_state_) return std::max<int64_t>(keep, 0);
+    return q.snapshot && q.snapshot->tokens <= keep ? q.snapshot->tokens : 0;
+}
+
+void Engine::take_prefix(const std::vector<PositionKey>& keys) {
+    size_t donor = current_;
+    int64_t tokens = usable_prefix(seq(), keys) + kCopyGain - 1;
+    for (size_t q = 0; q < sequences_.size(); ++q) {
+        if (q == current_) continue;
+        const int64_t n = copyable_prefix(sequences_[q], keys);
+        if (n > tokens) {
+            donor = q;
+            tokens = n;
+        }
+    }
+    if (donor == current_) return;
+    Timer timer;
+    reset_sequence();
+    session_->copy_prefix(state_program(), static_cast<int64_t>(donor), tokens);
+    if (fixed_state_) session_->restore_state(state_program(), *sequences_[donor].snapshot);
+    seq().cached.assign(keys.begin(), keys.begin() + tokens);
+    seq().snapshot = fixed_state_ ? sequences_[donor].snapshot : nullptr;
+    log::debug("engine: sequence ", current_, " took ", tokens, " tokens of sequence ", donor, "'s prefix in ",
+               static_cast<int>(timer.elapsed_ms()), " ms");
+}
+
 int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
     std::vector<PositionKey>& cached = seq().cached;
     const int64_t keep = usable_prefix(seq(), prompt_keys);
@@ -398,6 +437,7 @@ std::optional<Engine::Handle> Engine::start(const GenerateRequest& request, Toke
         g.argmax_only = has_argmax_ && !g.sampler->needs_logits();
         argmax_only_ = g.argmax_only;
         Timer timer;
+        take_prefix(g.keys);
         const int64_t cached = reuse_prefix(g.keys);
         result.stats.cached_tokens = static_cast<int>(cached);
         result.stats.prefill_ms += timer.elapsed_ms();
@@ -491,7 +531,7 @@ void Engine::prefill_chunk(Generation& g) {
     g.fed += len;
     if (fixed_state_ && g.fed == snapshot_at) {
         Timer saving;
-        seq().snapshot = session_->save_state(state_program());
+        seq().snapshot = std::make_shared<const StateSnapshot>(session_->save_state(state_program()));
         log::debug("engine: saved sequence ", g.sequence, "'s state at ", snapshot_at, " tokens (",
                    seq().snapshot->bytes() >> 20, " MiB) in ", static_cast<int>(saving.elapsed_ms()), " ms");
     }

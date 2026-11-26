@@ -1,7 +1,7 @@
 # 0029: Reusing a prompt's prefix: state snapshots, not paged KV blocks
 
-Status: **accepted**: snapshots of a sequence's state (option A), done; copies of a prefix between sequences still to
-come; paged KV blocks shared between sequences (option B) deferred · 2026-11-26
+Status: **accepted**: snapshots of a sequence's state and copies of a prefix between sequences (option A), done;
+paged KV blocks shared between sequences (option B) deferred · 2026-11-26
 
 ## Context
 
@@ -60,6 +60,11 @@ s. The first turn took 0.3 s longer (the save, and the prefill chunk that ends a
   `GenerateRequest::snapshot_at`, saves the state there and restores it in prefix reuse, and a free sequence is chosen
   by the prefix a request can use of it; the chat and messages APIs set `snapshot_at` where the template's rendering
   without the generation prompt ends.
+- A request whose own sequence offers 64 tokens less than another sequence's prefix (busy or free) takes that prefix
+  as a copy (`Session::copy_prefix`, the KV copied on the device) with the other's snapshot, which the two then share
+  in host memory (`Engine::take_prefix`). With conv or recurrent state a copy reaches the other's snapshot, where its
+  conversation's messages ended: two users sharing only a system prompt still prefill it on such a model (a snapshot
+  where that prompt ends would need a second one a sequence); an attention-only model copies any shared prefix.
 - A snapshot is the latest prompt's only: an earlier point of a conversation (an edited old message) still prefills
   from where the two prompts agree, or from the start.
 - Revisit B when many sequences share long prefixes and their copies crowd out the context, or when the server runs
