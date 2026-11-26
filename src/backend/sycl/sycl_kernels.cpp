@@ -82,14 +82,25 @@ void binary_period_t(sycl::queue& q, const float* a, const float* b, Y* y, int64
     });
 }
 
+template <BinaryOp Op, typename Y>
+void binary_block_t(sycl::queue& q, const float* a, const float* b, Y* y, int64_t n, int64_t block) {
+    syclex::parallel_for(q, sycl::range<2>(static_cast<size_t>(n / block), static_cast<size_t>(block)),
+                         [=](sycl::item<2> it) {
+                             const auto i = static_cast<int64_t>(it[0]) * block + static_cast<int64_t>(it[1]);
+                             y[i] = static_cast<Y>(apply_binary<Op>(a[i], b[it[0]]));
+                         });
+}
+
+// The slice of each outer index is one run of len * inner elements: a work item per (outer index, element of its
+// run) finds both without dividing (a 64-bit division is emulated).
 template <typename E>
 void slice_t(sycl::queue& q, const E* x, E* y, int64_t outer, int64_t dim, int64_t begin, int64_t len, int64_t inner) {
-    syclex::parallel_for(q, sycl::range<1>(static_cast<size_t>(outer * len * inner)), [=](sycl::id<1> idx) {
-        const int64_t i = static_cast<int64_t>(idx[0]);
-        const int64_t j = i % inner;
-        const int64_t r = (i / inner) % len;
-        const int64_t o = i / (inner * len);
-        y[i] = x[(o * dim + begin + r) * inner + j];
+    const int64_t run = len * inner;
+    const sycl::range<2> range(static_cast<size_t>(outer), static_cast<size_t>(run));
+    syclex::parallel_for(q, range, [=](sycl::item<2> it) {
+        const auto o = static_cast<int64_t>(it[0]);
+        const auto j = static_cast<int64_t>(it[1]);
+        y[o * run + j] = x[(o * dim + begin) * inner + j];
     });
 }
 
@@ -1136,6 +1147,15 @@ void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, 
     }
 }
 
+template <typename Y>
+void binary_block(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, int64_t block) {
+    switch (op) {
+        case BinaryOp::Add: return binary_block_t<BinaryOp::Add, Y>(q, a, b, y, n, block);
+        case BinaryOp::Mul: return binary_block_t<BinaryOp::Mul, Y>(q, a, b, y, n, block);
+        case BinaryOp::Div: return binary_block_t<BinaryOp::Div, Y>(q, a, b, y, n, block);
+    }
+}
+
 void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width) {
     const size_t wg = width >= 256 ? 256 : 64;
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * wg, wg), [=](sycl::nd_item<1> it) {
@@ -1735,6 +1755,7 @@ void layer_norm(sycl::queue& q, const float* x, const float* shift, const float*
     template void binary<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, const Broadcast&);      \
     template void binary_same<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t);                   \
     template void binary_period<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, int64_t);        \
+    template void binary_block<Y>(sycl::queue&, BinaryOp, const float*, const float*, Y*, int64_t, int64_t);         \
     template void rms_norm<Y>(sycl::queue&, const float*, const float*, const float*, Y*, int64_t, int64_t, float);   \
     template void layer_norm<Y>(sycl::queue&, const float*, const float*, const float*, const float*, Y*, int64_t, \
                                 int64_t, float);

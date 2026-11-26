@@ -203,7 +203,7 @@ void matmul_quant(sycl::queue& q, Scratch& scratch, const X* x, const QuantWeigh
             if (w.block != nullptr) {
                 gemm_block_xmx(q, xh, *w.block, y, m, n, k, plan.compute_units, add);
             } else {
-                quant_gemm(q, xh, w, y, m, n, k, quant_gemm_slices(n, k, plan.compute_units), add);
+                quant_gemm(q, xh, w, y, m, n, k, quant_gemm_slices(m, n, k, plan.compute_units), add);
             }
             return;
         case QuantPath::Tiled:
@@ -255,7 +255,7 @@ void matmul_quant_parts(sycl::queue& q, Scratch& scratch, const X* x, const Quan
     }
     int64_t n = 0;
     for (int j = 0; j < count; ++j) n += parts[j].n;
-    quant_gemm_parts(q, xh, parts, count, m, k, quant_gemm_slices(n, k, plan.compute_units));
+    quant_gemm_parts(q, xh, parts, count, m, k, quant_gemm_slices(m, n, k, plan.compute_units));
 }
 
 template bool quant_parts_few_rows<float>(int64_t, const QuantPart<float>*, int, int64_t, const QuantMatmulPlan&);
@@ -652,15 +652,23 @@ void expert_gemm_t(sycl::queue& q, Scratch& scratch, const float* x, bool per_sl
 }  // namespace
 
 template <typename I>
-void expert_matmul_quant_gemm(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const QuantWeight& w,
-                              const I* idx, float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n,
-                              int64_t k, bool f32) {
-    if (f32) {
-        expert_gemm_t(q, scratch, x, per_slot, ExpertRows<float>{&w, nullptr, n, k}, idx, out, tokens * slots, slots,
-                      experts);
+void expert_matmul_bank(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const QuantWeight& w,
+                        const I* idx, float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n,
+                        int64_t k, const QuantMatmulPlan& plan) {
+    const int64_t pairs = tokens * slots;
+    const int64_t xmx_units = plan.xmx_block_rows > 0 ? plan.compute_units : 0;
+    if (pairs <= kExpertPairsDirect) {
+        expert_matmul_quant(q, x, per_slot, w, idx, out, tokens, slots, experts, n, k, nullptr, xmx_units);
+    } else if (w.block != nullptr && xmx_units > 0 && expert_gemm_block_xmx_fits(*w.block, pairs, k)) {
+        expert_gemm_block_xmx(q, x, per_slot, *w.block, idx, out, tokens, slots, experts, n, k, xmx_units,
+                              scratch.get(expert_gemm_block_xmx_scratch(pairs, experts, k)));
+    } else if (pairs < kExpertPairsGemm) {
+        auto* grouping = static_cast<int32_t*>(scratch.get(expert_grouping_bytes(pairs, experts)));
+        expert_matmul_quant(q, x, per_slot, w, idx, out, tokens, slots, experts, n, k, grouping, xmx_units);
+    } else if (plan.f32) {
+        expert_gemm_t(q, scratch, x, per_slot, ExpertRows<float>{&w, nullptr, n, k}, idx, out, pairs, slots, experts);
     } else {
-        expert_gemm_t(q, scratch, x, per_slot, ExpertRows<half>{&w, nullptr, n, k}, idx, out, tokens * slots, slots,
-                      experts);
+        expert_gemm_t(q, scratch, x, per_slot, ExpertRows<half>{&w, nullptr, n, k}, idx, out, pairs, slots, experts);
     }
 }
 
@@ -670,12 +678,12 @@ void expert_matmul_gemm(sycl::queue& q, Scratch& scratch, const float* x, bool p
     expert_gemm_t(q, scratch, x, per_slot, ExpertRows<W>{nullptr, w, n, k}, idx, out, tokens * slots, slots, experts);
 }
 
-template void expert_matmul_quant_gemm<int32_t>(sycl::queue&, Scratch&, const float*, bool, const QuantWeight&,
-                                                const int32_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,
-                                                bool);
-template void expert_matmul_quant_gemm<int64_t>(sycl::queue&, Scratch&, const float*, bool, const QuantWeight&,
-                                                const int64_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,
-                                                bool);
+template void expert_matmul_bank<int32_t>(sycl::queue&, Scratch&, const float*, bool, const QuantWeight&,
+                                          const int32_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                          const QuantMatmulPlan&);
+template void expert_matmul_bank<int64_t>(sycl::queue&, Scratch&, const float*, bool, const QuantWeight&,
+                                          const int64_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                          const QuantMatmulPlan&);
 
 template void expert_matmul_gemm<half, int32_t>(sycl::queue&, Scratch&, const float*, bool, const half*,
                                                 const int32_t*, float*, int64_t, int64_t, int64_t, int64_t, int64_t);

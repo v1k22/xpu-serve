@@ -43,6 +43,16 @@ template <typename I>
 void expert_matmul_block(sycl::queue& q, const float* x, bool per_slot, const BlockWeight& w, const I* idx, float* out,
                          int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k, int32_t* grouping,
                          int64_t xmx_units);
+// ExpertMatMul over a bank for many pairs on the matrix engines (needs xmx_device), expert_matmul_quant's contract:
+// the pairs grouped by expert, an expert's weights read once per 64 of its pairs and never written out. x is read in
+// f16 and the weights rounded to f16, as a GEMM over the dequantized bank reads them. `scratch`
+// (expert_gemm_block_xmx_scratch bytes, 64-byte aligned) holds the grouping and x in f16 while it runs.
+bool expert_gemm_block_xmx_fits(const BlockWeight& w, int64_t pairs, int64_t k);
+size_t expert_gemm_block_xmx_scratch(int64_t pairs, int64_t experts, int64_t k);
+template <typename I>
+void expert_gemm_block_xmx(sycl::queue& q, const float* x, bool per_slot, const BlockWeight& w, const I* idx,
+                           float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k,
+                           int64_t compute_units, void* scratch);
 // Rows [first, ...) of a weight of K columns, as a weight of its own (an expert of a bank).
 BlockWeight block_rows(const BlockWeight& w, int64_t first, int64_t k);
 // out [N, K] = w as f16 or f32: the values ggml's dequantization gives, rounded to T.

@@ -202,7 +202,7 @@ kernel path at f16) can flip (DESIGN.md 10.4; the margin was not measured).
 53.4 ms, a round 64.6 ms. What the round costs, and what brought it there (each from its own measurement):
 
 - A verify of T tokens costs more than a decode step (44.4 ms). The GEMV's arithmetic grows with the rows; its
-  matrix-engine version (`gemv_quant_xmx`, from 4 rows) costs about the same at any row count. Its sub-groups used to
+  matrix-engine version (`gemv_quant_xmx`, from 2 rows) costs about the same at any row count. Its sub-groups used to
   convert x to f16 and sum it per group (a DPAS by ones) themselves: one small launch before now does both for every
   weight that reads the same x (an isolated chain of MLP-sized matmuls at 5 rows, Arc B390: 8.71 to 8.22 ms, the
   one-row GEMV 7.66).

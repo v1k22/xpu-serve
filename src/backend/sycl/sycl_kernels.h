@@ -39,11 +39,14 @@ struct Broadcast {
 };
 template <typename Y>
 void binary(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, const Broadcast& shape);
-// Fast paths: same shape, and b repeating every `period` elements of a (a row vector over the leading dims).
+// Fast paths: same shape, b repeating every `period` elements of a (a row vector over the leading dims), and each
+// element of b held across a block of `block` elements of a (b of a's shape with trailing dims of 1).
 template <typename Y>
 void binary_same(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n);
 template <typename Y>
 void binary_period(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, int64_t period);
+template <typename Y>
+void binary_block(sycl::queue& q, BinaryOp op, const float* a, const float* b, Y* y, int64_t n, int64_t block);
 
 // Rows of `width`.
 void softmax(sycl::queue& q, const float* x, float* y, int64_t rows, int64_t width);
@@ -404,7 +407,7 @@ inline constexpr int64_t kQuantGemmMaxSlices = 8;
 // the weight).
 bool block_load_aligned(const void* x);
 bool quant_gemm_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w);
-int64_t quant_gemm_slices(int64_t n, int64_t k, int64_t compute_units);
+int64_t quant_gemm_slices(int64_t m, int64_t n, int64_t k, int64_t compute_units);
 // With `add` the kernels add their product into y (a residual folded in) instead of storing it.
 template <typename Y>
 void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,

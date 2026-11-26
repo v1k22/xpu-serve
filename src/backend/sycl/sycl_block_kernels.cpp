@@ -1402,6 +1402,186 @@ void expert_block_xmx_t(sycl::queue& q, const float* x, bool per_slot, const Str
     });
 }
 
+// Columns 16 h .. 16 h + 15 of a unit as a B operand of the weights themselves, rounded to f16: the values
+// dequantize_block writes, so their product with x needs no sums of x beside it and adds straight into an accumulator.
+template <BlockFormat F>
+inline int8_v weight_operand(const typename Fmt<F>::Fields& f, const uint32_t* grid, int h) {
+    int8_v b;
+    for (int q = 0; q < 2; ++q) {
+        float v[8];
+        exact_quarter<F>(f, grid, 2 * h + q, v);
+        for (int i = 0; i < 4; ++i) {
+            b[4 * q + i] = __builtin_bit_cast(
+                int, h2_v{static_cast<_Float16>(v[2 * i]), static_cast<_Float16>(v[2 * i + 1])});
+        }
+    }
+    return b;
+}
+
+// ExpertMatMul over many pairs on the matrix engines (expert_gemm_block_xmx). The pairs come grouped by expert, their
+// rows of x gathered in that order in f16, and cut into passes: up to kPassRows rows of one expert. A work-group owns
+// a pass and 16 rows of its expert, a lane each, and splits K between its sub-groups. Per 16 columns a lane decodes
+// its row's weights once into a B operand (weight_operand) and every tile of 8 of the pass's rows multiplies it, 32
+// rows of x a load: the bank is read once per pass and never written out, where a GEMM per expert first writes every
+// expert that has a pair out in f16. A pass runs the body compiled for its tiles (1, 2, 4 or 8): what a pass costs
+// beside decoding its weights is loading its rows of x, so the pairs left over after an expert's whole passes cost
+// their own rows and not 64.
+constexpr int kPassTiles = 8;
+constexpr int kPassRows = 8 * kPassTiles;
+constexpr int kPassFields = 3;  // a pass in the table: its expert, its first row, its rows
+
+template <BlockFormat F>
+struct ExpertGemmBlockXmx {
+    Streams w;
+    const half* xh;         // [pairs, K]: row i is the input of pair order[i]
+    const int32_t* order;
+    const int32_t* passes;  // their number, then kPassFields each
+    float* out;
+    int64_t pairs, n, k, row_groups;
+    int32_t slice_blocks;
+    sycl::local_accessor<float, 1> slm;  // every slice's sums: [slice][rows][16 lanes]
+
+    auto get(syclex::properties_tag) const {
+        return syclex::properties{syclex::sub_group_size<kSubGroup>, intelex::grf_size<256>};
+    }
+
+    template <int MT>
+    void pass(const sycl::nd_item<1>& it, int64_t expert, int32_t first, int32_t rows) const {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        const int slice = static_cast<int>(sg.get_group_linear_id());
+        const int slices = static_cast<int>(sg.get_group_linear_range());
+        const int64_t row = (static_cast<int64_t>(it.get_group(0)) % row_groups) * kSubGroup + lane;
+        const RowPtr rp = row_ptr(w, expert * n + std::min(row, n - 1));
+        const int width = static_cast<int>(k * 2) - 1;  // x as a [pairs, K] f16 surface; rows past it read as zero
+        const int height = static_cast<int>(pairs) - 1;
+        const auto base = reinterpret_cast<long>(xh);
+        float8_v acc[MT];
+        #pragma unroll
+        for (int t = 0; t < MT; ++t)
+            acc[t] = 0.0f;
+        const auto unit = [&](const RowPtr& r, int32_t j, int32_t u) {
+            const auto f = Fmt<F>::fields(r, j);
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int8_v b = weight_operand<F>(f, w.grid, h);
+                const int col = u * kUnit + kXmxCols * h;
+                if constexpr (MT == 1) {
+                    const short8_v a = __builtin_bit_cast(
+                        short8_v, __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(base, width, height, width,
+                                                                                    int2_v{col, first}));
+                    acc[0] = __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(acc[0], a, b);
+                } else {
+                    #pragma unroll
+                    for (int t0 = 0; t0 < MT; t0 += 4) {
+                        const ushort32_v a4 = __builtin_IB_subgroup_block_read_flat_u16_m32k16v1(
+                            base, width, height, width, int2_v{col, first + 8 * t0});
+                        #pragma unroll
+                        for (int t = t0; t < t0 + 4 && t < MT; ++t) {
+                            ushort8_v a;
+                            #pragma unroll
+                            for (int r2 = 0; r2 < 8; ++r2)
+                                a[r2] = a4[8 * (t - t0) + r2];
+                            const short8_v a8 = __builtin_bit_cast(short8_v, a);
+                            acc[t] = __builtin_IB_sub_group16_fdpas_f_f_hf_hf_8_8(acc[t], a8, b);
+                        }
+                    }
+                }
+            }
+        };
+        const auto units = static_cast<int32_t>(k / kUnit);
+        const int32_t blocks = units / 8;
+        const int32_t b_lo = std::min(blocks, slice * slice_blocks);
+        const int32_t b_hi = std::min(blocks, b_lo + slice_blocks);
+        for (int32_t b = b_lo; b < b_hi; ++b) {
+            uint32_t copy[BlockRun<F>::kWords];  // its eight units then decode from registers
+            RowPtr r;
+            BlockRun<F>::load(rp, b, copy, r);
+            #pragma unroll
+            for (int32_t j = 0; j < 8; ++j)
+                unit(r, j, b * 8 + j);
+        }
+        if (slice == slices - 1) {  // the units past the last whole block, from the streams
+            for (int32_t u = blocks * 8; u < units; ++u)
+                unit(rp, u, u);
+        }
+        // The slices add up in local memory; element r of acc[t] at lane l is row 8 t + r of the pass, feature `row`.
+        #pragma unroll
+        for (int t = 0; t < MT; ++t) {
+            #pragma unroll
+            for (int r2 = 0; r2 < 8; ++r2)
+                slm[(slice * kPassRows + 8 * t + r2) * kSubGroup + lane] = acc[t][r2];
+        }
+        sycl::group_barrier(it.get_group());
+        if (slice == 0 && row < n) {
+            for (int32_t r2 = 0; r2 < rows; ++r2) {
+                float sum = 0.0f;
+                for (int s2 = 0; s2 < slices; ++s2)
+                    sum += slm[(s2 * kPassRows + r2) * kSubGroup + lane];
+                out[static_cast<int64_t>(order[first + r2]) * n + row] = sum;
+            }
+        }
+    }
+
+    void operator()(sycl::nd_item<1> it) const {
+        const int64_t p = static_cast<int64_t>(it.get_group(0)) / row_groups;
+        if (p >= passes[0]) return;  // uniform across the work-group, as is the pass's body
+        const int32_t* entry = passes + 1 + p * kPassFields;
+        const int64_t expert = entry[0];
+        const int32_t first = entry[1];
+        const int32_t rows = entry[2];
+        if (rows <= 8) {
+            pass<1>(it, expert, first, rows);
+        } else if (rows <= 16) {
+            pass<2>(it, expert, first, rows);
+        } else if (rows <= 32) {
+            pass<4>(it, expert, first, rows);
+        } else {
+            pass<kPassTiles>(it, expert, first, rows);
+        }
+    }
+};
+
+// The passes of a grouping (expert_group): an expert's rows kPassRows at a time, its last pass the rows left over.
+int64_t expert_max_passes(int64_t pairs, int64_t experts) {
+    return pairs / kPassRows + std::min(pairs, experts);
+}
+
+void expert_passes(sycl::queue& q, const int32_t* grouping, int64_t experts, int32_t* passes) {
+    const int32_t* offsets = expert_offsets(grouping, experts);
+    syclex::single_task(q, [=] {
+        int32_t count = 0;
+        for (int64_t e = 0; e < experts; ++e) {
+            for (int32_t first = offsets[e]; first < offsets[e + 1]; first += kPassRows) {
+                int32_t* entry = passes + 1 + count * kPassFields;
+                entry[0] = static_cast<int32_t>(e);
+                entry[1] = first;
+                entry[2] = std::min<int32_t>(kPassRows, offsets[e + 1] - first);
+                ++count;
+            }
+        }
+        passes[0] = count;
+    });
+}
+
+template <BlockFormat F>
+void expert_gemm_block_xmx_t(sycl::queue& q, const Streams& w, const half* xh, const int32_t* order,
+                             const int32_t* passes, float* out, int64_t pairs, int64_t experts, int64_t n, int64_t k,
+                             int64_t compute_units) {
+    const int64_t row_groups = ceil_div(n, kSubGroup);
+    const auto blocks = static_cast<int32_t>(k / 256);
+    // every pair on one expert makes the fewest passes
+    const int slices = xmx_slices(ceil_div(pairs, kPassRows) * row_groups, blocks, compute_units);
+    const auto slice_blocks = static_cast<int32_t>(ceil_div(blocks, slices));
+    const int64_t wgs = expert_max_passes(pairs, experts) * row_groups;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> slm(sycl::range<1>(static_cast<size_t>(slices * kPassRows * kSubGroup)), h);
+        const auto local = static_cast<size_t>(slices * kSubGroup);
+        syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(wgs) * local, local),
+                          ExpertGemmBlockXmx<F>{w, xh, order, passes, out, pairs, n, k, row_groups, slice_blocks, slm});
+    });
+}
+
 // One work item per 8 columns: neighbouring items write neighbouring bytes, so a sub-group's stores cover whole
 // cache lines (sycl_kernels.cpp dequantize_t).
 template <BlockFormat F, typename T>
@@ -1602,6 +1782,50 @@ void expert_matmul_block(sycl::queue& q, const float* x, bool per_slot, const Bl
     });
 }
 
+bool expert_gemm_block_xmx_fits(const BlockWeight& w, int64_t pairs, int64_t k) {
+    return block_on_device(w.format) && block_whole_rows(w.format, k) && k % kUnit == 0 && k * 2 < (int64_t{1} << 24) &&
+           pairs < (int64_t{1} << 24);
+}
+
+namespace {
+
+struct ExpertGemmScratch {
+    size_t passes, x, bytes;  // where the passes and x in f16 start, after the grouping
+    ExpertGemmScratch(int64_t pairs, int64_t experts, int64_t k) {
+        const auto align = [](size_t v) { return (v + 63) / 64 * 64; };
+        passes = align(expert_grouping_bytes(pairs, experts));
+        x = passes + align(static_cast<size_t>(1 + expert_max_passes(pairs, experts) * kPassFields) * sizeof(int32_t));
+        bytes = x + align(static_cast<size_t>(pairs * k) * sizeof(half));
+    }
+};
+
+}  // namespace
+
+size_t expert_gemm_block_xmx_scratch(int64_t pairs, int64_t experts, int64_t k) {
+    return ExpertGemmScratch(pairs, experts, k).bytes;
+}
+
+template <typename I>
+void expert_gemm_block_xmx(sycl::queue& q, const float* x, bool per_slot, const BlockWeight& w, const I* idx,
+                           float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k,
+                           int64_t compute_units, void* scratch) {
+    const int64_t pairs = tokens * slots;
+    XS_CHECK(expert_gemm_block_xmx_fits(w, pairs, k) && block_load_aligned(scratch), "sycl expert_gemm_block_xmx: a ",
+             block_format_name(w.format), " bank of K ", k, " at ", pairs, " pairs");
+    const Streams s = streams_of(w, k);
+    const ExpertGemmScratch at(pairs, experts, k);
+    auto* grouping = static_cast<int32_t*>(scratch);
+    auto* passes = reinterpret_cast<int32_t*>(static_cast<char*>(scratch) + at.passes);
+    auto* xh = reinterpret_cast<half*>(static_cast<char*>(scratch) + at.x);
+    expert_group(q, idx, pairs, experts, grouping);
+    const int32_t* order = expert_order(grouping, experts);
+    expert_passes(q, grouping, experts, passes);
+    expert_gather_rows(q, x, per_slot, slots, order, pairs, k, xh);
+    dispatch(w.format, [&]<BlockFormat F>() {
+        expert_gemm_block_xmx_t<F>(q, s, xh, order, passes, out, pairs, experts, n, k, compute_units);
+    });
+}
+
 BlockWeight block_rows(const BlockWeight& w, int64_t first, int64_t k) {
     int64_t stride[kBlockStreams];
     block_stream_rows(w.format, k, stride);
@@ -1628,6 +1852,10 @@ template void expert_matmul_block<int32_t>(sycl::queue&, const float*, bool, con
                                            int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*, int64_t);
 template void expert_matmul_block<int64_t>(sycl::queue&, const float*, bool, const BlockWeight&, const int64_t*, float*,
                                            int64_t, int64_t, int64_t, int64_t, int64_t, int32_t*, int64_t);
+template void expert_gemm_block_xmx<int32_t>(sycl::queue&, const float*, bool, const BlockWeight&, const int32_t*,
+                                             float*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, void*);
+template void expert_gemm_block_xmx<int64_t>(sycl::queue&, const float*, bool, const BlockWeight&, const int64_t*,
+                                             float*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, void*);
 template void gemm_block_xmx<float>(sycl::queue&, const half*, const BlockWeight&, float*, int64_t, int64_t, int64_t,
                                     int64_t, bool);
 template void gemm_block_xmx<half>(sycl::queue&, const half*, const BlockWeight&, half*, int64_t, int64_t, int64_t,

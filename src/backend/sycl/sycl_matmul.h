@@ -73,17 +73,20 @@ template <typename X, typename Y>
 void matmul_quant_parts(sycl::queue& q, Scratch& scratch, const X* x, const QuantPart<Y>* parts, int count, int64_t m,
                         int64_t k, const QuantMatmulPlan& plan);
 
-// ExpertMatMul over a quantized bank (expert_matmul_quant's contract) through oneMKL, for many (token, slot) pairs
-// (prefill): the pairs are grouped by expert, each expert's input rows gathered, its bank dequantized (to f16, or f32
-// when `f32`) in runs of at most kExpertDequantBytes, and every expert's GEMM runs in one grouped gemm_batch.
-inline constexpr int64_t kExpertPairsGemm = 256;  // from this many pairs up
+// ExpertMatMul over a quantized bank (expert_matmul_quant's contract) along the path its pairs take. Up to
+// kExpertPairsDirect: expert_matmul_quant's launch with no grouping before it. Beyond, a GGUF block format on the
+// matrix engines is read in passes of an expert's pairs (expert_gemm_block_xmx), whatever their number. Any other
+// bank: the grouped GEMV of expert_matmul_quant, or from kExpertPairsGemm pairs up oneMKL, each expert's input rows
+// gathered, the bank dequantized (to f16, or f32 in f32 precision) in runs of at most kExpertDequantBytes, and
+// every expert's GEMM in one grouped gemm_batch.
+inline constexpr int64_t kExpertPairsGemm = 256;
 inline constexpr size_t kExpertDequantBytes = size_t{256} << 20;
 template <typename I>
-void expert_matmul_quant_gemm(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const QuantWeight& w,
-                              const I* idx, float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n,
-                              int64_t k, bool f32);
-// The same over a float bank w [E, N, K] (expert_matmul's contract) whose type is the GEMM's (f16, or f32 in f32
-// precision): its rows are read where they are.
+void expert_matmul_bank(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const QuantWeight& w,
+                        const I* idx, float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n,
+                        int64_t k, const QuantMatmulPlan& plan);
+// The grouped GEMM over a float bank w [E, N, K] (expert_matmul's contract) whose type is the GEMM's (f16, or f32 in
+// f32 precision): its rows are read where they are.
 template <typename W, typename I>
 void expert_matmul_gemm(sycl::queue& q, Scratch& scratch, const float* x, bool per_slot, const W* w, const I* idx,
                         float* out, int64_t tokens, int64_t slots, int64_t experts, int64_t n, int64_t k);

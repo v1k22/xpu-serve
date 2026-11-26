@@ -189,6 +189,16 @@ struct StateBuffers {
     size_t bytes = 0;
 };
 
+// How many elements of `out` each element of b is held across, when b has out's shape but for trailing dims of 1;
+// 0 when it has not.
+int64_t broadcast_block(const Dims& b, const Dims& out) {
+    if (b.size() != out.size()) return 0;
+    int64_t block = 1;
+    size_t d = out.size();
+    for (; d > 0 && b[d - 1] == 1; --d) block *= out[d - 1];
+    return block > 1 && std::equal(b.begin(), b.begin() + static_cast<std::ptrdiff_t>(d), out.begin()) ? block : 0;
+}
+
 bool is_suffix_broadcast(const Dims& b, const Dims& out) {
     if (b.size() > out.size()) return false;
     const size_t pad = out.size() - b.size();
@@ -223,10 +233,9 @@ constexpr int64_t kTiledMaxRows = 512;
 // card the scores stream fast enough that the chunks gain nothing (Arc Pro B60: within its run-to-run spread).
 constexpr int64_t kScoreCacheBytes = int64_t{4} << 20;
 // From how many rows the GEMV's matrix-engine version (gemv_quant_xmx) wins: its cost is about flat in the rows, the
-// GEMV's grows with them (Arc Pro B60, Qwen3.8-27B q4 decode steps of 1 to 6 tokens: 44.7, 48.0, 52.4, 62.0, 68.5,
-// 78.1 ms; with it from 4 rows 56.0, 56.5, 56.8).
-constexpr int64_t kXmxGemvRows = 4;
-// The same for q8, whose GEMV keeps up with the matrix engines for a row less than q4's does.
+// GEMV's grows with them, and one row is the only count at which the GEMV streams the weight faster.
+constexpr int64_t kXmxGemvRows = 2;
+// The same for q8, whose GEMV keeps up with the matrix engines for a row more than q4's does.
 constexpr int64_t kXmxQ8Rows = 3;
 // The same for the GGUF block formats (gemv_block_xmx), whose GEMV costs more with every row than the q4 one.
 constexpr int64_t kXmxBlockRows = 2;
@@ -2676,6 +2685,11 @@ private:
                 } else if (op != sycl_be::BinaryOp::Div && b == out_shape && is_suffix_broadcast(a, out_shape)) {
                     // add, mul commute
                     with_out([&](auto* y) { sycl_be::binary_period(q_, op, in_f32(1), in_f32(0), y, out_n, numel(a)); });
+                } else if (const int64_t block = broadcast_block(b, out_shape); a == out_shape && block > 0) {
+                    with_out([&](auto* y) { sycl_be::binary_block(q_, op, in_f32(0), in_f32(1), y, out_n, block); });
+                } else if (const int64_t held = broadcast_block(a, out_shape);
+                           op != sycl_be::BinaryOp::Div && b == out_shape && held > 0) {
+                    with_out([&](auto* y) { sycl_be::binary_block(q_, op, in_f32(1), in_f32(0), y, out_n, held); });
                 } else {
                     XS_CHECK(out_shape.size() <= static_cast<size_t>(sycl_be::kMaxRank), where(i), ": rank ",
                              out_shape.size(), " exceeds ", sycl_be::kMaxRank);
@@ -3004,30 +3018,14 @@ private:
                 const bool per_slot = in_shape(0).size() == 3;
                 if (device_quantized(in_dt(1))) {
                     const sycl_be::QuantWeight& w = leaf_quant_[static_cast<size_t>(n.inputs[1].node)];
-                    const int64_t pairs = is[0] * is[1];
-                    if (pairs >= sycl_be::kExpertPairsGemm) {
-                        const bool f32 = precision_ == DType::F32;
-                        if (in_dt(2) == DType::I32) {
-                            sycl_be::expert_matmul_quant_gemm(q_, *this, in_f32(0), per_slot, w,
-                                                              reinterpret_cast<const int32_t*>(in_ptr(2)), out, is[0],
-                                                              is[1], ws[0], ws[1], ws[2], f32);
-                        } else {
-                            sycl_be::expert_matmul_quant_gemm(q_, *this, in_f32(0), per_slot, w,
-                                                              reinterpret_cast<const int64_t*>(in_ptr(2)), out, is[0],
-                                                              is[1], ws[0], ws[1], ws[2], f32);
-                        }
-                        return;
-                    }
-                    auto* grouping = pairs > sycl_be::kExpertPairsDirect
-                                         ? static_cast<int32_t*>(get(sycl_be::expert_grouping_bytes(pairs, ws[0])))
-                                         : nullptr;
-                    const int64_t xmx_units = quant_.xmx_block_rows > 0 ? quant_.compute_units : 0;
+                    const auto run = [&](const auto* idx) {
+                        sycl_be::expert_matmul_bank(q_, *this, in_f32(0), per_slot, w, idx, out, is[0], is[1], ws[0],
+                                                    ws[1], ws[2], quant_);
+                    };
                     if (in_dt(2) == DType::I32) {
-                        sycl_be::expert_matmul_quant(q_, in_f32(0), per_slot, w, reinterpret_cast<const int32_t*>(in_ptr(2)),
-                                                     out, is[0], is[1], ws[0], ws[1], ws[2], grouping, xmx_units);
+                        run(reinterpret_cast<const int32_t*>(in_ptr(2)));
                     } else {
-                        sycl_be::expert_matmul_quant(q_, in_f32(0), per_slot, w, reinterpret_cast<const int64_t*>(in_ptr(2)),
-                                                     out, is[0], is[1], ws[0], ws[1], ws[2], grouping, xmx_units);
+                        run(reinterpret_cast<const int64_t*>(in_ptr(2)));
                     }
                     return;
                 }

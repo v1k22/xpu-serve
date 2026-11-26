@@ -468,9 +468,12 @@ void gemv_xmx_t(sycl::queue& q, XmxParts parts, int64_t m, int64_t k, int64_t co
     for (int j = 0; j < kQuantGemvParts; ++j)
         parts.wg_begin[j + 1] = parts.wg_begin[j] + (j < parts.count ? parts.n[j] / kSg : 0);
     const int64_t wgs = parts.wg_begin[parts.count];
-    // About 8 sub-groups per compute unit streaming the weight, each slice of K at least two steps.
+    // Sub-groups splitting K: about 32 per compute unit, several for each of the device's threads, so that a thread
+    // that finishes its slice takes another while the launch lasts (with about one sub-group a thread, the last of
+    // them ran beside idle threads). Each slice of K at least four steps: shorter ones cost more to start and to
+    // add up than they balance.
     int64_t slices = 1;
-    while (slices < kQuantGemmMaxSlices && wgs * slices < 8 * compute_units && k / (slices * 2) >= 2 * kXmxStep)
+    while (slices < kQuantGemmMaxSlices && wgs * slices < 32 * compute_units && k / (slices * 2) >= 4 * kXmxStep)
         slices *= 2;
     const int64_t k_slice = ceil_div(ceil_div(k, slices), kXmxStep) * kXmxStep;
     q.submit([&](sycl::handler& h) {
@@ -688,11 +691,15 @@ bool quant_gemm_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w) {
            block_load_aligned(w.codes) && k * 2 < (int64_t{1} << 24) && n < (int64_t{1} << 24);
 }
 
-int64_t quant_gemm_slices(int64_t n, int64_t k, int64_t compute_units) {
-    // about 4 sub-groups per execution unit streaming the weight, each slice at least 128 columns of K
+int64_t quant_gemm_slices(int64_t m, int64_t n, int64_t k, int64_t compute_units) {
+    // Sub-groups streaming the weight, each slice at least 128 columns of K. Up to 32 rows about 16 per compute
+    // unit, several for each of the device's threads, as gemv_xmx_t splits K. Past them a sub-group owns half the
+    // features and twice the accumulators, which every slice writes out to be added: about 8.
+    const int64_t per_unit = m > 32 ? 4 : 16;  // of the sub-groups at 32 features each
     const int64_t blocks = n / (2 * kSg);
     int64_t slices = 1;
-    while (slices < kQuantGemmMaxSlices && blocks * slices < compute_units * 4 && k / (slices * 2) >= 128) slices *= 2;
+    while (slices < kQuantGemmMaxSlices && blocks * slices < compute_units * per_unit && k / (slices * 2) >= 128)
+        slices *= 2;
     return slices;
 }
 

@@ -1,6 +1,7 @@
 // The GPU backend with weights in GGUF block formats: MatMul at every row count the GEMV's variants take and past
 // them (the weight written out for a GEMM), a residual folded into that GEMM, Gather, and ExpertMatMul over a bank
-// (few pairs, pairs grouped by expert, grouped GEMMs), against fp64 over the values the host decodes
+// (few pairs, pairs grouped by expert, many pairs in passes of an expert's rows or grouped GEMMs), against fp64 over
+// the values the host decodes
 // (quant/block_decode.h). Blocks are random bytes, so every code and scale field takes every value.
 // The reference option block=f16 (weights decoded as they are uploaded) is held to the same values, and so are both
 // GEMVs at every row count they take (gemv=vector, gemv=xmx).
@@ -47,13 +48,12 @@ struct Mode {
     std::string gemv;
 };
 
-// From how many rows a matmul reads x in f16 (the matrix-engine GEMVs: a pack's q4 from four rows, its q8 from three,
-// the block formats' from two, all from one with gemv=xmx; and past 8 rows, the GEMM).
+// From how many rows a matmul reads x in f16 (the matrix-engine GEMVs: a pack's q8 from three rows, its q4 and the
+// block formats' from two, all from one with gemv=xmx; and past 8 rows, the GEMM).
 int64_t f16_x_from(BlockFormat f, const Mode& mode) {
     if (mode.gemv == "vector") return 9;
     if (mode.gemv == "xmx") return 1;
-    if (f == BlockFormat::Q8_0) return 3;
-    return pack_kernels(f) ? 4 : 2;
+    return f == BlockFormat::Q8_0 ? 3 : 2;
 }
 
 double max_abs(const Tensor64& t) {
@@ -173,7 +173,9 @@ TEST_SUITE("device ops") {
                     o.extra["gemv"] = mode.gemv;
                     // up to 64 pairs: an expert's pairs as the rows of a GEMV on the matrix engines, 1, 2 or 4 at a
                     // time by the tokens (-3: every pair on one expert, more than the rows of a GEMV), or with
-                    // gemv=vector a GEMV a pair; 80: grouped by expert; 280: a GEMM per expert
+                    // gemv=vector a GEMV a pair; 80 and 280: an expert's pairs in passes on the matrix engines, or
+                    // with gemv=vector (and for the formats a pack's kernels read) grouped by expert and a GEMM per
+                    // expert
                     for (const int64_t step : {1, 2, 3, -3, 8, 40, 140}) {
                         CAPTURE(step);
                         const int64_t tokens = std::abs(step);
@@ -195,7 +197,7 @@ TEST_SUITE("device ops") {
                                             {"x3", x3}}, o);
                         // the GEMVs read the exact values, and but for the one on the matrix engines x in f32; a
                         // GEMM, or block=f16, the weight rounded to the session's precision
-                        const bool f16_x = mode.gemv == "auto" && tokens * slots <= 64 && !pack_kernels(f);
+                        const bool f16_x = mode.gemv == "auto" && !pack_kernels(f);
                         const bool exact = mode.block == "auto" && tokens * slots < 256 && !f16_x;
                         const dev::Tolerance tol = exact ? dev::Tolerance{2e-5 * scale, 2e-5}
                                                          : dev::tolerance({2e-5 * scale, 2e-5}, {3e-3 * scale, 3e-3});
@@ -205,6 +207,51 @@ TEST_SUITE("device ops") {
                                          test::ref::expert_matmul(to_f64(x3), w64, idx64, slots), tol));
                     }
                 }
+            }
+        }
+    }
+    TEST_CASE("expert_matmul over many pairs of GGUF block format banks: passes of every size" *
+              doctest::skip(!dev::enabled())) {
+        test::TensorRng rng(74);
+        // An expert's pairs run 64 rows a pass and the rest in a pass of 8, 16, 32 or 64: 69 pairs are a whole pass
+        // and one of 8, 12 one of 16, 31 one of 32, 200 three whole passes and one of 8, 50 one of 64; an expert
+        // without pairs has none. 21 rows an expert: no whole group of 16.
+        const std::vector<int64_t> counts{69, 12, 31, 0, 200, 50};
+        const auto experts = static_cast<int64_t>(counts.size());
+        const int64_t n = 21, slots = 2;
+        std::vector<int32_t> idx;
+        for (int64_t e = 0; e < experts; ++e)
+            idx.insert(idx.end(), static_cast<size_t>(counts[static_cast<size_t>(e)]), static_cast<int32_t>(e));
+        for (size_t i = idx.size() - 1, state = 12345; i > 0; --i) {  // any fixed order that mixes the experts
+            state = state * 1103515245u + 12345u;
+            std::swap(idx[i], idx[(state >> 8) % (i + 1)]);
+        }
+        const std::vector<int64_t> idx64(idx.begin(), idx.end());
+        const auto tokens = static_cast<int64_t>(idx.size()) / slots;
+        // 1,152 columns: whole blocks of 256 and four units after them
+        for (const int64_t k : {768, 256, 1152}) {
+            for (const BlockFormat f : kFormats) {
+                if (k % block_layout(f).weights != 0) continue;
+                CAPTURE(block_format_name(f));
+                CAPTURE(k);
+                test::MemoryWeights w;
+                w.add_block("bank", f, {experts, n, k}, blocks(f, {experts, n, k}, 41));
+                const Tensor64 w64 = to_f64(w.tensor("bank"));
+                const double scale = max_abs(w64) * std::sqrt(static_cast<double>(k));
+                const HostTensor x2 = rng.uniform(DType::F32, {tokens, k});
+                const HostTensor x3 = rng.uniform(DType::F32, {tokens, slots, k});
+                Graph g;
+                const Value i = g.input("idx", DType::I32, {kT, slots});
+                g.output("shared", g.expert_matmul(g.input("x2", DType::F32, {kT, k}), g.weight(w, "bank"), i));
+                g.output("per_slot",
+                         g.expert_matmul(g.input("x3", DType::F32, {kT, slots, k}), g.weight(w, "bank"), i));
+                const TensorMap out = dev::run(
+                    g, w, {{"idx", test::make_tensor(DType::I32, {tokens, slots}, idx)}, {"x2", x2}, {"x3", x3}});
+                const dev::Tolerance tol = dev::tolerance({2e-5 * scale, 2e-5}, {3e-3 * scale, 3e-3});
+                CHECK(dev::close(str_cat("expert_matmul passes ", block_format_name(f)), out.at("shared"),
+                                 test::ref::expert_matmul(to_f64(x2), w64, idx64, slots), tol));
+                CHECK(dev::close(str_cat("expert_matmul passes per slot ", block_format_name(f)), out.at("per_slot"),
+                                 test::ref::expert_matmul(to_f64(x3), w64, idx64, slots), tol));
             }
         }
     }

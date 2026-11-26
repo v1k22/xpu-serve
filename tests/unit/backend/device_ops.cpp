@@ -338,8 +338,10 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
         struct Case {
             Dims a, b;
         };
+        // the last three: an operand of the other's shape with trailing dims of 1, each element held across a block
         for (const Case& c : {Case{{4, 6}, {4, 6}}, Case{{4, 6}, {6}}, Case{{4, 1, 6}, {3, 1}}, Case{{1}, {2, 3}},
-                              Case{{2, 1, 5}, {1, 4, 1}}}) {
+                              Case{{2, 1, 5}, {1, 4, 1}}, Case{{5, 3, 6}, {5, 3, 1}}, Case{{5, 1, 1}, {5, 3, 6}},
+                              Case{{5, 3, 6}, {5, 1, 1}}}) {
             CAPTURE(dims_to_string(c.a));
             CAPTURE(dims_to_string(c.b));
             const HostTensor a = rng.uniform(DType::F32, c.a);
