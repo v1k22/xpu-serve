@@ -384,7 +384,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       a 16 GiB pack lost the device in 2 of 8 loads while the driver still held the previous run's pages)
 - [x] GGUF: the 9 to 64 row kernel over block formats (`gemm_block_xmx`: tiles of 8 rows, the weight read once per 32)
 - [ ] GGUF: Q4_0 at its file's size (its q4 form stores a bias per group it does not need)
-- [ ] GGUF: `serve <file.gguf>` (an import into a cache), split files
+- [x] GGUF: `serve <file.gguf>` (an import into a cache, again when the file changes; companions found beside it),
+      split files (by the first part; `-hf` downloads every part); docs/decisions/0030, 0031
 - [ ] GGUF: the tiled value-head order inside GatedDelta (four small transposes per linear layer now: 1 % of a
       decode step of Qwen3.5-4B at f16)
 - [x] Data-aware quantization: AWQ-style scale and clip search in `convert`, calibrated on our own engine

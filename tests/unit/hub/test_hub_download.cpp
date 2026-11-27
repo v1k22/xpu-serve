@@ -175,7 +175,7 @@ TEST_SUITE("hub download") {
             SourceOptions o;
             o.hub = hub.options(dir.path / "hf");
             o.cache = dir.path / "xs";
-            const ModelSource m = resolve_model("org/Tiny-GGUF:Q8_0", FileRole::Model, o);
+            const ModelSource m = resolve_model({.hf = "org/Tiny-GGUF:Q8_0"}, FileRole::Model, o);
             CHECK(m.name == "org/Tiny-GGUF:Q8_0");
             REQUIRE(fs::exists(m.dir / "xpu_pack.json"));
             CHECK(m.dir.parent_path().parent_path().filename() == "models--org--Tiny-GGUF");
@@ -193,14 +193,24 @@ TEST_SUITE("hub download") {
                                    "mmproj-F16.gguf"));
             const auto written = fs::last_write_time(m.dir / "model.safetensors");
             const int requests = hub.file_requests;
-            CHECK(resolve_model("org/Tiny-GGUF:Q8_0", FileRole::Model, o).dir == m.dir);
+            CHECK(resolve_model({.hf = "org/Tiny-GGUF:Q8_0"}, FileRole::Model, o).dir == m.dir);
             CHECK(fs::last_write_time(m.dir / "model.safetensors") == written);
             CHECK(hub.file_requests == requests);
             CHECK_FALSE(fs::exists(m.dir.string() + ".partial"));
-            // fetch_source hands convert the files themselves.
-            const SourceFiles s = fetch_source("org/Tiny-GGUF:Q8_0", FileRole::Model, o);
+            CHECK_FALSE(fs::exists(m.dir / ".source"));  // filed under the commit: no stamp to check
+            // source_files hands convert the files themselves.
+            const SourceFiles s = source_files({.hf = "org/Tiny-GGUF:Q8_0"}, FileRole::Model, o);
             CHECK(s.gguf.filename() == "Tiny-Q8_0.gguf");
             CHECK(s.mtp.filename() == "mtp-Tiny-Q8_0.gguf");
+            CHECK(s.commit == FakeHub::kCommit);
+            // A head the user names is taken in place of the repository's, and the pack is filed by the files.
+            const SourceFiles named =
+                source_files({.hf = "org/Tiny-GGUF:Q8_0", .mtp = dir.path / "mtp.gguf"}, FileRole::Model, o);
+            CHECK(named.mtp == dir.path / "mtp.gguf");
+            CHECK(named.commit.empty());
+            const fs::path own = model_dir(named, o).dir;
+            CHECK(own.parent_path().parent_path().filename() == "local");
+            CHECK(read_file(own / "model.safetensors") == read_file(m.dir / "model.safetensors"));
         }
     }
 
@@ -220,7 +230,7 @@ TEST_SUITE("hub download") {
         SourceOptions o;
         o.hub = hub.options(dir.path / "hf");
         o.cache = dir.path / "xs";
-        const ModelSource m = resolve_model("org/Tiny-GGUF:BF16", FileRole::Model, o);
+        const ModelSource m = resolve_model({.hf = "org/Tiny-GGUF:BF16"}, FileRole::Model, o);
         CHECK(m.dir.filename() == "Tiny-BF16");
         gguf_import::ImportOptions io;
         io.source = dir.path / "Tiny-BF16.gguf";
@@ -229,7 +239,7 @@ TEST_SUITE("hub download") {
         CHECK(xs::test::pack_files(m.dir) == xs::test::pack_files(dir.path / "local"));
         const fs::path snapshot = fs::path(o.hub.cache) / "models--org--Tiny-GGUF" / "snapshots" / FakeHub::kCommit;
         CHECK_FALSE(fs::exists(snapshot / "Tiny-Q8_0.gguf"));
-        const SourceFiles s = fetch_source("org/Tiny-GGUF:BF16", FileRole::Model, o);
+        const SourceFiles s = source_files({.hf = "org/Tiny-GGUF:BF16"}, FileRole::Model, o);
         CHECK(s.gguf == snapshot / gguf::split_path("BF16/Tiny-BF16", 1, count));
     }
 
@@ -244,11 +254,11 @@ TEST_SUITE("hub download") {
         SourceOptions o;
         o.hub = hub.options(dir.path / "hf");
         o.cache = dir.path / "xs";
-        CHECK_THROWS_WITH_AS(resolve_model("lerobot/tiny-pi05", FileRole::Model, o),
+        CHECK_THROWS_WITH_AS(resolve_model({.hf = "lerobot/tiny-pi05"}, FileRole::Model, o),
                              doctest::Contains("google/paligemma-3b-pt-224 is gated"), Error);
         CHECK(hub.cdn_requests == 0);  // refused before the checkpoint's weights were downloaded
         o.hub.token = FakeHub::kToken;
-        const ModelSource m = resolve_model("lerobot/tiny-pi05", FileRole::Model, o);
+        const ModelSource m = resolve_model({.hf = "lerobot/tiny-pi05"}, FileRole::Model, o);
         CHECK(m.dir.parent_path().parent_path() == o.cache / "models");
         CHECK(read_file(m.dir / "config.json") == R"({"type": "pi05"})");
         CHECK(read_file(m.dir / "model.safetensors") == pattern_bytes(5000, 4));
@@ -258,7 +268,13 @@ TEST_SUITE("hub download") {
                                FakeHub::kCommit / "model-00001-of-00003.safetensors"));
         // A checkpoint that needs nothing more is its snapshot.
         add_checkpoint(hub, "org/tiny");
-        CHECK(resolve_model("org/tiny", FileRole::Model, o).dir ==
+        CHECK(resolve_model({.hf = "org/tiny"}, FileRole::Model, o).dir ==
               fs::path(o.hub.cache) / "models--org--tiny" / "snapshots" / FakeHub::kCommit);
+        // A file the user names belongs to a GGUF model, not to a checkpoint.
+        test::GgufWriter().string("general.architecture", "x").write(dir.path / "x.gguf");
+        CHECK_THROWS_WITH_AS(resolve_model({.hf = "org/tiny", .mtp = dir.path / "x.gguf"}, FileRole::Model, o),
+                             doctest::Contains("--mtp names a GGUF file's MTP head, and org/tiny is not"), Error);
+        CHECK_THROWS_WITH_AS(resolve_model({.hf = "org/tiny", .mtp = m.dir / "config.json"}, FileRole::Model, o),
+                             doctest::Contains("is not a GGUF file"), Error);
     }
 }

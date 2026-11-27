@@ -25,7 +25,6 @@
 #include "embedding/runner.h"
 #include "embedding/service.h"
 #include "hub/model_source.h"
-#include "io/gguf.h"
 #include "models/letter_readout/letter_readout.h"
 #include "models/policy.h"
 #include "policy/runner.h"
@@ -49,23 +48,25 @@ const char* kUsage =
     "xpu-serve " XS_VERSION " - LLM serving on Intel GPUs\n"
     "\n"
     "usage:\n"
-    "  xpu-serve serve <model-dir> [options]   OpenAI-compatible server (a decision model: the System One API; an\n"
+    "  xpu-serve serve <model> [options]       OpenAI-compatible server (a decision model: the System One API; an\n"
     "                                          embedding model: /v1/embeddings)\n"
-    "  xpu-serve run   <model-dir> [options]   chat in the terminal (--prompt for one shot; an embedding model: the\n"
+    "  xpu-serve run   <model> [options]       chat in the terminal (--prompt for one shot; an embedding model: the\n"
     "                                          embedding of --prompt)\n"
-    "  xpu-serve bench <model-dir> [options]   prefill / decode speed, a decision model's latency, or an embedding\n"
+    "  xpu-serve bench <model> [options]       prefill / decode speed, a decision model's latency, or an embedding\n"
     "                                          model's latency and throughput\n"
     "  xpu-serve convert <model-dir> --out <dir> [--quant q4|q8] [--method rtn|awq]   quantized pack\n"
     "  xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>] [--mmproj <mmproj.gguf>]\n"
-    "                                          a GGUF file as a pack, its tensors as the file stores them (--mtp: its\n"
-    "                                          MTP head, --mmproj: its vision tower, each from a file of its own)\n"
+    "                                          a GGUF file as a pack, its tensors as the file stores them, with the\n"
+    "                                          companions <model> takes (--mtp: its MTP head, --mmproj: its vision\n"
+    "                                          tower, from files of their own)\n"
     "  xpu-serve info                          backends and devices\n"
     "\n"
-    "Instead of <model-dir>, serve, run, bench and convert take -hf <org/name> (a Hugging Face repository, downloaded\n"
-    "into the Hugging Face cache) or -hf <org/name:QUANT> (one GGUF file of it, imported into a pack).\n"
-    "\n"
-    "<model-dir> is a Hugging Face model directory (config.json, *.safetensors, tokenizer.json) or a pack that\n"
-    "'xpu-serve convert' wrote from one or from a GGUF file.\n"
+    "<model> is a model directory: a Hugging Face checkpoint (config.json, *.safetensors, tokenizer.json) or a pack\n"
+    "'xpu-serve convert' wrote; or a GGUF file (a split one by its first part, *-00001-of-0000N.gguf), imported once\n"
+    "into a pack in xpu-serve's cache, again when it changes, with the MTP head and vision tower files beside it that\n"
+    "its import reads (--mtp and --mmproj name others); or -hf <org/name> (a Hugging Face repository, downloaded into\n"
+    "the Hugging Face cache), or -hf <org/name:QUANT> (one GGUF file of it, imported likewise); convert takes -hf in\n"
+    "place of <model-dir> or <file.gguf>.\n"
     "Run 'xpu-serve <command> --help' for the options of a command.\n";
 
 std::string default_backend() {
@@ -104,11 +105,18 @@ void add_engine_options(Args& a) {
                "off")
         .value("spec-k", "speculative decoding: drafts per round (default: 3, 7 of a block drafter's block, 2 of DSpark's)")
         .value("drafter",
-               "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, a DFlash or DSpine drafter)")
+               "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, a DFlash or DSpine drafter), or a "
+               "GGUF file of one (imported as <model> is)")
         .value("hf",
-               "instead of <model-dir>: a Hugging Face repository, downloaded into the Hugging Face cache (org/name), "
+               "instead of <model>: a Hugging Face repository, downloaded into the Hugging Face cache (org/name), "
                "or one GGUF file of it, imported into a pack (org/name:QUANT, e.g. :Q4_K_M); @revision after the name "
                "picks a branch, tag or commit")
+        .value("mtp",
+               "a GGUF model: its MTP head or drafter from this file of its own (llama.cpp's draft model; default: "
+               "the one beside the file, or its repository's, when the file has none)")
+        .value("mmproj",
+               "a GGUF model: its vision tower from this file of its own (llama.cpp's mmproj; default: the one beside "
+               "the file, or its repository's, for a model whose import reads one)")
         .value("hf-drafter", "instead of --drafter: the drafter's Hugging Face repository (org/name, or org/name:QUANT)")
         .value("draft-shortlist",
                "speculative decoding: an MTP head picks among this many tokens, chosen by a one-bit "
@@ -170,10 +178,10 @@ ServiceOptions service_options(const Args& a) {
     } else if (spec != "off") {
         fail("--spec must be off, mtp, dflash, dspine or dspark, got '", spec, "'");
     }
-    o.drafter = a.get("drafter");
-    if (a.has("hf-drafter")) {
-        if (!o.drafter.empty()) fail("give --drafter or --hf-drafter, not both");
-        o.drafter = hub::resolve_model(a.get("hf-drafter"), hub::FileRole::Drafter, source_options()).dir;
+    if (a.has("drafter") && a.has("hf-drafter")) fail("give --drafter or --hf-drafter, not both");
+    if (a.has("drafter") || a.has("hf-drafter")) {
+        const hub::ModelSpec drafter{.path = a.get("drafter"), .hf = a.get("hf-drafter")};
+        o.drafter = hub::resolve_model(drafter, hub::FileRole::Drafter, source_options()).dir;
     }
     if (!o.drafter.empty() && spec == "off") fail("--drafter drafts for --spec mtp, dflash or dspine");
     if (o.drafter.empty() && (spec == "dflash" || spec == "dspine")) fail("--spec ", spec, " needs --drafter <its checkpoint>");
@@ -253,22 +261,32 @@ void refuse_flags(const Args& a, std::initializer_list<const char*> flags, const
     }
 }
 
-// The model a command reads: <model-dir>, or with --hf a repository of the Hugging Face Hub, downloaded first.
-struct ModelArg {
-    std::string dir;
-    std::string name;  // --hf's org/name[:QUANT], what /v1/models calls the model; empty for <model-dir>
-};
-
-ModelArg model_arg(const Args& a, const char* command) {
+// The model a command is given: its first positional (a model directory or a GGUF file) or --hf, with --mtp and
+// --mmproj; `rest` gets the positionals after it.
+hub::ModelSpec model_spec(const Args& a, std::vector<std::string>* rest) {
+    hub::ModelSpec spec;
+    std::vector<std::string> pos = a.positionals();
     if (a.has("hf")) {
-        if (!a.positionals().empty()) fail("xpu-serve ", command, ": give <model-dir> or --hf, not both");
-        const hub::ModelSource m = hub::resolve_model(a.get("hf"), hub::FileRole::Model, source_options());
-        return {m.dir.string(), m.name};
+        spec.hf = a.get("hf");
+    } else if (!pos.empty()) {
+        spec.path = pos.front();
+        pos.erase(pos.begin());
     }
-    if (a.positionals().size() != 1) {
-        fail("usage: xpu-serve ", command, " <model-dir> [options], or xpu-serve ", command, " --hf <org/name> [options]");
+    spec.mtp = a.get("mtp");
+    spec.mmproj = a.get("mmproj");
+    *rest = std::move(pos);
+    return spec;
+}
+
+// The directory a command reads: <model>, or --hf, resolved (downloaded, imported) before anything loads.
+hub::ModelSource model_arg(const Args& a, const char* command) {
+    std::vector<std::string> rest;
+    const hub::ModelSpec spec = model_spec(a, &rest);
+    if (!rest.empty() || (spec.path.empty() && spec.hf.empty())) {
+        fail("usage: xpu-serve ", command, " <model-dir | file.gguf> [options], or xpu-serve ", command,
+             " --hf <org/name[:QUANT]> [options]");
     }
-    return {a.positionals()[0], {}};
+    return hub::resolve_model(spec, hub::FileRole::Model, source_options());
 }
 
 bool wants_help(const Args& a, const char* command, const char* summary) {
@@ -277,37 +295,25 @@ bool wants_help(const Args& a, const char* command, const char* summary) {
     return true;
 }
 
-bool is_gguf_name(const std::filesystem::path& path) {
-    std::string ext = path.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return std::tolower(c); });
-    return ext == ".gguf";
-}
-
 // `convert <file.gguf> <out-dir>` (or `--out <dir>`), or `convert --hf <org/name:QUANT> <out-dir>`: the file's tensors
 // go into the pack as it stores them, so the quantization options have nothing to choose and are refused by name.
-int convert_gguf(const Args& a, const hub::SourceFiles* from_hub) {
+// `rest`: the positionals after the model.
+int convert_gguf(const Args& a, const hub::SourceFiles& files, const std::vector<std::string>& rest) {
     for (const char* flag :
          {"target", "quant", "group", "q8", "scope", "method", "calib", "calib-tokens", "backend", "device"}) {
         if (a.has(flag)) {
             fail("convert: --", flag, " does not apply to a GGUF file: its tensors are kept as the file stores them");
         }
     }
-    std::vector<std::string> pos = a.positionals();
-    if (from_hub != nullptr) pos.insert(pos.begin(), from_hub->gguf.string());
-    if (pos.empty() || pos.size() > 2 || (pos.size() == 2) == a.has("out")) {
+    if (rest.size() > 1 || rest.empty() != a.has("out")) {
         fail("usage: xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>] [--mmproj <mmproj.gguf>], or "
              "convert --hf <org/name:QUANT> <out-dir>");
     }
     gguf_import::ImportOptions o;
-    o.source = pos[0];
-    o.output = pos.size() == 2 ? pos[1] : a.get("out");
-    o.mtp = a.has("mtp") || from_hub == nullptr ? std::filesystem::path(a.get("mtp")) : from_hub->mtp;
-    o.mmproj = a.has("mmproj") || from_hub == nullptr ? std::filesystem::path(a.get("mmproj")) : from_hub->mmproj;
-    for (const std::filesystem::path& file : {o.source, o.mtp, o.mmproj}) {
-        if (file.empty()) continue;
-        if (!std::filesystem::is_regular_file(file)) fail("convert: '", file.string(), "' is not a file");
-        if (!gguf::has_gguf_magic(file)) fail("convert: '", file.string(), "' is not a GGUF file");
-    }
+    o.source = files.gguf;
+    o.output = rest.empty() ? a.get("out") : rest[0];
+    o.mtp = files.mtp;
+    o.mmproj = files.mmproj;
     o.converter = std::string("xpu-serve ") + XS_VERSION;
     const gguf_import::ImportReport r = gguf_import::import_gguf(o);
     const std::string named = r.model_name.empty() ? r.architecture : r.architecture + " (" + r.model_name + ")";
@@ -340,9 +346,11 @@ int cmd_convert(const std::vector<std::string>& argv) {
         .value("backend", "AWQ: calibration backend (default: the first of this build)")
         .value("device", "AWQ: calibration device")
         .value("mtp",
-               "a GGUF file: the model's MTP head from this file of its own (llama.cpp's draft model of it), for a "
-               "GGUF file without one")
-        .value("mmproj", "a GGUF file: the model's vision tower from this file of its own (llama.cpp's mmproj)")
+               "a GGUF file: the model's MTP head or drafter from this file of its own (llama.cpp's draft model of "
+               "it; default: the one beside the file, or its repository's, when the file has none)")
+        .value("mmproj",
+               "a GGUF file: the model's vision tower from this file of its own (llama.cpp's mmproj; default: the one "
+               "beside the file, or its repository's, for a model whose import reads one)")
         .value("hf",
                "instead of <model-dir>: a Hugging Face repository, downloaded into the Hugging Face cache (org/name), "
                "or one GGUF file of it (org/name:QUANT; its MTP head too, when the repository publishes it apart)")
@@ -353,28 +361,21 @@ int cmd_convert(const std::vector<std::string>& argv) {
     if (wants_help(
             a, "convert",
             "<model-dir> --out <dir> [options]\n"
-            "       xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>]   (a GGUF file, its tensors as the file "
-            "stores them: of the options, only --out, --mtp and --log-level apply)\n"
+            "       xpu-serve convert <file.gguf> <out-dir> [--mtp <mtp.gguf>] [--mmproj <mmproj.gguf>]   (a GGUF "
+            "file, its tensors as the file stores them: of the options, only --out, --mtp, --mmproj and --log-level "
+            "apply)\n"
             "       xpu-serve convert --hf <org/name> --out <dir> [options], or --hf <org/name:QUANT> <out-dir>")) {
         return 0;
     }
     log::set_level(log::parse_level(a.get("log-level")));
+    std::vector<std::string> rest;
+    const hub::ModelSpec spec = model_spec(a, &rest);
+    if (spec.path.empty() && spec.hf.empty()) fail("usage: xpu-serve convert <model-dir> --out <dir> [options]");
+    const hub::SourceFiles files = hub::source_files(spec, hub::FileRole::Model, source_options());
+    if (!files.gguf.empty()) return convert_gguf(a, files, rest);
+    if (!rest.empty()) fail("convert: the pack of a checkpoint goes to --out <dir>");
     ConvertOptions o;
-    if (a.has("hf")) {
-        const hub::SourceFiles files = hub::fetch_source(a.get("hf"), hub::FileRole::Model, source_options());
-        if (!files.gguf.empty()) return convert_gguf(a, &files);
-        if (!a.positionals().empty()) fail("convert --hf ", a.get("hf"), ": the pack goes to --out <dir>");
-        o.source = hub::resolve_model(a.get("hf"), hub::FileRole::Model, source_options()).dir;
-    } else if (!a.positionals().empty() && is_gguf_name(a.positionals()[0])) {
-        return convert_gguf(a, nullptr);
-    } else {
-        o.source = model_arg(a, "convert").dir;
-    }
-    if (a.has("mtp")) fail("convert: --mtp applies to a GGUF file (the MTP head of a model file without one)");
-    if (a.has("mmproj")) fail("convert: --mmproj applies to a GGUF file (its vision tower from a file of its own)");
-    if (std::filesystem::is_regular_file(o.source)) {
-        fail("convert: '", o.source.string(), "' is a file; the source is a model directory or a .gguf file");
-    }
+    o.source = hub::model_dir(files, source_options()).dir;
     o.target = a.get("target");
     o.output = a.get("out");
     if (o.output.empty()) fail("usage: xpu-serve convert <model-dir> --out <dir> [options]");
@@ -437,14 +438,15 @@ int cmd_serve(const std::vector<std::string>& argv) {
     a.value("host", "address to bind", "127.0.0.1")
         .value("port", "port", "8080")
         .value("api-key", "require 'Authorization: Bearer <key>'")
-        .value("model-id", "model name reported by /v1/models (default: the directory's name, or --hf's org/name)")
+        .value("model-id",
+               "model name reported by /v1/models (default: the directory's name, a GGUF file's, or --hf's org/name)")
         .value("http-threads", "HTTP worker threads", "8")
         .value("cameras", "policies: warm up for the first N cameras (default: all; others compile on first use)", "0");
     a.parse(argv);
-    if (wants_help(a, "serve", "<model-dir> | --hf <org/name[:QUANT]> [options]")) return 0;
+    if (wants_help(a, "serve", "<model-dir> | <file.gguf> | --hf <org/name[:QUANT]> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
-    const ModelArg model = model_arg(a, "serve");
-    const std::string& dir = model.dir;
+    const hub::ModelSource model = model_arg(a, "serve");
+    const std::string dir = model.dir.string();
     ServiceOptions so = service_options(a);
     so.model_id = a.has("model-id") ? a.get("model-id") : model.name;
     server::ServerOptions opts;
@@ -629,9 +631,9 @@ int cmd_run(const std::vector<std::string>& argv) {
         .flag("think", "enable the model's thinking mode")
         .flag("raw", "feed --prompt to the model as is, without the chat template");
     a.parse(argv);
-    if (wants_help(a, "run", "<model-dir> | --hf <org/name[:QUANT]> [options]")) return 0;
+    if (wants_help(a, "run", "<model-dir> | <file.gguf> | --hf <org/name[:QUANT]> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
-    const std::string dir = model_arg(a, "run").dir;
+    const std::string dir = model_arg(a, "run").dir.string();
     if (model_kind(dir) == ModelKind::Embedding) return run_embedding(a, dir);
     if (decides(a, dir)) return run_decision(a, dir);
     refuse_flags(a, {"set-size"}, "a language model");
@@ -966,9 +968,9 @@ int cmd_bench(const std::vector<std::string>& argv) {
                "0")
         .flag("verbose", "policies and decision models: print every run");
     a.parse(argv);
-    if (wants_help(a, "bench", "<model-dir> | --hf <org/name[:QUANT]> [options]")) return 0;
+    if (wants_help(a, "bench", "<model-dir> | <file.gguf> | --hf <org/name[:QUANT]> [options]")) return 0;
     log::set_level(log::parse_level(a.get("log-level")));
-    const std::string dir = model_arg(a, "bench").dir;
+    const std::string dir = model_arg(a, "bench").dir.string();
     if (model_kind(dir) == ModelKind::Policy) return bench_policy(a, dir);
     if (model_kind(dir) == ModelKind::Embedding) return bench_embedding(a, dir);
     if (decides(a, dir)) return bench_decision(a, dir);

@@ -50,6 +50,16 @@ std::string human_bytes(double b) {
     return s;
 }
 
+std::string hex_of(const unsigned char* md, unsigned int n) {
+    std::string hex;
+    char b[3];
+    for (unsigned int i = 0; i < n; ++i) {
+        std::snprintf(b, sizeof b, "%02x", md[i]);
+        hex += b;
+    }
+    return hex;
+}
+
 }  // namespace
 
 std::string sha256_file(const fs::path& path) {
@@ -66,13 +76,14 @@ std::string sha256_file(const fs::path& path) {
     unsigned int n = 0;
     EVP_DigestFinal_ex(ctx, md, &n);
     EVP_MD_CTX_free(ctx);
-    std::string hex;
-    char b[3];
-    for (unsigned int i = 0; i < n; ++i) {
-        std::snprintf(b, sizeof b, "%02x", md[i]);
-        hex += b;
-    }
-    return hex;
+    return hex_of(md, n);
+}
+
+std::string sha256_hex(std::string_view bytes) {
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int n = 0;
+    XS_CHECK(EVP_Digest(bytes.data(), bytes.size(), md, &n, EVP_sha256(), nullptr) == 1, "sha256: OpenSSL failed");
+    return hex_of(md, n);
 }
 
 void download_files(const std::vector<FileJob>& jobs, const DownloadOptions& options) {

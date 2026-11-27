@@ -64,8 +64,9 @@ APIs look; the numbers live here.
 - The commands download what they need with `-hf <org/name>`: the checkpoint goes into the Hugging Face cache, where
   a model huggingface_hub or `hf download` fetched before is found and not downloaded again; `-hf <org/name:QUANT>`
   names one GGUF file of a repository ([README, Downloading models](README.md#downloading-models--hf)). A local
-  directory works wherever `-hf` is shown (`xpu-serve serve <dir>`), and `~/models/<name>` below is a pack `convert`
-  writes. `xpu-serve` is the installed binary ([README, Build](README.md#build)).
+  directory or GGUF file works wherever `-hf` is shown (`xpu-serve serve <dir>`, `xpu-serve serve <file.gguf>`), and
+  `~/models/<name>` below is a pack `convert` writes. `xpu-serve` is the installed binary
+  ([README, Build](README.md#build)).
 - **Reference** is the original checkpoint with nothing lossy: weights and KV cache in f16, no drafter. It needs
   about two bytes of GPU memory per weight; where a model is larger than a 24 GB card, the recipe says so.
 - **Optimized** is the setting the measurements below recommend, in this order of steps:
@@ -889,13 +890,16 @@ xpu-serve serve -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M --device GPU
 xpu-serve convert -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M <pack-dir>       # the pack in a directory of your choice
 ```
 
-A file on disk imports with `convert`:
+A file on disk is served by its path, imported the same way into xpu-serve's cache (again when the file changes); a
+file split into parts by its first part. The files beside it are read as its repository: the MTP head, drafter or
+vision tower `-hf` would take comes from there, or from the file `--mtp` or `--mmproj` names. `convert` writes the
+pack into a directory of your choice:
 
 ```bash
-xpu-serve convert <file.gguf> <pack-dir>
-xpu-serve convert <file.gguf> <pack-dir> --mtp <mtp.gguf>     # a Qwen3.5-family file that comes without its MTP head
-xpu-serve convert <file-00001-of-00003.gguf> <pack-dir>       # a file split into parts, by its first part
-xpu-serve serve <pack-dir> --device GPU
+xpu-serve serve <file.gguf> --device GPU
+xpu-serve serve <file-00001-of-00003.gguf> --device GPU        # a file split into parts
+xpu-serve serve <file.gguf> --device GPU --mtp <mtp.gguf>      # a Qwen3.5-family file without its MTP head
+xpu-serve convert <file.gguf> <pack-dir> [--mtp <mtp.gguf>] [--mmproj <mmproj.gguf>]
 ```
 
 What is supported, and what a pack takes from the file: [README, From a GGUF file](README.md#from-a-gguf-file).
@@ -1034,7 +1038,8 @@ pack is the one a file with the head gives:
 xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ2_XXS --device GPU --spec mtp
 ```
 
-From files on disk, `convert <file.gguf> <pack-dir> --mtp <mtp-file.gguf>` does the same.
+From files on disk, `serve <file.gguf>` does the same with the `MTP/mtp-*.gguf` file beside it, or the one
+`--mtp <mtp-file.gguf>` names.
 
 - Less VRAM: a smaller file, and `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2`
   ([KV cache formats](#kv-cache-formats)).
@@ -1130,9 +1135,9 @@ work from every file. Since 2026-11-23 the repository's files are in mainline ll
 drafter in mainline's format (its head folded through the output layer; [DSpark](#dspark-inkling-2s-drafter)). The
 earlier files, in Unsloth's layout (`inkling2`), are in `Old_Support/` as `.gguf_file` (the drafter also as
 `dspark-Inkling-2-Mini-Q8_0_Old.gguf`) and import too, but not through `-hf`: downloaded and renamed to `.gguf`,
-`convert <file.gguf> <pack-dir> --mtp <drafter.gguf> --mmproj <mmproj.gguf>`, with either drafter. The two layouts
-of a file are the same model: every file measured again from the repository's new layout gave the perplexity below
-within 0.13 % (f16's rounding) and the speeds below.
+`serve <file.gguf> --mtp <drafter.gguf> --mmproj <mmproj.gguf>` (or `convert` with the same), with either drafter.
+The two layouts of a file are the same model: every file measured again from the repository's new layout gave the
+perplexity below within 0.13 % (f16's rounding) and the speeds below.
 
 Closest to the reference, on either device (the release's own values; on a 24 GB card text only, with the drafter
 28,672 tokens of context, 63,488 without; [what fits](#inkling-2-mini)):
@@ -1357,7 +1362,7 @@ xpu-serve serve ~/models/Inkling-2-Mini-q4 --device GPU --spec dspark --spec-k 1
 xpu-serve serve -hf unsloth/Inkling-2-Mini-GGUF:UD-Q8_K_XL --device GPU --spec dspark --spec-k 1
 ```
 
-From files on disk: `convert <model.gguf> <pack-dir> --mtp dspark-Inkling-2-Mini-Q8_0.gguf`.
+From files on disk: `serve <model.gguf>` with `dspark-Inkling-2-Mini-Q8_0.gguf` beside it, or named with `--mtp`.
 
 Over the six chat prompts with the q4 pack on the Arc Pro B60 (41.7 tok/s without, a decode step 24 ms; before the
 decode fixes of [Inkling-2-Mini](#inkling-2-mini), after which k = 1 gives 51.9 → 57.7):

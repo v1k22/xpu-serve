@@ -47,10 +47,11 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Quantized packs**: q8 and q4 from `xpu-serve convert` (round to nearest; AWQ calibration opt-in)
 - ✅ **FP8 checkpoints** (Qwen3.8-27B-FP8, Qwen3.6-35B-A3B-FP8, Ornith-1.5-35B-A3B-FP8: a scale per 128 x 128 block,
   or compressed-tensors' scale per channel), served as they are or converted to a pack
-- ✅ **GGUF import**: `qwen35`, `qwen35moe`, `gemma4`, `gemma4-assistant`, `inkling2_loop` and `inkling2` (Inkling 2
-  in mainline llama.cpp's layout and Unsloth's, with its DSpark drafter's file in either format and its vision
-  tower's), `clef` and the `modern-bert` files of Laya and Julia-1, in all 19 of GGUF's block formats and Unsloth's
-  NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them; files split into parts too
+- ✅ **GGUF files**, served by their path (`serve model.gguf`, imported once into a cache) or with `-hf`, split
+  files by their first part: `qwen35`, `qwen35moe`, `gemma4`, `gemma4-assistant`, `inkling2_loop` and `inkling2`
+  (Inkling 2 in mainline llama.cpp's layout and Unsloth's, with its DSpark drafter's file in either format and its
+  vision tower's), `clef` and the `modern-bert` files of Laya and Julia-1, in all 19 of GGUF's block formats and
+  Unsloth's NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them
 - ✅ **Speculative decoding**: Qwen's MTP heads, Gemma 4's assistants, DFlash 2 and DSpine block drafters
   (Qwen3.8-27B), a DFlash block drafter (Ornith-1.5-35B-A3B), Inkling 2's DSpark drafter
 - ✅ **LoRA adapters** in llama.cpp's GGUF form (`--lora`): each change added where the model reads the weight, which
@@ -141,7 +142,7 @@ backend: the CPU reference backend, which is the test oracle and far too slow to
 
 ## Run
 
-Name a model on the Hugging Face Hub with `-hf`, or give the directory of one you have:
+Name a model on the Hugging Face Hub with `-hf`, or give the directory or GGUF file of one you have:
 
 ```bash
 xpu-serve info                                                # backends and devices (the first is the default)
@@ -150,6 +151,7 @@ xpu-serve run   -hf google/gemma-4-E2B-it --device GPU --image photo.jpg --promp
 xpu-serve serve -hf Qwen/Qwen3.5-4B --device GPU              # http://127.0.0.1:8080/v1
 xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --spec mtp --spec-k 4   # one GGUF file of a repository
 xpu-serve bench ~/models/gemma-4-E2B-it --device GPU --prompt-tokens 1024 --gen-tokens 128   # a local directory
+xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M.gguf --device GPU   # a GGUF file you have
 ```
 
 That is the reference setting: the checkpoint's own weights at f16, an f16 KV cache. The steps below make a model
@@ -214,16 +216,22 @@ xpu-serve serve ~/models/Qwen3.5-4B-q8 --device GPU
 
 ### From a GGUF file
 
-`convert` also imports a GGUF file (llama.cpp's format) into a pack. Each quantized tensor stays exactly as the file
-stores it (Q4_K, Q6_K, IQ3_S, ...: nothing is decoded or quantized again), so the model has the file's weights and
-takes the file's size in GPU memory:
+A GGUF file (llama.cpp's format) is imported into a pack, which is then served like any model directory. Each
+quantized tensor stays exactly as the file stores it (Q4_K, Q6_K, IQ3_S, ...: nothing is decoded or quantized again),
+so the model has the file's weights and takes the file's size in GPU memory:
 
 ```bash
-xpu-serve serve -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M --device GPU            # the file, imported once into a pack
-xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M   # a file you have
-xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
+xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M.gguf --device GPU               # a file you have, imported once
+xpu-serve serve -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M --device GPU            # a file of a repository, likewise
+xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M   # the pack in a directory you choose
 ```
 
+- `serve`, `run` and `bench` take a GGUF file by its path and import it into xpu-serve's cache (`~/.cache/xpu-serve`,
+  or `XS_CACHE_DIR`) the first time; the next start uses that pack, and a file that changed (its size or time) is
+  imported again.
+- The files beside a GGUF file are read as its repository: a model whose import reads a file of its own gets the one
+  `-hf` would take, its MTP head or drafter (`MTP/mtp-*.gguf`, `dspark-*.gguf`) and its vision tower
+  (`mmproj-*.gguf`); `--mtp <file>` and `--mmproj <file>` name others.
 - The architecture comes from the file (`general.architecture`). Supported: `qwen35` and `qwen35moe`, the Qwen3.5 /
   Qwen3.6 / Qwen3.8 text models, dense and mixture of experts (Ornith-1.5-35B-A3B's files are `qwen35moe`); `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
   images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
@@ -236,7 +244,8 @@ xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
 - A file split into parts (llama.cpp's gguf-split: `*-00001-of-00003.gguf` and on) is named by its first part, the
   others found beside it; it gives the pack the whole file gives.
 - A Qwen3.5-family file that comes without its MTP head (the smallest files of Qwen3.8-27B) takes the head from its
-  `MTP/mtp-*.gguf` file with `--mtp`: the pack is the one a file with the head gives, and `--spec mtp` drafts with it.
+  `MTP/mtp-*.gguf` file (found beside it, or named with `--mtp`): the pack is the one a file with the head gives, and
+  `--spec mtp` drafts with it.
 - config.json, the tokenizer and the chat template are written from the file's metadata (on Qwen3.5-4B and Gemma 4
   E2B the tokenizer equals the original's token by token), and the template is the file's, which a publisher may have
   changed from the original checkpoint's. Thinking, tool calls and streaming work as with the original checkpoint.

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "hub/http.h"
@@ -35,7 +36,8 @@ struct DownloadOptions {
 // only when its size and SHA-256 are right; on a wrong one it is deleted and the error names it.
 void download_files(const std::vector<FileJob>& jobs, const DownloadOptions& options);
 
-// SHA-256 of a file, lower-case hex.
+// SHA-256 of a file, and of bytes, lower-case hex.
 std::string sha256_file(const std::filesystem::path& path);
+std::string sha256_hex(std::string_view bytes);
 
 }  // namespace xs::hub
