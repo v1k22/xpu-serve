@@ -27,6 +27,9 @@ target_sources(xs_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/backend/session.cpp)
 
 xs_add_library(xs_tokenizer DIRS tokenizer DEPS xs_core)
 
+# Grammars over bytes, JSON Schema compiled into them, and the tokens of a vocabulary a grammar allows next.
+xs_add_library(xs_grammar DIRS grammar DEPS xs_core)
+
 set(xs_chat_deps xs_core)
 if(TARGET xs_jinja)
   list(APPEND xs_chat_deps xs_jinja)
