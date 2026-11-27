@@ -55,14 +55,14 @@ struct BlockImage {
 // The streams of `rows` rows of `cols` columns stored as blocks of `f` (block_on_device).
 BlockImage block_image(BlockFormat f, const uint8_t* blocks, int64_t rows, int64_t cols);
 
-// The formats a pack already has kernels for, rewritten as that pack format with a group of 32 (the same values):
-// Q8_0 as q8, Q4_1 as q4, Q4_0 as q4 with every bias -8 scale.
+// The formats a pack already has kernels for, rewritten as that pack format with a group of 32 (the same values, in
+// the file's bytes): Q8_0 as q8, Q4_1 as q4, Q4_0 as q4 without biases, which the kernels read around 8.
 bool block_as_pack(BlockFormat f);
 struct PackImage {
     bool q4 = false;
     std::vector<uint8_t> codes;    // q8: i8 [rows, cols]; q4: [rows, cols / 2], the even column in the low nibble
     std::vector<uint16_t> scales;  // f16 [rows, cols / 32]
-    std::vector<uint16_t> biases;  // q4 only
+    std::vector<uint16_t> biases;  // Q4_1 only
 };
 PackImage block_pack_image(BlockFormat f, const uint8_t* blocks, int64_t rows, int64_t cols);
 

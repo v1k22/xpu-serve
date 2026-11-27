@@ -5,7 +5,6 @@
 #include <thread>
 
 #include "util/error.h"
-#include "util/half.h"
 
 namespace xs::sycl_be {
 
@@ -299,7 +298,7 @@ PackImage block_pack_image(BlockFormat f, const uint8_t* blocks, int64_t rows, i
     const auto row_codes = static_cast<size_t>(image.q4 ? cols / 2 : cols);
     image.codes.assign(static_cast<size_t>(rows) * row_codes, 0);
     image.scales.resize(static_cast<size_t>(rows * groups));
-    if (image.q4) image.biases.resize(image.scales.size());
+    if (f == BlockFormat::Q4_1) image.biases.resize(image.scales.size());
     for_rows(rows, cols, [&](int64_t r) {
         const uint8_t* in = blocks + static_cast<size_t>(r * groups) * static_cast<size_t>(layout.bytes);
         uint8_t* codes = image.codes.data() + static_cast<size_t>(r) * row_codes;
@@ -311,8 +310,7 @@ PackImage block_pack_image(BlockFormat f, const uint8_t* blocks, int64_t rows, i
             } else if (f == BlockFormat::Q4_1) {  // d, m, qs[16]: w = d q + m
                 std::memcpy(&image.biases[at], in + 2, 2);
                 put_split_nibbles(codes, 32 * g, in + 4);
-            } else {  // d, qs[16]: w = d (q - 8), and -8 d is exact in f16 short of overflow
-                image.biases[at] = f32_to_f16(-8.0f * f16_to_f32(image.scales[at]));
+            } else {  // d, qs[16]: w = d (q - 8)
                 put_split_nibbles(codes, 32 * g, in + 2);
             }
         }

@@ -1,5 +1,6 @@
 // The GPU backend with weights in GGUF block formats: MatMul at every row count the GEMV's variants take and past
-// them (the weight written out for a GEMM), a residual folded into that GEMM, Gather, and ExpertMatMul over a bank
+// them (the weight written out for a GEMM), a residual folded into that GEMM, matmuls of weights in different formats
+// that read one x, Gather, and ExpertMatMul over a bank
 // (few pairs, pairs grouped by expert, many pairs in passes of an expert's rows or grouped GEMMs), against fp64 over
 // the values the host decodes
 // (quant/block_decode.h). Blocks are random bytes, so every code and scale field takes every value.
@@ -42,10 +43,12 @@ bool pack_kernels(BlockFormat f) {
     return f == BlockFormat::Q4_0 || f == BlockFormat::Q4_1 || f == BlockFormat::Q8_0;
 }
 
-// How the weights are uploaded (block=auto: as stored, f16: decoded) and which GEMV reads up to 8 rows.
+// How the weights are uploaded (block=auto: as stored, f16: decoded), which GEMV reads up to 8 rows, and up to how
+// many rows the formats a pack's kernels read take the many-row kernel past the few-row one ("": the device's choice).
 struct Mode {
     std::string block;
     std::string gemv;
+    std::string tiled_rows = "";
 };
 
 // From how many rows a matmul reads x in f16 (the matrix-engine GEMVs: a pack's q8 from three rows, its q4 and the
@@ -83,15 +86,19 @@ TEST_SUITE("device ops") {
                 const Tensor64 w64 = to_f64(w.tensor("w"));
                 const double w_max = max_abs(w64);
                 for (const Mode& mode : {Mode{"auto", "auto"}, Mode{"f16", "auto"}, Mode{"auto", "vector"},
-                                         Mode{"auto", "xmx"}}) {
+                                         Mode{"auto", "xmx"}, Mode{"auto", "auto", "1024"}}) {
+                    if (!mode.tiled_rows.empty() && !pack_kernels(f)) continue;
                     CAPTURE(mode.block);
                     CAPTURE(mode.gemv);
+                    CAPTURE(mode.tiled_rows);
                     SessionOptions o = dev::options();
                     o.extra["block"] = mode.block;
                     o.extra["gemv"] = mode.gemv;
+                    if (!mode.tiled_rows.empty()) o.extra["tiled_rows"] = mode.tiled_rows;
                     // up to 8 rows the GEMVs, 9 to 64 the matrix engines' kernel over tiles of 8 rows (2 or 4 a
-                    // pass, 32 rows a pass), beyond the GEMM
-                    for (const int64_t m : {1, 2, 3, 5, 8, 9, 12, 16, 32, 38, 64, 70}) {
+                    // pass, 32 rows a pass), beyond the GEMM, or with tiled_rows the many-row kernel (work-groups
+                    // of 512 rows: one in part, one whole and more)
+                    for (const int64_t m : {1, 2, 3, 5, 8, 9, 12, 16, 32, 38, 64, 70, 600}) {
                         CAPTURE(m);
                         const HostTensor x = rng.uniform(DType::F32, {m, k});
                         Graph g;
@@ -106,7 +113,7 @@ TEST_SUITE("device ops") {
                         CHECK(dev::close(str_cat("matmul ", block_format_name(f)), out.at("out"),
                                          test::ref::matmul(to_f64(x), w64), tol));
                     }
-                    if (mode.gemv == "auto") {
+                    if (mode.gemv == "auto" && mode.tiled_rows.empty()) {
                         const std::vector<int32_t> ids{20, 0, 7, 7, 13};
                         Graph g;
                         g.output("rows", g.gather(g.weight(w, "table"), g.input("ids", DType::I32, {5})));
@@ -148,6 +155,57 @@ TEST_SUITE("device ops") {
             const double scale = max_abs(w64) * std::sqrt(static_cast<double>(k));
             CHECK(dev::close("residual block gemm", out.at("out"), want,
                              dev::tolerance({2e-5 * scale, 2e-5}, {3e-3 * scale, 3e-3})));
+        }
+    }
+
+    TEST_CASE("matmuls of Q4_0, Q4_1 and Q8_0 weights that read the same x: each launch one way of reading codes" *
+              doctest::skip(!dev::enabled())) {
+        test::TensorRng rng(75);
+        // Q4_0 has no biases and Q4_1 has them: a launch that took one for the other would read past a weight or
+        // drop its biases. a and b (Q4_0) share a launch, the others run alone; `next` reads each output in
+        // f16 when the kernels past the GEMV write it so.
+        const int64_t k = 512, n = 64;
+        using Spec = std::pair<const char*, BlockFormat>;
+        const std::vector<Spec> specs{{"a", BlockFormat::Q4_0}, {"c", BlockFormat::Q4_1}, {"b", BlockFormat::Q4_0},
+                                      {"e", BlockFormat::Q8_0}, {"d", BlockFormat::Q4_1}};
+        test::MemoryWeights w;
+        uint32_t seed = 51;
+        double w_max = 0;
+        for (const auto& [name, f] : specs) {
+            w.add_block(name, f, {n, k}, blocks(f, {n, k}, seed++));
+            w_max = std::max(w_max, max_abs(to_f64(w.tensor(name))));
+        }
+        w.add("next", rng.uniform(DType::F32, {16, n}, 1.0f / 8));
+        const double scale = w_max * std::sqrt(static_cast<double>(k));
+        for (const Mode& mode : {Mode{"auto", "auto"}, Mode{"auto", "vector"}, Mode{"auto", "xmx"},
+                                 Mode{"auto", "auto", "1024"}}) {
+            CAPTURE(mode.gemv);
+            CAPTURE(mode.tiled_rows);
+            SessionOptions o = dev::options();
+            o.extra["gemv"] = mode.gemv;
+            if (!mode.tiled_rows.empty()) o.extra["tiled_rows"] = mode.tiled_rows;
+            for (const int64_t m : {1, 2, 5, 8, 12, 40, 64, 200}) {
+                CAPTURE(m);
+                const HostTensor xv = rng.uniform(DType::F32, {m, k});
+                for (const bool chained : {false, true}) {
+                    CAPTURE(chained);
+                    Graph g;
+                    const Value x = g.input("x", DType::F32, {m, k});
+                    for (const auto& [name, f] : specs) {
+                        const Value y = g.matmul(x, g.weight(w, name));
+                        g.output(name, chained ? g.matmul(y, g.weight(w, "next")) : y);
+                    }
+                    const TensorMap out = dev::run(g, w, {{"x", xv}}, o);
+                    for (const auto& [name, f] : specs) {
+                        CAPTURE(name);
+                        Tensor64 want = test::ref::matmul(to_f64(xv), to_f64(w.tensor(name)));
+                        if (chained) want = test::ref::matmul(want, to_f64(w.tensor("next")));
+                        const double bound = chained ? scale * std::sqrt(static_cast<double>(n)) : scale;
+                        CHECK(dev::close(str_cat("matmul beside other formats ", block_format_name(f)), out.at(name),
+                                         want, dev::tolerance({2e-5 * bound, 2e-5}, {3e-3 * bound, 3e-3})));
+                    }
+                }
+            }
         }
     }
 

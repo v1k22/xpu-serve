@@ -1997,7 +1997,7 @@ private:
             w.group = 32;
             w.codes = reinterpret_cast<const uint8_t*>(copy(image.codes.data(), image.codes.size()));
             w.scales = reinterpret_cast<const half*>(copy(image.scales.data(), image.scales.size() * sizeof(uint16_t)));
-            if (w.q4) {
+            if (!image.biases.empty()) {
                 w.biases =
                     reinterpret_cast<const half*>(copy(image.biases.data(), image.biases.size() * sizeof(uint16_t)));
             }

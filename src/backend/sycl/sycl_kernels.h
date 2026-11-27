@@ -11,6 +11,7 @@
 #include <sycl/sycl.hpp>
 
 #include "quant/kv_format.h"
+#include "util/error.h"
 
 namespace xs::sycl_be {
 
@@ -349,6 +350,7 @@ void gemv(sycl::queue& q, const float* x, const W* w, float* y, int64_t m, int64
 
 // A quantized weight [N, K] on the device (pack formats, tensor.h QuantParams): Q8 codes int8 [N, K]; Q4 codes
 // [N, K / 2] with the even column in the low nibble; f16 scales and (Q4) biases [N, K / group]; group >= 32.
+// A Q4 weight without biases is symmetric: its codes are read around 8, value = scale * (code - 8) (QuantCode).
 // Or, with `block` set, a weight in a GGUF block format (sycl_block_kernels.h) and none of the other fields: the
 // GEMV, dequantize and gather below read it through the block kernels, and no other kernel takes it.
 struct BlockWeight;
@@ -364,7 +366,7 @@ struct QuantWeight {
 // y [M, N] = x [M, K] @ dequant(w)^T for M <= kGemvMaxRows; K a multiple of 32.
 void gemv_quant(sycl::queue& q, const float* x, const QuantWeight& w, float* y, int64_t m, int64_t n, int64_t k);
 // Up to kQuantGemvParts weights that read the same x, in one launch: y_p [M, N_p] = x @ dequant(w_p)^T. The parts
-// match in format and in carrying AWQ input scales (quant_gemv_parts_match); groups and N may differ.
+// match in how their codes read and in carrying AWQ input scales (quant_gemv_parts_match); groups and N may differ.
 inline constexpr int kQuantGemvParts = 4;
 template <typename Y>
 struct QuantPart {
@@ -373,15 +375,29 @@ struct QuantPart {
     int64_t n = 0;
 };
 using QuantGemvPart = QuantPart<float>;
-// Calls f.template operator()<Q4, AWQ>() for w's format and whether it carries AWQ input scales (the kernels'
-// compile-time variants).
+// How a weight's codes become values: what the kernels' compile-time variants differ by.
+enum class QuantCode {
+    Q8,     // scale * code
+    Q4,     // scale * code + bias
+    Q4Sym,  // scale * (code - 8): no biases to read
+};
+constexpr bool quant_nibbles(QuantCode c) { return c != QuantCode::Q8; }
+inline QuantCode quant_code(const QuantWeight& w) {
+    return !w.q4 ? QuantCode::Q8 : w.biases != nullptr ? QuantCode::Q4 : QuantCode::Q4Sym;
+}
+// Calls f.template operator()<QC, AWQ>() for w's codes and whether it carries AWQ input scales (the kernels'
+// compile-time variants). No symmetric weight carries them, so that variant is not compiled.
 template <typename F>
 void quant_dispatch(const QuantWeight& w, F&& f) {
     const bool awq = w.input_scales != nullptr;
-    if (w.q4) {
-        awq ? f.template operator()<true, true>() : f.template operator()<true, false>();
-    } else {
-        awq ? f.template operator()<false, true>() : f.template operator()<false, false>();
+    switch (quant_code(w)) {
+        case QuantCode::Q8:
+            return awq ? f.template operator()<QuantCode::Q8, true>() : f.template operator()<QuantCode::Q8, false>();
+        case QuantCode::Q4:
+            return awq ? f.template operator()<QuantCode::Q4, true>() : f.template operator()<QuantCode::Q4, false>();
+        case QuantCode::Q4Sym:
+            XS_CHECK(!awq, "sycl: a symmetric q4 weight with AWQ input scales");
+            return f.template operator()<QuantCode::Q4Sym, false>();
     }
 }
 bool quant_gemv_parts_match(const QuantWeight& a, const QuantWeight& b);

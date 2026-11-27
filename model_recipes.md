@@ -964,7 +964,7 @@ Measured (decode 58 to 99 tok/s over all its files):
 | Q6_K | 3.53 GB | 3.27 GiB | 81 tok/s | 269 |
 | Q5_K_M | 3.14 GB | 2.92 GiB | 84 tok/s | 271 |
 | Q4_K_M | 2.74 GB | 2.54 GiB | 90 tok/s | 251 |
-| Q4_0 | 2.58 GB | 2.58 GiB | 99 tok/s | 227 |
+| Q4_0 | 2.58 GB | 2.39 GiB | 99 tok/s | 227 |
 | Q3_K_M | 2.29 GB | 2.12 GiB | 90 tok/s | 198 |
 | UD-IQ2_M | 1.76 GB | 1.63 GiB | 85 tok/s | 90 |
 | *original, f16* | | 7.83 GiB | 44 tok/s | 300 |
@@ -1004,7 +1004,7 @@ Measured:
 | Q6_K | 4.50 GB | 1.79 GiB | 109 tok/s | 276 |
 | Q5_K_M | 3.36 GB | 1.54 GiB | 110 tok/s | 261 |
 | Q4_K_M | 3.11 GB | 1.31 GiB | 120 tok/s | 237 |
-| Q4_0 | 3.04 GB | 1.36 GiB | 127 tok/s | 195 |
+| Q4_0 | 3.04 GB | 1.25 GiB | 127 tok/s | 195 |
 | Q3_K_M | 2.54 GB | 1.06 GiB | 116 tok/s | 199 |
 | UD-IQ2_M | 2.29 GB | 0.83 GiB | 114 tok/s | 122 |
 | *original, f16* | | 4.25 GiB | 61 tok/s | 300 |
@@ -1060,7 +1060,7 @@ Over all its files: 15 to 21 tok/s decode, 25 to 47 with MTP.
 | UD-Q6_K_M | 23.09 GB | 21.16 GiB | 16 tok/s | 33 tok/s | 293 | 193 |
 | UD-Q5_K_XL | 20.98 GB | 19.20 GiB | 17 tok/s | 33 tok/s | 288 | 193 |
 | UD-Q4_K_XL | 17.66 GB | 16.11 GiB | 16 tok/s | 38 tok/s | 280 | 187 |
-| Q4_0 | 16.06 GB | 16.01 GiB | 21 tok/s | 47 tok/s | 251 | 180 |
+| Q4_0 | 16.06 GB | 14.65 GiB | 21 tok/s | 47 tok/s | 251 | 180 |
 | UD-IQ4_XS | 14.35 GB | 13.03 GiB | 15 tok/s | 41 tok/s | 259 | 187 |
 | UD-IQ3_XXS | 10.93 GB | 9.84 GiB | 18 tok/s | 37 tok/s | 236 | 182 |
 | UD-Q2_K_XL | 9.95 GB | 8.93 GiB | 18 tok/s | 39 tok/s | 219 | 171 |

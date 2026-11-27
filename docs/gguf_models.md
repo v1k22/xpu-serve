@@ -38,7 +38,7 @@ Files: [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)
 | Q4_K_S | 2.59 GB | 2.40 GiB | 93 tok/s | 4,146 tok/s | 24 | 138 | 248 | 0.146 |
 | our q4 pack of it | n/a | 2.49 GiB | 109 tok/s | 4,543 tok/s | 23 | 134 | 194 | 0.260 |
 | Q4_K_M | 2.74 GB | 2.54 GiB | 90 tok/s | 4,158 tok/s | 24 | 139 | 251 | 0.143 |
-| Q4_0 | 2.58 GB | 2.58 GiB | 99 tok/s | 4,215 tok/s | 24 | 121 | 227 | 0.178 |
+| Q4_0 | 2.58 GB | 2.39 GiB | 99 tok/s | 4,215 tok/s | 24 | 121 | 227 | 0.178 |
 | Q4_1 | 2.78 GB | 2.58 GiB | 99 tok/s | 4,216 tok/s | 24 | 138 | 238 | 0.148 |
 | UD-Q4_K_XL | 2.91 GB | 2.70 GiB | 84 tok/s | 4,149 tok/s | 24 | 148 | 252 | 0.120 |
 | Q5_K_S | 3.02 GB | 2.81 GiB | 83 tok/s | 4,126 tok/s | 24 | 136 | 272 | 0.076 |
@@ -52,7 +52,7 @@ Files: [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)
 | BF16 | 8.42 GB | 7.83 GiB | 43 tok/s | 4,622 tok/s | 24 | 144 | 300 | 0.001 |
 | original checkpoint, f16 | n/a | 7.83 GiB | 44 tok/s | 4,990 tok/s | 24 | 144 | 300 | 0.000 |
 
-- A file's GPU memory is its size (2.74 GB is 2.55 GiB), except Q4_0, which takes 7 % more.
+- A file's GPU memory is its size (2.74 GB is 2.55 GiB).
 - The BF16 file gives the original's answer on all 300 questions: the import (names, transforms, value-head order,
   tokenizer, template) is exact.
 - From 5 bits up a file answers like the original on 9 questions in 10 or more; the 4-bit K-quants on 5 in 6, where
@@ -119,7 +119,7 @@ without theirs (`--no-vision`).
 | IQ4_NL | 3.04 GB | 1.25 GiB | 97 tok/s | 5,747 tok/s | 22 | 61 | 249 | 0.158 |
 | Q4_K_S | 3.04 GB | 1.25 GiB | 124 tok/s | 6,175 tok/s | 22 | 64 | 239 | 0.179 |
 | Q4_K_M | 3.11 GB | 1.31 GiB | 120 tok/s | 6,156 tok/s | 23 | 63 | 237 | 0.170 |
-| Q4_0 | 3.04 GB | 1.36 GiB | 127 tok/s | 6,296 tok/s | 21 | 51 | 195 | 0.301 |
+| Q4_0 | 3.04 GB | 1.25 GiB | 127 tok/s | 6,296 tok/s | 21 | 51 | 195 | 0.301 |
 | Q4_1 | 3.15 GB | 1.36 GiB | 126 tok/s | 6,089 tok/s | 23 | 60 | 240 | 0.178 |
 | UD-Q4_K_XL | 3.18 GB | 1.38 GiB | 117 tok/s | 6,198 tok/s | 23 | 65 | 233 | 0.184 |
 | our q4 pack of it | n/a | 1.43 GiB | 121 tok/s | 4,792 tok/s | 22 | 64 | 227 | 0.229 |
@@ -227,7 +227,7 @@ k = 1 to 5 drafts a round; the five files without the head take it from the MTP 
 | UD-Q3_K_XL | 13.15 GB | 11.90 GiB | 15.8 tok/s | 922 tok/s | 24 | 178 | 240 | 0.148 | 37.8 tok/s (k = 5), 2.36x |
 | UD-IQ4_XS | 14.35 GB | 13.03 GiB | 14.6 tok/s | 920 tok/s | 24 | 187 | 259 | 0.101 | 41.3 tok/s (k = 5), 2.79x |
 | UD-Q4_K_S | 15.36 GB | 13.96 GiB | 15.4 tok/s | 916 tok/s | 24 | 192 | 270 | 0.090 | 39.9 tok/s (k = 5), 2.54x |
-| Q4_0 | 16.06 GB | 16.01 GiB | 21.3 tok/s | 929 tok/s | 24 | 180 | 251 | 0.133 | 47.4 tok/s (k = 5), 2.20x |
+| Q4_0 | 16.06 GB | 14.65 GiB | 21.3 tok/s | 929 tok/s | 24 | 180 | 251 | 0.133 | 47.4 tok/s (k = 5), 2.20x |
 | UD-Q4_K_M | 16.56 GB | 15.09 GiB | 15.5 tok/s | 914 tok/s | 24 | 184 | 279 | 0.073 | 38.2 tok/s (k = 5), 2.43x |
 | Q4_1 | 17.54 GB | 16.01 GiB | 21.4 tok/s | 926 tok/s | 24 | 184 | 265 | 0.087 | 46.7 tok/s (k = 5), 2.16x |
 | UD-Q4_K_XL | 17.66 GB | 16.11 GiB | 16.1 tok/s | 912 tok/s | 24 | 187 | 280 | 0.063 | 37.9 tok/s (k = 5), 2.33x |

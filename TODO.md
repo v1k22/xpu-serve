@@ -387,7 +387,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Integrated GPUs: drop a pack's file pages from the page cache as its weights upload (on a 30 GB Arc B390 machine
       a 16 GiB pack lost the device in 2 of 8 loads while the driver still held the previous run's pages)
 - [x] GGUF: the 9 to 64 row kernel over block formats (`gemm_block_xmx`: tiles of 8 rows, the weight read once per 32)
-- [ ] GGUF: Q4_0 at its file's size (its q4 form stores a bias per group it does not need)
+- [x] GGUF: Q4_0 at its file's size (a q4 weight without biases, read around 8 by the pack kernels)
 - [x] GGUF: `serve <file.gguf>` (an import into a cache, again when the file changes; companions found beside it),
       split files (by the first part; `-hf` downloads every part); docs/decisions/0030, 0031
 - [ ] GGUF: the tiled value-head order inside GatedDelta (four small transposes per linear layer now: 1 % of a

@@ -5,5 +5,8 @@ target_link_libraries(xs_tests PRIVATE xs_service xs_server xs_convert xs_hub xs
                                        xs_doctest xs_warnings)
 target_include_directories(xs_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/unit)
 target_compile_definitions(xs_tests PRIVATE XS_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+if(XS_WITH_SYCL)  # the tests of the SYCL backend's host-side code
+  target_compile_definitions(xs_tests PRIVATE XS_HAVE_SYCL=1)
+endif()
 # Tests that need a model directory or fixtures read XS_TEST_MODEL_DIR / XS_TEST_FIXTURES and skip when unset.
 add_test(NAME unit COMMAND xs_tests)

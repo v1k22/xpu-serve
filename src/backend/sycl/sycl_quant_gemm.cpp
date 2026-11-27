@@ -56,7 +56,8 @@ inline int dequant_pair(uint32_t pair, _Float16 offset, h2_v scale) {
 }
 
 
-// The same with a bias: c * scale + bias (q4's affine codes).
+// The same with a bias: c * scale + bias (q4's affine codes; symmetric ones go through dequant_pair, 8 in the
+// offset).
 inline uint32_t dequant_pair_affine(uint32_t pair, _Float16 offset, h2_v scale, h2_v bias) {
     const h2_v c = __builtin_bit_cast(h2_v, pair | 0x64006400u) - h2_v{offset, offset};
     return __builtin_bit_cast(uint32_t, c * scale + bias);
@@ -73,8 +74,10 @@ struct GemmParts {
     int count = 0;
 };
 
-template <bool Q4, int MT, bool AWQ, typename Y, bool ADD>
+template <QuantCode QC, int MT, bool AWQ, typename Y, bool ADD>
 struct QuantGemmKernel {
+    static constexpr bool Q4 = quant_nibbles(QC);
+    static constexpr bool BIAS = QC == QuantCode::Q4;
     // 16-feature columns per sub-group (each lane: kNt output features); past 4 row tiles one, or the accumulators
     // spill (q4 at 7 tiles ran five times slower with two)
     static constexpr int kNt = MT > 4 ? 1 : 2;
@@ -132,7 +135,7 @@ struct QuantGemmKernel {
             const int64_t row = n0 + nt * kSg + lane;  // this lane's output feature
             codes[nt] = w.codes + row * row_bytes;
             scales[nt] = w.scales + row * groups;
-            biases[nt] = Q4 ? w.biases + row * groups : nullptr;
+            biases[nt] = BIAS ? w.biases + row * groups : nullptr;
         }
 
         float8_v acc[MT][kNt];
@@ -152,7 +155,7 @@ struct QuantGemmKernel {
                     group = g;
                     for (int nt = 0; nt < kNt; ++nt) {
                         scale[nt] = scales[nt][g];
-                        if constexpr (Q4) bias[nt] = biases[nt][g];
+                        if constexpr (BIAS) bias[nt] = biases[nt][g];
                     }
                 }
                 int8_v b[kNt];
@@ -167,9 +170,16 @@ struct QuantGemmKernel {
                             #pragma unroll
                             for (int i = 0; i < 4; ++i) {
                                 const uint32_t byte = (word >> (8 * i)) & 0xFF;
-                                b[nt][4 * d + i] =
-                                    pack_half2(sycl::fma(static_cast<half>(byte & 0x0F), scale[nt], bias[nt]),
-                                               sycl::fma(static_cast<half>(byte >> 4), scale[nt], bias[nt]));
+                                if constexpr (BIAS) {
+                                    b[nt][4 * d + i] =
+                                        pack_half2(sycl::fma(static_cast<half>(byte & 0x0F), scale[nt], bias[nt]),
+                                                   sycl::fma(static_cast<half>(byte >> 4), scale[nt], bias[nt]));
+                                } else {
+                                    const auto lo = static_cast<int32_t>(byte & 0x0F) - 8;
+                                    const auto hi = static_cast<int32_t>(byte >> 4) - 8;
+                                    b[nt][4 * d + i] = pack_half2(static_cast<half>(lo) * scale[nt],
+                                                                  static_cast<half>(hi) * scale[nt]);
+                                }
                             }
                         }
                     } else {
@@ -237,9 +247,9 @@ struct QuantGemmKernel {
     }
 };
 
-template <bool Q4, int MT, bool AWQ, typename Y, bool ADD>
+template <QuantCode QC, int MT, bool AWQ, typename Y, bool ADD>
 void quant_gemm_t(sycl::queue& q, const half* x, GemmParts<Y> parts, int64_t m, int64_t k, int64_t slices) {
-    using K = QuantGemmKernel<Q4, MT, AWQ, Y, ADD>;
+    using K = QuantGemmKernel<QC, MT, AWQ, Y, ADD>;
     const int64_t k_slice = ceil_div(ceil_div(k, slices), 128) * 128;  // whole steps (64 or 128 columns)
     parts.wg_begin[0] = 0;
     for (int j = 0; j < kQuantGemvParts; ++j) {
@@ -256,35 +266,35 @@ void quant_gemm_t(sycl::queue& q, const half* x, GemmParts<Y> parts, int64_t m, 
     });
 }
 
-template <bool Q4, bool AWQ, typename Y, bool ADD>
+template <QuantCode QC, bool AWQ, typename Y, bool ADD>
 void quant_gemm_q(sycl::queue& q, const half* x, const GemmParts<Y>& parts, int64_t m, int64_t k, int64_t slices) {
     const int64_t mt = ceil_div(m, kTm);
     if (mt <= 2) {
-        quant_gemm_t<Q4, 2, AWQ, Y, ADD>(q, x, parts, m, k, slices);
+        quant_gemm_t<QC, 2, AWQ, Y, ADD>(q, x, parts, m, k, slices);
     } else if (mt <= 4) {
-        quant_gemm_t<Q4, 4, AWQ, Y, ADD>(q, x, parts, m, k, slices);
+        quant_gemm_t<QC, 4, AWQ, Y, ADD>(q, x, parts, m, k, slices);
     } else if (mt <= 7) {
-        quant_gemm_t<Q4, 7, AWQ, Y, ADD>(q, x, parts, m, k, slices);
+        quant_gemm_t<QC, 7, AWQ, Y, ADD>(q, x, parts, m, k, slices);
     } else {
-        quant_gemm_t<Q4, 8, AWQ, Y, ADD>(q, x, parts, m, k, slices);
+        quant_gemm_t<QC, 8, AWQ, Y, ADD>(q, x, parts, m, k, slices);
     }
 }
 
 // The GEMV on the matrix engines (gemv_quant_xmx), M <= 8, described for q4. A sub-group owns 16 output features, one
 // per lane (the DPAS B operand's columns), and a slice of K. Per step of 256 columns a lane loads its feature's 128
-// bytes of codes (whole cache lines) and the step's scales and biases as one vector each: per lane, every load is a
-// row of its own,
-// so loading few and wide is what keeps the memory busy (the transposed 2D block loads quant_gemm uses, 32 bytes a
-// row, and a scale per 16 columns, streamed under half as fast on the Arc Pro B60). Per 16 columns an 8 x 16 tile of x
-// (one 2D block load, rows past M read as zero) is the A operand, and the codes become the B operand as f16
-// 1 + q / 1024: a byte holds two codes, and byte * 0x1001 puts them 16 bits apart. The group's scale and bias then
-// apply to its sums: with d = x . (1 + q / 1024) and s = sum(x), x . (q scale + bias) = 1024 scale d + (bias - 1024
-// scale) s. x in f16 and s per group come from one small launch before (xmx_prep), shared by the weights that
-// read the same x: converting x and summing it (a DPAS by ones) in every sub-group was a third of the kernel's
-// arithmetic, and the f32 x twice the bytes a sub-group reads beside the weight. Dequantizing every code first cost
-// a fifth more time; the weight as the A operand (lanes along K, as the GEMV reads it) reloaded x per DPAS and ran
-// slower, and so did two feature tiles a sub-group (one load of x for both) on an integrated GPU. q8 reads a step's
-// 256 bytes of codes and has no bias: its B operands are the codes themselves (q8_pair), and x's sums go unread.
+// bytes of codes (whole cache lines) and the step's scales and biases as one vector each: per lane, every load is a row
+// of its own, so loading few and wide is what keeps the memory busy (the transposed 2D block loads quant_gemm uses, 32
+// bytes a row, and a scale per 16 columns, streamed under half as fast on the Arc Pro B60). Per 16 columns an 8 x 16
+// tile of x (one 2D block load, rows past M read as zero) is the A operand, and the codes become the B operand as f16 1
+// + q / 1024: a byte holds two codes, and byte * 0x1001 puts them 16 bits apart. The group's scale and bias then apply
+// to its sums: with d = x . (1 + q / 1024) and s = sum(x), x . (q scale + bias) = 1024 scale d + (bias - 1024 scale) s
+// (a symmetric weight has no biases to load: its bias is -8 scale). x in f16 and s per group come from one small launch
+// before (xmx_prep), shared by the weights that read the same x: converting x and summing it (a DPAS by ones) in every
+// sub-group was a third of the kernel's arithmetic, and the f32 x twice the bytes a sub-group reads beside the weight.
+// Dequantizing every code first cost a fifth more time; the weight as the A operand (lanes along K, as the GEMV reads
+// it) reloaded x per DPAS and ran slower, and so did two feature tiles a sub-group (one load of x for both) on an
+// integrated GPU. q8 reads a step's 256 bytes of codes and has no bias: its B operands are the codes themselves
+// (q8_pair), and x's sums go unread.
 constexpr int kXmxStep = 256;  // columns per step
 
 struct XmxParts {  // the weights of one launch, each one's x (f16 [M, K]) and group sums, where its work-groups start
@@ -343,8 +353,10 @@ inline int q8_pair(uint32_t two) {
     return __builtin_bit_cast(int, __builtin_bit_cast(h2_v, spread ^ 0x64806480u) - h2_v{kBias, kBias});
 }
 
-template <int G, bool Q4>
+template <int G, QuantCode QC>
 struct GemvXmxKernel {
+    static constexpr bool Q4 = quant_nibbles(QC);
+    static constexpr bool BIAS = QC == QuantCode::Q4;
     static constexpr int kPerGroup = G / kTk;              // DPAS per group
     static constexpr int kScaleWords = kXmxStep / G / 2;   // a step's scales (or biases) in pairs
     static constexpr int kCodeLines = Q4 ? 2 : 4;          // a step's codes in cache lines
@@ -391,7 +403,7 @@ struct GemvXmxKernel {
         const int64_t k_hi = std::min(k, k_lo + k_slice);
         const uint8_t* codes = w.codes + row * (Q4 ? k / 2 : k);
         const half* scales = w.scales + row * (k / G);
-        const half* biases = Q4 ? w.biases + row * (k / G) : scales;  // q8 has none
+        const half* biases = BIAS ? w.biases + row * (k / G) : scales;  // only affine codes have them
         const int x_width = static_cast<int>(k * 2) - 1;  // x as an [M, K] f16 surface
         const int x_height = static_cast<int>(m) - 1;
         const auto x_base = reinterpret_cast<long>(xh);
@@ -404,7 +416,7 @@ struct GemvXmxKernel {
             }
             const ScaleVec s = *reinterpret_cast<const ScaleVec*>(scales + kk / G);
             ScaleVec b;
-            if constexpr (Q4) b = *reinterpret_cast<const ScaleVec*>(biases + kk / G);
+            if constexpr (BIAS) b = *reinterpret_cast<const ScaleVec*>(biases + kk / G);
             #pragma unroll
             for (int g = 0; g < kXmxStep / G; ++g) {
                 float8_v dot = 0.0f;
@@ -439,7 +451,7 @@ struct GemvXmxKernel {
                 if constexpr (Q4) {
                     const GroupSums xsum = *reinterpret_cast<const GroupSums*>(xs + (kk / G + g) * kTm);
                     const float sc = scale_at(s, g) * 1024.0f;
-                    const float bc = scale_at(b, g) - sc;
+                    const float bc = (BIAS ? scale_at(b, g) : -8.0f * scale_at(s, g)) - sc;
                     #pragma unroll
                     for (int r = 0; r < kTm; ++r) acc[r] = sycl::fma(sc, dot[r], sycl::fma(bc, xsum[r], acc[r]));
                 } else {
@@ -462,9 +474,9 @@ struct GemvXmxKernel {
     }
 };
 
-template <int G, bool Q4>
+template <int G, QuantCode QC>
 void gemv_xmx_t(sycl::queue& q, XmxParts parts, int64_t m, int64_t k, int64_t compute_units) {
-    using K = GemvXmxKernel<G, Q4>;
+    using K = GemvXmxKernel<G, QC>;
     for (int j = 0; j < kQuantGemvParts; ++j)
         parts.wg_begin[j + 1] = parts.wg_begin[j] + (j < parts.count ? parts.n[j] / kSg : 0);
     const int64_t wgs = parts.wg_begin[parts.count];
@@ -500,8 +512,9 @@ constexpr int kTiledFeatures = kTiledWn * kTiledNt * kSg;
 constexpr int kTiledTiles = kTiledWn * kTiledNt * kTiledSlices;  // B tiles per step
 constexpr int kTileWords = 8 * kSg;  // a B tile: 8 dwords per lane, stored [dword][lane]
 
-template <bool Q4, bool AWQ, typename Y, bool ADD>
+template <QuantCode QC, bool AWQ, typename Y, bool ADD>
 struct QuantGemmTiledKernel {
+    static constexpr bool Q4 = quant_nibbles(QC);
     static constexpr int kSgs = kTiledWm * kTiledWn;
     static constexpr int kRows = kTiledWm * kTiledMt * kTm;
     static constexpr int kPerSg = kTiledTiles / kSgs;  // tiles each sub-group dequantizes per step
@@ -559,7 +572,7 @@ struct QuantGemmTiledKernel {
                 const _Float16 sf = sycl::bit_cast<_Float16>(w.scales[g]);
                 const h2_v s2{sf, sf};
                 uint32_t pairs[8];
-                if constexpr (Q4) {  // 16 columns = 2 dwords; even column in the low nibble
+                if constexpr (QC == QuantCode::Q4) {  // 16 columns = 2 dwords; even column in the low nibble
                     const _Float16 bf = sycl::bit_cast<_Float16>(w.biases[g]);
                     const h2_v b2{bf, bf};
                     #pragma unroll
@@ -568,6 +581,16 @@ struct QuantGemmTiledKernel {
                         for (int i = 0; i < 4; ++i) {
                             const uint32_t v = c[j][d] >> (8 * i);
                             pairs[4 * d + i] = dequant_pair_affine((v & 0x0Fu) | ((v & 0xF0u) << 12), 1024, s2, b2);
+                        }
+                    }
+                } else if constexpr (QC == QuantCode::Q4Sym) {  // the same codes, read around 8
+                    #pragma unroll
+                    for (int d = 0; d < 2; ++d) {
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const uint32_t v = c[j][d] >> (8 * i);
+                            pairs[4 * d + i] =
+                                static_cast<uint32_t>(dequant_pair((v & 0x0Fu) | ((v & 0xF0u) << 12), 1032, s2));
                         }
                     }
                 } else {  // 16 columns = 4 dwords; codes biased to unsigned (c + 128)
@@ -662,9 +685,9 @@ struct QuantGemmTiledKernel {
     }
 };
 
-template <bool Q4, bool AWQ, typename Y, bool ADD>
+template <QuantCode QC, bool AWQ, typename Y, bool ADD>
 void quant_gemm_tiled_t(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k) {
-    using K = QuantGemmTiledKernel<Q4, AWQ, Y, ADD>;
+    using K = QuantGemmTiledKernel<QC, AWQ, Y, ADD>;
     const int64_t m_blocks = ceil_div(m, K::kRows);
     const auto wgs = static_cast<size_t>(m_blocks * (n / kTiledFeatures));
     int shift = 0;
@@ -711,9 +734,9 @@ void quant_gemm(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64
     parts.y[0] = y;
     parts.n[0] = n;
     parts.count = 1;
-    quant_dispatch(w, [&]<bool Q4, bool AWQ>() {
-        add ? quant_gemm_q<Q4, AWQ, Y, true>(q, x, parts, m, k, slices)
-            : quant_gemm_q<Q4, AWQ, Y, false>(q, x, parts, m, k, slices);
+    quant_dispatch(w, [&]<QuantCode QC, bool AWQ>() {
+        add ? quant_gemm_q<QC, AWQ, Y, true>(q, x, parts, m, k, slices)
+            : quant_gemm_q<QC, AWQ, Y, false>(q, x, parts, m, k, slices);
     });
 }
 
@@ -730,7 +753,8 @@ void quant_gemm_parts(sycl::queue& q, const half* x, const QuantPart<Y>* parts, 
         p.y[j] = parts[j].y;
         p.n[j] = parts[j].n;
     }
-    quant_dispatch(parts[0].w, [&]<bool Q4, bool AWQ>() { quant_gemm_q<Q4, AWQ, Y, false>(q, x, p, m, k, slices); });
+    quant_dispatch(parts[0].w,
+                   [&]<QuantCode QC, bool AWQ>() { quant_gemm_q<QC, AWQ, Y, false>(q, x, p, m, k, slices); });
 }
 
 bool gemv_quant_xmx_fits(const QuantGemvPart* parts, int count, int64_t k) {
@@ -740,9 +764,10 @@ bool gemv_quant_xmx_fits(const QuantGemvPart* parts, int count, int64_t k) {
         const QuantWeight& w = parts[j].w;
         // codes and a step's scales and biases read as aligned vectors (each row's start is, given K)
         const bool aligned = block_load_aligned(w.codes) && reinterpret_cast<uintptr_t>(w.scales) % 16 == 0 &&
-                             (!w.q4 || reinterpret_cast<uintptr_t>(w.biases) % 16 == 0);
-        if (w.q4 != first.q4 || (w.group != 32 && w.group != 64 && w.group != 128) || w.group != first.group ||
-            (w.input_scales != nullptr) != (first.input_scales != nullptr) || parts[j].n % kSg != 0 || !aligned)
+                             reinterpret_cast<uintptr_t>(w.biases) % 16 == 0;
+        if (quant_code(w) != quant_code(first) || (w.group != 32 && w.group != 64 && w.group != 128) ||
+            w.group != first.group || (w.input_scales != nullptr) != (first.input_scales != nullptr) ||
+            parts[j].n % kSg != 0 || !aligned)
             return false;
     }
     return true;
@@ -776,14 +801,18 @@ void gemv_quant_xmx(sycl::queue& q, const float* x, const QuantGemvPart* parts, 
         }
     }
     p.wg_begin[0] = 0;
-    const auto run = [&]<bool Q4>() {
+    const auto run = [&]<QuantCode QC>() {
         switch (group) {
-            case 32: return gemv_xmx_t<32, Q4>(q, p, m, k, compute_units);
-            case 64: return gemv_xmx_t<64, Q4>(q, p, m, k, compute_units);
-            default: return gemv_xmx_t<128, Q4>(q, p, m, k, compute_units);
+            case 32: return gemv_xmx_t<32, QC>(q, p, m, k, compute_units);
+            case 64: return gemv_xmx_t<64, QC>(q, p, m, k, compute_units);
+            default: return gemv_xmx_t<128, QC>(q, p, m, k, compute_units);
         }
     };
-    parts[0].w.q4 ? run.template operator()<true>() : run.template operator()<false>();
+    switch (quant_code(parts[0].w)) {
+        case QuantCode::Q8: return run.template operator()<QuantCode::Q8>();
+        case QuantCode::Q4: return run.template operator()<QuantCode::Q4>();
+        case QuantCode::Q4Sym: return run.template operator()<QuantCode::Q4Sym>();
+    }
 }
 
 bool quant_gemm_tiled_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w) {
@@ -796,9 +825,9 @@ bool quant_gemm_tiled_fits(int64_t m, int64_t n, int64_t k, const QuantWeight& w
 template <typename Y>
 void quant_gemm_tiled(sycl::queue& q, const half* x, const QuantWeight& w, Y* y, int64_t m, int64_t n, int64_t k,
                       bool add) {
-    quant_dispatch(w, [&]<bool Q4, bool AWQ>() {
-        add ? quant_gemm_tiled_t<Q4, AWQ, Y, true>(q, x, w, y, m, n, k)
-            : quant_gemm_tiled_t<Q4, AWQ, Y, false>(q, x, w, y, m, n, k);
+    quant_dispatch(w, [&]<QuantCode QC, bool AWQ>() {
+        add ? quant_gemm_tiled_t<QC, AWQ, Y, true>(q, x, w, y, m, n, k)
+            : quant_gemm_tiled_t<QC, AWQ, Y, false>(q, x, w, y, m, n, k);
     });
 }
 
