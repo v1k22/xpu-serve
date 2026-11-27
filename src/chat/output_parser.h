@@ -31,6 +31,8 @@ public:
     virtual ParsedDelta feed(std::string_view text) = 0;
     // End of generation: returns anything held back (e.g. a partial marker that never completed is plain content).
     virtual ParsedDelta finish() = 0;
+    // Inside reasoning (where a prompt left it, before any feed), the marker that ends it; empty otherwise.
+    virtual std::string_view reasoning_end() const { return {}; }
 };
 
 // Dialects: "gemma4", "qwen3" (Qwen 3's JSON tool calls), "qwen3_5" (Qwen 3.5's XML ones), "inkling2" (messages of
@@ -48,6 +50,16 @@ struct DirectAnswer {
     std::string opening;
 };
 DirectAnswer direct_answer(std::string_view dialect);
+
+// Where an answer held to a format (response_format) starts in the output of a model of `dialect` after a prompt
+// ending in `prompt_tail`: when the prompt leaves the model reasoning (Qwen 3.5 with thinking on), once it has written
+// `reasoning_end`, the marker that closes the thought; then after `opening`, what the dialect writes before an
+// answer's text (direct_answer's: Inkling 2's message header). Throws as make_output_parser for an unknown dialect.
+struct AnswerStart {
+    std::string reasoning_end;  // empty: the prompt leaves the model writing its answer
+    std::string opening;
+};
+AnswerStart answer_start(std::string_view dialect, std::string_view prompt_tail);
 
 // The end of a rendered prompt that make_output_parser needs; keeping only this avoids copying whole prompts.
 inline std::string_view prompt_tail(std::string_view rendered_prompt) {

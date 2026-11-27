@@ -60,6 +60,7 @@ public:
         if (where_ == Where::call) close_call(delta);  // a call the model never closed, if its body is whole
         return delta;
     }
+    std::string_view reasoning_end() const override { return where_ == Where::thinking ? kEnd : ""; }
 
 private:
     enum class Where { between, header, thinking, text, call };

@@ -361,6 +361,21 @@ TEST_SUITE("chat qwen3_5 parser prompt tail") {
         }
     }
 
+    TEST_CASE("an answer held to a format starts after </think> where the prompt leaves the model thinking") {
+        for (const char* dialect : {"qwen3_5", "qwen3"}) {
+            CAPTURE(dialect);
+            for (const std::string name : {"thinking_on", "tool_call_object_arguments"}) {
+                const xs::chat::AnswerStart on = xs::chat::answer_start(dialect, rendered_prompt(name));
+                CHECK(on.reasoning_end == "</think>");
+                CHECK(on.opening.empty());
+            }
+            for (const std::string name : {"thinking_off", "reasoning_content_after_last_user"}) {
+                CHECK(xs::chat::answer_start(dialect, rendered_prompt(name)).reasoning_end.empty());
+            }
+        }
+        CHECK(xs::chat::answer_start("plain", kThinkingOn).reasoning_end.empty());  // raw completions: at once
+    }
+
     TEST_CASE("a prefilled reply after its reasoning, or without one, continues in content") {
         CHECK(parse(" more", rendered_prompt("reasoning_content_after_last_user")).content == " more");
         CHECK(parse(" more", rendered_prompt("assistant_prefill")).content == " more");

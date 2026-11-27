@@ -106,6 +106,8 @@ public:
         return delta;
     }
 
+    std::string_view reasoning_end() const override { return mode_ == Mode::reasoning ? "<channel|>" : ""; }
+
 private:
     // The template ends some prompts inside a thought channel ("<|channel>thought\n" after a tool response with
     // thinking on). Replaying the prompt from its last channel opener puts the parser where the prompt left off.

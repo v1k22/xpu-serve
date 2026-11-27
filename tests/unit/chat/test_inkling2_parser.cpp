@@ -145,3 +145,14 @@ TEST_CASE("inkling2: an answer at once opens the model's text message after the 
     }
     CHECK_THROWS(xs::chat::direct_answer("nope"));
 }
+
+TEST_CASE("inkling2: an answer held to a format opens a text message, after the thought a prompt leaves open") {
+    const xs::chat::AnswerStart thinking = xs::chat::answer_start(
+        "inkling2", "<|message_user|><|content_text|>Hi<|end_message|><|message_model|><|content_thinking|>");
+    CHECK(thinking.reasoning_end == "<|end_message|>");
+    CHECK(thinking.opening == "<|message_model|><|content_text|>");
+    const xs::chat::AnswerStart at_once = xs::chat::answer_start("inkling2", "<|content_text|>Hi<|end_message|>");
+    CHECK(at_once.reasoning_end.empty());
+    CHECK(at_once.opening == "<|message_model|><|content_text|>");
+    CHECK_THROWS(xs::chat::answer_start("nope", ""));
+}

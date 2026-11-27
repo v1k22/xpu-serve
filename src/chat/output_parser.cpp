@@ -40,4 +40,8 @@ DirectAnswer direct_answer(std::string_view dialect) {
     return {{{"enable_thinking", false}}, ""};
 }
 
+AnswerStart answer_start(std::string_view dialect, std::string_view prompt_tail) {
+    return {std::string(make_output_parser(dialect, prompt_tail)->reasoning_end()), direct_answer(dialect).opening};
+}
+
 }  // namespace xs::chat

@@ -219,6 +219,8 @@ public:
         return delta;
     }
 
+    std::string_view reasoning_end() const override { return mode_ == Mode::reasoning ? kThinkClose : ""; }
+
 private:
     // The generation prompt ends inside "<think>\n" (thinking on) or after "</think>\n\n" (thinking off, or a
     // prefilled reply); whichever of the two markers comes last in the open assistant turn decides the start.

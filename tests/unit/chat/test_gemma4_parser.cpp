@@ -319,6 +319,12 @@ TEST_SUITE("chat gemma4 parser prompt tail") {
         CHECK(closed.reasoning.empty());
     }
 
+    TEST_CASE("an answer held to a format starts after <channel|> where the prompt leaves a thought open") {
+        CHECK(xs::chat::answer_start("gemma4", "<|turn>model\n<|channel>thought\n").reasoning_end == "<channel|>");
+        CHECK(xs::chat::answer_start("gemma4", rendered_prompt("user_only")).reasoning_end.empty());
+        CHECK(xs::chat::answer_start("gemma4", rendered_prompt("user_only")).opening.empty());
+    }
+
     TEST_CASE("a prompt ending inside the channel opener completes it from the output") {
         const Collected c = parse_after("<|turn>model\n<|channel>thou", "ght\nidea\n<channel|>done");
         CHECK(c.reasoning == "idea");
