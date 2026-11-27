@@ -298,7 +298,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       expert by expert joined without a copy; `run`, `serve`, `bench` and `convert` take the directory
       (`docs/decisions/0014`); also compressed-tensors' float-quantized format with a scale per channel
       (`ornith-ai/Ornith-1.5-35B-A3B-FP8`)
-- [ ] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse; vision tower
+- [x] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse (docs/decisions/0029)
+- [ ] Qwen3.5: vision tower
 - [x] SenseNova Loop (`sensenova_loop`): the Qwen3.5 decoder with layers run in a loop (each run with state slots of its
       own) and manifold-constrained hyper-connections (graph ops MhcRoute and StreamMix; routers kept unquantized by
       `convert`); parity with the checkpoint's own code on a tiny checkpoint (cpu-ref and SYCL exact) and on
@@ -373,14 +374,15 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] GGUF: a `qwen35moe` file whose gate and up banks the converter fused (`--fuse-gate-up-exps`)
 - [ ] GGUF: more architectures (Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
 - [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
-- [ ] GGUF: expert banks in block formats (the expert kernel reads q8 / q4 only)
+- [x] GGUF: expert banks in block formats (a GEMV per expert or per pair up to 64 pairs; past them on the matrix
+      engines, passes of up to 64 of an expert's pairs read from its codes: `expert_gemm_block_xmx`)
 - [x] GGUF: a matrix-engine GEMV over block formats (`gemv_block_xmx`, from 2 rows: a speculative verify)
 - [x] GGUF: Qwen3.8-27B's files that fit a 24 GB card (20 of unsloth's), with MTP; results in docs/gguf_models.md
 - [ ] GGUF: one six-prompt bench of Qwen3.8-27B UD-Q6_K_M (1.5 GiB left beside its weights) lost the device once and
       not in eight runs after; check what a step allocates when the card is that full
 - [ ] Integrated GPUs: drop a pack's file pages from the page cache as its weights upload (on a 30 GB Arc B390 machine
       a 16 GiB pack lost the device in 2 of 8 loads while the driver still held the previous run's pages)
-- [ ] GGUF: the 9 to 64 row kernel over block formats (past 8 rows the weight is dequantized for a GEMM)
+- [x] GGUF: the 9 to 64 row kernel over block formats (`gemm_block_xmx`: tiles of 8 rows, the weight read once per 32)
 - [ ] GGUF: Q4_0 at its file's size (its q4 form stores a bias per group it does not need)
 - [ ] GGUF: `serve <file.gguf>` (an import into a cache), split files
 - [ ] GGUF: the tiled value-head order inside GatedDelta (four small transposes per linear layer now: 1 % of a
