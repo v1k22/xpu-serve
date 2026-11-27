@@ -213,6 +213,17 @@ TEST_CASE("media input matches Hugging Face: features, encoder rows, prompt, log
         MESSAGE(c["name"].get<std::string>(), ": greedy matches ", same, "/", ref.size(), " tokens (encode ",
                 r.stats.encode_ms, " ms, prefill ", r.stats.prefill_ms, " ms, decode ", r.stats.decode_tok_per_s(),
                 " tok/s)");
-        CHECK(same >= std::min(greedy_must_match, ref.size()));
+        // f16 may flip a near tie (DESIGN.md 10.4): the reference ranks our token within 1% of its logit range.
+        bool near_tie = false;
+        if (!f32 && same < ref.size() && same < r.tokens.size() && c.contains("greedy_top")) {
+            const auto& step = c["greedy_top"][same];
+            const auto ids = step["ids"].get<std::vector<int32_t>>();
+            const auto logits = step["logits"].get<std::vector<float>>();
+            for (size_t j = 0; j < ids.size(); ++j) {
+                if (ids[j] == r.tokens[same]) near_tie = logits[0] - logits[j] < 0.01f * step["range"].get<float>();
+            }
+            if (near_tie) MESSAGE("  step ", same, " is a near tie");
+        }
+        CHECK((same >= std::min(greedy_must_match, ref.size()) || near_tie));
     }
 }

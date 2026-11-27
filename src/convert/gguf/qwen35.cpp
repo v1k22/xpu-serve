@@ -25,6 +25,12 @@
 //   model's embedding and lm_head (mtp_use_dedicated_embeddings false), and the final norm of its own block
 //   (nextn.shared_head_norm, mtp.norm).
 //
+// - the vision tower is not in the file: llama.cpp writes it to a file of its own (mmproj: general.architecture clip,
+//   projector type qwen3vl_merger), which `convert --mmproj` reads into the pack under the checkpoint's names
+//   (model.visual.*), with the release's config.json layout around the text config (text_config, vision_config). The
+//   converter cuts the patch embedding, a convolution over two frames, into one kernel a frame: kept apart, as
+//   patch_embed.proj.frames.<t>.weight, which models/qwen3_vision/ reads in the whole kernel's place.
+//
 // The decoder is read under any namespace (read_qwen35_decoder, qwen35.h): clef files hold it under clef.*.
 
 #include "convert/gguf/qwen35.h"
@@ -348,6 +354,145 @@ Layout layout(const Dimensions& d, int64_t layers, int64_t blocks, const std::ve
 }
 
 // The language model of a file: its decoder, and its MTP head when the file, or a file of its own, holds one.
+// The vision tower's file (llama.cpp's mmproj): Qwen3-VL's tower without deepstack layers, as Qwen3.5, 3.6 and 3.8
+// have it.
+constexpr std::string_view kProjector = "clip";
+constexpr std::string_view kProjectorType = "qwen3vl_merger";
+const std::string kVisionPrefix = "model.visual.";
+// image_size is llama.cpp's own bound on an image; the processor here is the checkpoint's (preprocessor_config.json).
+const std::set<std::string_view> kProjectorKeys = {
+    "has_vision_encoder", "projector_type", "use_gelu", "vision.projection_dim", "vision.image_size",
+    "vision.patch_size", "vision.embedding_length", "vision.feed_forward_length", "vision.block_count",
+    "vision.attention.head_count", "vision.image_mean", "vision.image_std", "vision.spatial_merge_size",
+    "vision.attention.layer_norm_epsilon", "vision.is_deepstack_layers",
+};
+
+struct VisionDimensions {
+    int64_t hidden = 0, width = 0, layers = 0, heads = 0, patch = 0, merge = 0, frames = 0, positions = 0, out = 0;
+};
+
+// The projector file `f` against the model's hidden size: its dimensions, refusing by name a file that is not this
+// family's tower (or another model's) and settings the tower here does not read as the file means them.
+VisionDimensions vision_dimensions(const gguf::File& f, std::string_view arch, int64_t hidden) {
+    const std::string_view general = f.get_string("general.architecture");
+    const gguf::Value* type = f.find("clip.projector_type");
+    if (general != kProjector || type == nullptr || type->as_string() != kProjectorType) {
+        fail(arch, ": --mmproj: the file is not a Qwen3.5-family vision tower (general.architecture '", general,
+             "', clip.projector_type '", type != nullptr ? type->as_string() : std::string_view("none"),
+             "'; expected '", kProjector, "' and '", kProjectorType, "')");
+    }
+    refuse_unknown_keys(f, kProjector, kProjectorKeys);
+    const auto positive_of = [&](std::string_view rest) { return positive(f, kProjector, str_cat("clip.", rest)); };
+    VisionDimensions v;
+    v.hidden = positive_of("vision.embedding_length");
+    v.width = positive_of("vision.feed_forward_length");
+    v.layers = positive_of("vision.block_count");
+    v.heads = positive_of("vision.attention.head_count");
+    v.patch = positive_of("vision.patch_size");
+    v.merge = positive_of("vision.spatial_merge_size");
+    v.out = positive_of("vision.projection_dim");
+    XS_CHECK(v.out == hidden, arch, ": --mmproj: the tower projects to ", v.out, ", the model's hidden size is ",
+             hidden, ": another model's file");
+    if (const gguf::Value* deep = f.find("clip.vision.is_deepstack_layers")) {
+        for (const bool layer : deep->bools()) {
+            XS_CHECK(!layer, arch, ": --mmproj: the tower has deepstack layers (Qwen3-VL's), which this family's ",
+                     "does not");
+        }
+    }
+    const gguf::Value* gelu = f.find("clip.use_gelu");
+    XS_CHECK(gelu != nullptr && gelu->as_bool(), arch, ": --mmproj: the tower's blocks are not GELU (clip.use_gelu)");
+    for (const char* key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
+        const gguf::Value* m = f.find(key);
+        XS_CHECK(m != nullptr, arch, ": --mmproj: the file has no ", key);
+        for (const double x : m->floats()) XS_CHECK(x == 0.5, arch, ": --mmproj: ", key, " is not 0.5 a channel");
+    }
+    const double eps = f.get("clip.vision.attention.layer_norm_epsilon").as_float();
+    XS_CHECK(std::fabs(eps - 1e-6) < 1e-9, arch, ": --mmproj: layer_norm_epsilon ", eps, " (the tower's is 1e-6)");
+    const gguf::TensorInfo* table = f.find_tensor("v.position_embd.weight");
+    XS_CHECK(table != nullptr && table->dims.size() == 2, arch, ": --mmproj: the file lacks v.position_embd.weight");
+    v.positions = table->rows();
+    v.frames = f.find_tensor("v.patch_embd.weight.1") != nullptr ? 2 : 1;
+    return v;
+}
+
+// vision_config as the release's config.json has it.
+nlohmann::ordered_json vision_config(const VisionDimensions& v, bool experts) {
+    nlohmann::ordered_json c;
+    c["model_type"] = experts ? "qwen3_5_moe" : "qwen3_5";
+    c["depth"] = v.layers;
+    c["hidden_size"] = v.hidden;
+    c["intermediate_size"] = v.width;
+    c["num_heads"] = v.heads;
+    c["out_hidden_size"] = v.out;
+    c["patch_size"] = v.patch;
+    c["spatial_merge_size"] = v.merge;
+    c["temporal_patch_size"] = v.frames;
+    c["in_channels"] = 3;
+    c["num_position_embeddings"] = v.positions;
+    c["hidden_act"] = "gelu_pytorch_tanh";
+    c["deepstack_visual_indexes"] = nlohmann::ordered_json::array();
+    return c;
+}
+
+// The release's image processor (preprocessor_config.json, the same for Qwen3.5, 3.6 and 3.8), which the file does
+// not hold: its patch and merge sizes are the file's.
+nlohmann::ordered_json preprocessor_config(const VisionDimensions& v) {
+    nlohmann::ordered_json c;
+    c["size"] = {{"longest_edge", 16777216}, {"shortest_edge", 65536}};
+    c["patch_size"] = v.patch;
+    c["temporal_patch_size"] = v.frames;
+    c["merge_size"] = v.merge;
+    c["image_mean"] = {0.5, 0.5, 0.5};
+    c["image_std"] = {0.5, 0.5, 0.5};
+    c["processor_class"] = "Qwen3VLProcessor";
+    c["image_processor_type"] = "Qwen2VLImageProcessorFast";
+    return c;
+}
+
+Layout vision_layout(const VisionDimensions& v) {
+    const std::string& P = kVisionPrefix;
+    const int64_t h = v.hidden;
+    Layout l;
+    for (int64_t t = 0; t < v.frames; ++t) {
+        l.top[t == 0 ? "v.patch_embd.weight" : "v.patch_embd.weight." + std::to_string(t)] =
+            one({h, 3, v.patch, v.patch}, P + "patch_embed.proj.frames." + std::to_string(t) + ".weight");
+    }
+    l.top["v.patch_embd.bias"] = one({h}, P + "patch_embed.proj.bias");
+    l.top["v.position_embd.weight"] = one({v.positions, h}, P + "pos_embed.weight");
+    for (int64_t i = 0; i < v.layers; ++i) {
+        const std::string from = "v.blk." + std::to_string(i) + ".", to = P + "blocks." + std::to_string(i) + ".";
+        for (const auto& [a, b] : {std::pair{"ln1", "norm1"}, std::pair{"ln2", "norm2"}}) {
+            l.top[from + a + ".weight"] = one({h}, to + b + ".weight");
+            l.top[from + a + ".bias"] = one({h}, to + b + ".bias");
+        }
+        l.top[from + "attn_qkv.weight"] = one({3 * h, h}, to + "attn.qkv.weight");
+        l.top[from + "attn_qkv.bias"] = one({3 * h}, to + "attn.qkv.bias");
+        l.top[from + "attn_out.weight"] = one({h, h}, to + "attn.proj.weight");
+        l.top[from + "attn_out.bias"] = one({h}, to + "attn.proj.bias");
+        l.top[from + "ffn_up.weight"] = one({v.width, h}, to + "mlp.linear_fc1.weight");
+        l.top[from + "ffn_up.bias"] = one({v.width}, to + "mlp.linear_fc1.bias");
+        l.top[from + "ffn_down.weight"] = one({h, v.width}, to + "mlp.linear_fc2.weight");
+        l.top[from + "ffn_down.bias"] = one({h}, to + "mlp.linear_fc2.bias");
+    }
+    const int64_t joined = v.merge * v.merge * h;
+    l.top["v.post_ln.weight"] = one({h}, P + "merger.norm.weight");
+    l.top["v.post_ln.bias"] = one({h}, P + "merger.norm.bias");
+    l.top["mm.0.weight"] = one({joined, joined}, P + "merger.linear_fc1.weight");
+    l.top["mm.0.bias"] = one({joined}, P + "merger.linear_fc1.bias");
+    l.top["mm.2.weight"] = one({v.out, joined}, P + "merger.linear_fc2.weight");
+    l.top["mm.2.bias"] = one({v.out}, P + "merger.linear_fc2.bias");
+    return l;
+}
+
+// The id of the token spelled `text` in the file's vocabulary.
+int32_t token_id(const gguf::File& f, std::string_view arch, std::string_view text) {
+    const std::vector<std::string_view> tokens = f.get("tokenizer.ggml.tokens").strings();
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == text) return static_cast<int32_t>(i);
+    }
+    fail(arch, ": --mmproj: the vocabulary has no ", text);
+}
+
 class Qwen35 final : public Architecture {
 public:
     Qwen35(std::string_view name, Qwen35Mlp mlp) : name_(name), mlp_(mlp) {}
@@ -356,6 +501,31 @@ public:
 
     ImportPlan plan(const gguf::File& f) const override { return plan_from(f, nullptr); }
     ImportPlan plan_with_mtp(const gguf::File& f, const gguf::File& mtp) const override { return plan_from(f, &mtp); }
+
+    // A file without its MTP head (nextn_predict_layers 0: unsloth's smallest Qwen3.8-27B files) takes llama.cpp's
+    // draft model.
+    bool drafter_apart(const gguf::File& f) const override {
+        const gguf::Value* n = f.find(str_cat(name_, ".nextn_predict_layers"));
+        return n == nullptr || n->as_int() == 0;
+    }
+    bool reads_projector() const override { return true; }
+
+    // The tower's tensors under the checkpoint's names, and config.json as the release lays it out: the text config,
+    // vision_config and the image token around it.
+    void add_projector(ImportPlan& p, const gguf::File& f, const gguf::File& projector) const override {
+        const bool experts = mlp_ == Qwen35Mlp::Experts;
+        const VisionDimensions v =
+            vision_dimensions(projector, name_, positive(f, name_, str_cat(name_, ".embedding_length")));
+        nlohmann::ordered_json config;
+        config["architectures"] = {experts ? "Qwen3_5MoeForConditionalGeneration" : "Qwen3_5ForConditionalGeneration"};
+        config["model_type"] = experts ? "qwen3_5_moe" : "qwen3_5";
+        config["image_token_id"] = token_id(f, name_, "<|image_pad|>");
+        config["text_config"] = std::move(p.config);
+        config["vision_config"] = vision_config(v, experts);
+        p.config = std::move(config);
+        p.files["preprocessor_config.json"] = preprocessor_config(v);
+        map_tensors(projector, kProjector, vision_layout(v), p);
+    }
 
 private:
     // The plan of the model file `f`, with its MTP head from the file `head` when one is given.

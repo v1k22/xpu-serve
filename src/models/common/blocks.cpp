@@ -140,6 +140,17 @@ HostTensor rope_inv_freq(double theta, int64_t dim, int64_t pairs, int64_t lengt
     return t;
 }
 
+std::vector<int32_t> interleaved_mrope_axes(std::span<const int32_t> section, int64_t pairs, const std::string& where) {
+    XS_CHECK(section.size() == 3 && section[0] + section[1] + section[2] == pairs, where,
+             ": mrope_section must be three counts that add up to the ", pairs, " rotated frequencies of a head");
+    std::vector<int32_t> axes(static_cast<size_t>(pairs), 0);
+    for (int64_t i = 0; i < pairs; ++i) {
+        if (i % 3 == 1 && i < 3 * section[1]) axes[static_cast<size_t>(i)] = 1;
+        if (i % 3 == 2 && i < 3 * section[2]) axes[static_cast<size_t>(i)] = 2;
+    }
+    return axes;
+}
+
 AttentionOut attention(Graph& g, const AttentionSpec& s, const AttentionParts& p, Value x, Value pos, Value inv_freq,
                        const std::pair<Value, Value>* shared_kv) {
     const int64_t hd = s.head_dim;

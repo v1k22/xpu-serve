@@ -291,7 +291,7 @@ TEST_SUITE("gguf import") {
         const auto original = tok::Tokenizer::load(work.path / "hf");
         const auto imported = tok::Tokenizer::load(work.path / "pack");
         CHECK(imported->vocab_size() == original->vocab_size());  // the [PAD<id>] placeholders are left out
-        CHECK(imported->vocab_size() == 274);
+        CHECK(imported->vocab_size() == 275);
         CHECK(imported->eos_id() == original->eos_id());
         CHECK(imported->bos_id() == original->bos_id());
         for (int32_t id = 0; id < original->vocab_size(); ++id) {

@@ -236,14 +236,27 @@ ImportPlan Architecture::plan_with_mtp(const gguf::File&, const gguf::File&) con
     fail(name(), ": an MTP head in a file of its own (--mtp) is not supported for this architecture");
 }
 
-const Architecture& find_architecture(std::string_view name) {
-    const std::vector<const Architecture*> all{&qwen35(), &qwen35moe(),   &gemma4(),  &gemma4_assistant(),
-                                               &clef(),   &modern_bert(), &inkling2(), &inkling2_loop()};
-    std::string list;
-    for (const Architecture* a : all) {
-        if (a->name() == name) return *a;
-        list += str_cat(list.empty() ? "" : ", ", a->name());
+namespace {
+
+const std::vector<const Architecture*>& all_architectures() {
+    static const std::vector<const Architecture*> all{&qwen35(), &qwen35moe(),   &gemma4(),   &gemma4_assistant(),
+                                                      &clef(),   &modern_bert(), &inkling2(), &inkling2_loop()};
+    return all;
+}
+
+}  // namespace
+
+const Architecture* architecture_named(std::string_view name) {
+    for (const Architecture* a : all_architectures()) {
+        if (a->name() == name) return a;
     }
+    return nullptr;
+}
+
+const Architecture& find_architecture(std::string_view name) {
+    if (const Architecture* a = architecture_named(name)) return *a;
+    std::string list;
+    for (const Architecture* a : all_architectures()) list += str_cat(list.empty() ? "" : ", ", a->name());
     fail("GGUF architecture '", name, "' is not supported (supported: ", list, ")");
 }
 

@@ -33,6 +33,8 @@ class VisionTower final : public VisionEncoder {
 public:
     VisionTower(Config cfg, Processor proc, const WeightStore& weights, std::string prefix, int32_t image_token)
         : cfg_(std::move(cfg)), proc_(proc), weights_(weights), prefix_(std::move(prefix)), image_token_(image_token) {
+        // Qwen3-Omni names a merger's layers ln_q, mlp.0, mlp.2; Qwen3-VL and Qwen3.5 norm, linear_fc1, linear_fc2.
+        if (!weights_.contains(prefix_ + "merger.ln_q.weight")) merger_names_ = {".norm", ".linear_fc1", ".linear_fc2"};
         const TensorView& table = weights_.get(prefix_ + "pos_embed.weight");
         side_ = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(table.shape[0]))));
         XS_CHECK(side_ * side_ == table.shape[0] && table.shape[1] == cfg_.hidden, "qwen3_vision: ", prefix_,
@@ -118,9 +120,10 @@ private:
     Value merger(Value x, const std::string& stem, bool after_join) {
         Graph& g = graph_;
         const int64_t joined = cfg_.merge * cfg_.merge * cfg_.hidden;
-        x = after_join ? layer_norm(g.reshape(x, {kT, joined}), stem + ".ln_q")
-                       : g.reshape(layer_norm(x, stem + ".ln_q"), {kT, joined});
-        return linear(g.gelu(linear(x, stem + ".mlp.0")), stem + ".mlp.2");
+        const MergerNames& n = merger_names_;
+        x = after_join ? layer_norm(g.reshape(x, {kT, joined}), stem + n.norm)
+                       : g.reshape(layer_norm(x, stem + n.norm), {kT, joined});
+        return linear(g.gelu(linear(x, stem + n.fc1)), stem + n.fc2);
     }
 
     void build() {
@@ -132,12 +135,26 @@ private:
         const Value pos_w = g.input("pos_w", DType::F32, {kT, rows, kTaps, 1});
         const Value rot_pos = g.input("rot_pos", DType::I32, {kT, rows, 2});
 
-        // The Conv3d of stride = kernel is a Linear over a patch's values (channel, frame, y, x).
+        // The Conv3d of stride = kernel is a Linear over a patch's values (channel, frame, y, x); a GGUF import keeps
+        // it as one kernel a frame (llama.cpp's converter cuts it so): the sum of each frame's Linear.
         Value x;
         {
             Graph::Scope s(g, "patch_embed");
-            const Value w = g.reshape(g.weight(weights_, prefix_ + "patch_embed.proj.weight"), {d, patch_values});
-            x = g.add(g.matmul(pixels, w), g.weight(weights_, prefix_ + "patch_embed.proj.bias"));
+            const std::string whole = prefix_ + "patch_embed.proj.weight";
+            if (weights_.contains(whole)) {
+                x = g.matmul(pixels, g.reshape(g.weight(weights_, whole), {d, patch_values}));
+            } else {
+                const int64_t frame_values = patch_values / cfg_.temporal_patch;
+                const Value frames = g.reshape(pixels, {kT, rows, cfg_.channels, cfg_.temporal_patch,
+                                                        frame_values / cfg_.channels});
+                for (int64_t t = 0; t < cfg_.temporal_patch; ++t) {
+                    const std::string name = prefix_ + "patch_embed.proj.frames." + std::to_string(t) + ".weight";
+                    const Value frame = g.reshape(g.slice(frames, 3, t, t + 1), {kT, rows, frame_values});
+                    const Value y = g.matmul(frame, g.reshape(g.weight(weights_, name), {d, frame_values}));
+                    x = t == 0 ? y : g.add(x, y);
+                }
+            }
+            x = g.add(x, g.weight(weights_, prefix_ + "patch_embed.proj.bias"));
             const Value taps = g.gather(g.weight(weights_, prefix_ + "pos_embed.weight"), pos_idx);
             x = g.add(x, g.reduce_sum(g.mul(taps, pos_w), 2));
         }
@@ -187,6 +204,10 @@ private:
     std::string prefix_;
     int32_t image_token_;
     int64_t side_ = 0;  // the position table's grid side
+    struct MergerNames {
+        std::string norm, fc1, fc2;
+    };
+    MergerNames merger_names_{".ln_q", ".mlp.0", ".mlp.2"};
     Graph graph_;
 };
 

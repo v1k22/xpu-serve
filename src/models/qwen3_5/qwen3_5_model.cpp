@@ -9,6 +9,7 @@
 #include "models/drafters/dflash.h"
 #include "models/qwen3_5/qwen3_5.h"
 #include "models/qwen3_5/qwen3_5_decoder.h"
+#include "models/qwen3_vision/qwen3_vision.h"
 #include "quant/quant.h"
 #include "util/error.h"
 #include "util/log.h"
@@ -43,13 +44,29 @@ constexpr const char* kDrafterPrefix = "drafter.";
 // prefill and verify programs (the same decoder, other outputs) and the drafter's. The drafter is the checkpoint's MTP
 // head (vLLM's Qwen3.5 MTP: one decoder layer of the target's kind over fc(cat(norm(embed(t_{i+1})), norm(h_i))),
 // then the target's lm_head), or, with a drafter checkpoint beside the model, a block drafter of the DFlash family
-// (models/drafters/dflash.h), whose context the prefill and verify programs append.
+// (models/drafters/dflash.h), whose context the prefill and verify programs append. With the vision tower (Qwen3-VL's,
+// without deepstack rows), an image's rows replace its tokens' embeddings and the target's programs read positions on
+// three axes; the drafter's programs read one position a token, the cache's.
 class Qwen35Model final : public Model, public Speculation, public ChainDrafting {
 public:
+    // The vision tower's settings, when it is loaded.
+    struct Vision {
+        qwen3_vision::Config config;
+        qwen3_vision::Processor processor;
+        std::string prefix;  // of the tower's weights
+        int32_t image_token = 0;
+    };
     // `drafter`: a block drafter's config, its weights already in `weights` under kDrafterPrefix.
     Qwen35Model(Config cfg, ModelInfo info, std::unique_ptr<WeightStore> weights, const LoadOptions& options,
-                std::optional<dflash::Config> drafter)
-        : cfg_(std::move(cfg)), info_(std::move(info)), weights_(std::move(weights)), dec_(cfg_, *weights_) {
+                std::optional<dflash::Config> drafter, std::optional<Vision> vision)
+        : cfg_(std::move(cfg)),
+          info_(std::move(info)),
+          weights_(std::move(weights)),
+          dec_(cfg_, *weights_, vision.has_value()) {
+        if (vision) {
+            vision_ = qwen3_vision::make_encoder(vision->config, vision->processor, *weights_, vision->prefix,
+                                                 vision->image_token);
+        }
         build_target(step_, Head::LastLogits);
         if (options.batch) build_target(batch_, Head::AllLogits);
         batched_ = options.batch;
@@ -87,11 +104,30 @@ public:
     const WeightStore& weights() const override { return *weights_; }
     const Speculation* speculation() const override { return has_mtp_ || block_ ? this : nullptr; }
     const graph::Graph* batch_graph() const override { return batched_ ? &batch_ : nullptr; }
+    const VisionEncoder* vision() const override { return vision_.get(); }
 
     void prepare_inputs(std::span<const int32_t> tokens, int64_t start_pos, std::span<const float* const> embeddings,
                         TensorMap& inputs) const override {
-        XS_CHECK(embeddings.empty(), "qwen3_5: image input is not supported yet");
+        if (vision_) {
+            std::vector<RotaryPosition> positions(tokens.size());
+            for (size_t i = 0; i < positions.size(); ++i) {
+                const auto p = static_cast<int32_t>(start_pos + static_cast<int64_t>(i));
+                positions[i] = {p, p, p};
+            }
+            prepare_positioned_inputs(tokens, positions, embeddings, inputs);
+            return;
+        }
+        XS_CHECK(embeddings.empty(), "qwen3_5: image input needs the vision tower, which was not loaded");
         dec_.token_inputs(tokens, start_pos, inputs);
+    }
+    void prepare_positioned_inputs(std::span<const int32_t> tokens, std::span<const RotaryPosition> positions,
+                                   std::span<const float* const> embeddings, TensorMap& inputs) const override {
+        if (!vision_) {
+            Model::prepare_positioned_inputs(tokens, positions, embeddings, inputs);
+            return;
+        }
+        dec_.token_inputs(tokens, positions, inputs);
+        blocks::media_inputs(embeddings, static_cast<int64_t>(tokens.size()), cfg_.hidden_size, inputs);
     }
 
     const graph::Graph& prefill_graph() const override { return prefill_; }
@@ -125,7 +161,10 @@ private:
     void build_target(Graph& g, Head head) const {
         if (head == Head::AllLogits || (head == Head::AllLogitsAllHidden && batched_)) g.allow_segments();
         const Decoder::Inputs in = dec_.inputs(g);
-        const std::vector<Value> after = dec_.layers(g, in);  // the state after each layer
+        // The state after each layer; with the vision tower from the embedded tokens with an image's rows in place.
+        const Value embedded = dec_.embed(g, in);
+        const std::vector<Value> after =
+            dec_.layers(g, in, vision_ ? blocks::splice_media(g, embedded, cfg_.hidden_size) : embedded);
         const Value h = after.back();
         if (head == Head::LastLogits || head == Head::AllLogits) {
             Graph::Scope scope(g, "head");
@@ -165,7 +204,7 @@ private:
         const Value e = dec_.norm(g, g.gather(dec_.embedding(g), in.ids), "mtp.pre_fc_norm_embedding.weight");
         const Value x = g.matmul(g.concat({e, dec_.norm(g, hidden, "mtp.pre_fc_norm_hidden.weight")}, 1),
                                  dec_.weight(g, "mtp.fc.weight"));
-        const Value h = dec_.layer(g, "mtp.layers.0.", "mtp.layers.0", LayerKind::Full, x, in.pos, dec_.inv_freq(g));
+        const Value h = dec_.layer(g, "mtp.layers.0.", "mtp.layers.0", LayerKind::Full, x, in.pos, dec_.rope(g));
         const Value last = dec_.norm(g, g.slice(h, 0, -1), "mtp.norm.weight");
         if (shortlist > 0 && shortlist < cfg_.vocab_size && cfg_.hidden_size % 32 == 0) {
             Timer timer;
@@ -191,6 +230,7 @@ private:
     bool batched_ = false;
     bool has_mtp_ = false;
     std::unique_ptr<dflash::Drafter> block_;  // a block drafter instead of the MTP head
+    std::unique_ptr<VisionEncoder> vision_;
 };
 
 }  // namespace
@@ -198,8 +238,31 @@ private:
 std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
                             const LoadOptions& options) {
     Config cfg = parse_config(config_json);
+    std::unique_ptr<SafetensorsWeights> checkpoint = SafetensorsWeights::open_dir(dir);
+    std::optional<Qwen35Model::Vision> vision;
     if (options.vision && config_json.contains("vision_config") && !config_json.at("vision_config").is_null()) {
-        log::warn("qwen3_5: the vision tower is not supported yet; loading the text decoder only");
+        std::string prefix;
+        for (const char* p : {"model.visual.", "visual."}) {
+            if (prefix.empty() && checkpoint->contains(std::string(p) + "pos_embed.weight")) prefix = p;
+        }
+        if (prefix.empty()) {
+            log::warn("qwen3_5: config.json names a vision tower the checkpoint has no weights of; loading the text ",
+                      "decoder only");
+        } else if (options.speculation && !options.drafter.empty()) {
+            // Block drafters were trained on text, reading the target's positions one a token.
+            log::warn("qwen3_5: the vision tower is not loaded beside a block drafter (--drafter); images are refused");
+        } else if (cfg.looped() || cfg.mhc.streams > 0) {
+            log::warn("qwen3_5: SenseNova Loop's vision tower is not supported yet; loading the text decoder only");
+        } else {
+            Qwen35Model::Vision v;
+            v.config = qwen3_vision::parse_config(config_json.at("vision_config"), "qwen3_5 vision_config");
+            XS_CHECK(v.config.out_hidden == cfg.hidden_size, "qwen3_5: the vision tower's out_hidden_size ",
+                     v.config.out_hidden, " is not the decoder's hidden_size ", cfg.hidden_size);
+            v.processor = qwen3_vision::processor_spec(dir, v.config, options.image_max_pixels);
+            v.prefix = prefix;
+            v.image_token = static_cast<int32_t>(cfg::get_int(config_json, "image_token_id", "config.json"));
+            vision = std::move(v);
+        }
     }
 
     ModelInfo info;
@@ -233,7 +296,6 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     XS_CHECK(!stops.empty(), "qwen3_5: no end-of-sequence token in config.json or tokenizer_config.json");
     info.stop_token_ids = std::move(stops);
 
-    std::unique_ptr<SafetensorsWeights> checkpoint = SafetensorsWeights::open_dir(dir);
     join_expert_banks(*checkpoint, cfg);
     std::unique_ptr<WeightStore> weights = std::move(checkpoint);
     std::optional<dflash::Config> drafter;
@@ -243,7 +305,9 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
         drafter = dflash::parse_config(nlohmann::json::parse(in));
         weights = std::make_unique<JoinedWeights>(std::move(weights), dflash::open_weights(options.drafter), kDrafterPrefix);
     }
-    return std::make_unique<Qwen35Model>(std::move(cfg), std::move(info), std::move(weights), options, std::move(drafter));
+    if (vision) info.media_width = cfg.hidden_size;
+    return std::make_unique<Qwen35Model>(std::move(cfg), std::move(info), std::move(weights), options,
+                                         std::move(drafter), std::move(vision));
 }
 
 }  // namespace xs::qwen3_5

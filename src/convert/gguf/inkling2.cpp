@@ -725,6 +725,9 @@ public:
     // The drafter is always a file of its own (its blocks are named as the model's are): its tensors go into the
     // pack beside the model's, under the names a pack of the released checkpoint gives them, and its settings into
     // config.json's mtp_config.
+    bool drafter_apart(const gguf::File&) const override { return true; }
+    bool reads_projector() const override { return true; }
+
     void add_projector(ImportPlan& p, const gguf::File& f, const gguf::File& projector) const override {
         VisionDimensions v;
         p.config["vision_config"] = vision_config(projector, fl_, dimensions(f, fl_), v);

@@ -8,6 +8,7 @@
 #include <iterator>
 #include <system_error>
 
+#include "convert/gguf/architecture.h"
 #include "convert/gguf/gguf_import.h"
 #include "hub/download.h"
 #include "hub/file_lock.h"
@@ -36,22 +37,22 @@ std::string read_text(const fs::path& path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
-// A model file whose drafter is not in it: one of the Qwen3.5 family (qwen35, qwen35moe) without its MTP head
-// (nextn_predict_layers 0: unsloth's smallest Qwen3.8-27B files), or Inkling 2's, whose drafter is always a file of
-// its own.
-bool lacks_mtp_head(const gguf::File& f) {
+// The importer of a model file, or null when none reads its architecture (the import then refuses it by name).
+const gguf_import::Architecture* importer(const gguf::File& f) {
     const gguf::Value* arch = f.find("general.architecture");
-    if (arch != nullptr && (arch->as_string() == "inkling2" || arch->as_string() == "inkling2_loop")) return true;
-    if (arch == nullptr || (arch->as_string() != "qwen35" && arch->as_string() != "qwen35moe")) return false;
-    const gguf::Value* n = f.find(std::string(arch->as_string()) + ".nextn_predict_layers");
-    return n == nullptr || n->as_int() == 0;
+    return arch != nullptr ? gguf_import::architecture_named(arch->as_string()) : nullptr;
 }
 
-// A model file whose vision tower the importer reads from the repository's projector file: Inkling 2's, in either
-// layout.
+// A model file whose drafter comes in a file of its own (Architecture::drafter_apart).
+bool lacks_mtp_head(const gguf::File& f) {
+    const gguf_import::Architecture* a = importer(f);
+    return a != nullptr && a->drafter_apart(f);
+}
+
+// A model file whose vision tower its importer reads from a file of its own (Architecture::reads_projector).
 bool reads_projector(const gguf::File& f) {
-    const gguf::Value* arch = f.find("general.architecture");
-    return arch != nullptr && (arch->as_string() == "inkling2" || arch->as_string() == "inkling2_loop");
+    const gguf_import::Architecture* a = importer(f);
+    return a != nullptr && a->reads_projector();
 }
 
 // The companions of `model` (`model_path` in `listing`) that its import reads, the user did not name, and `listing`

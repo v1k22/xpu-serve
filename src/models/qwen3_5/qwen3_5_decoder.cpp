@@ -1,5 +1,6 @@
 #include "models/qwen3_5/qwen3_5_decoder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -49,32 +50,57 @@ Value swap_head_order(Graph& g, Value x, int64_t a, int64_t b, int64_t d) {
 
 }  // namespace
 
-Decoder::Decoder(const Config& cfg, const WeightStore& weights)
-    : cfg_(cfg), weights_(weights), prefix_(probe_prefix(weights)) {}
+Decoder::Decoder(const Config& cfg, const WeightStore& weights, bool three_axes)
+    : cfg_(cfg), weights_(weights), prefix_(probe_prefix(weights)), three_axes_(three_axes) {
+    XS_CHECK(!three_axes_ || !cfg_.mrope_axes.empty(), "qwen3_5: images need positions on three axes, which need an ",
+             "interleaved mrope_section in rope_parameters covering the ", cfg_.rotary_dim / 2, " rotated frequencies");
+}
 
 Decoder::Inputs Decoder::inputs(Graph& g) const {
-    return {g.input("token_ids", DType::I32, {kT}), g.input("positions", DType::I32, {kT})};
+    const Dims pos = three_axes_ ? Dims{kT, 3} : Dims{kT};
+    return {g.input("token_ids", DType::I32, {kT}), g.input("positions", DType::I32, pos)};
 }
 
 void Decoder::token_inputs(std::span<const int32_t> tokens, int64_t start_pos, TensorMap& inputs) const {
     const auto n = static_cast<int64_t>(tokens.size());
     XS_CHECK(n > 0, "qwen3_5: a step needs at least one token");
+    const int64_t axes = three_axes_ ? 3 : 1;
     HostTensor ids(DType::I32, {n});
-    HostTensor pos(DType::I32, {n});
+    HostTensor pos(DType::I32, three_axes_ ? Dims{n, 3} : Dims{n});
     for (int64_t i = 0; i < n; ++i) {
         const int32_t t = tokens[static_cast<size_t>(i)];
         if (t < 0 || t >= cfg_.vocab_size)
             fail("qwen3_5: token id ", t, " outside the vocabulary (", cfg_.vocab_size, ")");
         ids.data<int32_t>()[i] = t;
-        pos.data<int32_t>()[i] = static_cast<int32_t>(start_pos + i);
+        std::fill_n(pos.data<int32_t>() + axes * i, axes, static_cast<int32_t>(start_pos + i));
     }
     inputs["token_ids"] = std::move(ids);
     inputs["positions"] = std::move(pos);
 }
 
+void Decoder::token_inputs(std::span<const int32_t> tokens, std::span<const RotaryPosition> positions,
+                           TensorMap& inputs) const {
+    const auto n = static_cast<int64_t>(tokens.size());
+    XS_CHECK(three_axes_ && positions.size() == tokens.size(), "qwen3_5: ", positions.size(),
+             " positions for a step of ", n, " tokens on ", three_axes_ ? "three axes" : "one axis");
+    token_inputs(tokens, 0, inputs);
+    int32_t* pos = inputs.at("positions").data<int32_t>();
+    for (int64_t i = 0; i < n; ++i) std::copy_n(positions[static_cast<size_t>(i)].data(), 3, pos + 3 * i);
+}
+
+Decoder::Rope Decoder::rope(Graph& g) const {
+    const int64_t pairs = cfg_.rotary_dim / 2;
+    Rope r{g.constant(blocks::rope_inv_freq(cfg_.rope_theta, cfg_.rotary_dim, pairs, pairs)), {}};
+    if (three_axes_) r.axes = g.constant(HostTensor::from_vector(DType::I32, {pairs}, cfg_.mrope_axes));
+    return r;
+}
+
 std::vector<Value> Decoder::layers(Graph& g, const Inputs& in, Attention attention) const {
-    Value h = g.gather(embedding(g), in.ids);
-    const Value freq = inv_freq(g);
+    return layers(g, in, embed(g, in), attention);
+}
+
+std::vector<Value> Decoder::layers(Graph& g, const Inputs& in, Value h, Attention attention) const {
+    const Rope r = rope(g);
     std::vector<int64_t> plan = cfg_.plan;
     if (plan.empty()) {
         for (int64_t i = 0; i < cfg_.num_layers; ++i) plan.push_back(i);
@@ -87,9 +113,9 @@ std::vector<Value> Decoder::layers(Graph& g, const Inputs& in, Attention attenti
         const std::string label = pass == 0 ? name : name + ".pass" + std::to_string(pass);
         const std::string L = prefix_ + name + ".";
         if (cfg_.mhc.streams > 0 && i >= cfg_.mhc.start && i < cfg_.mhc.end) {
-            h = mhc_layer(g, L, label, i, h, in.pos, freq, attention);
+            h = mhc_layer(g, L, label, i, h, in.pos, r, attention);
         } else {
-            h = layer(g, L, label, cfg_.layer_kinds[static_cast<size_t>(i)], h, in.pos, freq, attention);
+            h = layer(g, L, label, cfg_.layer_kinds[static_cast<size_t>(i)], h, in.pos, r, attention);
         }
         after.push_back(h);
     }
@@ -97,16 +123,16 @@ std::vector<Value> Decoder::layers(Graph& g, const Inputs& in, Attention attenti
 }
 
 Value Decoder::layer(Graph& g, const std::string& L, const std::string& label, LayerKind kind, Value h, Value pos,
-                     Value freq, Attention attention) const {
+                     const Rope& rope, Attention attention) const {
     Graph::Scope s(g, label);
-    h = g.add(h, mixer(g, L, label, kind, norm(g, h, L + "input_layernorm.weight"), pos, freq, attention));
+    h = g.add(h, mixer(g, L, label, kind, norm(g, h, L + "input_layernorm.weight"), pos, rope, attention));
     return g.add(h, mlp(g, L, norm(g, h, L + "post_attention_layernorm.weight")));
 }
 
 Value Decoder::mixer(Graph& g, const std::string& L, const std::string& label, LayerKind kind, Value x, Value pos,
-                     Value freq, Attention attention) const {
+                     const Rope& rope, Attention attention) const {
     return kind == LayerKind::Linear ? linear_attention(g, L, label, x)
-                                     : full_attention(g, L, label, x, pos, freq, attention);
+                                     : full_attention(g, L, label, x, pos, rope, attention);
 }
 
 Value Decoder::mlp(Graph& g, const std::string& L, Value y) const {
@@ -117,7 +143,7 @@ Value Decoder::mlp(Graph& g, const std::string& L, Value y) const {
 
 // MHCDecoderLayer: enter (copy into the streams), each branch through its router, leave (mean of the streams).
 Value Decoder::mhc_layer(Graph& g, const std::string& L, const std::string& label, int64_t physical, Value h, Value pos,
-                         Value freq, Attention attention) const {
+                         const Rope& rope, Attention attention) const {
     Graph::Scope s(g, label);
     const int64_t streams = cfg_.mhc.streams, hidden = cfg_.hidden_size;
     Value r = h;
@@ -126,7 +152,7 @@ Value Decoder::mhc_layer(Graph& g, const std::string& L, const std::string& labe
     }
     const LayerKind kind = cfg_.layer_kinds[static_cast<size_t>(physical)];
     r = mhc_branch(g, L + "mhc_attn.", r, [&](Value x) {
-        return mixer(g, L, label, kind, norm(g, x, L + "input_layernorm.weight"), pos, freq, attention);
+        return mixer(g, L, label, kind, norm(g, x, L + "input_layernorm.weight"), pos, rope, attention);
     });
     r = mhc_branch(g, L + "mhc_ffn.", r,
                    [&](Value x) { return mlp(g, L, norm(g, x, L + "post_attention_layernorm.weight")); });
@@ -158,11 +184,6 @@ Value Decoder::norm(Graph& g, Value x, const std::string& name) const {
 
 std::string Decoder::lm_head_name() const {
     return weights_.contains("lm_head.weight") ? "lm_head.weight" : prefix_ + "embed_tokens.weight";
-}
-
-Value Decoder::inv_freq(Graph& g) const {
-    return g.constant(
-        blocks::rope_inv_freq(cfg_.rope_theta, cfg_.rotary_dim, cfg_.rotary_dim / 2, cfg_.rotary_dim / 2));
 }
 
 // A projection whose weight node is made when the block uses it.
@@ -263,7 +284,7 @@ Value Decoder::linear_attention(Graph& g, const std::string& layer, const std::s
 
 // Qwen3_5Attention: q_proj yields [query | gate] per head; the output is gated by sigmoid(gate).
 Value Decoder::full_attention(Graph& g, const std::string& layer, const std::string& label, Value x, Value pos,
-                              Value freq, Attention attention) const {
+                              const Rope& rope, Attention attention) const {
     Graph::Scope s(g, "self_attn");
     const std::string L = layer + "self_attn.";
     blocks::AttentionSpec spec;
@@ -274,6 +295,7 @@ Value Decoder::full_attention(Graph& g, const std::string& layer, const std::str
     spec.rotary_dim = cfg_.rotary_dim;
     spec.output_gate = cfg_.attn_output_gate;
     spec.kv_label = label;
+    spec.rope_axes = rope.axes;
     if (attention == Attention::WholeStep) {
         spec.kv_cache = false;
         spec.attrs.causal = false;
@@ -285,7 +307,7 @@ Value Decoder::full_attention(Graph& g, const std::string& layer, const std::str
     parts.o = proj(g, L + "o_proj.weight");
     parts.q_norm = [this, &g, L](Value q) { return norm(g, q, L + "q_norm.weight"); };
     parts.k_norm = [this, &g, L](Value k) { return norm(g, k, L + "k_norm.weight"); };
-    return blocks::attention(g, spec, parts, x, pos, freq).out;
+    return blocks::attention(g, spec, parts, x, pos, rope.freq).out;
 }
 
 }  // namespace xs::qwen3_5

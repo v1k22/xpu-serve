@@ -38,7 +38,8 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3, Inkling 2 Mini (a
   looped mixture of experts without rotary positions)
-- ✅ **Image input** (Gemma 4 E2B / E4B, Qwen3-Omni, Inkling 2 Mini), as base64 `data:` URLs
+- ✅ **Image input** (Gemma 4 E2B / E4B, Qwen3.5 / Qwen3.6 / Qwen3.8, Qwen3-Omni, Inkling 2 Mini), as base64 `data:`
+  URLs; from a GGUF file with its vision tower's file (`mmproj-*.gguf`) too
 - ✅ **Audio and images in chat**: Qwen3-Omni-30B-A3B's thinker (text, audio and images in, text and tool calls
   out), as `input_audio` and `image_url` parts
 - ✅ **Speech recognition** (Qwen3-ASR) behind `/v1/audio/transcriptions` (json, text or streamed), OpenAI's
@@ -75,8 +76,8 @@ Not yet:
   where a conversation's messages ended: decision 0029); with `--spec`, the drafts of several requests in one step
   (their verifies already are).
 - One model across two GPUs.
-- Timestamps and translation of speech; speech output; video input; images for Qwen3.5 (its vision tower is not
-  loaded) and Gemma 4 26B-A4B; images from remote URLs.
+- Timestamps and translation of speech; speech output; video input; images for Gemma 4 26B-A4B and SenseNova Loop,
+  and for a Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.
 - Gemma 4 26B-A4B from a GGUF file (a `gemma4` file with experts).
 - `response_format` (JSON mode), `n` above 1, a rerank API.
 
@@ -233,14 +234,15 @@ xpu-serve convert ~/models/Qwen3.5-4B-Q4_K_M.gguf ~/models/Qwen3.5-4B-Q4_K_M   #
   `-hf` would take, its MTP head or drafter (`MTP/mtp-*.gguf`, `dspark-*.gguf`) and its vision tower
   (`mmproj-*.gguf`); `--mtp <file>` and `--mmproj <file>` name others.
 - The architecture comes from the file (`general.architecture`). Supported: `qwen35` and `qwen35moe`, the Qwen3.5 /
-  Qwen3.6 / Qwen3.8 text models, dense and mixture of experts (Ornith-1.5-35B-A3B's files are `qwen35moe`); `gemma4`, Gemma 4 E2B and E4B (the text model: a GGUF file holds no vision or audio tower, so
-  images need the original checkpoint), with its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the
-  drafter; `inkling2_loop`, Inkling 2 Mini in mainline llama.cpp's layout (Unsloth's files, and AtomicChat's
-  uncensored ones), with its drafter's file (`dspark-*.gguf`, in mainline's format or Unsloth's earlier one) and its
-  vision tower's (`mmproj-*.gguf`), both fetched by `-hf`, and AtomicChat's LoRA adapter file with `--lora`;
-  `inkling2`, the same model in Unsloth's earlier layout (the `Old_Support/` copies of its repository);
-  `clef`, the Clef decision models; and `modern-bert` with a Laya read-out, the files of Laya and Julia-1. Others
-  are refused by name.
+  Qwen3.6 / Qwen3.8 models, dense and mixture of experts (Ornith-1.5-35B-A3B's files are `qwen35moe`), with their
+  vision tower's file (`mmproj-*.gguf`, fetched by `-hf` and found beside a file) for images; `gemma4`, Gemma 4 E2B
+  and E4B (the text model: a GGUF file holds no vision or audio tower, so images need the original checkpoint), with
+  its assistant (`gemma4-assistant`, the `MTP/mtp-*.gguf` files) as the drafter; `inkling2_loop`, Inkling 2 Mini in
+  mainline llama.cpp's layout (Unsloth's files, and AtomicChat's uncensored ones), with its drafter's file
+  (`dspark-*.gguf`, in mainline's format or Unsloth's earlier one) and its vision tower's (`mmproj-*.gguf`), both
+  fetched by `-hf`, and AtomicChat's LoRA adapter file with `--lora`; `inkling2`, the same model in Unsloth's earlier
+  layout (the `Old_Support/` copies of its repository); `clef`, the Clef decision models; and `modern-bert` with a
+  Laya read-out, the files of Laya and Julia-1. Others are refused by name.
 - A file split into parts (llama.cpp's gguf-split: `*-00001-of-00003.gguf` and on) is named by its first part, the
   others found beside it; it gives the pack the whole file gives.
 - A Qwen3.5-family file that comes without its MTP head (the smallest files of Qwen3.8-27B) takes the head from its

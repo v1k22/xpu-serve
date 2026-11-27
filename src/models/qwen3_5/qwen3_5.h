@@ -10,8 +10,9 @@
 // attention (sigmoid output gate, q/k norms, partial rotary). Norms are zero-centered (x * (1 + w)). Served: the text
 // decoder, dense ("qwen3_5") or mixture of experts in every layer ("qwen3_5_moe": softmax router, top-k renormalized,
 // expert banks whose gate and up projections come fused, as Hugging Face stores them, or apart, as a GGUF import keeps
-// them, a sigmoid-gated shared expert), and its MTP head (mtp.*) as the drafter for speculative decoding. The vision
-// tower is not loaded.
+// them, a sigmoid-gated shared expert), and its MTP head (mtp.*) as the drafter for speculative decoding. Images
+// through the vision tower (Qwen3-VL's without deepstack rows, models/qwen3_vision/; Qwen3_5ForConditionalGeneration):
+// an image's rows replace its tokens' embeddings and the full-attention layers read positions on three axes.
 
 #include <filesystem>
 #include <memory>
@@ -66,6 +67,9 @@ struct Config {
     bool attn_output_gate = true;
     double rope_theta = 10000.0;
     int64_t rotary_dim = 0;  // head_dim * partial_rotary_factor
+    // Multimodal RoPE (rope_parameters' mrope_section, interleaved): the position axis (0 time, 1 height, 2 width) each
+    // rotated frequency reads when the model feeds positions on three axes (images). Empty: none in the config.
+    std::vector<int32_t> mrope_axes;
     // Gated DeltaNet.
     int64_t linear_key_heads = 0;
     int64_t linear_value_heads = 0;

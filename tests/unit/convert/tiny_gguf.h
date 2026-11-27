@@ -74,7 +74,8 @@ inline nlohmann::json tiny_tokenizer_json() {
                                                                                  {"<tool_call>", false},
                                                                                  {"</tool_call>", false},
                                                                                  {"<|fim_prefix|>", false},
-                                                                                 {"<|vision_pad|>", true}}) {
+                                                                                 {"<|vision_pad|>", true},
+                                                                                 {"<|image_pad|>", true}}) {
         added.push_back({{"id", id++},
                          {"content", text},
                          {"single_word", false},

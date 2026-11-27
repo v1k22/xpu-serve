@@ -42,6 +42,24 @@ TEST_CASE("qwen3_5 config: the Qwen3.8-27B layout") {
     CHECK(c.mtp_layers == 1);
 }
 
+TEST_CASE("qwen3_5 config: the multimodal RoPE axis of each rotated frequency, interleaved") {
+    const xs::qwen3_5::Config c = xs::qwen3_5::parse_config(qwen38_config());
+    REQUIRE(c.mrope_axes.size() == 32);
+    // Sections (11, 11, 10): height at 1, 4, ..., 31, width at 2, 5, ..., 29, time elsewhere (Qwen3-VL's layout).
+    for (int32_t i = 0; i < 32; ++i) {
+        CAPTURE(i);
+        const int32_t axis = i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : 0;
+        CHECK(c.mrope_axes[static_cast<size_t>(i)] == axis);
+    }
+    // Sections in turn, or ones that do not cover the rotated frequencies, leave none (text reads one position).
+    json in_turn = qwen38_config();
+    in_turn["text_config"]["rope_parameters"].erase("mrope_interleaved");
+    CHECK(xs::qwen3_5::parse_config(in_turn).mrope_axes.empty());
+    json short_sections = qwen38_config();
+    short_sections["text_config"]["rope_parameters"]["mrope_section"] = {8, 8, 8};
+    CHECK(xs::qwen3_5::parse_config(short_sections).mrope_axes.empty());
+}
+
 TEST_CASE("qwen3_5 config: refuses what it does not implement, by name") {
     struct Case {
         const char* key;

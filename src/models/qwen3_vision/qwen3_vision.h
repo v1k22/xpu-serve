@@ -1,12 +1,15 @@
 #pragma once
 
-// Qwen3-VL's vision tower, Qwen3-Omni's too (transformers Qwen3VLVisionModel, Qwen3OmniMoeVisionEncoder; the image
-// processor is Qwen2VLImageProcessor's). An image is resized to a multiple of 32 pixels a side within the processor's
-// pixel bounds, cut into 16 x 16 patches of two (identical) frames, and every 2 x 2 block of patches becomes one token
-// for the decoder. The tower: the patches' projection, a learned position table interpolated to the image's grid, pre-
+// Qwen3-VL's vision tower, Qwen3-Omni's and the Qwen3.5 family's too (transformers Qwen3VLVisionModel,
+// Qwen3OmniMoeVisionEncoder, Qwen3_5VisionModel: the same tower without deepstack rows; the image processor is
+// Qwen2VLImageProcessor's). An image is resized to a multiple of 32 pixels a side within the processor's pixel bounds,
+// cut into 16 x 16 patches of two (identical) frames, and every 2 x 2 block of patches becomes one token for the
+// decoder. The tower: the patches' projection, a learned position table interpolated to the image's grid, pre-
 // LayerNorm blocks with 2-D rotary positions and attention over all of the image's patches, and mergers that join a
 // block's four patches: the last one gives the token's row, and those after some blocks ("deepstack") give rows the
-// decoder adds to its first layers' output at the image's tokens.
+// decoder adds to its first layers' output at the image's tokens. Weights under either naming: Qwen3-Omni's mergers
+// (ln_q, mlp.0, mlp.2) or Qwen3-VL's (norm, linear_fc1, linear_fc2); the patch embedding as one kernel, or one a frame
+// (patch_embed.proj.frames.<t>.weight, a GGUF import's).
 //
 // The encoder program runs with T = the image's tokens, each with its 4 patches as rows ([T, 4, ...]): its output
 // "embeddings" [T, (1 + deepstack) * out_hidden] is each token's merged row and then its deepstack rows.

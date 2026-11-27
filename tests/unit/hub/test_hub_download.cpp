@@ -13,6 +13,7 @@
 #include "convert/gguf/gguf_import.h"
 #include "convert/import_test_util.h"
 #include "convert/tiny_gguf.h"
+#include "convert/tiny_qwen35_projector.h"
 #include "fake_hub.h"
 #include "hub/download.h"
 #include "hub/hf_hub.h"
@@ -170,7 +171,8 @@ TEST_SUITE("hub download") {
             files.mtp.write(dir.path / "mtp.gguf");
             hub.add("org/Tiny-GGUF", "Tiny-Q8_0.gguf", read_file(dir.path / "model.gguf"));
             hub.add("org/Tiny-GGUF", "MTP/mtp-Tiny-Q8_0.gguf", read_file(dir.path / "mtp.gguf"));
-            hub.add("org/Tiny-GGUF", "mmproj-F16.gguf", "not a model");
+            test::tiny_qwen35_projector(test::tiny_gguf_model().hidden).write(dir.path / "mmproj.gguf");
+            hub.add("org/Tiny-GGUF", "mmproj-F16.gguf", read_file(dir.path / "mmproj.gguf"));
             hub.add("org/Tiny-GGUF", "README.md", "# Tiny", false);
             SourceOptions o;
             o.hub = hub.options(dir.path / "hf");
@@ -179,18 +181,19 @@ TEST_SUITE("hub download") {
             CHECK(m.name == "org/Tiny-GGUF:Q8_0");
             REQUIRE(fs::exists(m.dir / "xpu_pack.json"));
             CHECK(m.dir.parent_path().parent_path().filename() == "models--org--Tiny-GGUF");
-            CHECK(m.dir.filename() == "Tiny-Q8_0+mtp-Tiny-Q8_0");
-            // The same pack convert writes from the two files.
+            CHECK(m.dir.filename() == "Tiny-Q8_0+mtp-Tiny-Q8_0+mmproj-F16");
+            // The same pack convert writes from the three files.
             gguf_import::ImportOptions io;
             io.source = dir.path / "model.gguf";
             io.mtp = dir.path / "mtp.gguf";
+            io.mmproj = dir.path / "mmproj.gguf";
             io.output = dir.path / "local";
             gguf_import::import_gguf(io);
             CHECK(read_file(m.dir / "model.safetensors") == read_file(dir.path / "local" / "model.safetensors"));
             CHECK(read_file(m.dir / "config.json") == read_file(dir.path / "local" / "config.json"));
-            // Neither the projector nor the README was downloaded; the second time nothing is imported again.
+            // The README was not downloaded; the second time nothing is imported again.
             CHECK_FALSE(fs::exists(fs::path(o.hub.cache) / "models--org--Tiny-GGUF" / "snapshots" / FakeHub::kCommit /
-                                   "mmproj-F16.gguf"));
+                                   "README.md"));
             const auto written = fs::last_write_time(m.dir / "model.safetensors");
             const int requests = hub.file_requests;
             CHECK(resolve_model({.hf = "org/Tiny-GGUF:Q8_0"}, FileRole::Model, o).dir == m.dir);

@@ -91,6 +91,11 @@ public:
     // its tensors under the checkpoint's names and what config.json says of it. Refuses by name a file that is not
     // this model's tower. The default refuses it by name, for an architecture whose tower is not read.
     virtual void add_projector(ImportPlan& plan, const gguf::File& file, const gguf::File& projector) const;
+    // Whether the model of `file` drafts with a file of its own, which plan_with_mtp reads: what a repository (-hf) or
+    // a model file's folder is searched for. The default: no.
+    virtual bool drafter_apart(const gguf::File&) const { return false; }
+    // Whether the model's vision tower comes in a file of its own, which add_projector reads. The default: no.
+    virtual bool reads_projector() const { return false; }
     // The checkpoint's name for `tensor`, a tensor name of this architecture's files, when the file stores that
     // weight whole and in the checkpoint's order (what an adapter of the file changes). Nothing otherwise; the
     // default: nothing, for an architecture whose adapters are not read.
@@ -108,6 +113,8 @@ const Architecture& modern_bert();
 
 // The importer of general.architecture `name`; a named error listing the supported ones otherwise.
 const Architecture& find_architecture(std::string_view name);
+// The same, or null for an architecture no importer reads.
+const Architecture* architecture_named(std::string_view name);
 
 // A metadata value of type f32 as the shortest decimal that reads back as the same float (what a config.json written
 // by Python holds: 1e-06, not 9.99999997e-07); an f64 or an integer as it is.

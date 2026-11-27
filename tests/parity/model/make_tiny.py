@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|gemma4_moe|lfm3|sensenova_loop|qwen3_asr|
-        inkling2_loop --tokenizer-from <dir> --out <dir>
+    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|lfm3|
+        sensenova_loop|qwen3_asr|inkling2_loop --tokenizer-from <dir> --out <dir>
     python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
         [--pooling mean|cls] [--normalize] [--max-seq-length N]
     python -I tests/parity/model/make_tiny.py --drafter dflash|dflash2|dspine --target <tiny dir> --dflash-repo <clone
@@ -42,10 +42,8 @@ TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "chat_template.jin
                    "merges.txt", "preprocessor_config.json", "processor_config.json"]
 
 
-def qwen3_5_moe(vocab_size, source):
-    from transformers import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
-
-    config = Qwen3_5MoeTextConfig(
+def qwen3_5_moe_text(vocab_size):
+    return dict(
         vocab_size=vocab_size, hidden_size=64, num_hidden_layers=4,
         layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
         full_attention_interval=4, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
@@ -53,9 +51,10 @@ def qwen3_5_moe(vocab_size, source):
         linear_conv_kernel_dim=4, num_experts=8, num_experts_per_tok=2, moe_intermediate_size=32,
         shared_expert_intermediate_size=48, max_position_embeddings=4096, tie_word_embeddings=False,
         rms_norm_eps=1e-6, initializer_range=0.05,
-        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
-    )
-    model = Qwen3_5MoeForCausalLM(config)
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25})
+
+
+def decisive_routers(model):
     with torch.no_grad():
         for name, p in model.named_parameters():
             if name.endswith("mlp.gate.weight"):
@@ -63,12 +62,14 @@ def qwen3_5_moe(vocab_size, source):
     return model
 
 
-def qwen3_5(vocab_size, source):
-    """Dense, with Qwen3.8-27B's ratios: three linear value heads per key head, six query heads per KV head, gated
-    attention output, a quarter of the head rotary with interleaved multimodal sections, an untied head."""
-    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+def qwen3_5_moe(vocab_size, source):
+    from transformers import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
 
-    config = Qwen3_5TextConfig(
+    return decisive_routers(Qwen3_5MoeForCausalLM(Qwen3_5MoeTextConfig(**qwen3_5_moe_text(vocab_size))))
+
+
+def qwen3_5_text(vocab_size):
+    return dict(
         vocab_size=vocab_size, hidden_size=96, intermediate_size=192, num_hidden_layers=4,
         layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
         full_attention_interval=4, num_attention_heads=6, num_key_value_heads=1, head_dim=64, attn_output_gate=True,
@@ -76,9 +77,60 @@ def qwen3_5(vocab_size, source):
         linear_conv_kernel_dim=4, max_position_embeddings=4096, tie_word_embeddings=False, rms_norm_eps=1e-6,
         initializer_range=0.05,
         rope_parameters={"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25,
-                         "mrope_interleaved": True, "mrope_section": [3, 3, 2]},
-    )
-    return Qwen3_5ForCausalLM(config)
+                         "mrope_interleaved": True, "mrope_section": [3, 3, 2]})
+
+
+def qwen3_5(vocab_size, source):
+    """Dense, with Qwen3.8-27B's ratios: three linear value heads per key head, six query heads per KV head, gated
+    attention output, a quarter of the head rotary with interleaved multimodal sections, an untied head."""
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    return Qwen3_5ForCausalLM(Qwen3_5TextConfig(**qwen3_5_text(vocab_size)))
+
+
+def qwen3_5_vision(model):
+    """A tiny Qwen3-VL tower without deepstack rows, as Qwen3.5's checkpoints carry it (model.visual.*), with its
+    norms and biases away from their initial values so a skipped one shows."""
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "visual" not in name or p.dim() != 1:
+                continue
+            if "norm" in name:
+                p.uniform_(0.5, 1.5)
+            else:
+                p.normal_(0.0, 0.2)
+    return model
+
+
+def qwen3_5_vl_config(config_cls, text, source):
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(source)
+    ids = {key: tok.convert_tokens_to_ids(token) for key, token in [
+        ("image_token_id", "<|image_pad|>"), ("video_token_id", "<|video_pad|>"),
+        ("vision_start_token_id", "<|vision_start|>"), ("vision_end_token_id", "<|vision_end|>")]}
+    # out_hidden_size is the decoder's width; the multimodal sections must cover the MoE's rotary pairs too.
+    text = dict(text, rope_parameters=dict(text["rope_parameters"], mrope_interleaved=True,
+                                           mrope_section=[2, 1, 1] if text["head_dim"] == 32 else [3, 3, 2]))
+    vision = dict(depth=2, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=text["hidden_size"],
+                  patch_size=16, spatial_merge_size=2, temporal_patch_size=2, num_position_embeddings=64)
+    return config_cls(text_config=text, vision_config=vision, tie_word_embeddings=False, **ids)
+
+
+def qwen3_5_vl(vocab_size, source):
+    """qwen3_5's decoder with Qwen3.5's vision tower (Qwen3_5ForConditionalGeneration): images in."""
+    from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
+
+    config = qwen3_5_vl_config(Qwen3_5Config, qwen3_5_text(vocab_size), source)
+    return qwen3_5_vision(Qwen3_5ForConditionalGeneration(config))
+
+
+def qwen3_5_moe_vl(vocab_size, source):
+    """qwen3_5_moe's decoder with the vision tower (Qwen3_5MoeForConditionalGeneration), as Qwen3.6-35B-A3B."""
+    from transformers import Qwen3_5MoeConfig, Qwen3_5MoeForConditionalGeneration
+
+    config = qwen3_5_vl_config(Qwen3_5MoeConfig, qwen3_5_moe_text(vocab_size), source)
+    return qwen3_5_vision(decisive_routers(Qwen3_5MoeForConditionalGeneration(config)))
 
 
 def gemma4_moe(vocab_size, source):
@@ -486,9 +538,9 @@ def perturbed(model):
     return model.eval()
 
 
-ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "gemma4_moe": gemma4_moe, "lfm3": lfm3,
-         "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr, "qwen3_omni": qwen3_omni,
-         "inkling2_loop": inkling2_loop, "bert": bert, "nomic_bert": nomic_bert}
+ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "qwen3_5_vl": qwen3_5_vl, "qwen3_5_moe_vl": qwen3_5_moe_vl,
+         "gemma4_moe": gemma4_moe, "lfm3": lfm3, "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr,
+         "qwen3_omni": qwen3_omni, "inkling2_loop": inkling2_loop, "bert": bert, "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}
 ENCODER_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]
 
@@ -691,7 +743,7 @@ def main():
     model = ARCHS[args.arch](len(tok), args.tokenizer_from)
     model.config.eos_token_id = tok.eos_token_id
     model.generation_config.eos_token_id = tok.eos_token_id
-    qwen = args.arch in ("qwen3_5", "qwen3_5_moe", "sensenova_loop")  # with an MTP head
+    qwen = args.arch in ("qwen3_5", "qwen3_5_moe", "qwen3_5_vl", "qwen3_5_moe_vl", "sensenova_loop")  # an MTP head
     if qwen:
         model.config.get_text_config().mtp_num_hidden_layers = 1
     model.save_pretrained(args.out, safe_serialization=True)

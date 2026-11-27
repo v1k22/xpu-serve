@@ -299,7 +299,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       (`docs/decisions/0014`); also compressed-tensors' float-quantized format with a scale per channel
       (`ornith-ai/Ornith-1.5-35B-A3B-FP8`)
 - [x] Qwen3.5: state snapshots at prompt ends for multi-turn prefix reuse (docs/decisions/0029)
-- [ ] Qwen3.5: vision tower
+- [x] Qwen3.5: vision tower (Qwen3.5, 3.6, 3.8: Qwen3-VL's without deepstack rows; from the checkpoint or a GGUF
+      file's mmproj; parity with transformers fp32 on tiny dense and MoE checkpoints and Qwen3.5-4B;
+      docs/decisions/0032)
+- [ ] Qwen3.5 with images: the MTP head's positions on three axes, and an image's rows as its embeddings (it drafts
+      at one position a token from the image token's embedding now); images beside a block drafter
 - [x] SenseNova Loop (`sensenova_loop`): the Qwen3.5 decoder with layers run in a loop (each run with state slots of its
       own) and manifold-constrained hyper-connections (graph ops MhcRoute and StreamMix; routers kept unquantized by
       `convert`); parity with the checkpoint's own code on a tiny checkpoint (cpu-ref and SYCL exact) and on

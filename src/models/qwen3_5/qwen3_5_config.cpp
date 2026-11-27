@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "models/common/blocks.h"
 #include "models/config_util.h"
 #include "models/qwen3_5/qwen3_5.h"
 #include "util/error.h"
@@ -144,7 +145,16 @@ Config parse_config(const nlohmann::json& config_json) {
     c.rope_theta = cfg::get_float(rope, "rope_theta", rw);
     const double partial = rope.contains("partial_rotary_factor") ? cfg::get_float(rope, "partial_rotary_factor", rw) : 1.0;
     c.rotary_dim = static_cast<int64_t>(static_cast<double>(c.head_dim) * partial);
-    // Multimodal RoPE (mrope_section) gives text tokens the same position on all three axes, which is plain RoPE.
+    // Multimodal RoPE gives text tokens the same position on all three axes, which is plain RoPE: only an image's
+    // tokens read the axes the sections assign. Sections that do not cover the rotated frequencies, or that run in
+    // turn (no mrope_interleaved), leave none, which the vision tower refuses (Decoder).
+    if (rope.contains("mrope_section") && cfg::get_bool_or(rope, "mrope_interleaved", false, rw)) {
+        const std::vector<int32_t> section = cfg::get_int_list(rope, "mrope_section", rw);
+        const int64_t pairs = c.rotary_dim / 2;
+        if (section.size() == 3 && section[0] + section[1] + section[2] == pairs) {
+            c.mrope_axes = blocks::interleaved_mrope_axes(section, pairs, rw);
+        }
+    }
 
     XS_CHECK(c.num_heads % c.num_kv_heads == 0, where, ": num_attention_heads ", c.num_heads,
              " is not a multiple of num_key_value_heads ", c.num_kv_heads);

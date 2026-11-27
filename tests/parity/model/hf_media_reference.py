@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Reference outputs for models that read audio and images from Hugging Face transformers (test-only): Qwen3-ASR, and
-Qwen3-Omni's thinker (text, audio and images in).
+"""Reference outputs for models that read audio and images from Hugging Face transformers (test-only): Qwen3-ASR,
+Qwen3-Omni's thinker (text, audio and images in), and the Qwen3.5 family with its vision tower (qwen3_5,
+qwen3_5_moe: text and images in).
 
     python -I tests/parity/model/hf_media_reference.py --model-dir <checkpoint> --out <dir> [--audio a.wav ...]
         [--image a.png ...] [--gen 32] [--converted-out <dir>]
 
-Runs transformers' Qwen3ASRForConditionalGeneration or Qwen3OmniMoeThinkerForConditionalGeneration in float32 on
-the CPU. A checkpoint in the released layout (weights under thinker.*, a thinker_config; Qwen3-Omni's experts one
-tensor each) is converted in memory as transformers' conversion does; for Qwen3-ASR --converted-out also writes that
+Runs transformers' Qwen3ASRForConditionalGeneration, Qwen3OmniMoeThinkerForConditionalGeneration or the Qwen3.5
+family's ForConditionalGeneration class in float32 on the CPU. A checkpoint in the released layout (weights under
+thinker.*, a thinker_config; Qwen3-Omni's experts one tensor each) is converted in memory as transformers' conversion
+does; for Qwen3-ASR --converted-out also writes that
 converted copy, so the engine's reading of both layouts can be checked against the same outputs. Qwen3-ASR hears each
 clip as its own turn; Qwen3-Omni is asked about it. The clips are the --audio files, or, without any, synthetic ones
 (tones, noise, a chirp) at several lengths and sample rates. Per case it writes:
@@ -18,11 +20,13 @@ clip as its own turn; Qwen3-Omni is asked about it. The clips are the --audio fi
     features pad to,
   * the encoder's rows after the projector (float32 [rows, hidden], <name>.audio_rows.bin),
   * the messages and the prompt token ids (the chat template's turn, <|audio_pad|> once per row),
-  * the full-vocabulary logits of the last prompt position (<name>.last_logits.bin) and the greedy continuation.
-For Qwen3-Omni, image cases too (the --image files, or synthetic ones of sizes the processor resizes in each of its
-ways): the image as PNG, the processor's patches (float32 [patches, values], <name>.pixels.bin, in its merge-block
-order), the vision tower's rows (float32 [tokens, (1 + deepstack) * hidden]: the merged row, then each deepstack
-row, <name>.image_rows.bin), the prompt with <|image_pad|> once per token, the last logits and the greedy text.
+  * the full-vocabulary logits of the last prompt position (<name>.last_logits.bin) and the greedy continuation, with
+    each step's five best tokens and logit range (where f16 may flip a near tie).
+For Qwen3-Omni and the Qwen3.5 family, image cases too (the --image files, or synthetic ones of sizes the processor
+resizes in each of its ways): the image as PNG, the processor's patches (float32 [patches, values],
+<name>.pixels.bin, in its merge-block order), the vision tower's rows (float32 [tokens, (1 + deepstack) * hidden]:
+the merged row, then each deepstack row, <name>.image_rows.bin), the prompt with <|image_pad|> once per token, the
+last logits and the greedy text.
 A text-only case checks the decoder alone.
 """
 
@@ -206,8 +210,17 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.model_dir, "config.json")) as f:
-        omni = json.load(f)["model_type"] == "qwen3_omni_moe"
-    model, config = load_omni(args.model_dir) if omni else load_model(args.model_dir, args.converted_out)
+        model_type = json.load(f)["model_type"]
+    omni = model_type == "qwen3_omni_moe"
+    vl = model_type in ("qwen3_5", "qwen3_5_moe")  # images, no audio
+    if vl and args.audio:
+        ap.error(f"{model_type} takes no audio")
+    if vl:
+        from transformers import AutoModelForImageTextToText
+
+        model = AutoModelForImageTextToText.from_pretrained(args.model_dir, dtype=torch.float32).eval()
+    else:
+        model, config = load_omni(args.model_dir) if omni else load_model(args.model_dir, args.converted_out)
     tok = AutoTokenizer.from_pretrained(args.model_dir)
     # Qwen3-Omni's processor: the checkpoint's WhisperFeatureExtractor, clips as they are; Qwen3-ASR's package pads a
     # clip under half a second.
@@ -218,7 +231,8 @@ def main():
         if os.path.exists(os.path.join(args.model_dir, "generation_config.json")) else {}
     eos = gen.get("eos_token_id", tok.eos_token_id)
     eos = eos if isinstance(eos, list) else [eos]
-    clips = [(os.path.splitext(os.path.basename(p))[0], *read_wav(p)) for p in args.audio] or synthetic_clips()
+    clips = [] if vl else [(os.path.splitext(os.path.basename(p))[0], *read_wav(p)) for p in args.audio] \
+        or synthetic_clips()
 
     # AutoTokenizer does not read chat_template.json (the processor does): pass it.
     chat_template = None
@@ -238,7 +252,7 @@ def main():
     manifest = {"model_dir": os.path.abspath(args.model_dir), "dtype": "float32", "mel_min_length": min_length,
                 "cases": []}
     images = []
-    if omni:
+    if omni or vl:
         from PIL import Image
         from transformers import AutoImageProcessor
 
@@ -255,7 +269,8 @@ def main():
                 pixels, grid = feats["pixel_values"], feats["image_grid_thw"]
                 pixels.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.pixels.bin"))
                 vision = model.model.visual(pixels, grid_thw=grid)
-                rows = torch.cat([vision.pooler_output] + list(vision.deepstack_features), dim=1)
+                deepstack = getattr(vision, "deepstack_features", None) or []
+                rows = torch.cat([vision.pooler_output] + list(deepstack), dim=1)
                 rows.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.image_rows.bin"))
                 messages = [{"role": "user", "content": [{"type": "image"},
                                                          {"type": "text", "text": "Describe the image in one line."}]}]
@@ -264,6 +279,8 @@ def main():
                 ids = ids[:at] + [image_pad] * rows.shape[0] + ids[at + 1:]
                 inputs = {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
                           "pixel_values": pixels, "image_grid_thw": grid}
+                if vl:  # which tokens are an image's, for the multimodal positions
+                    inputs["mm_token_type_ids"] = (inputs["input_ids"] == image_pad).long()
                 case.update({"image": f"{name}.png", "pixels": f"{name}.pixels.bin",
                              "image_rows": f"{name}.image_rows.bin", "rows": int(rows.shape[0]),
                              "grid": grid[0].tolist()})
@@ -294,8 +311,15 @@ def main():
                              "audio_rows": f"{name}.audio_rows.bin", "rows": int(rows.shape[0])})
             logits = model(**inputs).logits[0, -1].float()
             out = model.generate(**inputs, max_new_tokens=args.gen, do_sample=False, eos_token_id=eos,
-                                 repetition_penalty=1.0)
-        greedy = out[0, len(ids):].tolist()
+                                 repetition_penalty=1.0, output_scores=True, return_dict_in_generate=True)
+        greedy = out.sequences[0, len(ids):].tolist()
+        # Each step's five best tokens and its logit range: where an f16 run may flip a near tie.
+        top = []
+        for step in out.scores:
+            values, indices = step[0].float().topk(5)
+            top.append({"ids": indices.tolist(), "logits": values.tolist(),
+                        "range": float(step[0].max() - step[0].min())})
+        case["greedy_top"] = top
         logits.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.last_logits.bin"))
         case.update({"messages": messages, "input_ids": ids, "last_logits": f"{name}.last_logits.bin",
                      "greedy": greedy, "greedy_text": tok.decode(greedy)})

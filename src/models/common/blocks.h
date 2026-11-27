@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "graph/graph.h"
 #include "io/safetensors.h"
@@ -110,6 +111,11 @@ Value gated_rms_norm(Graph& g, Value x, Value w, Value gate, float eps);
 // RoPE over the first R channels: (theta, R, R / 2, R / 2). Gemma 4's proportional RoPE keeps the full head layout:
 // (theta, head_dim, rotated pairs, head_dim / 2). Axial 2-D RoPE (vision): (theta, head_dim / 2, head_dim / 4, same).
 HostTensor rope_inv_freq(double theta, int64_t dim, int64_t pairs, int64_t length);
+// Multimodal RoPE's frequencies laid out as Qwen3-VL interleaves them (an mrope_section of three counts, time, height
+// and width, adding up to `pairs`): the position axis each of the `pairs` frequencies reads. Frequency i reads height
+// (1) when i % 3 == 1 and i < 3 * section[1], width (2) when i % 3 == 2 and i < 3 * section[2], else time (0).
+// `where` names the config in errors.
+std::vector<int32_t> interleaved_mrope_axes(std::span<const int32_t> section, int64_t pairs, const std::string& where);
 
 // ---- Attention
 

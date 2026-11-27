@@ -11,6 +11,7 @@
 #include "convert/import_test_util.h"
 #include "convert/tiny_gguf.h"
 #include "convert/tiny_inkling2_gguf.h"
+#include "convert/tiny_qwen35_projector.h"
 #include "fake_hub.h"
 #include "hub/model_source.h"
 #include "io/gguf.h"
@@ -76,20 +77,25 @@ TEST_SUITE("model source") {
         fs::create_directories(folder / "MTP");
         files.model.write(folder / "Tiny-Q8_0.gguf");
         files.mtp.write(folder / "MTP" / "mtp-Tiny-Q8_0.gguf");
-        std::ofstream(folder / "mmproj-F16.gguf") << "a projector the model's import does not read";
-        import_into(folder / "Tiny-Q8_0.gguf", dir.path / "with-head", folder / "MTP" / "mtp-Tiny-Q8_0.gguf");
+        xs::test::tiny_qwen35_projector(xs::test::tiny_gguf_model().hidden).write(folder / "mmproj-F16.gguf");
+        gguf_import::ImportOptions both;
+        both.source = folder / "Tiny-Q8_0.gguf";
+        both.mtp = folder / "MTP" / "mtp-Tiny-Q8_0.gguf";
+        both.mmproj = folder / "mmproj-F16.gguf";
+        both.output = dir.path / "with-head";
+        gguf_import::import_gguf(both);
 
         const SourceFiles s = source_files({.path = (folder / "Tiny-Q8_0.gguf").string()}, FileRole::Model, o);
         CHECK(s.mtp == folder / "MTP" / "mtp-Tiny-Q8_0.gguf");
-        CHECK(s.mmproj.empty());
+        CHECK(s.mmproj == folder / "mmproj-F16.gguf");
         const ModelSource m = model_dir(s, o);
-        CHECK(m.dir.filename() == "Tiny-Q8_0+mtp-Tiny-Q8_0");
+        CHECK(m.dir.filename() == "Tiny-Q8_0+mtp-Tiny-Q8_0+mmproj-F16");
         CHECK(pack_files(m.dir) == pack_files(dir.path / "with-head"));
         // A drafter takes no companions; a head the user names wins.
         CHECK(source_files({.path = (folder / "Tiny-Q8_0.gguf").string()}, FileRole::Drafter, o).mtp.empty());
         fs::copy_file(folder / "MTP" / "mtp-Tiny-Q8_0.gguf", dir.path / "head.gguf");
         const ModelSpec named{.path = (folder / "Tiny-Q8_0.gguf").string(), .mtp = dir.path / "head.gguf"};
-        CHECK(resolve_model(named, FileRole::Model, o).dir.filename() == "Tiny-Q8_0+head");
+        CHECK(resolve_model(named, FileRole::Model, o).dir.filename() == "Tiny-Q8_0+head+mmproj-F16");
         // A companion that changes is imported again with the model.
         const auto written = fs::last_write_time(m.dir / "model.safetensors");
         touch(folder / "MTP" / "mtp-Tiny-Q8_0.gguf");

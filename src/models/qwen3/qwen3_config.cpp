@@ -1,5 +1,6 @@
 #include <algorithm>
 
+#include "models/common/blocks.h"
 #include "models/config_util.h"
 #include "models/qwen3/qwen3.h"
 #include "util/error.h"
@@ -58,19 +59,10 @@ Config parse_config(const nlohmann::json& t, const std::string& where) {
             const std::vector<int32_t> section = cfg::get_int_list(*r, "mrope_section", where);
             const bool plain_flag = cfg::get_bool_or(*r, "interleaved", false, where);
             const bool interleaved = cfg::get_bool_or(*r, "mrope_interleaved", plain_flag, where);
-            const int64_t pairs = c.head_dim / 2;
-            XS_CHECK(section.size() == 3 && section[0] + section[1] + section[2] == pairs, where,
-                     ": mrope_section must be three counts that add up to the ", pairs, " frequencies of a head");
-            // Interleaved (Qwen3-Omni, Qwen3-VL): frequency i reads height when i % 3 == 1 and i < 3 h, width when
-            // i % 3 == 2 and i < 3 w, else time. Without the flag, sections in turn (Qwen2-VL), which is refused
+            // Interleaved (Qwen3-Omni, Qwen3-VL). Without the flag, sections in turn (Qwen2-VL), which is refused
             // when positions on three axes are fed (Decoder).
-            if (interleaved) {
-                c.mrope_axes.assign(static_cast<size_t>(pairs), 0);
-                for (int64_t i = 0; i < pairs; ++i) {
-                    if (i % 3 == 1 && i < 3 * section[1]) c.mrope_axes[static_cast<size_t>(i)] = 1;
-                    if (i % 3 == 2 && i < 3 * section[2]) c.mrope_axes[static_cast<size_t>(i)] = 2;
-                }
-            }
+            std::vector<int32_t> axes = blocks::interleaved_mrope_axes(section, c.head_dim / 2, where);
+            if (interleaved) c.mrope_axes = std::move(axes);
         }
         for (const char* key : {"rope_type", "type"}) {
             if (!r->contains(key)) continue;
