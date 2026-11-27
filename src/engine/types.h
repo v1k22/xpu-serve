@@ -3,12 +3,14 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "audio/audio.h"
+#include "engine/constraint.h"
 #include "tensor/tensor.h"
 
 namespace xs {
@@ -63,6 +65,9 @@ struct GenerateRequest {
     // generation prompt. A model with conv or recurrent state saves its state at that prompt position, so that a
     // prompt sharing the tokens up to it starts from there (decision 0029). 0: nowhere.
     int64_t snapshot_at = 0;
+    // What the output must follow (engine/constraint.h); null: anything. A constrained request needs a stop token, the
+    // only way its output can end once complete.
+    std::shared_ptr<const OutputConstraint> constraint;
 };
 
 enum class FinishReason { Stop, Length, Cancelled, Error };
@@ -84,6 +89,10 @@ struct GenerateStats {
     int spec_accepted = 0;
     double spec_draft_ms = 0.0;
     double spec_verify_ms = 0.0;
+    // A constrained request: the rows its constraint masked (speculating, rejected ones too), and the time it took to
+    // mask them and accept the tokens chosen.
+    int constrained_rows = 0;
+    double constraint_ms = 0.0;
     double prefill_tok_per_s() const { return prefill_ms > 0 ? (prompt_tokens - cached_tokens) * 1000.0 / prefill_ms : 0; }
     double decode_tok_per_s() const {
         return decode_ms > 0 && generated_tokens > 1 ? (generated_tokens - 1) * 1000.0 / decode_ms : 0;

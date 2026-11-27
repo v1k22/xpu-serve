@@ -83,6 +83,7 @@ struct Engine::Generation {
     std::vector<RotaryPosition> positions;
     std::vector<std::shared_ptr<const HostTensor>> encoded;  // by media item, once encoded
     std::unique_ptr<Sampler> sampler;
+    std::unique_ptr<TokenConstraint> constraint;  // the request's, when it has one
     bool argmax_only = false;
     size_t fed = 0;  // prompt positions the sequence holds
     bool decoding = false;
@@ -164,10 +165,10 @@ void Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKe
     }
 }
 
-int32_t Engine::target_token(Sampler& sampler, int64_t row, std::span<const int32_t> prompt,
-                             std::span<const int32_t> generated, const int32_t* draft) {
+int32_t Engine::target_token(Generation& g, int64_t row, std::span<const int32_t> generated, const int32_t* draft) {
     const int64_t vocab = model_->info().vocab_size;
     if (argmax_only_) {
+        XS_CHECK(g.constraint == nullptr, "a constrained request's step read its rows' argmax, not their logits");
         const HostTensor& top = outputs_.at("argmax");
         XS_CHECK(top.dtype() == DType::I32 && row < top.numel(), "argmax output is ", dtype_name(top.dtype()),
                  dims_to_string(top.shape()), ", row ", row, " asked");
@@ -179,39 +180,78 @@ int32_t Engine::target_token(Sampler& sampler, int64_t row, std::span<const int3
     XS_CHECK(logits.dtype() == DType::F32 && logits.numel() % vocab == 0 && row < logits.numel() / vocab,
              "logits output is ", dtype_name(logits.dtype()), dims_to_string(logits.shape()), ", row ", row, " asked");
     const std::span<float> values(logits.data<float>() + row * vocab, static_cast<size_t>(vocab));
-    return draft != nullptr ? sampler.verify(values, prompt, generated, *draft) : sampler.sample(values, prompt, generated);
+    if (g.constraint) constrain(g, values);
+    Sampler& sampler = *g.sampler;
+    const std::vector<int32_t>& prompt = g.request.prompt;
+    const int32_t t = draft != nullptr ? sampler.verify(values, prompt, generated, *draft)
+                                       : sampler.sample(values, prompt, generated);
+    const std::vector<int32_t>& stops = g.request.stop_token_ids;
+    if (g.constraint && std::find(stops.begin(), stops.end(), t) == stops.end()) {
+        Timer timer;
+        g.constraint->accept(t);
+        g.result.stats.constraint_ms += timer.elapsed_ms();
+    }
+    return t;
 }
 
-std::vector<int32_t> Engine::spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
-                                        std::span<const int32_t> generated, GenerateStats& stats) {
-    std::vector<int32_t> fed{token};
-    spec::Drafter& drafter = *seq().drafter;
-    std::vector<PositionKey>& cached = seq().cached;
+void Engine::constrain(Generation& g, std::span<float> logits) {
     Timer timer;
+    const std::vector<int32_t>& stops = g.request.stop_token_ids;
+    const auto in_vocab = [&](int32_t t) { return t >= 0 && static_cast<size_t>(t) < logits.size(); };
+    stop_logits_.clear();
+    for (const int32_t s : stops) stop_logits_.push_back(in_vocab(s) ? logits[static_cast<size_t>(s)] : 0.0f);
+    const bool allowed = g.constraint->mask(logits);
+    const bool end = g.constraint->complete();
+    for (size_t i = 0; i < stops.size(); ++i) {
+        if (in_vocab(stops[i])) {
+            logits[static_cast<size_t>(stops[i])] = end ? stop_logits_[i] : -std::numeric_limits<float>::infinity();
+        }
+    }
+    GenerateStats& stats = g.result.stats;
+    stats.constraint_ms += timer.elapsed_ms();
+    ++stats.constrained_rows;
+    XS_CHECK(allowed || end, "the request's output constraint allows no token after its ", g.result.tokens.size(),
+             " generated");
+}
+
+std::vector<int32_t> Engine::propose(Generation& g, int k, double& ms) {
+    Timer timer;
+    std::vector<int32_t> drafts = seq().drafter->propose(g.token, k);
+    ms = timer.elapsed_ms();
+    if (g.constraint) {
+        Timer checking;
+        drafts.resize(g.constraint->allowed_prefix(drafts));
+        g.result.stats.constraint_ms += checking.elapsed_ms();
+    }
+    return drafts;
+}
+
+std::vector<int32_t> Engine::spec_round(Generation& g, int k) {
+    std::vector<int32_t> fed{g.token};
+    double draft_ms = 0.0;
     if (k > 0) {
-        const std::vector<int32_t> drafts = drafter.propose(token, k);
+        const std::vector<int32_t> drafts = propose(g, k, draft_ms);
         fed.insert(fed.end(), drafts.begin(), drafts.end());
     }
-    const double draft_ms = timer.elapsed_ms();
     std::vector<PositionKey> keys(fed.size());
     std::transform(fed.begin(), fed.end(), keys.begin(), text_key);
-    const auto start = static_cast<int64_t>(cached.size());
+    const auto start = static_cast<int64_t>(seq().cached.size());
+    Timer timer;
     run_target(spec::kVerify, fed, keys, text_positions(seq(), start, fed.size()), {});
+    GenerateStats& stats = g.result.stats;
     stats.spec_draft_ms += draft_ms;
-    stats.spec_verify_ms += timer.elapsed_ms() - draft_ms;
-    return accept_round(fed, 0, start, outputs_, sampler, prompt, generated, stats);
+    stats.spec_verify_ms += timer.elapsed_ms();
+    return accept_round(g, fed, 0, start, outputs_);
 }
 
-std::vector<int32_t> Engine::accept_round(std::span<const int32_t> fed, int64_t row, int64_t start,
-                                          const TensorMap& target, Sampler& sampler, std::span<const int32_t> prompt,
-                                          std::span<const int32_t> generated, GenerateStats& stats) {
+std::vector<int32_t> Engine::accept_round(Generation& g, std::span<const int32_t> fed, int64_t row, int64_t start,
+                                          const TensorMap& target) {
     // Row i of the round is the target's distribution after fed[i]: it accepts the draft fed[i + 1] or replaces it.
-    std::vector<int32_t> history(generated.begin(), generated.end());
+    std::vector<int32_t> history(g.result.tokens.begin(), g.result.tokens.end());
     std::vector<int32_t> out;
     for (size_t i = 0; i < fed.size(); ++i) {
         const bool last = i + 1 == fed.size();
-        const int32_t t =
-            target_token(sampler, row + static_cast<int64_t>(i), prompt, history, last ? nullptr : &fed[i + 1]);
+        const int32_t t = target_token(g, row + static_cast<int64_t>(i), history, last ? nullptr : &fed[i + 1]);
         out.push_back(t);
         history.push_back(t);
         if (!last && t != fed[i + 1]) break;
@@ -224,6 +264,7 @@ std::vector<int32_t> Engine::accept_round(std::span<const int32_t> fed, int64_t 
         cached.resize(static_cast<size_t>(keep));
     }
     seq().drafter->add(target, accepted + 1, start, fed);
+    GenerateStats& stats = g.result.stats;
     ++stats.spec_rounds;
     stats.spec_drafted += static_cast<int>(fed.size()) - 1;
     stats.spec_accepted += static_cast<int>(accepted);
@@ -380,6 +421,12 @@ std::optional<Engine::Handle> Engine::start(const GenerateRequest& request, Toke
         g.done = true;
         return h;
     }
+    if (g.request.constraint && g.request.stop_token_ids.empty()) {
+        result.finish = FinishReason::Error;
+        result.error = "a constrained request needs a stop token to end on";
+        g.done = true;
+        return h;
+    }
     result.stats.prompt_tokens = static_cast<int>(prompt.size());
     try {
         // Soft-token positions take the encoder rows of the request's media items, in order.
@@ -434,7 +481,8 @@ std::optional<Engine::Handle> Engine::start(const GenerateRequest& request, Toke
         select(g.sequence);
         seq().rotary_delta = rotary.next - static_cast<int64_t>(n);
         g.sampler = std::make_unique<Sampler>(g.request.sampling);
-        g.argmax_only = has_argmax_ && !g.sampler->needs_logits();
+        if (g.request.constraint) g.constraint = g.request.constraint->start();
+        g.argmax_only = has_argmax_ && !g.sampler->needs_logits() && !g.constraint;
         argmax_only_ = g.argmax_only;
         Timer timer;
         take_prefix(g.keys);
@@ -501,6 +549,7 @@ void Engine::fail_generation(Generation& g, const std::exception& e) {
     g.result.finish = FinishReason::Error;
     g.result.error = e.what();
     g.done = true;
+    release(g);  // advance() returns at once for a request that is done: one that failed in start() too
     log::error("generation failed: ", e.what());
 }
 
@@ -548,7 +597,7 @@ void Engine::begin_decode(Generation& g) {
         g.done = true;
         return;
     }
-    g.token = target_token(*g.sampler, 0, g.request.prompt, g.result.tokens, nullptr);
+    g.token = target_token(g, 0, g.result.tokens, nullptr);
 }
 
 bool Engine::emit(Generation& g) {
@@ -577,16 +626,14 @@ bool Engine::emit(Generation& g) {
 
 void Engine::decode_step(Generation& g) {
     if (!emit(g)) return;
-    GenerateResult& result = g.result;
     if (g.ready.empty() && seq().drafter) {
-        const std::vector<int32_t> round =
-            spec_round(g.token, round_drafts(g), *g.sampler, g.request.prompt, result.tokens, result.stats);
+        const std::vector<int32_t> round = spec_round(g, round_drafts(g));
         g.ready.assign(round.begin(), round.end());
     } else if (g.ready.empty()) {
         const int32_t fed[] = {g.token};
         const PositionKey fed_key[] = {text_key(g.token)};
         forward(fed, fed_key, text_positions(seq(), static_cast<int64_t>(seq().cached.size()), 1), {});
-        g.ready.push_back(target_token(*g.sampler, 0, g.request.prompt, result.tokens, nullptr));
+        g.ready.push_back(target_token(g, 0, g.result.tokens, nullptr));
     }
     g.token = g.ready.front();
     g.ready.pop_front();
@@ -650,10 +697,8 @@ void Engine::decode_together(std::span<Generation* const> gs) {
         select(g.sequence);
         fed[i] = {g.token};
         if (const int k = speculating ? std::min(round_drafts(g), share) : 0; k > 0) {
-            Timer timer;
-            const std::vector<int32_t> drafts = seq().drafter->propose(g.token, k);
+            const std::vector<int32_t> drafts = propose(g, k, draft_ms[i]);
             fed[i].insert(fed[i].end(), drafts.begin(), drafts.end());
-            draft_ms[i] = timer.elapsed_ms();
         }
         const auto at = static_cast<int64_t>(seq().cached.size());
         const auto n = static_cast<int64_t>(fed[i].size());
@@ -690,15 +735,14 @@ void Engine::decode_together(std::span<Generation* const> gs) {
                  cached.size());
         const auto n = static_cast<int64_t>(fed[i].size());
         if (!speculating) {
-            g.token = target_token(*g.sampler, row, g.request.prompt, g.result.tokens, nullptr);
+            g.token = target_token(g, row, g.result.tokens, nullptr);
         } else {
             TensorMap target;  // the drafter's outputs of this request's rows
             for (const std::string& name : drafter_outputs) target[name] = rows_of(outputs_.at(name), row, n);
             GenerateStats& stats = g.result.stats;
             stats.spec_draft_ms += draft_ms[i];
             stats.spec_verify_ms += verify_ms;
-            const std::vector<int32_t> round =
-                accept_round(fed[i], row, start, target, *g.sampler, g.request.prompt, g.result.tokens, stats);
+            const std::vector<int32_t> round = accept_round(g, fed[i], row, start, target);
             g.ready.assign(round.begin() + 1, round.end());
             g.token = round.front();
         }

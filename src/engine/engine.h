@@ -134,21 +134,25 @@ private:
     static std::vector<RotaryPosition> text_positions(const Sequence& q, int64_t index, size_t count);
     // Width of the rows a media item's encoder runs give (ModelInfo::media_width, or the hidden size).
     int64_t media_width() const;
-    // The target's token after row `row` of the last run: sampled from the row's logits (checked against `draft`
-    // when there is one, Sampler::verify), or the row's argmax when that is all the sampler reads (argmax_only_).
-    int32_t target_token(Sampler& sampler, int64_t row, std::span<const int32_t> prompt,
-                         std::span<const int32_t> generated, const int32_t* draft);
-    // One speculative round after `token` (emitted, not yet cached): `k` drafts, one verify of them all, acceptance
-    // and rollback. Returns the accepted drafts and the target's next token.
-    std::vector<int32_t> spec_round(int32_t token, int k, Sampler& sampler, std::span<const int32_t> prompt,
-                                    std::span<const int32_t> generated, GenerateStats& stats);
-    // The end of a round of the selected sequence, which ran `fed` (the pending token and its drafts) from cached
+    // The token of `g` after row `row` of the last run, its output so far `generated` (a round's tokens included):
+    // sampled from the row's logits as its constraint allows them (checked against `draft` when there is one,
+    // Sampler::verify), or the row's argmax when that is all its sampler reads (argmax_only_). The constraint accepts
+    // the token.
+    int32_t target_token(Generation& g, int64_t row, std::span<const int32_t> generated, const int32_t* draft);
+    // The row's logits as `g`'s constraint allows them: its mask, and the stop tokens only where the output may end.
+    void constrain(Generation& g, std::span<float> logits);
+    // The drafts of a round of `g` after its pending token: up to `k`, none from the first its constraint refuses (a
+    // target row masked by it never takes that draft), and the time drafting took.
+    std::vector<int32_t> propose(Generation& g, int k, double& ms);
+    // One speculative round of `g` after its pending token (emitted, not yet cached): `k` drafts, one verify of them
+    // all, acceptance and rollback. Returns the accepted drafts and the target's next token.
+    std::vector<int32_t> spec_round(Generation& g, int k);
+    // The end of a round of `g`'s sequence (selected), which ran `fed` (the pending token and its drafts) from cached
     // position `start` as rows `row`, `row` + 1, ... of the last run: the target's token after each row while the
     // drafts agree, the sequence cut back past the last draft kept, and the kept rows handed to the drafter (`target`:
     // its outputs of the round's rows, from row 0). Returns the accepted drafts and the target's next token.
-    std::vector<int32_t> accept_round(std::span<const int32_t> fed, int64_t row, int64_t start, const TensorMap& target,
-                                      Sampler& sampler, std::span<const int32_t> prompt,
-                                      std::span<const int32_t> generated, GenerateStats& stats);
+    std::vector<int32_t> accept_round(Generation& g, std::span<const int32_t> fed, int64_t row, int64_t start,
+                                      const TensorMap& target);
     // The program whose state slots are the sequence's: the step graph's, and speculating the verify graph's, which
     // also writes what a block drafter reads of the target.
     size_t state_program() const;
@@ -173,6 +177,7 @@ private:
     std::list<std::pair<uint64_t, std::shared_ptr<const HostTensor>>> encoded_;  // most recent first
     TensorMap inputs_;
     TensorMap outputs_;
+    std::vector<float> stop_logits_;  // constrain()'s scratch
     // The model has conv or recurrent state: a prefix is kept whole or from the sequence's snapshot, taken at
     // GenerateRequest::snapshot_at.
     bool fixed_state_ = false;

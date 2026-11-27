@@ -15,6 +15,8 @@ void accumulate(GenerateStats& total, const GenerateStats& more) {
     total.spec_accepted += more.spec_accepted;
     total.spec_draft_ms += more.spec_draft_ms;
     total.spec_verify_ms += more.spec_verify_ms;
+    total.constrained_rows += more.constrained_rows;
+    total.constraint_ms += more.constraint_ms;
 }
 
 const char* modality_name(Modality m) {
