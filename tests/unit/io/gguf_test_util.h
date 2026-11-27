@@ -169,6 +169,40 @@ public:
         std::ofstream(path, std::ios::binary).write(b.data(), static_cast<std::streamsize>(b.size()));
     }
 
+    // The parts llama.cpp's gguf-split writes of this file with --split-max-tensors `per_part` (with `empty_first`,
+    // --no-tensor-first-split: a first part of metadata alone). The first part holds every value, then split.no,
+    // split.count and split.tensors.count; every other part those three alone, its tensors at the default alignment.
+    std::vector<GgufWriter> split(size_t per_part, bool empty_first = false) const {
+        std::vector<GgufWriter> parts(1);
+        parts[0].kvs_ = kvs_;
+        parts[0].alignment_ = alignment_;
+        size_t in_part = empty_first ? per_part : 0;
+        for (const Tensor& t : tensors_) {
+            if (in_part == per_part) {
+                parts.emplace_back();
+                in_part = 0;
+            }
+            parts.back().tensors_.push_back(t);
+            ++in_part;
+        }
+        for (size_t i = 0; i < parts.size(); ++i) {
+            parts[i].u16("split.no", static_cast<uint16_t>(i));
+            parts[i].u16("split.count", static_cast<uint16_t>(parts.size()));
+            parts[i].i32("split.tensors.count", static_cast<int32_t>(tensors_.size()));
+        }
+        return parts;
+    }
+    // Writes `parts` as `<prefix>-00001-of-0000N.gguf` and on; returns the first part's path.
+    static std::filesystem::path write_parts(const std::vector<GgufWriter>& parts, const std::string& prefix) {
+        std::filesystem::path first;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            const auto path = gguf::split_path(prefix, static_cast<int>(i + 1), static_cast<int>(parts.size()));
+            parts[i].write(path);
+            if (i == 0) first = path;
+        }
+        return first;
+    }
+
 private:
     uint64_t padded(uint64_t n) const { return (n + alignment_ - 1) / alignment_ * alignment_; }
 

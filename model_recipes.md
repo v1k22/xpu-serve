@@ -894,6 +894,7 @@ A file on disk imports with `convert`:
 ```bash
 xpu-serve convert <file.gguf> <pack-dir>
 xpu-serve convert <file.gguf> <pack-dir> --mtp <mtp.gguf>     # a Qwen3.5-family file that comes without its MTP head
+xpu-serve convert <file-00001-of-00003.gguf> <pack-dir>       # a file split into parts, by its first part
 xpu-serve serve <pack-dir> --device GPU
 ```
 

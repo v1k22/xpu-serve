@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <cctype>
-#include <regex>
 #include <set>
 
+#include "io/gguf.h"
 #include "util/error.h"
 
 namespace xs::hub {
@@ -44,13 +44,8 @@ std::string folder_of(const std::string& path) {
 
 // A GGUF file's name without its extension and without a split part's "-00001-of-00003".
 std::string gguf_stem(const std::string& path, bool* split) {
-    static const std::regex part("-[0-9]{5}-of-[0-9]{5}$");
-    std::string stem = basename(path);
-    stem.resize(stem.size() - 5);  // ".gguf"
-    std::smatch m;
-    *split = std::regex_search(stem, m, part);
-    if (*split) stem.resize(static_cast<size_t>(m.position(0)));
-    return stem;
+    *split = gguf::split_name(path).has_value();
+    return gguf::model_name(path);
 }
 
 // Whether a GGUF file's name ends in the quantization tag `quant` (case aside): "...-Q4_K_M", "....Q4_K_M".
@@ -72,6 +67,8 @@ const std::set<std::string> kSkippedFolders = {"onnx", "openvino", "coreml", "or
 struct Candidate {
     std::string path, stem;
     bool split = false;
+    // Which model it is (its folder and stem): the parts of a split model are one.
+    std::string model() const { return folder_of(path) + "/" + stem; }
 };
 
 // The length of the prefix that marks a GGUF repository's drafter files (llama.cpp's draft models: `mtp-*.gguf`, and
@@ -88,6 +85,38 @@ std::string list_of(const std::vector<Candidate>& cs) {
     for (const Candidate& c : cs)
         s += (s.empty() ? "" : ", ") + basename(c.path);
     return s;
+}
+
+// How many models `cs` are files of.
+size_t models(const std::vector<Candidate>& cs) {
+    std::set<std::string> m;
+    for (const Candidate& c : cs)
+        m.insert(c.model());
+    return m.size();
+}
+
+// The files of one model (candidates of one folder and stem): the file, or every part of a split one in order, part 1
+// first. A part missing from the listing, or parts that number the model differently, are refused by name.
+std::vector<std::string> model_files(const RepoListing& l, const std::string& quant, const std::vector<Candidate>& cs) {
+    const std::string what = quant.empty() ? std::string("default") : quant;
+    if (cs.size() == 1 && !cs.front().split) return {cs.front().path};
+    const auto first = gguf::split_name(cs.front().path);
+    const int count = first ? first->count : 0;
+    std::vector<std::string> parts(static_cast<size_t>(count));
+    for (const Candidate& c : cs) {
+        const auto n = gguf::split_name(c.path);
+        if (!n || n->count != count || !parts[static_cast<size_t>(n->no - 1)].empty()) {
+            fail(l.repo, ": the ", what, " file is not one file or the parts of one: ", list_of(cs));
+        }
+        parts[static_cast<size_t>(n->no - 1)] = c.path;
+    }
+    for (int no = 1; no <= count; ++no) {
+        if (parts[static_cast<size_t>(no - 1)].empty()) {
+            fail(l.repo, ": the ", what, " file is split into ", count, " parts and the repository lacks part ", no,
+                 " (it has ", list_of(cs), ")");
+        }
+    }
+    return parts;
 }
 
 Selection select_gguf(const RepoListing& l, const HubSpec& spec, FileRole role) {
@@ -115,7 +144,7 @@ Selection select_gguf(const RepoListing& l, const HubSpec& spec, FileRole role) 
     };
     if (quant.empty()) {
         pick(role == FileRole::Drafter ? "Q8_0" : "Q4_K_M");
-        if (match.empty() && cs.size() == 1) match = cs;
+        if (match.empty() && models(cs) == 1) match = cs;
         if (match.empty()) {
             fail(l.repo, " has several ", what, "GGUF files; name one by its quantization (", spec.repo,
                  ":<QUANT>): ", list_of(cs));
@@ -132,15 +161,9 @@ Selection select_gguf(const RepoListing& l, const HubSpec& spec, FileRole role) 
         }
         if (!plain.empty()) match = plain;
     }
-    std::set<std::string> stems;
-    for (const Candidate& c : match)
-        stems.insert(folder_of(c.path) + "/" + c.stem);
-    if (stems.size() > 1) fail(l.repo, ": quantization ", quant, " names several files: ", list_of(match));
-    if (match.front().split) {
-        fail(l.repo, ": the ", quant.empty() ? std::string("default") : quant, " file is split into ", match.size(),
-             " parts (", list_of(match), "); a GGUF file is imported whole: pick another quantization");
-    }
-    return {{match.front().path}, match.front().path};
+    if (models(match) > 1) fail(l.repo, ": quantization ", quant, " names several files: ", list_of(match));
+    const std::vector<std::string> files = model_files(l, quant, match);
+    return {files, files.front()};
 }
 
 }  // namespace

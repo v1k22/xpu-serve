@@ -33,7 +33,8 @@ where eight in parallel got 54 MB/s).
   own when the top does (other variants: Laya's `multilingual/`). A repository of GGUF files (no safetensors, or a
   `:QUANT`): the one file whose name ends in that tag, Q4_K_M by default (a drafter's `mtp-*.gguf`: Q8_0), the plain
   file before unsloth's dynamic `UD-` one of the same tag, never a vision projector or an importance matrix; a file
-  split into parts is refused, as the import refuses it. Every refusal lists what the repository has.
+  split into parts is refused, as the import refuses it (since docs/decisions/0030, every part is downloaded). Every
+  refusal lists what the repository has.
 - **A GGUF file is imported once** (`src/hub/model_source.cpp`) into a pack in xpu-serve's own cache
   (`~/.cache/xpu-serve/packs/<repo folder>/<commit>/<file>`, or XS_CACHE_DIR), built in a partial directory and renamed
   when whole. A `qwen35` file without its MTP head gets the head the repository publishes in a file of its own

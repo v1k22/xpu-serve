@@ -26,14 +26,15 @@ enum class FileRole { Model, Drafter };
 
 struct Selection {
     std::vector<std::string> paths;  // to download
-    std::string gguf;                // the GGUF file among them; empty for a checkpoint
+    std::string gguf;                // the GGUF file among them (a split one's first part); empty for a checkpoint
 };
 
 // A checkpoint: every file but other formats' weights (PyTorch, ONNX, OpenVINO, TensorFlow, GGUF), pictures and
 // media, and subfolders that hold weights of their own (other variants of the model). A GGUF repository (one with no
 // safetensors, or a spec with a quantization): the one file of the quantization asked for, Q4_K_M by default (a
-// drafter: Q8_0), never a vision projector (`mmproj`) or an importance matrix. Refused by name: no safetensors, no
-// file of the quantization (the error lists the ones there are), several, a file split into parts.
+// drafter: Q8_0), never a vision projector (`mmproj`) or an importance matrix; of a file split into parts, every part
+// (`gguf` is the first). Refused by name: no safetensors, no file of the quantization (the error lists the ones there
+// are), several, a part missing.
 Selection select_files(const RepoListing& listing, const HubSpec& spec, FileRole role);
 
 // For a GGUF file of a model whose drafter is published apart (llama.cpp's draft model: an MTP head, `mtp-*.gguf`,

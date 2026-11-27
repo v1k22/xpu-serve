@@ -219,8 +219,8 @@ TEST_SUITE("gguf reader") {
         CHECK(refusal(dir.path, good().bytes(0x03000000)).find("is big-endian") != std::string::npos);
 
         GgufWriter split = good();
-        split.u16("split.count", 3);
-        CHECK(refusal(dir.path, split.bytes()).find("split into 3 files (split.count)") != std::string::npos);
+        split.u16("split.no", 0).u16("split.count", 3).i32("split.tensors.count", 1);
+        CHECK(refusal(dir.path, split.bytes()).find("is not named <name>-00001-of-00003.gguf") != std::string::npos);
         GgufWriter one_part = good();
         one_part.u16("split.count", 1);
         CHECK(refusal(dir.path, one_part.bytes()).empty());
@@ -280,5 +280,111 @@ TEST_SUITE("gguf reader") {
         bad_type.raw("k", static_cast<T>(13), "");
         CHECK(refusal(dir.path, bad_type.bytes()).find("'k' has unknown value type 13") != std::string::npos);
         CHECK_FALSE(gguf::has_gguf_magic(dir.path / "absent.gguf"));
+    }
+
+    TEST_CASE("a split model reads as one file from its first part: its metadata, every part's tensors") {
+        const TempDir dir("xs_gguf_reader_split_test");
+        std::filesystem::create_directories(dir.path);
+        GgufWriter whole;
+        whole.alignment(64).string("general.architecture", "x").u32("x.block_count", 3);
+        for (int i = 0; i < 5; ++i) {
+            whole.f32_tensor("t" + std::to_string(i), {4, 2}, std::vector<float>(8, static_cast<float>(i)));
+        }
+        whole.write(dir.path / "whole.gguf");
+        const gguf::File one(dir.path / "whole.gguf");
+        CHECK(one.parts().size() == 1);
+        for (const bool empty_first : {false, true}) {
+            CAPTURE(empty_first);
+            const std::string prefix = (dir.path / (empty_first ? "m-e" : "m")).string();
+            const auto first = GgufWriter::write_parts(whole.split(2, empty_first), prefix);
+            CHECK(first.filename() == (empty_first ? "m-e-00001-of-00004.gguf" : "m-00001-of-00003.gguf"));
+            const gguf::File f(first);
+            REQUIRE(f.parts().size() == (empty_first ? 4u : 3u));
+            CHECK(f.path() == first);
+            CHECK(f.alignment() == 64);  // the first part's; the others use the default
+            CHECK(f.parts()[1].alignment == 32);
+            CHECK(f.get_string("general.architecture") == "x");
+            CHECK(f.get_int("split.count") == static_cast<int64_t>(f.parts().size()));
+            REQUIRE(f.tensors().size() == 5);
+            for (int i = 0; i < 5; ++i) {
+                const gguf::TensorInfo& t = f.tensors()[static_cast<size_t>(i)];
+                CHECK(t.name == "t" + std::to_string(i));
+                CHECK(t.part == (empty_first ? 1 + i / 2 : i / 2));
+                CHECK(std::memcmp(t.data, one.find_tensor(t.name)->data, 32) == 0);
+                CHECK(f.find_tensor(t.name) == &t);
+            }
+            CHECK(gguf::model_name(first) == (empty_first ? "m-e" : "m"));
+        }
+        const auto name = gguf::split_name(dir.path / "a.b-00002-of-00003.gguf");
+        REQUIRE(name);
+        CHECK(name->prefix == (dir.path / "a.b").string());
+        CHECK(name->no == 2);
+        CHECK(name->count == 3);
+        for (const char* not_a_part : {"m.gguf", "m-0001-of-00003.gguf", "m-00004-of-00003.gguf", "m-00001-of-00003"}) {
+            CAPTURE(not_a_part);
+            CHECK_FALSE(gguf::split_name(not_a_part));
+        }
+    }
+
+    TEST_CASE("split models: refused by name, a part other than the first, a missing part, parts that disagree") {
+        const TempDir dir("xs_gguf_reader_split_refusal_test");
+        std::filesystem::create_directories(dir.path);
+        GgufWriter whole;
+        whole.string("general.architecture", "x");
+        for (int i = 0; i < 4; ++i)
+            whole.f32_tensor("t" + std::to_string(i), {4}, std::vector<float>(4, 1.0f));
+        const auto error = [&](const std::filesystem::path& path) -> std::string {
+            try {
+                gguf::File f(path);
+            } catch (const Error& e) {
+                return e.what();
+            }
+            return "";
+        };
+        const auto parts = [&] { return whole.split(2); };  // two parts of two tensors
+        const auto write = [&](const std::vector<GgufWriter>& p, const std::string& name) {
+            return GgufWriter::write_parts(p, (dir.path / name).string());
+        };
+
+        const auto good = write(parts(), "good");
+        CHECK(error(good).empty());
+        CHECK(error(dir.path / "good-00002-of-00002.gguf").find("is part 2 of a model split into 2 files: give its "
+                                                                "first part, good-00001-of-00002.gguf") !=
+              std::string::npos);
+        const auto missing = write(parts(), "missing");
+        std::filesystem::remove(dir.path / "missing-00002-of-00002.gguf");
+        CHECK(error(missing).find("part 2, " + (dir.path / "missing-00002-of-00002.gguf").string() + ", is missing") !=
+              std::string::npos);
+        std::filesystem::copy_file(good, dir.path / "renamed.gguf");
+        CHECK(error(dir.path / "renamed.gguf").find("is not named <name>-00001-of-00002.gguf") != std::string::npos);
+
+        std::vector<GgufWriter> no = parts();
+        no[1].drop_value("split.no").u16("split.no", 3);
+        CHECK(error(write(no, "no")).find("says it is part 4 (split.no), not part 2") != std::string::npos);
+        std::vector<GgufWriter> count = parts();
+        count[1].drop_value("split.count").u16("split.count", 3);
+        CHECK(error(write(count, "count")).find("metadata 'split.count' differs from part 1's") != std::string::npos);
+        std::vector<GgufWriter> total = parts();
+        for (GgufWriter& p : total)
+            p.drop_value("split.tensors.count").i32("split.tensors.count", 5);
+        CHECK(error(write(total, "total")).find("the 2 parts hold 4 tensors, split.tensors.count says 5") !=
+              std::string::npos);
+        std::vector<GgufWriter> lacking = parts();
+        lacking[1].drop_value("split.tensors.count");
+        CHECK(error(write(lacking, "lacking")).find("has no split.tensors.count") != std::string::npos);
+        std::vector<GgufWriter> other = parts();
+        other[1].string("general.architecture", "y");
+        CHECK(error(write(other, "other")).find("metadata 'general.architecture' differs from part 1's") !=
+              std::string::npos);
+        std::vector<GgufWriter> extra = parts();
+        extra[1].u32("x.block_count", 2);
+        CHECK(error(write(extra, "extra")).find("metadata 'x.block_count' is not in part 1") != std::string::npos);
+        std::vector<GgufWriter> twice = parts();
+        twice[1].f32_tensor("t0", {4}, std::vector<float>(4, 2.0f)).drop_tensor("t3");
+        CHECK(error(write(twice, "twice")).find("tensor 't0' is in part 1 and in part 2") != std::string::npos);
+        // A part's own values (it repeats the first part's, or says its alignment) are not a disagreement.
+        std::vector<GgufWriter> repeated = parts();
+        repeated[1].string("general.architecture", "x").alignment(64);
+        CHECK(error(write(repeated, "repeated")).empty());
     }
 }

@@ -1,9 +1,15 @@
 #pragma once
 
-// GGUF files (llama.cpp's model format), read in place from a memory map: the header's metadata and tensor table, and
+// GGUF files (llama.cpp's model format), read in place from memory maps: the header's metadata and tensor table, and
 // each tensor's bytes. Versions 2 and 3, little-endian (the layout is the same; version 3 only allows big-endian
-// files, which are refused). Refused by name: other versions, big-endian files, a file that is one part of a split
-// model (split.count > 1), tensor types the engine cannot hold, and anything the file's size does not cover.
+// files, which are refused).
+//
+// A model split into parts (llama.cpp's gguf-split, or its converter's --split-max-size) reads as one file from its
+// first part: the parts are `<name>-00001-of-0000N.gguf` to `<name>-0000N-of-0000N.gguf`, found beside the first by
+// name, each with split.no, split.count and split.tensors.count; the metadata is the first part's, the tensors those
+// of every part. Refused by name: other versions, big-endian files, a part other than the first, a missing part,
+// parts that disagree (split.no, split.count, split.tensors.count, a value of a later part the first does not hold
+// the same, a tensor in two parts), tensor types the engine cannot hold, and anything a file's size does not cover.
 //
 // A tensor's dimensions are listed innermost first (ggml's ne): a matrix [rows, cols] in row-major order is listed
 // as {cols, rows}. TensorInfo::shape() gives the row-major order the rest of the engine uses.
@@ -11,6 +17,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -92,7 +99,8 @@ struct TensorInfo {
     uint32_t ggml_type = 0;                 // the file's type code
     DType dtype = DType::F32;               // F32, F16, BF16, or Block
     BlockFormat block = BlockFormat::Q4_0;  // dtype Block only
-    uint64_t offset = 0;                    // from the start of the data section
+    int part = 0;                           // the part of a split model that holds it (File::parts); 0 for a file
+    uint64_t offset = 0;                    // from the start of its part's data section
     size_t nbytes = 0;
     const std::byte* data = nullptr;  // into the map
 
@@ -107,15 +115,26 @@ struct TensorInfo {
 
 class File {
 public:
+    // A file, or the first part of a split model.
     explicit File(const std::filesystem::path& path);
     File(const File&) = delete;
     File& operator=(const File&) = delete;
 
-    const std::filesystem::path& path() const { return map_.path(); }
-    uint32_t version() const { return version_; }
-    uint32_t alignment() const { return alignment_; }
-    uint64_t data_offset() const { return data_offset_; }
-    uint64_t size() const { return map_.size(); }
+    // A file the model is read from: the one file, or one part of a split model.
+    struct Part {
+        std::filesystem::path path;
+        uint32_t version = 0;
+        uint32_t alignment = 32;
+        uint64_t data_offset = 0;  // where its tensors' bytes start
+        uint64_t size = 0;
+    };
+    // In order: parts()[i] is part i + 1 of a split model.
+    const std::vector<Part>& parts() const { return parts_; }
+    // The first part's.
+    const std::filesystem::path& path() const { return parts_.front().path; }
+    uint32_t version() const { return parts_.front().version; }
+    uint32_t alignment() const { return parts_.front().alignment; }
+    uint64_t data_offset() const { return parts_.front().data_offset; }
 
     // Metadata in file order.
     const std::vector<Value>& metadata() const { return values_; }
@@ -125,15 +144,20 @@ public:
     double get_float(std::string_view key) const { return get(key).as_float(); }
     std::string_view get_string(std::string_view key) const { return get(key).as_string(); }
 
-    // Tensors in file order.
+    // Tensors in file order, part after part.
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
     const TensorInfo* find_tensor(std::string_view name) const;
 
 private:
-    MappedFile map_;
-    uint32_t version_ = 0;
-    uint32_t alignment_ = 32;
-    uint64_t data_offset_ = 0;
+    // The header of `map`, part `part` of the model: its values and tensors appended to `values` and `tensors`, each
+    // tensor's bytes placed in the map and checked to be inside it.
+    static Part read_part(const MappedFile& map, int part, std::vector<Value>& values,
+                          std::vector<TensorInfo>& tensors);
+    // Parts 2 to `count` of the model whose first part this is, their tensors appended to `tensors`.
+    void read_other_parts(int64_t count, std::vector<TensorInfo>& tensors);
+
+    std::vector<MappedFile> maps_;  // a map per part
+    std::vector<Part> parts_;
     std::vector<Value> values_;
     std::map<std::string_view, size_t, std::less<>> value_index_;
     std::vector<TensorInfo> tensors_;
@@ -142,5 +166,18 @@ private:
 
 // The file's first four bytes are GGUF's magic.
 bool has_gguf_magic(const std::filesystem::path& path);
+
+// What a part's file name says, as llama.cpp names a split model's parts: `<prefix>-00002-of-00003.gguf` is part 2 of
+// 3 (`no` counts from 1). Nothing for a name that is not a part's.
+struct SplitName {
+    std::string prefix;  // the path without `-00002-of-00003.gguf`
+    int no = 0;
+    int count = 0;
+};
+std::optional<SplitName> split_name(const std::filesystem::path& path);
+// The path of part `no` (from 1) of `count`: llama.cpp's llama_split_path.
+std::filesystem::path split_path(const std::string& prefix, int no, int count);
+// The model's name: the file name without `.gguf` and, for a part, without `-00001-of-00003`.
+std::string model_name(const std::filesystem::path& path);
 
 }  // namespace xs::gguf

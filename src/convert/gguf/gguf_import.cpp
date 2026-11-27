@@ -192,6 +192,12 @@ std::optional<nlohmann::ordered_json> generation_config(const gguf::File& f) {
     return out;
 }
 
+// A source file's name in the manifest: a split model's is the name of the file its parts were split from, so that
+// the parts and the whole make the same pack.
+std::string source_name(const gguf::File& f) {
+    return f.parts().size() > 1 ? gguf::model_name(f.path()) + ".gguf" : f.path().filename().string();
+}
+
 }  // namespace
 
 double config_number(const gguf::Value& v) {
@@ -330,7 +336,7 @@ ImportReport import_gguf(const ImportOptions& o) {
     manifest["pack_version"] = kPackVersion;
     manifest["converter"] = o.converter;
     nlohmann::ordered_json source;
-    source["name"] = o.source.filename().string();
+    source["name"] = source_name(file);
     source["format"] = "gguf";
     source["model_type"] = plan.config.value("model_type", "");
     source["general.architecture"] = architecture;
@@ -338,8 +344,8 @@ ImportReport import_gguf(const ImportOptions& o) {
         if (const gguf::Value* v = file.find(key)) source[key] = std::string(v->as_string());
     }
     if (const gguf::Value* v = file.find("general.file_type")) source["general.file_type"] = v->as_int();
-    if (mtp) source["mtp"] = o.mtp.filename().string();
-    if (mmproj) source["mmproj"] = o.mmproj.filename().string();
+    if (mtp) source["mtp"] = source_name(*mtp);
+    if (mmproj) source["mmproj"] = source_name(*mmproj);
     manifest["source"] = std::move(source);
     manifest["tensors"] = std::move(manifest_tensors);
     write_json(o.output / kPackManifest, manifest, 1);

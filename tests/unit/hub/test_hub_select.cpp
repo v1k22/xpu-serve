@@ -1,7 +1,7 @@
 // Which files of a Hugging Face repository the hub client downloads (hub/select.h), on listings shaped as real
 // repositories are: a sentence-transformers checkpoint with other runtimes' weights beside it, a decision model with
-// variants in subfolders, unsloth's GGUF repositories with dynamic quantizations, split files, vision projectors and
-// MTP drafter files.
+// variants in subfolders, unsloth's GGUF repositories with dynamic quantizations, split files (every part, the first
+// named), vision projectors and MTP drafter files.
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -141,12 +141,37 @@ TEST_SUITE("hub select") {
                   .gguf == "Laya-BF16.gguf");
     }
 
-    TEST_CASE("GGUF refusals name what the repository has: no such file, no default, a split file") {
+    TEST_CASE("a GGUF file split into parts: every part, the first named as the file; one lacking refused") {
+        const RepoListing qwen = listing("unsloth/Qwen3.8-27B-GGUF", kQwen38Gguf);
+        const Selection bf16 = select_files(qwen, parse_hub_spec("unsloth/Qwen3.8-27B-GGUF:BF16"), FileRole::Model);
+        CHECK(bf16.paths == std::vector<std::string>{"BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf",
+                                                     "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf"});
+        CHECK(bf16.gguf == "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf");
+        // Listed out of order, three parts; a repository of one split model needs no quantization.
+        const RepoListing three = listing("o/m-GGUF", {"m-Q8_0-00003-of-00003.gguf", "m-Q8_0-00001-of-00003.gguf",
+                                                       "README.md", "m-Q8_0-00002-of-00003.gguf"});
+        const Selection s = select_files(three, parse_hub_spec("o/m-GGUF"), FileRole::Model);
+        CHECK(s.paths == std::vector<std::string>{"m-Q8_0-00001-of-00003.gguf", "m-Q8_0-00002-of-00003.gguf",
+                                                  "m-Q8_0-00003-of-00003.gguf"});
+        CHECK(s.gguf == "m-Q8_0-00001-of-00003.gguf");
+        CHECK_THROWS_WITH_AS(
+            select_files(listing("o/m-GGUF", {"m-Q8_0-00001-of-00003.gguf", "m-Q8_0-00003-of-00003.gguf"}),
+                         parse_hub_spec("o/m-GGUF:Q8_0"), FileRole::Model),
+            doctest::Contains("the Q8_0 file is split into 3 parts and the repository lacks part 2"), Error);
+        CHECK_THROWS_WITH_AS(
+            select_files(listing("o/m-GGUF", {"m-Q8_0-00001-of-00002.gguf", "m-Q8_0-00002-of-00003.gguf"}),
+                         parse_hub_spec("o/m-GGUF:Q8_0"), FileRole::Model),
+            doctest::Contains("is not one file or the parts of one"), Error);
+        CHECK_THROWS_WITH_AS(select_files(listing("o/m-GGUF", {"m-Q8_0.gguf", "m-Q8_0-00001-of-00002.gguf",
+                                                               "m-Q8_0-00002-of-00002.gguf"}),
+                                          parse_hub_spec("o/m-GGUF:Q8_0"), FileRole::Model),
+                             doctest::Contains("is not one file or the parts of one"), Error);
+    }
+
+    TEST_CASE("GGUF refusals name what the repository has: no such file, no default") {
         const RepoListing qwen = listing("unsloth/Qwen3.8-27B-GGUF", kQwen38Gguf);
         CHECK_THROWS_WITH_AS(select_files(qwen, parse_hub_spec("unsloth/Qwen3.8-27B-GGUF:Q5_K_M"), FileRole::Model),
                              doctest::Contains("Qwen3.8-27B-Q4_0.gguf"), Error);
-        CHECK_THROWS_WITH_AS(select_files(qwen, parse_hub_spec("unsloth/Qwen3.8-27B-GGUF:BF16"), FileRole::Model),
-                             doctest::Contains("split into 2 parts"), Error);
         CHECK_THROWS_WITH_AS(select_files(listing("ggml-org/Laya-GGUF", {"Laya-BF16.gguf", "Laya-Q8_0.gguf"}),
                                           parse_hub_spec("ggml-org/Laya-GGUF"), FileRole::Model),
                              doctest::Contains("name one by its quantization"), Error);

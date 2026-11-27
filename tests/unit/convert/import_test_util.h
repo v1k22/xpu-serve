@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -123,6 +126,19 @@ inline std::vector<float> values(const TensorView& v) {
     std::vector<float> out(static_cast<size_t>(v.numel()));
     quant::read_rows(v, 0, quant::matrix_rows(v.shape), out.data());
     return out;
+}
+
+// Every file of the pack in `dir`, by its path in it: its bytes. Hidden files (xpu-serve's cache stamps the imports it
+// keeps) are left out.
+inline std::map<std::string, std::string> pack_files(const std::filesystem::path& dir) {
+    std::map<std::string, std::string> files;
+    for (const auto& e : std::filesystem::recursive_directory_iterator(dir)) {
+        if (!e.is_regular_file() || e.path().filename().string().starts_with(".")) continue;
+        std::ifstream in(e.path(), std::ios::binary);
+        files[e.path().lexically_relative(dir).generic_string()] = {std::istreambuf_iterator<char>(in),
+                                                                     std::istreambuf_iterator<char>()};
+    }
+    return files;
 }
 
 // `error` names `text`; else it is shown.

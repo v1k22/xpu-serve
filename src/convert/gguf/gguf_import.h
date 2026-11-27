@@ -28,6 +28,8 @@
 
 namespace xs::gguf_import {
 
+// Each file may be a model split into parts, named by its first part (io/gguf.h): the pack is the one the whole file
+// gives.
 struct ImportOptions {
     std::filesystem::path source;         // the .gguf file
     std::filesystem::path output;         // created; must not exist or be empty

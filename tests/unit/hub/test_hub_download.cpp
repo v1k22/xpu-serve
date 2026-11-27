@@ -2,8 +2,8 @@
 // layout: blobs by hash, a snapshot of relative links, refs), the second time nothing is downloaded, files fetched in
 // ranges over several connections and resumed after a failure, a wrong byte caught, tokens sent to the Hub and never to
 // the CDN, gated and missing repositories, offline use; then `--hf` as the commands use it: a GGUF file imported into
-// a pack with the MTP head its repository publishes apart, and a checkpoint given the file it needs from another
-// repository.
+// a pack with the MTP head its repository publishes apart, a GGUF file split into parts, every part downloaded, and a
+// checkpoint given the file it needs from another repository.
 #include <doctest/doctest.h>
 
 #include <filesystem>
@@ -11,6 +11,7 @@
 #include <string>
 
 #include "convert/gguf/gguf_import.h"
+#include "convert/import_test_util.h"
 #include "convert/tiny_gguf.h"
 #include "fake_hub.h"
 #include "hub/download.h"
@@ -201,6 +202,35 @@ TEST_SUITE("hub download") {
             CHECK(s.gguf.filename() == "Tiny-Q8_0.gguf");
             CHECK(s.mtp.filename() == "mtp-Tiny-Q8_0.gguf");
         }
+    }
+
+    TEST_CASE("--hf of a GGUF file split into parts: every part downloaded, imported as the whole file") {
+        FakeHub hub;
+        HubTempDir dir("xs_hub_gguf_split");
+        const test::GgufWriter whole = test::build_tiny_gguf(dir.path / "tiny", 4);
+        whole.write(dir.path / "Tiny-BF16.gguf");
+        const std::vector<test::GgufWriter> parts = whole.split(10);
+        REQUIRE(parts.size() > 2);
+        const int count = static_cast<int>(parts.size());
+        for (size_t i = 0; i < parts.size(); ++i) {
+            const auto name = gguf::split_path("BF16/Tiny-BF16", static_cast<int>(i + 1), count);
+            hub.add("org/Tiny-GGUF", name.string(), parts[i].bytes());
+        }
+        hub.add("org/Tiny-GGUF", "Tiny-Q8_0.gguf", "another quantization");
+        SourceOptions o;
+        o.hub = hub.options(dir.path / "hf");
+        o.cache = dir.path / "xs";
+        const ModelSource m = resolve_model("org/Tiny-GGUF:BF16", FileRole::Model, o);
+        CHECK(m.dir.filename() == "Tiny-BF16");
+        gguf_import::ImportOptions io;
+        io.source = dir.path / "Tiny-BF16.gguf";
+        io.output = dir.path / "local";
+        gguf_import::import_gguf(io);
+        CHECK(xs::test::pack_files(m.dir) == xs::test::pack_files(dir.path / "local"));
+        const fs::path snapshot = fs::path(o.hub.cache) / "models--org--Tiny-GGUF" / "snapshots" / FakeHub::kCommit;
+        CHECK_FALSE(fs::exists(snapshot / "Tiny-Q8_0.gguf"));
+        const SourceFiles s = fetch_source("org/Tiny-GGUF:BF16", FileRole::Model, o);
+        CHECK(s.gguf == snapshot / gguf::split_path("BF16/Tiny-BF16", 1, count));
     }
 
     TEST_CASE("a checkpoint that reads a file its repository does not publish gets it beside its files") {

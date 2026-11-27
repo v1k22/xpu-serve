@@ -1,6 +1,7 @@
 #include "io/gguf.h"
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -14,6 +15,14 @@ namespace {
 constexpr std::array<char, 4> kMagic = {'G', 'G', 'U', 'F'};
 constexpr uint32_t kMaxDims = 4;  // ggml's GGML_MAX_DIMS
 constexpr int kMaxNesting = 8;    // arrays of arrays of ...
+constexpr int64_t kMaxParts = 99999;  // a part's name numbers it in five digits
+
+// `-00002-of-00003.gguf`: the end of a part's name.
+std::string part_suffix(int no, int count) {
+    char s[32];
+    std::snprintf(s, sizeof s, "-%05d-of-%05d.gguf", no, count);
+    return s;
+}
 
 // Bytes of one value of a fixed-size type; 0 for strings and arrays.
 size_t fixed_size(ValueType t) {
@@ -404,47 +413,121 @@ TensorView TensorInfo::view(Dims shape) const {
     return v;
 }
 
-File::File(const std::filesystem::path& path) : map_(path) {
-    const std::string where = str_cat("GGUF '", path.string(), "'");
-    Cursor c(map_.data(), map_.size(), map_.path());
-    if (map_.size() < kMagic.size() || std::memcmp(map_.data(), kMagic.data(), kMagic.size()) != 0) {
-        fail(path.string(), " is not a GGUF file (its first bytes are not 'GGUF')");
+File::File(const std::filesystem::path& path) {
+    maps_.emplace_back(path);
+    std::vector<TensorInfo> tensors;
+    parts_.push_back(read_part(maps_.front(), 0, values_, tensors));
+    for (size_t i = 0; i < values_.size(); ++i)
+        value_index_.emplace(values_[i].key(), i);
+    if (const Value* count = find("split.count"); count != nullptr && count->as_int() > 1) {
+        read_other_parts(count->as_int(), tensors);
+    }
+    tensors_ = std::move(tensors);
+    for (size_t i = 0; i < tensors_.size(); ++i) {
+        const TensorInfo& t = tensors_[i];
+        const auto [it, fresh] = tensor_index_.emplace(t.name, i);
+        if (fresh) continue;
+        const int first = tensors_[it->second].part;
+        if (first == t.part) fail("GGUF '", parts_[t.part].path.string(), "': tensor '", t.name, "' appears twice");
+        fail("GGUF '", path.string(), "': tensor '", t.name, "' is in part ", first + 1, " and in part ", t.part + 1,
+             ": the parts disagree");
+    }
+}
+
+void File::read_other_parts(int64_t count, std::vector<TensorInfo>& tensors) {
+    const std::string where = str_cat("GGUF '", path().string(), "'");
+    const auto split_int = [&](const std::vector<Value>& values, std::string_view key, std::string_view part) {
+        for (const Value& v : values) {
+            if (v.key() == key) return v.as_int();
+        }
+        fail(part, " is one of a model's ", count, " parts (split.count) but has no ", key);
+    };
+    if (count > kMaxParts) fail(where, ": split.count ", count, " is more parts than a part's name can number");
+    const std::optional<SplitName> name = split_name(path());
+    if (const int64_t no = split_int(values_, "split.no", where); no != 0) {
+        fail(where, " is part ", no + 1, " of a model split into ", count, " files: give its first part",
+             name ? str_cat(", ", split_path(name->prefix, 1, static_cast<int>(count)).filename().string()) : "");
+    }
+    const int64_t total = split_int(values_, "split.tensors.count", where);
+    if (!name || name->no != 1 || name->count != count) {
+        fail(where, " is the first of ", count, " parts (split.count), but is not named <name>",
+             part_suffix(1, static_cast<int>(count)), ": the other parts are found by that name");
+    }
+    maps_.reserve(static_cast<size_t>(count));
+    for (int k = 1; k < count; ++k) {
+        const std::filesystem::path p = split_path(name->prefix, k + 1, static_cast<int>(count));
+        if (!std::filesystem::exists(p)) {
+            fail(where, " is part 1 of ", count, ": part ", k + 1, ", ", p.string(), ", is missing");
+        }
+        maps_.emplace_back(p);
+        std::vector<Value> values;
+        parts_.push_back(read_part(maps_.back(), k, values, tensors));
+        const std::string part = str_cat("GGUF '", p.string(), "'");
+        if (const int64_t no = split_int(values, "split.no", part); no != k) {
+            fail(part, " says it is part ", no + 1, " (split.no), not part ", k + 1, ": the parts disagree");
+        }
+        split_int(values, "split.count", part);
+        split_int(values, "split.tensors.count", part);
+        // A part's own: its number and the alignment of its tensors. Every other value is the first part's.
+        for (const Value& v : values) {
+            if (v.key() == "split.no" || v.key() == "general.alignment") continue;
+            const Value* first = find(v.key());
+            if (first == nullptr || !first->same_as(v)) {
+                const char* how = first == nullptr ? "is not in part 1" : "differs from part 1's";
+                fail(part, ": metadata '", v.key(), "' ", how, ": the parts disagree");
+            }
+        }
+    }
+    if (static_cast<int64_t>(tensors.size()) != total) {
+        fail(where, ": the ", count, " parts hold ", tensors.size(), " tensors, split.tensors.count says ", total,
+             ": the parts disagree");
+    }
+}
+
+File::Part File::read_part(const MappedFile& map, int part, std::vector<Value>& values,
+                           std::vector<TensorInfo>& tensors) {
+    const std::string where = str_cat("GGUF '", map.path().string(), "'");
+    Part info;
+    info.path = map.path();
+    info.size = map.size();
+    Cursor c(map.data(), map.size(), map.path());
+    if (map.size() < kMagic.size() || std::memcmp(map.data(), kMagic.data(), kMagic.size()) != 0) {
+        fail(map.path().string(), " is not a GGUF file (its first bytes are not 'GGUF')");
     }
     c.skip(kMagic.size(), "the magic");
-    version_ = c.read<uint32_t>("the version");
-    if (version_ != 2 && version_ != 3) {
-        if ((version_ & 0xFFFF) == 0) fail(where, " is big-endian; only little-endian GGUF files are read");
-        fail(where, " is GGUF version ", version_, "; versions 2 and 3 are read");
+    info.version = c.read<uint32_t>("the version");
+    if (info.version != 2 && info.version != 3) {
+        if ((info.version & 0xFFFF) == 0) fail(where, " is big-endian; only little-endian GGUF files are read");
+        fail(where, " is GGUF version ", info.version, "; versions 2 and 3 are read");
     }
     const auto n_tensors = c.read<uint64_t>("the tensor count");
     const auto n_values = c.read<uint64_t>("the metadata count");
 
     // A key, its type and value take at least 13 bytes; a tensor's name, dimensions, type and offset 32.
     c.need_entries(n_values, 13, "the metadata");
-    values_.reserve(static_cast<size_t>(n_values));
+    std::map<std::string_view, size_t, std::less<>> keys;
     for (uint64_t i = 0; i < n_values; ++i) {
         const std::string_view key = c.string("a metadata key");
         const ValueType type = read_type(c, key);
         const Parsed p = parse_value(c, type, key, 0);
-        if (!value_index_.emplace(key, values_.size()).second) fail(where, ": metadata '", key, "' appears twice");
-        values_.push_back(Value(key, p.type, p.element, p.count, p.data, p.bytes));
-    }
-    if (const Value* split = find("split.count"); split != nullptr && split->as_int() > 1) {
-        fail(where, " is one part of a model split into ", split->as_int(),
-             " files (split.count); merge the parts into one file first");
-    }
-    if (const Value* a = find("general.alignment")) {
-        if (a->type() != ValueType::U32) a->wrong_type("a u32");
-        alignment_ = static_cast<uint32_t>(a->as_int());
-        if (alignment_ == 0 || (alignment_ & (alignment_ - 1)) != 0) {
-            fail(where, ": general.alignment ", alignment_, " is not a power of two");
+        if (!keys.emplace(key, i).second) fail(where, ": metadata '", key, "' appears twice");
+        const Value v(key, p.type, p.element, p.count, p.data, p.bytes);
+        if (key == "general.alignment") {
+            if (v.type() != ValueType::U32) v.wrong_type("a u32");
+            info.alignment = static_cast<uint32_t>(v.as_int());
+            if (info.alignment == 0 || (info.alignment & (info.alignment - 1)) != 0) {
+                fail(where, ": general.alignment ", info.alignment, " is not a power of two");
+            }
         }
+        values.push_back(v);
     }
 
     c.need_entries(n_tensors, 32, "the tensor table");
-    tensors_.reserve(static_cast<size_t>(n_tensors));
+    const size_t first = tensors.size();
+    tensors.reserve(first + static_cast<size_t>(n_tensors));
     for (uint64_t i = 0; i < n_tensors; ++i) {
         TensorInfo t;
+        t.part = part;
         t.name = std::string(c.string("a tensor name"));
         const auto n_dims = c.read<uint32_t>("a tensor's dimension count");
         if (n_dims == 0 || n_dims > kMaxDims) {
@@ -477,31 +560,30 @@ File::File(const std::filesystem::path& path) : map_(path) {
             }
             t.nbytes = block_storage_bytes(t.block, numel);
         } else {
-            if (static_cast<uint64_t>(numel) > map_.size()) {
+            if (static_cast<uint64_t>(numel) > map.size()) {
                 fail(where, " is truncated: tensor '", t.name, "' holds ", numel, " values, more than the file's ",
-                     map_.size(), " bytes");
+                     map.size(), " bytes");
             }
             t.nbytes = storage_bytes(t.dtype, numel);
         }
-        if (!tensor_index_.emplace(t.name, tensors_.size()).second) {
-            fail(where, ": tensor '", t.name, "' appears twice");
-        }
-        tensors_.push_back(std::move(t));
+        tensors.push_back(std::move(t));
     }
 
-    data_offset_ = (static_cast<uint64_t>(c.pos()) + alignment_ - 1) / alignment_ * alignment_;
-    const uint64_t data_size = map_.size() > data_offset_ ? map_.size() - data_offset_ : 0;
-    for (TensorInfo& t : tensors_) {
-        if (t.offset % alignment_ != 0) {
-            fail(where, ": tensor '", t.name, "' starts at offset ", t.offset, ", not a multiple of the alignment ",
-                 alignment_);
+    const uint64_t a = info.alignment;
+    info.data_offset = (static_cast<uint64_t>(c.pos()) + a - 1) / a * a;
+    const uint64_t data_size = map.size() > info.data_offset ? map.size() - info.data_offset : 0;
+    for (size_t i = first; i < tensors.size(); ++i) {
+        TensorInfo& t = tensors[i];
+        if (t.offset % a != 0) {
+            fail(where, ": tensor '", t.name, "' starts at offset ", t.offset, ", not a multiple of the alignment ", a);
         }
         if (t.offset > data_size || t.nbytes > data_size - t.offset) {
-            fail(where, " is truncated: tensor '", t.name, "' needs bytes ", data_offset_ + t.offset, " to ",
-                 data_offset_ + t.offset + t.nbytes, ", the file has ", map_.size());
+            fail(where, " is truncated: tensor '", t.name, "' needs bytes ", info.data_offset + t.offset, " to ",
+                 info.data_offset + t.offset + t.nbytes, ", the file has ", map.size());
         }
-        t.data = map_.data() + data_offset_ + t.offset;
+        t.data = map.data() + info.data_offset + t.offset;
     }
+    return info;
 }
 
 const Value* File::find(std::string_view key) const {
@@ -524,6 +606,36 @@ bool has_gguf_magic(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     std::array<char, 4> head{};
     return in.read(head.data(), head.size()) && head == kMagic;
+}
+
+std::optional<SplitName> split_name(const std::filesystem::path& path) {
+    const std::string s = path.string();
+    constexpr size_t kSuffix = 20;  // "-00002-of-00003.gguf"
+    if (s.size() <= kSuffix) return std::nullopt;
+    const std::string_view end = std::string_view(s).substr(s.size() - kSuffix);
+    const auto digits = [&](size_t at) {
+        int n = 0;
+        for (size_t i = at; i < at + 5; ++i) {
+            if (end[i] < '0' || end[i] > '9') return -1;
+            n = n * 10 + (end[i] - '0');
+        }
+        return n;
+    };
+    const int no = digits(1), count = digits(10);
+    if (end[0] != '-' || end.substr(6, 4) != "-of-" || no < 1 || count < no) return std::nullopt;
+    if (end.substr(15) != ".gguf") return std::nullopt;
+    return SplitName{s.substr(0, s.size() - kSuffix), no, count};
+}
+
+std::filesystem::path split_path(const std::string& prefix, int no, int count) {
+    return prefix + part_suffix(no, count);
+}
+
+std::string model_name(const std::filesystem::path& path) {
+    if (const std::optional<SplitName> part = split_name(path)) {
+        return std::filesystem::path(part->prefix).filename().string();
+    }
+    return path.stem().string();
 }
 
 }  // namespace xs::gguf

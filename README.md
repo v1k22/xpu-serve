@@ -49,9 +49,8 @@ optimized one) and what was measured**; this page says what is supported and how
   or compressed-tensors' scale per channel), served as they are or converted to a pack
 - ✅ **GGUF import**: `qwen35`, `qwen35moe`, `gemma4`, `gemma4-assistant`, `inkling2_loop` and `inkling2` (Inkling 2
   in mainline llama.cpp's layout and Unsloth's, with its DSpark drafter's file in either format and its vision
-  tower's), `clef` and the `modern-bert`
-  files of Laya and Julia-1, in all 19 of GGUF's block formats and Unsloth's
-  NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them
+  tower's), `clef` and the `modern-bert` files of Laya and Julia-1, in all 19 of GGUF's block formats and Unsloth's
+  NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them; files split into parts too
 - ✅ **Speculative decoding**: Qwen's MTP heads, Gemma 4's assistants, DFlash 2 and DSpine block drafters
   (Qwen3.8-27B), a DFlash block drafter (Ornith-1.5-35B-A3B), Inkling 2's DSpark drafter
 - ✅ **LoRA adapters** in llama.cpp's GGUF form (`--lora`): each change added where the model reads the weight, which
@@ -170,8 +169,9 @@ smaller and faster; [model_recipes.md](model_recipes.md) has the combination to 
 - **A GGUF file**: `-hf org/name:QUANT` names one file of a GGUF repository by its quantization (`Q4_K_M` by default;
   `Q4_0`, `UD-Q4_K_XL`, `Q8_0`, ...). It is imported once into a pack in xpu-serve's cache (`~/.cache/xpu-serve`, or
   `XS_CACHE_DIR`), so it takes its size twice on disk. A Qwen3.5-family file published without its MTP head gets the
-  head from the repository's `mtp-*.gguf`, so `--spec mtp` works. `-hfd org/name` picks a GGUF repository's drafter
-  file (`mtp-*.gguf`, `Q8_0` by default).
+  head from the repository's `mtp-*.gguf`, so `--spec mtp` works. A file split into parts (`*-00001-of-00003.gguf`)
+  comes down whole, every part. `-hfd org/name` picks a GGUF repository's drafter file (`mtp-*.gguf`, `Q8_0` by
+  default).
 - **Fast and resumable**: files come in ranges over eight connections, an interrupted download continues where it
   stopped, and every file is checked against its SHA-256 before it is used.
 - **Gated and private repositories** need `HF_TOKEN` (or the token file `hf auth login` writes) from an account that
@@ -233,6 +233,8 @@ xpu-serve serve ~/models/Qwen3.5-4B-Q4_K_M --device GPU
   `inkling2`, the same model in Unsloth's earlier layout (the `Old_Support/` copies of its repository);
   `clef`, the Clef decision models; and `modern-bert` with a Laya read-out, the files of Laya and Julia-1. Others
   are refused by name.
+- A file split into parts (llama.cpp's gguf-split: `*-00001-of-00003.gguf` and on) is named by its first part, the
+  others found beside it; it gives the pack the whole file gives.
 - A Qwen3.5-family file that comes without its MTP head (the smallest files of Qwen3.8-27B) takes the head from its
   `MTP/mtp-*.gguf` file with `--mtp`: the pack is the one a file with the head gives, and `--spec mtp` drafts with it.
 - config.json, the tokenizer and the chat template are written from the file's metadata (on Qwen3.5-4B and Gemma 4

@@ -43,8 +43,6 @@ bool reads_projector(const fs::path& file) {
     return arch != nullptr && (arch->as_string() == "inkling2" || arch->as_string() == "inkling2_loop");
 }
 
-std::string stem(const fs::path& p) { return p.stem().string(); }
-
 // `dir` once and for all: made by `make` in a partial directory renamed into place when whole, under a lock, so an
 // interrupted run or a second process never leaves or reads half of it.
 void build_once(const fs::path& dir, const fs::path& marker, const std::function<void(const fs::path&)>& make) {
@@ -127,8 +125,8 @@ ModelSource resolve_model(const std::string& text, FileRole role, const SourceOp
     ModelSource m;
     m.name = s.name;
     if (!s.gguf.empty()) {
-        const std::string name = stem(s.gguf) + (s.mtp.empty() ? "" : "+" + stem(s.mtp)) +
-                                 (s.mmproj.empty() ? "" : "+" + stem(s.mmproj));
+        const std::string name = gguf::model_name(s.gguf) + (s.mtp.empty() ? "" : "+" + gguf::model_name(s.mtp)) +
+                                 (s.mmproj.empty() ? "" : "+" + gguf::model_name(s.mmproj));
         m.dir = o.cache / "packs" / s.folder / s.commit.substr(0, 12) / name;
         build_once(m.dir, m.dir / "xpu_pack.json", [&](const fs::path& out) {
             log::info("importing ", s.gguf.filename().string(), " into ", m.dir.string());
