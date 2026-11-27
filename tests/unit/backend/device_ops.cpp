@@ -157,8 +157,9 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
                     CHECK(dev::close("matmul_quant", run_out(g, w, {{"x", x}}), expected,
                                      dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
                 }
-                // many rows (prefill): quant_gemm_tiled's work-groups of 128, 256 and 512 rows and past them; x made
-                // by an op of a static shape is kept in f16 (plan_half_values), of a dynamic one in f32
+                // many rows (prefill): quant_gemm_tiled's work-groups of 128, 256 and 512 rows and past them, on the
+                // devices that take it by themselves and (tiled_rows) on any other; x made by an op of a static
+                // shape is kept in f16 (plan_half_values), of a dynamic one in f32
                 for (const int64_t m : {65, 200, 513, 1100}) {
                     CAPTURE(m);
                     const HostTensor x = rng.uniform(DType::F32, {m, k});
@@ -170,8 +171,14 @@ TEST_SUITE("device ops" * doctest::skip(!dev::enabled())) {
                         Graph g;
                         const Value xs = g.add(g.input("x", DType::F32, {rows, k}), g.input("zero", DType::F32, {rows, k}));
                         g.output("out", g.matmul(xs, g.weight(w, "w")));
-                        CHECK(dev::close("matmul_quant rows", run_out(g, w, {{"x", x}, {"zero", zero}}), expected,
-                                         dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+                        for (const char* tiled_rows : {"", "2048"}) {
+                            CAPTURE(tiled_rows);
+                            SessionOptions o = dev::options();
+                            if (*tiled_rows != 0) o.extra["tiled_rows"] = tiled_rows;
+                            const TensorMap out = dev::run(g, w, {{"x", x}, {"zero", zero}}, o);
+                            CHECK(dev::close("matmul_quant rows", out.at("out"), expected,
+                                             dev::tolerance({1e-5, 1e-4}, {4e-3, 4e-3})));
+                        }
                     }
                 }
                 Graph g;

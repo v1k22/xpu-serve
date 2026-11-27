@@ -244,9 +244,10 @@ constexpr int64_t kXmxBlockRows = 2;
 constexpr int64_t kFewTokens = 8;
 
 // How quantized matmuls run (the GEMV option: auto, vector = the GEMV only, xmx = its matrix-engine version from one
-// row, where it fits; few_rows: the most rows quant_gemm takes, the device's own choice when negative).
+// row, where it fits; few_rows: the most rows quant_gemm takes, tiled_rows: the most quant_gemm_tiled takes past
+// them, each the device's own choice when negative).
 sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::AttentionPlan& attention, DType precision,
-                                    const std::string& gemv, int64_t few_rows, bool block_float) {
+                                    const std::string& gemv, int64_t few_rows, int64_t tiled_rows, bool block_float) {
     sycl_be::QuantMatmulPlan p;
     p.f32 = precision == DType::F32;
     p.block_float = block_float;
@@ -258,7 +259,7 @@ sycl_be::QuantMatmulPlan quant_plan(const sycl::device& d, const sycl_be::Attent
     }
     if (attention.xmx) {
         p.few_rows = few_rows >= 0 ? few_rows : sycl_be::kQuantGemmMaxRows;
-        if (integrated_gpu(d)) p.tiled_rows = kTiledMaxRows;
+        p.tiled_rows = tiled_rows >= 0 ? tiled_rows : integrated_gpu(d) ? kTiledMaxRows : 0;
     }
     return p;
 }
@@ -3487,6 +3488,7 @@ public:
         sycl_be::AttentionPlan attention;
         std::string gemv = "auto";
         int64_t few_rows = -1;
+        int64_t tiled_rows = -1;
         bool block_float = false;
         for (const auto& [key, value] : options.extra) {
             if (key == "block") {
@@ -3510,6 +3512,12 @@ public:
                 }
                 continue;
             }
+            if (key == "tiled_rows") {
+                const bool digits = !value.empty() && value.find_first_not_of("0123456789") == std::string::npos;
+                XS_CHECK(digits && value.size() <= 6, "sycl backend option tiled_rows=", value, " is not a row count");
+                tiled_rows = std::stoll(value);
+                continue;
+            }
             if (key == "kv_chunk") {  // keys a chunk of a quantized cache on the fused kernel (0: whole)
                 const bool digits = !value.empty() && value.find_first_not_of("0123456789") == std::string::npos;
                 XS_CHECK(digits && value.size() <= 9, "sycl backend option kv_chunk=", value, " is not a key count");
@@ -3518,7 +3526,7 @@ public:
             }
             if (key != "attention") {
                 fail("sycl does not know backend option '", key,
-                     "' (known: attention, block, few_rows, gemv, kv_chunk)");
+                     "' (known: attention, block, few_rows, gemv, kv_chunk, tiled_rows)");
             }
             if (value == "rows") {
                 attention.path = sycl_be::AttentionPath::Rows;
@@ -3549,7 +3557,8 @@ public:
         if (integrated_gpu(devices_[index])) attention.score_cache = kScoreCacheBytes;
         auto session = std::make_unique<SyclSession>(
             std::make_unique<SyclShared>(it->second, options.max_context, options.rewind_tokens));
-        const sycl_be::QuantMatmulPlan quant = quant_plan(devices_[index], attention, options.precision, gemv, few_rows, block_float);
+        const sycl_be::QuantMatmulPlan quant =
+            quant_plan(devices_[index], attention, options.precision, gemv, few_rows, tiled_rows, block_float);
         for (const graph::Graph* graph : programs) {
             session->add(std::make_unique<SyclProgram>(*graph, weights, options, session->shared(), attention, quant));
         }
