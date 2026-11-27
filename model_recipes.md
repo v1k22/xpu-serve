@@ -402,7 +402,8 @@ Checked against Hugging Face on a tiny checkpoint of its layout (experts beside 
 
 ### Qwen3.5-4B
 
-`Qwen/Qwen3.5-4B` (`qwen3_5`). Text; its MTP head is the drafter, inside the checkpoint and its packs.
+`Qwen/Qwen3.5-4B` (`qwen3_5`). Text and images (its vision tower, in the checkpoint and its packs; `--no-vision`
+leaves it off); its MTP head is the drafter, inside the checkpoint and its packs.
 
 Reference:
 
@@ -432,7 +433,9 @@ Measured:
 Prefill 5,000 tok/s. Over six chat prompts the MTP head takes q4 from 104 to 149 tok/s. With an int8 KV cache it
 keeps its MMLU-Pro score.
 
-Checked against Hugging Face fp32 logits and greedy text.
+Checked against Hugging Face fp32 logits and greedy text, with images too: on the Arc Pro B60 at f32 the vision
+tower's rows and the logits at cosine 1, 24 greedy tokens equal on four images; at f16 rows 0.99999, logits
+0.999998, greedy equal. An image of 64 tokens encodes in about 14 ms at f16.
 
 ### Qwen3.5-9B
 
@@ -555,7 +558,11 @@ f16, 32 greedy tokens and the MTP head's drafts equal on six prompts of up to 1,
 ### Qwen3.6-35B-A3B
 
 `Qwen/Qwen3.6-35B-A3B`, or its FP8 release `Qwen/Qwen3.6-35B-A3B-FP8` (half the download) (`qwen3_5_moe`, a mixture
-of experts). Text; its MTP head is the drafter.
+of experts). Text and images; its MTP head is the drafter. Its GGUF file
+`-hf unsloth/Qwen3.6-35B-A3B-GGUF:Q4_K_M` (UD-Q4_K_M) imports with the repository's vision tower (mmproj-BF16): 21.0
+GB of weights and 0.85 GB of tower on the device, 0.1 GiB left at `--ctx 8192` on a 24 GB card (`--no-vision` frees
+the tower's); it described a test picture right ("a red circle on the left and a blue square on the right") and
+decodes 56 tok/s. That repository has no MTP file.
 
 Reference (its f16 weights do not fit a 24 GB card; an FP8 checkpoint also runs as f16 on the device):
 
@@ -650,9 +657,9 @@ original at cosine 0.99964 or better.
 
 ### Qwen3.8-27B
 
-`Qwen/Qwen3.8-27B`, or its FP8 release `Qwen/Qwen3.8-27B-FP8` (half the download) (`qwen3_5`). Text. Drafters: its
-MTP head (inside the checkpoint and its packs), and the block drafters `z-lab/Qwen3.8-27B-DFlash2` and
-`tencent/Qwen3.8-27B-DSpine-b16`.
+`Qwen/Qwen3.8-27B`, or its FP8 release `Qwen/Qwen3.8-27B-FP8` (half the download) (`qwen3_5`). Text and images
+(not beside a block drafter, which turns the vision tower off). Drafters: its MTP head (inside the checkpoint and its
+packs), and the block drafters `z-lab/Qwen3.8-27B-DFlash2` and `tencent/Qwen3.8-27B-DSpine-b16`.
 
 Reference (its f16 weights do not fit a 24 GB card; an FP8 checkpoint also runs as f16 on the device):
 
@@ -935,6 +942,8 @@ The decision models' files are in their own sections: [Clef-Flash](#clef-flash),
 ### Qwen3.5-4B GGUF
 
 [unsloth/Qwen3.5-4B-GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), all 22 files (2 to 16 bits a weight).
+`-hf` (or the file served by its path, with the projector beside it) imports the repository's vision tower
+(`mmproj-BF16.gguf`) with the model: images in, the tower's rows at cosine 0.99999 against the checkpoint's.
 
 Reference (the BF16 file is the original checkpoint):
 
@@ -1017,7 +1026,9 @@ With the drafter from its `MTP/` files the text is the same, at 230 to 270 tok/s
 
 [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF): the 20 files that fit a 24 GB card (1.8
 to 6.8 bits a weight, 6 to 23 GB). The original does not fit one card, so a file is the closest to the reference
-that does: the larger the file, the closer.
+that does: the larger the file, the closer. `-hf` imports the repository's vision tower (`mmproj-BF16.gguf`, 879 MiB
+on the device) with the file: on the Q4_0 file it described a test picture right ("a red circle and a blue square"),
+an image encoded in 111 ms; `--no-vision` leaves the tower off.
 
 Closest to the reference on one card:
 
