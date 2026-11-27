@@ -130,7 +130,7 @@ std::vector<std::string> pre_tokenize(std::string_view text) {
 }
 
 std::string decode_tokens(const nlohmann::json& config, std::vector<std::string> tokens) {
-    xs::tok::make_decoder(config)->decode(tokens);
+    xs::tok::make_decoder(config)->decode(tokens, xs::tok::DecodeAs::text);
     std::string text;
     for (const auto& token : tokens) text += token;
     return text;

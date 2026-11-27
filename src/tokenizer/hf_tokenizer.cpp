@@ -117,11 +117,22 @@ public:
             tokens.push_back(token_text(id));
         }
         if (!decoder_) return join_with_spaces(tokens);  // Hugging Face's behavior without a decoder
-        decoder_->decode(tokens);
+        decoder_->decode(tokens, DecodeAs::text);
         std::string text;
         for (const auto& token : tokens) text += token;
         return text;
     }
+
+    std::string token_bytes(int32_t id) const override {
+        std::vector<std::string> piece{token_text(id)};
+        if (!decoder_) return " " + piece[0];  // decode() joins tokens with spaces
+        decoder_->decode(piece, DecodeAs::pieces);
+        std::string bytes;
+        for (const auto& part : piece) bytes += part;
+        return bytes;
+    }
+
+    bool is_added(int32_t id) const override { return added_by_id_.contains(id); }
 
     int32_t vocab_size() const override { return id_limit_; }
 

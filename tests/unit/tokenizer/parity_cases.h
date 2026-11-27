@@ -57,6 +57,9 @@ inline void check_tokenizer_cases(const tok::Tokenizer& tok, const nlohmann::jso
         CHECK(tok.decode(expected, true) == c["decoded_skip_special"].get<std::string>());
         CHECK(stream_decode(tok, expected, false) == c["decoded"].get<std::string>());
         CHECK(stream_decode(tok, expected, true) == c["decoded_skip_special"].get<std::string>());
+        std::string bytes;  // each token's own bytes add up to the text, where they are valid UTF-8
+        for (const int32_t id : expected) bytes += tok.token_bytes(id);
+        if (tok::utf8::is_valid(bytes)) CHECK(bytes == c["decoded"].get<std::string>());
     }
     for (const auto& c : f["decode_cases"]) {
         CAPTURE(c["name"].get<std::string>());

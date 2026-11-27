@@ -43,6 +43,12 @@ public:
     // Face's id_to_token gives it, while token_id takes the content).
     virtual std::string token_text(int32_t id) const = 0;
     virtual std::optional<int32_t> token_id(std::string_view piece) const = 0;
+    // The bytes `id` adds to decoded text in the middle of it, as they are (a byte-level or byte-fallback piece may
+    // hold part of a character).
+    virtual std::string token_bytes(int32_t id) const = 0;
+    // One of tokenizer.json's added tokens (a marker such as <|im_end|> or <think>, special or not), not a piece of the
+    // model's vocabulary.
+    virtual bool is_added(int32_t id) const = 0;
     virtual bool is_special(int32_t id) const = 0;
     virtual std::optional<int32_t> bos_id() const = 0;
     virtual std::optional<int32_t> eos_id() const = 0;

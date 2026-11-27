@@ -38,6 +38,8 @@ public:
         if (piece.size() != 1) return std::nullopt;
         return int32_t(static_cast<unsigned char>(piece[0]));
     }
+    std::string token_bytes(int32_t id) const override { return std::string(1, char(id)); }
+    bool is_added(int32_t) const override { return false; }
     bool is_special(int32_t) const override { return false; }
     std::optional<int32_t> bos_id() const override { return std::nullopt; }
     std::optional<int32_t> eos_id() const override { return std::nullopt; }

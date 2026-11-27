@@ -11,7 +11,9 @@
 #include <nlohmann/json.hpp>
 
 #include "scratch_model_dir.h"
+#include "tokenizer/regex_split.h"
 #include "tokenizer/tokenizer.h"
+#include "tokenizer/tokenizer_json.h"
 #include "util/error.h"
 
 namespace {
@@ -155,6 +157,32 @@ TEST_SUITE("tokenizer") {
             CHECK(stream_decode(*tok, ids, false) == tok->decode(ids));
             CHECK(stream_decode(*tok, ids, true) == tok->decode(ids, true));
         }
+    }
+
+    TEST_CASE("tokenizer: a token's bytes in the middle of a text, as they are; added tokens told apart") {
+        const auto tok = xs::tok::Tokenizer::load(tiny_dir());
+        CHECK(tok->token_bytes(29) == " hello");  // Strip takes the leading space off a text, not off its pieces
+        CHECK(tok->token_bytes(13) == "\xC3");    // a byte-fallback piece: half a character
+        CHECK(tok->token_bytes(3) == "<mark>");
+        CHECK(tok->is_added(1));
+        CHECK(tok->is_added(3));  // not special, added all the same
+        CHECK_FALSE(tok->is_added(29));
+        for (const std::string text : {"hello world", "é€é€", "hello<s>é</s>"}) {
+            std::string bytes;
+            for (const int32_t id : tok->encode(text)) bytes += tok->token_bytes(id);
+            CHECK(bytes == text);
+        }
+
+        // Byte-level pieces: the GPT-2 alphabet mapped back to bytes (Ġ is a space, Ã and © the two bytes of é).
+        const nlohmann::json vocab = {{"Ġ", 0}, {"a", 1}, {"Ã", 2}, {"©", 3}, {"Ġa", 4}, {"Ã©", 5}};
+        const ScratchModelDir dir(xs::tok::make_tokenizer_json(
+            xs::tok::qwen_byte_level_pipeline(xs::tok::split_regex::kQwen35), vocab,
+            nlohmann::json::array({"Ġ a", "Ã ©"}), nlohmann::json::array()));
+        const auto bl = xs::tok::Tokenizer::load(dir.path());
+        CHECK(bl->token_bytes(4) == " a");
+        CHECK(bl->token_bytes(2) == "\xC3");
+        CHECK(bl->token_bytes(5) == "é");
+        CHECK(bl->decode(Ids{2}) == "\xEF\xBF\xBD");  // where a whole text replaces the half character
     }
 
     TEST_CASE("tokenizer: unsupported components are refused by name") {

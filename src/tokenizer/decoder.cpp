@@ -17,7 +17,7 @@ constexpr std::string_view kReplacementChar = "\xEF\xBF\xBD";
 class ReplaceDecoder final : public Decoder {
 public:
     ReplaceDecoder(std::string from, std::string to) : from_(std::move(from)), to_(std::move(to)) {}
-    void decode(std::vector<std::string>& tokens) const override {
+    void decode(std::vector<std::string>& tokens, DecodeAs) const override {
         for (auto& token : tokens) token = replace_all(token, from_, to_);
     }
 
@@ -42,17 +42,17 @@ std::optional<uint8_t> byte_token_value(const std::string& token) {
 }
 
 // A run of byte tokens becomes its UTF-8 text when the whole run is valid; otherwise every byte becomes U+FFFD
-// (Hugging Face's ByteFallback is all-or-nothing per run, not a lossy decode).
+// (Hugging Face's ByteFallback is all-or-nothing per run, not a lossy decode). Read as pieces, the bytes as they are.
 class ByteFallbackDecoder final : public Decoder {
 public:
-    void decode(std::vector<std::string>& tokens) const override {
+    void decode(std::vector<std::string>& tokens, DecodeAs as) const override {
         std::vector<std::string> out;
         out.reserve(tokens.size());
         std::string run;
         size_t run_tokens = 0;
         auto flush_run = [&] {
             if (run_tokens == 0) return;
-            if (utf8::is_valid(run)) {
+            if (as == DecodeAs::pieces || utf8::is_valid(run)) {
                 out.push_back(std::move(run));
             } else {
                 for (size_t i = 0; i < run_tokens; ++i) out.emplace_back(kReplacementChar);
@@ -75,10 +75,10 @@ public:
 };
 
 // Maps each token's characters back to bytes (a token with a character outside the alphabet keeps its own UTF-8
-// bytes, as in Hugging Face) and joins everything into one string, invalid sequences becoming U+FFFD.
+// bytes, as in Hugging Face) and joins everything into one string, invalid sequences becoming U+FFFD in a text.
 class ByteLevelDecoder final : public Decoder {
 public:
-    void decode(std::vector<std::string>& tokens) const override {
+    void decode(std::vector<std::string>& tokens, DecodeAs as) const override {
         std::string bytes;
         for (const auto& token : tokens) {
             const size_t start = bytes.size();
@@ -95,25 +95,27 @@ public:
                 bytes += token;
             }
         }
-        tokens.assign(1, utf8::lossy(bytes));
+        tokens.assign(1, as == DecodeAs::pieces ? std::move(bytes) : utf8::lossy(bytes));
     }
 };
 
 class FuseDecoder final : public Decoder {
 public:
-    void decode(std::vector<std::string>& tokens) const override {
+    void decode(std::vector<std::string>& tokens, DecodeAs) const override {
         std::string fused;
         for (const auto& token : tokens) fused += token;
         tokens.assign(1, std::move(fused));
     }
 };
 
-// Removes up to `start` leading and `stop` trailing copies of one character from each token.
+// Removes up to `start` leading and `stop` trailing copies of one character from each token. Tokenizers put it after a
+// Fuse, where it strips the ends of the text, which a piece in its middle is not at.
 class StripDecoder final : public Decoder {
 public:
     StripDecoder(std::string content, size_t start, size_t stop)
         : content_(std::move(content)), start_(start), stop_(stop) {}
-    void decode(std::vector<std::string>& tokens) const override {
+    void decode(std::vector<std::string>& tokens, DecodeAs as) const override {
+        if (as == DecodeAs::pieces) return;
         for (auto& token : tokens) {
             std::string_view view = token;
             for (size_t i = 0; i < start_ && view.starts_with(content_); ++i) view.remove_prefix(content_.size());
@@ -128,20 +130,20 @@ private:
     size_t stop_;
 };
 
-// Hugging Face's WordPiece decoder: each token after the first loses the continuing-subword prefix, or else gains a
-// leading space. Cleanup removes the spaces tokenization put before punctuation and contractions, token by token as
-// Hugging Face does (so " do not" changes only within one token).
+// Hugging Face's WordPiece decoder: each token after the first (every piece) loses the continuing-subword prefix, or
+// else gains a leading space. Cleanup removes the spaces tokenization put before punctuation and contractions, token
+// by token as Hugging Face does (so " do not" changes only within one token).
 class WordPieceDecoder final : public Decoder {
 public:
     WordPieceDecoder(std::string prefix, bool cleanup) : prefix_(std::move(prefix)), cleanup_(cleanup) {}
-    void decode(std::vector<std::string>& tokens) const override {
+    void decode(std::vector<std::string>& tokens, DecodeAs as) const override {
         static constexpr std::pair<std::string_view, std::string_view> kCleanups[] = {
             {" .", "."},   {" ?", "?"},           {" !", "!"},   {" ,", ","},     {" ' ", "'"},   {" n't", "n't"},
             {" 'm", "'m"}, {" do not", " don't"}, {" 's", "'s"}, {" 've", "'ve"}, {" 're", "'re"},
         };
         for (size_t i = 0; i < tokens.size(); ++i) {
             std::string& token = tokens[i];
-            if (i != 0) {
+            if (i != 0 || as == DecodeAs::pieces) {
                 if (token.starts_with(prefix_)) {
                     token.erase(0, prefix_.size());
                 } else {
@@ -161,8 +163,8 @@ private:
 class SequenceDecoder final : public Decoder {
 public:
     explicit SequenceDecoder(std::vector<std::unique_ptr<Decoder>> steps) : steps_(std::move(steps)) {}
-    void decode(std::vector<std::string>& tokens) const override {
-        for (const auto& step : steps_) step->decode(tokens);
+    void decode(std::vector<std::string>& tokens, DecodeAs as) const override {
+        for (const auto& step : steps_) step->decode(tokens, as);
     }
 
 private:
