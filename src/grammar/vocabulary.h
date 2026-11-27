@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace xs::grammar {
@@ -51,13 +52,14 @@ public:
 
     // The byte strings of the writable tokens as a trie, its nodes in depth-first order (each node one byte below its
     // parent, children in byte order). Node i is at depth depth[i] (1 below the root), its subtree ends before node
-    // end[i], and the tokens whose bytes end there are tokens[first[i] .. first[i + 1]).
+    // end[i], and token[i] is the token whose bytes end there (-1: none); the others with the same bytes as a token
+    // are listed apart (same_bytes: that token, then one of them).
     struct Trie {
         std::vector<uint8_t> byte;
         std::vector<uint16_t> depth;
         std::vector<uint32_t> end;
-        std::vector<uint32_t> first;  // one more than there are nodes
-        std::vector<int32_t> tokens;
+        std::vector<int32_t> token;
+        std::vector<std::pair<int32_t, int32_t>> same_bytes;
         int max_depth = 0;
         size_t nodes() const { return byte.size(); }
     };

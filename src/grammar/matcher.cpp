@@ -106,12 +106,12 @@ const TokenSet& Automaton::allowed(State s) {
     const uint8_t* byte = t.byte.data();
     const uint16_t* depth = t.depth.data();
     const uint32_t* end = t.end.data();
-    const uint32_t* first = t.first.data();
-    const int32_t* tokens = t.tokens.data();
+    const int32_t* tokens = t.token.data();
     const size_t nodes = t.nodes();
     State* walk = walk_.data();
     uint64_t* allowed = scratch_.data();
     const int32_t* next = next_.data();  // read again after a step had to be computed: the table may have grown
+    uint64_t none = 0;                   // where a node that ends no token writes: no branch on it
     walk[0] = s;
     size_t visited = 0;
     for (size_t i = 0; i < nodes; ++visited) {
@@ -126,10 +126,13 @@ const TokenSet& Automaton::allowed(State s) {
             continue;
         }
         walk[depth[i]] = to;
-        for (uint32_t k = first[i]; k < first[i + 1]; ++k) {
-            allowed[static_cast<uint32_t>(tokens[k]) >> 6] |= uint64_t{1} << (tokens[k] & 63);
-        }
+        const int32_t token = tokens[i];
+        uint64_t* word = token >= 0 ? allowed + (static_cast<uint32_t>(token) >> 6) : &none;
+        *word |= uint64_t{1} << (token & 63);
         ++i;
+    }
+    for (const auto& [token, same] : t.same_bytes) {
+        if (scratch_.has(token)) scratch_.set(same);
     }
     if (visited < kKeepVisits) return scratch_;
     if (kept_order_.size() == kKeepStates) {

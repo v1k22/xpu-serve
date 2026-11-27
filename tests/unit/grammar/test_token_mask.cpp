@@ -116,8 +116,8 @@ TEST_SUITE("grammar: token masks") {
         CHECK(std::string(t.byte.begin(), t.byte.end()) == "abcb");
         CHECK(t.depth == std::vector<uint16_t>{1, 2, 3, 1});
         CHECK(t.end == std::vector<uint32_t>{3, 3, 3, 4});
-        CHECK(std::vector<int32_t>(t.tokens.begin() + t.first[1], t.tokens.begin() + t.first[2]) ==
-              std::vector<int32_t>{0, 3});
+        CHECK(t.token == std::vector<int32_t>{1, 0, 5, 2});
+        CHECK(t.same_bytes == std::vector<std::pair<int32_t, int32_t>>{{0, 3}});
         CHECK(v.bytes(5) == "abc");
         CHECK_FALSE(v.writable(4));
     }

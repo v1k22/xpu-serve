@@ -39,14 +39,18 @@ Vocabulary::Vocabulary(std::vector<Token> tokens) {
             t.byte.push_back(static_cast<uint8_t>(b[d]));
             t.depth.push_back(static_cast<uint16_t>(d + 1));
             t.end.push_back(0);
-            t.first.push_back(static_cast<uint32_t>(t.tokens.size()));
+            t.token.push_back(-1);
         }
-        t.tokens.push_back(id);
+        int32_t& at = t.token[path.back()];
+        if (at < 0) {
+            at = id;
+        } else {
+            t.same_bytes.emplace_back(at, id);
+        }
         t.max_depth = std::max(t.max_depth, static_cast<int>(b.size()));
         previous = b;
     }
     for (; !path.empty(); path.pop_back()) t.end[path.back()] = static_cast<uint32_t>(t.nodes());
-    t.first.push_back(static_cast<uint32_t>(t.tokens.size()));
 }
 
 }  // namespace xs::grammar
