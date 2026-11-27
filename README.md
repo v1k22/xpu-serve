@@ -33,8 +33,9 @@ optimized one) and what was measured**; this page says what is supported and how
 
 - ✅ **Models straight from the Hugging Face Hub**: `-hf org/name`, or `-hf org/name:QUANT` for a GGUF file, into
   the Hugging Face cache (shared with huggingface_hub), resumable and checked
-- ✅ **OpenAI-compatible server**: `/v1/chat/completions` (streaming, tool calls, thinking), `/v1/completions`,
-  `/v1/models`; and Anthropic's Messages API, `/v1/messages` (content blocks, tools, thinking, streamed events)
+- ✅ **OpenAI-compatible server**: `/v1/chat/completions` (streaming, tool calls, thinking, structured outputs),
+  `/v1/completions`, `/v1/models`; and Anthropic's Messages API, `/v1/messages` (content blocks, tools, thinking,
+  streamed events)
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3, Inkling 2 Mini (a
   looped mixture of experts without rotary positions)
@@ -79,7 +80,7 @@ Not yet:
 - Timestamps and translation of speech; speech output; video input; images for Gemma 4 26B-A4B and SenseNova Loop,
   and for a Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.
 - Gemma 4 26B-A4B from a GGUF file (a `gemma4` file with experts).
-- `response_format` (JSON mode), `n` above 1, a rerank API.
+- `response_format` beside `tools`, `logprobs`, `n` above 1, a rerank API.
 
 ## Supported models
 
@@ -328,8 +329,15 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   audio (Qwen3-Omni; Qwen3-ASR, whose reply is `language <Name><asr_text><transcript>`).
 - **Sampling**: `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, `frequency_penalty`,
   `repetition_penalty`, `seed`, `stop`, `max_tokens` / `max_completion_tokens`.
-- A response carries `usage` and `timings`. One choice per request (`n` is 1); `response_format` other than text and
-  audio or video parts are refused by name.
+- **Structured outputs**: `response_format` `{"type": "json_object"}` (any JSON object) or `{"type": "json_schema",
+  "json_schema": {"name", "schema", "strict"}}`, on `/v1/chat/completions` and `/v1/completions`: the answer is held
+  to the schema token by token, and can end only once it is whole. With thinking on, the reasoning is free and the
+  answer after it is held. Schemas in OpenAI's strict subset (types, properties in their order, required,
+  `additionalProperties: false`, items, enum, const, anyOf, `$ref` / `$defs`, recursive ones too); any other keyword
+  is refused with a 400 naming its path (`response_format.json_schema.schema.properties.age.minimum`); not beside
+  `tools` yet. docs/decisions/0033.
+- A response carries `usage` and `timings`. One choice per request (`n` is 1); audio or video parts are refused by
+  name.
 
 ### Anthropic messages
 

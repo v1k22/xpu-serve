@@ -258,6 +258,67 @@ TEST_SUITE("server.http") {
         CHECK(events.back()["usage"]["prompt_tokens"] == 6);
     }
 
+    TEST_CASE("response_format: the answer held to the schema; a keyword it does not take refused by its path") {
+        xs::test::FakeService service;
+        service.reply = R"({"age": 7})";
+        RunningServer server(service);
+        auto client = server.client();
+        const json schema = {{"type", "object"},
+                             {"properties", {{"age", {{"type", "integer"}}}}},
+                             {"required", {"age"}},
+                             {"additionalProperties", false}};
+        const json format = {{"type", "json_schema"}, {"json_schema", {{"name", "person"}, {"schema", schema}}}};
+        const json r = post_json(client, "/v1/chat/completions", chat_body({{"response_format", format}}));
+        CHECK(r["choices"][0]["message"]["content"] == service.reply);
+        // What reached the engine holds a generation to the schema, byte token by byte token.
+        const auto constraint = service.last_request().constraint;
+        REQUIRE(constraint);
+        const auto c = constraint->start();
+        CHECK(c->allowed_prefix(xs::test::ByteTokenizer::tokens("Sure! {")) == 0);
+        for (const int32_t t : xs::test::ByteTokenizer::tokens(service.reply)) {
+            REQUIRE(c->allowed_prefix(std::vector<int32_t>{t}) == 1);
+            c->accept(t);
+        }
+        CHECK(c->complete());
+
+        const json object = {{"type", "json_object"}};
+        post_json(client, "/v1/completions", {{"prompt", "x"}, {"response_format", object}});
+        CHECK(service.last_request().constraint != nullptr);
+        post_json(client, "/v1/chat/completions", chat_body({{"response_format", {{"type", "text"}}}}));
+        CHECK(service.last_request().constraint == nullptr);
+        const int calls = service.calls();
+
+        json strict = schema;
+        strict["properties"]["age"]["minimum"] = 0;
+        const json e = post_json(client, "/v1/chat/completions",
+                                 chat_body({{"response_format", {{"type", "json_schema"},
+                                                                 {"json_schema", {{"schema", strict}}}}}}),
+                                 400)["error"];
+        CHECK(e["param"] == "response_format.json_schema.schema.properties.age.minimum");
+        CHECK(e["message"] == "'response_format.json_schema.schema.properties.age.minimum' is not supported");
+        const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}});
+        CHECK(post_json(client, "/v1/chat/completions", chat_body({{"response_format", format}, {"tools", tools}}),
+                        400)["error"]["param"] == "response_format");
+        CHECK(service.calls() == calls);
+    }
+
+    TEST_CASE("response_format after a prompt that leaves the model thinking: held once the thought closes") {
+        xs::test::FakeService service;
+        service.card().dialect = "qwen3_5";
+        RunningServer server(service);
+        auto client = server.client();
+        // The fake template renders the message as it is: the prompt ends inside the assistant's open <think>.
+        const json messages = json::array({{{"role", "user"}, {"content", "<|im_start|>assistant\n<think>\n"}}});
+        post_json(client, "/v1/chat/completions",
+                  chat_body({{"messages", messages}, {"response_format", {{"type", "json_object"}}}}));
+        const auto c = service.last_request().constraint->start();
+        const std::vector<int32_t> thought = xs::test::ByteTokenizer::tokens("Hmm, an object.");
+        CHECK(c->allowed_prefix(thought) == thought.size());
+        for (const int32_t t : thought) c->accept(t);
+        CHECK(c->allowed_prefix(xs::test::ByteTokenizer::tokens("</think>\n\n{}")) == 12);
+        CHECK(c->allowed_prefix(xs::test::ByteTokenizer::tokens("</think>\n\nNo.")) == 10);
+    }
+
     TEST_CASE("invalid requests get 400 naming the field") {
         xs::test::FakeService service;
         RunningServer server(service);

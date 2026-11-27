@@ -14,6 +14,10 @@
 #include "engine/types.h"
 #include "util/error.h"
 
+namespace xs::grammar {
+class Grammar;
+}
+
 namespace xs::server {
 
 // A request the client got wrong: answered with 400, naming the offending field in `param` (empty when none).
@@ -33,6 +37,8 @@ struct GenerationOptions {
     std::vector<std::string> stop;
     bool stream = false;
     bool include_usage = false;  // stream_options.include_usage
+    // response_format json_object or json_schema: the grammar the answer is held to; null for free text.
+    std::shared_ptr<const grammar::Grammar> format;
 };
 
 // A media part of a chat message: an image from its data: URL, an audio clip from input_audio's base64 (the bytes

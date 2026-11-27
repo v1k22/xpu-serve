@@ -3,6 +3,7 @@
 #include <string>
 
 #include "server/openai_request.h"
+#include "unit/grammar/grammar_test_util.h"
 
 using nlohmann::json;
 using xs::server::InvalidRequest;
@@ -122,16 +123,60 @@ TEST_SUITE("server.request") {
         CHECK(rejected_param(chat_body({{"reasoning_effort", 3}})) == "reasoning_effort");
     }
 
-    TEST_CASE("structured response formats are refused as not supported yet") {
-        for (const char* type : {"json_object", "json_schema"}) {
-            try {
-                parse_chat_request(chat_body({{"response_format", {{"type", type}}}}), {});
-                FAIL("accepted response_format ", type);
-            } catch (const InvalidRequest& e) {
-                CHECK(e.param() == "response_format");
-                CHECK(std::string(e.what()).find("not supported yet") != std::string::npos);
-            }
+    TEST_CASE("response_format: text is free; json_object and json_schema hold the answer to a grammar") {
+        CHECK(parse_chat_request(chat_body({{"response_format", {{"type", "text"}}}}), {}).options.format == nullptr);
+        CHECK(parse_chat_request(chat_body(json::object()), {}).options.format == nullptr);
+        const auto object = parse_chat_request(chat_body({{"response_format", {{"type", "json_object"}}}}), {});
+        REQUIRE(object.options.format);
+        CHECK(xs::test::matches(object.options.format, R"({"any": ["thing"]})"));
+        CHECK_FALSE(xs::test::matches(object.options.format, "[1]"));
+        const json format = {
+            {"type", "json_schema"},
+            {"json_schema",
+             {{"name", "person"},
+              {"strict", true},
+              {"schema", {{"type", "object"}, {"properties", {{"age", {{"type", "integer"}}}}}, {"required", {"age"}},
+                          {"additionalProperties", false}}}}}};
+        const auto schema = parse_chat_request(chat_body({{"response_format", format}}), {});
+        REQUIRE(schema.options.format);
+        CHECK(xs::test::matches(schema.options.format, R"({"age": 3})"));
+        CHECK_FALSE(xs::test::matches(schema.options.format, R"({"age": "3"})"));
+        CHECK(parse_completion_request({{"prompt", "x"}, {"response_format", format}}, {}).options.format != nullptr);
+        // tool_choice none drops the tools: nothing then stands beside the format.
+        const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}});
+        const json none = chat_body({{"response_format", format}, {"tools", tools}, {"tool_choice", "none"}});
+        CHECK(parse_chat_request(none, {}).options.format != nullptr);
+    }
+
+    TEST_CASE("response_format: what it does not take is refused by name, down to the schema's keyword") {
+        const auto with_schema = [](json schema) {
+            return chat_body({{"response_format", {{"type", "json_schema"}, {"json_schema", {{"schema", schema}}}}}});
+        };
+        CHECK(rejected_param(chat_body({{"response_format", {{"type", "yaml"}}}})) == "response_format.type");
+        CHECK(rejected_param(chat_body({{"response_format", {{"type", 3}}}})) == "response_format.type");
+        CHECK(rejected_param(chat_body({{"response_format", "json"}})) == "response_format");
+        CHECK(rejected_param(chat_body({{"response_format", {{"type", "json_schema"}}}})) ==
+              "response_format.json_schema");
+        const auto with_spec = [](json spec) {
+            return chat_body({{"response_format", {{"type", "json_schema"}, {"json_schema", spec}}}});
+        };
+        CHECK(rejected_param(with_spec({{"name", "x"}})) == "response_format.json_schema.schema");
+        CHECK(rejected_param(with_spec({{"name", 3}, {"schema", json::object()}})) ==
+              "response_format.json_schema.name");
+        CHECK(rejected_param(with_spec({{"strict", "yes"}, {"schema", json::object()}})) ==
+              "response_format.json_schema.strict");
+        const json age = {{"type", "object"}, {"properties", {{"age", {{"type", "integer"}, {"minimum", 0}}}}}};
+        CHECK(rejected_param(with_schema(age)) == "response_format.json_schema.schema.properties.age.minimum");
+        try {
+            parse_chat_request(with_schema(age), {});
+        } catch (const InvalidRequest& e) {
+            CHECK(std::string(e.what()) ==
+                  "'response_format.json_schema.schema.properties.age.minimum' is not supported");
         }
+        CHECK(rejected_param(with_schema(json::array({1}))) == "response_format.json_schema.schema");
+        const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}});
+        CHECK(rejected_param(chat_body({{"response_format", {{"type", "json_object"}}}, {"tools", tools}})) ==
+              "response_format");
     }
 
     TEST_CASE("completion prompt is a string or a one-string array") {

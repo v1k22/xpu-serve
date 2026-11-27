@@ -58,6 +58,10 @@ json timings_json(const GenerateStats& stats) {
         t["spec_drafted_tokens"] = stats.spec_drafted;
         t["spec_accepted_tokens"] = stats.spec_accepted;
     }
+    if (stats.constrained_rows > 0) {  // response_format: the rows its grammar masked, and what that took
+        t["constrained_rows"] = stats.constrained_rows;
+        t["constraint_ms"] = stats.constraint_ms;
+    }
     return t;
 }
 

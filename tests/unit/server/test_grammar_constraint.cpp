@@ -1,0 +1,120 @@
+// response_format's constraint (server/grammar_constraint.h): the vocabulary a tokenizer gives a grammar, rows masked
+// to what the grammar allows, complete only once it is, drafts checked without committing; and where the answer
+// starts: free while the prompt's reasoning goes on, the dialect's opening, then the grammar.
+#include <doctest/doctest.h>
+
+#include <filesystem>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include "grammar/json_schema.h"
+#include "server/grammar_constraint.h"
+#include "tokenizer/tokenizer.h"
+
+namespace xs {
+
+using server::GrammarConstraint;
+
+namespace {
+
+constexpr float kMasked = -std::numeric_limits<float>::infinity();
+constexpr int32_t kThinkEnd = 256, kEnd = 257, kOpening = 258, kTail = 259;
+
+// Token b is the byte b; then markers (</think>, <|im_end|>, <|msg|>) and one piece that ends a thought and opens an
+// object.
+std::shared_ptr<const grammar::Vocabulary> vocabulary() {
+    std::vector<grammar::Vocabulary::Token> tokens;
+    for (int b = 0; b < 256; ++b) tokens.push_back({std::string(1, static_cast<char>(b)), false});
+    tokens.push_back({"</think>", true});
+    tokens.push_back({"<|im_end|>", true});
+    tokens.push_back({"<|msg|>", true});
+    tokens.push_back({"nk>\n{", false});
+    return std::make_shared<const grammar::Vocabulary>(std::move(tokens));
+}
+
+std::vector<int32_t> bytes_of(std::string_view text) {
+    std::vector<int32_t> out;
+    for (const char c : text) out.push_back(static_cast<unsigned char>(c));
+    return out;
+}
+
+// The tokens a mask leaves, of a row as wide as `width`.
+std::vector<int32_t> left(TokenConstraint& c, size_t width = 260) {
+    std::vector<float> logits(width, 1.0f);
+    c.mask(logits);
+    std::vector<int32_t> out;
+    for (size_t t = 0; t < width; ++t) {
+        if (logits[t] != kMasked) out.push_back(static_cast<int32_t>(t));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST_SUITE("server.grammar_constraint") {
+    TEST_CASE("a tokenizer's tokens as a grammar reads them: each one's bytes, added tokens markers") {
+        const auto tok =
+            tok::Tokenizer::load(std::filesystem::path(XS_SOURCE_DIR) / "tests/fixtures/tokenizer/tiny");
+        const auto v = server::grammar_vocabulary(*tok);
+        CHECK(v->size() == tok->vocab_size());
+        CHECK(v->bytes(29) == " hello");
+        CHECK(v->bytes(13) == "\xC3");
+        CHECK(v->writable(29));
+        CHECK_FALSE(v->writable(1));  // <s>, special
+        CHECK_FALSE(v->writable(3));  // <mark>, added but not special
+        CHECK(v->bytes(3) == "<mark>");
+    }
+
+    TEST_CASE("rows masked to the grammar, complete only where it is, drafts checked without committing") {
+        const GrammarConstraint format(grammar::json_object_grammar(), vocabulary(), "", {});
+        const auto c = format.start();
+        CHECK(left(*c) == std::vector<int32_t>{'\n', ' ', '{'});
+        CHECK_FALSE(c->complete());
+        const std::vector<int32_t> drafts = bytes_of(R"({"a":1}x)");
+        CHECK(c->allowed_prefix(drafts) == 7);
+        CHECK(left(*c) == std::vector<int32_t>{'\n', ' ', '{'});  // nothing was accepted
+        for (size_t i = 0; i < 7; ++i) c->accept(drafts[i]);
+        CHECK(c->complete());
+        std::vector<float> logits(300, 1.0f);
+        CHECK_FALSE(c->mask(logits));  // nothing may follow but a stop token, which is the engine's
+        CHECK(logits[280] == kMasked);  // nor anything past the vocabulary
+        CHECK_THROWS(c->accept('x'));
+        // A second generation of the same format starts from the start.
+        CHECK(left(*format.start()) == std::vector<int32_t>{'\n', ' ', '{'});
+    }
+
+    TEST_CASE("reasoning first: free until the thought closes, then the dialect's opening, then the grammar") {
+        const auto g = grammar::json_schema_grammar(nlohmann::ordered_json::parse(R"({"type": "integer"})"));
+        const GrammarConstraint format(g, vocabulary(), "</think>", {kOpening});
+        const auto c = format.start();
+        CHECK(left(*c).size() == 260);  // the thought is free (the engine keeps stop tokens out)
+        CHECK_FALSE(c->complete());
+        for (const int32_t t : bytes_of("Seven, I think. ")) c->accept(t);
+        CHECK(left(*c).size() == 260);
+        CHECK(c->allowed_prefix(std::vector<int32_t>{'x', kThinkEnd, kOpening, '7', '}'}) == 4);
+        c->accept(kThinkEnd);
+        CHECK(left(*c) == std::vector<int32_t>{kOpening});
+        CHECK_FALSE(c->complete());
+        c->accept(kOpening);
+        CHECK(left(*c) == std::vector<int32_t>{'\n', ' ', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'});
+        c->accept('7');
+        CHECK(c->complete());
+
+        // The marker written in pieces, and a piece that also writes what comes after it.
+        const GrammarConstraint object(grammar::json_object_grammar(), vocabulary(), "</think>", {});
+        const auto d = object.start();
+        for (const int32_t t : bytes_of("hmm </thi")) d->accept(t);
+        CHECK(left(*d).size() == 260);
+        d->accept(kTail);  // "nk>\n{": the thought ends, and the object opens
+        CHECK_FALSE(d->complete());
+        for (const int32_t t : bytes_of("}")) d->accept(t);
+        CHECK(d->complete());
+        // A marker that is not the dialect's closes nothing.
+        const auto e = object.start();
+        e->accept(kEnd);
+        CHECK(left(*e).size() == 260);
+    }
+}
+
+}  // namespace xs

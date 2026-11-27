@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 
+#include "grammar/json_schema.h"
 #include "server/request_fields.h"
 #include "util/base64.h"
 #include "util/error.h"
@@ -62,6 +63,48 @@ void check_single_choice(const json& body) {
     if (n.has_value() && *n != 1) reject("n", "'n' must be 1: only one choice per request is supported");
 }
 
+// response_format: {"type": "text"}, {"type": "json_object"}, or {"type": "json_schema", "json_schema": {"name",
+// "schema", "strict", "description"}}. A schema the grammar compiler does not take is refused at the keyword's path.
+std::shared_ptr<const grammar::Grammar> parse_response_format(const json& body) {
+    const json* v = fields::object(body, "response_format");
+    if (v == nullptr) return nullptr;
+    const json* type = fields::find(*v, "type");
+    if (type == nullptr || !type->is_string()) {
+        reject("response_format.type", "'response_format.type' must be a string");
+    }
+    const std::string t = type->get<std::string>();
+    if (t == "text") return nullptr;
+    if (t == "json_object") {
+        static const std::shared_ptr<const grammar::Grammar> any_object = grammar::json_object_grammar();
+        return any_object;
+    }
+    if (t != "json_schema") {
+        reject("response_format.type",
+               str_cat("unknown response_format type '", t, "' (text, json_object and json_schema are known)"));
+    }
+    const json* spec = fields::find(*v, "json_schema");
+    if (spec == nullptr || !spec->is_object()) {
+        reject("response_format.json_schema", "'response_format.json_schema' must be an object holding the 'schema'");
+    }
+    for (const char* text : {"name", "description"}) {
+        const json* field = fields::find(*spec, text);
+        if (field != nullptr && !field->is_string()) {
+            const std::string param = str_cat("response_format.json_schema.", text);
+            reject(param, str_cat("'", param, "' must be a string"));
+        }
+    }
+    fields::boolean(*spec, "strict", "response_format.json_schema.strict");
+    const json* schema = fields::find(*spec, "schema");
+    constexpr std::string_view kSchema = "response_format.json_schema.schema";
+    if (schema == nullptr) reject(std::string(kSchema), str_cat("'", kSchema, "' is required"));
+    try {
+        return grammar::json_schema_grammar(*schema);
+    } catch (const grammar::GrammarError& e) {
+        const std::string param = e.path().empty() ? std::string(kSchema) : str_cat(kSchema, ".", e.path());
+        reject(param, str_cat("'", param, "' ", e.what()));
+    }
+}
+
 GenerationOptions parse_generation_options(const json& body, const SamplingParams& defaults) {
     check_single_choice(body);
     GenerationOptions o;
@@ -72,6 +115,7 @@ GenerationOptions parse_generation_options(const json& body, const SamplingParam
     if (const json* so = fields::object(body, "stream_options")) {
         o.include_usage = fields::boolean(*so, "include_usage", "stream_options.include_usage");
     }
+    o.format = parse_response_format(body);
     return o;
 }
 
@@ -183,21 +227,6 @@ json parse_tools(const json& body) {
     return *v;
 }
 
-void check_response_format(const json& body) {
-    const json* v = fields::object(body, "response_format");
-    if (v == nullptr) return;
-    const json* type = fields::find(*v, "type");
-    if (type == nullptr || !type->is_string()) {
-        reject("response_format.type", "'response_format.type' must be a string");
-    }
-    const std::string t = type->get<std::string>();
-    if (t == "text") return;
-    if (t == "json_object" || t == "json_schema") {
-        reject("response_format", str_cat("response_format type '", t, "' is not supported yet"));
-    }
-    reject("response_format.type", str_cat("unknown response_format type '", t, "'"));
-}
-
 std::string parse_prompt(const json& body) {
     const json* v = fields::find(body, "prompt");
     if (v == nullptr) reject("prompt", "'prompt' is a required field");
@@ -219,7 +248,6 @@ ChatRequest parse_chat_request(const json& body, const SamplingParams& defaults)
     ChatRequest r;
     r.messages = parse_messages(body, r.media);
     r.tools = parse_tools(body);
-    check_response_format(body);
     const json* kwargs = fields::object(body, "chat_template_kwargs");
     r.template_kwargs = kwargs != nullptr ? *kwargs : json::object();
     // OpenAI's reasoning_effort reaches the template under its own name (Inkling 2's reads it), unless the kwargs
@@ -231,6 +259,10 @@ ChatRequest parse_chat_request(const json& body, const SamplingParams& defaults)
         }
     }
     r.options = parse_generation_options(body, defaults);
+    if (r.options.format && !r.tools.is_null()) {
+        reject("response_format", "'response_format' beside 'tools' is not supported yet: a reply is either held to "
+                                  "the format or free to call a tool");
+    }
     return r;
 }
 

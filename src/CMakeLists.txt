@@ -68,7 +68,8 @@ xs_add_library(xs_decision DIRS decision DEPS xs_core xs_backends xs_tokenizer x
 # The embedding runtime: an embedding model's encoder compiled on one device, and the tokenizer for text.
 xs_add_library(xs_embedding DIRS embedding DEPS xs_core xs_backends xs_tokenizer)
 
-xs_add_library(xs_server DIRS server DEPS xs_core xs_tokenizer xs_chat xs_policy xs_decision xs_embedding xs_httplib)
+xs_add_library(xs_server DIRS server DEPS xs_core xs_tokenizer xs_chat xs_grammar xs_policy xs_decision xs_embedding
+               xs_httplib)
 
 # `convert`: checkpoint -> pack; AWQ calibration runs the model on a backend and needs the tokenizer.
 xs_add_library(xs_convert DIRS convert DEPS xs_core xs_backends xs_tokenizer)

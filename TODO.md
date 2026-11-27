@@ -396,7 +396,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] GPTQ; AWQ with the full activation covariance (not per channel); larger calibration sets
 - [x] Anthropic `/v1/messages` and `/v1/messages/count_tokens` (blocks, tools, thinking, streaming events)
 - [ ] Ollama `/api/chat` and `/api/generate`
-- [ ] Constrained decoding (JSON schema / grammar), logprobs
+- [x] Constrained decoding: `response_format` `json_object` and `json_schema` (a byte grammar, masks from a trie of
+      the vocabulary; after the reasoning a prompt leaves open; batched and speculative); docs/decisions/0033
+- [ ] logprobs
 - **Done when:** each item lands as one PR with its parity and E2E tests.
 
 ### Model enablement checklist

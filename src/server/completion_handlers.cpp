@@ -14,6 +14,7 @@
 #include "server/anthropic_format.h"
 #include "server/anthropic_request.h"
 #include "server/generation_run.h"
+#include "server/grammar_constraint.h"
 #include "server/openai_format.h"
 #include "server/openai_request.h"
 #include "server/response_format.h"
@@ -90,12 +91,26 @@ void log_summary(std::string_view id, const GenerationOutcome& outcome, bool has
     }
     const std::string media =
         s.media_encoded > 0 ? str_cat(" media_encoded=", s.media_encoded, " (", fixed1(s.encode_ms), " ms)") : "";
+    const std::string constraint =
+        s.constrained_rows > 0
+            ? str_cat(" constraint=", fixed1(s.constraint_ms), " ms over ", s.constrained_rows, " rows")
+            : "";
     log::info(id, ": prompt=", s.prompt_tokens, " cached=", s.cached_tokens, media, " generated=", s.generated_tokens,
-              " prefill=", fixed1(s.prefill_tok_per_s()), " tok/s decode=", fixed1(s.decode_tok_per_s()),
-              " tok/s finish=", finish);
+              " prefill=", fixed1(s.prefill_tok_per_s()), " tok/s decode=", fixed1(s.decode_tok_per_s()), " tok/s",
+              constraint, " finish=", finish);
 }
 
 }  // namespace
+
+std::shared_ptr<const OutputConstraint> CompletionHandlers::output_constraint(const GenerationOptions& options,
+                                                                              std::string_view dialect,
+                                                                              std::string_view prompt_tail) const {
+    if (!options.format) return nullptr;
+    std::call_once(vocabulary_once_, [this] { vocabulary_ = grammar_vocabulary(service_.tokenizer()); });
+    const chat::AnswerStart start = chat::answer_start(dialect, prompt_tail);
+    return std::make_shared<GrammarConstraint>(options.format, vocabulary_, start.reasoning_end,
+                                               service_.tokenizer().encode(start.opening, /*parse_special=*/true));
+}
 
 CompletionHandlers::Prompt CompletionHandlers::chat_prompt(const ChatRequest& chat) const {
     const ModelCard& card = service_.model();
@@ -146,6 +161,8 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
     GenerateRequest request = make_generate_request(std::move(p.tokens), chat.options, card, "messages");
     request.media = std::move(p.media);
     request.snapshot_at = p.messages_end;
+    const std::string_view tail = chat::prompt_tail(p.text);
+    request.constraint = output_constraint(chat.options, card.dialect, tail);
     const ResponseMeta meta{random_id("chatcmpl-"), card.id, unix_seconds_now()};
     const bool usage = chat.options.include_usage;
     Job job{.id = meta.id,
@@ -153,7 +170,7 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
             .request = std::move(request),
             .options = std::move(chat.options),
             .dialect = card.dialect,
-            .prompt_tail = std::string(chat::prompt_tail(p.text))};
+            .prompt_tail = std::string(tail)};
     respond(job, req, res);
 }
 
@@ -193,12 +210,15 @@ void CompletionHandlers::completion(const httplib::Request& req, httplib::Respon
     }
     const ResponseMeta meta{random_id("cmpl-"), card.id, unix_seconds_now()};
     const bool usage = completion.options.include_usage;
+    const std::string_view tail = chat::prompt_tail(completion.prompt);
+    GenerateRequest request = make_generate_request(std::move(prompt), completion.options, card, "prompt");
+    request.constraint = output_constraint(completion.options, "plain", tail);  // raw text: the answer starts at once
     Job job{.id = meta.id,
             .format = [meta, usage] { return openai_text_format(meta, usage); },
-            .request = make_generate_request(std::move(prompt), completion.options, card, "prompt"),
+            .request = std::move(request),
             .options = std::move(completion.options),
             .dialect = "plain",
-            .prompt_tail = std::string(chat::prompt_tail(completion.prompt))};
+            .prompt_tail = std::string(tail)};
     respond(job, req, res);
 }
 

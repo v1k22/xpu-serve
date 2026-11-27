@@ -576,7 +576,8 @@ A hit at position `p` is valid only when every block a later step needs is still
 
 Greedy, temperature, top-k, top-p, min-p, repetition/presence/frequency penalties and seed. Greedy and top-k run on
 the device (copying 262,144 logits per token is avoidable). Stop rules: EOS ids from `generation_config.json` and the
-tokenizer, stop strings, max tokens. Constrained decoding (JSON schema / grammar) comes later.
+tokenizer, stop strings, max tokens. Constrained decoding (`response_format`'s JSON schemas) masks a request's rows
+on the host through a grammar over bytes: docs/decisions/0033.
 
 ### 9.6 Memory budget
 
