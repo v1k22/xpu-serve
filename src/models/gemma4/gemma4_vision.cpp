@@ -191,14 +191,33 @@ private:
 
         for (int64_t i = 0; i < vc_.num_layers; ++i) h = encoder_layer(i, h, patch_pos, freq);
 
-        // Gemma4VisionPooler, then Gemma4MultimodalEmbedder. The pooler scales by sqrt(hidden) right before a
+        // Gemma4VisionPooler, then Gemma4MultimodalEmbedder. The pooler scales by c = sqrt(hidden) right before a
         // weightless RMSNorm, and rms_norm(c * x, eps) == rms_norm(x, eps / c^2): folding the scale into eps keeps
-        // the f16 range (the scaled values can pass 65504) with the same math.
+        // the f16 range (the scaled values can pass 65504) with the same math. A standardizing tower subtracts
+        // std_bias and multiplies by std_scale in between: (c x - b) s = (x - b / c) (c s), both constants of the
+        // host, so x keeps its own range there too.
         Graph::Scope s(g, "embed_vision");
         const Value pooled = g.matmul(pool, g.transpose(h, {1, 0}));  // [max_soft_tokens, hidden]
-        const Value normed = g.rms_norm(pooled, eps() / static_cast<float>(hidden));
+        const Value normed = vc_.standardize ? g.rms_norm(standardized(pooled), eps())
+                                             : g.rms_norm(pooled, eps() / static_cast<float>(hidden));
         g.output("embeddings", g.matmul(normed, weight("embed_vision.embedding_projection.weight")));
         g.validate();
+    }
+
+    // (sqrt(hidden) * x - std_bias) * std_scale, as (x - std_bias / c) * (c * std_scale).
+    Value standardized(Value x) {
+        const auto c = static_cast<float>(std::sqrt(static_cast<double>(vc_.hidden_size)));
+        HostTensor shift = blocks::float_values(weights_, prefix_ + "vision_tower.std_bias");
+        HostTensor gain = blocks::float_values(weights_, prefix_ + "vision_tower.std_scale");
+        for (const HostTensor* t : {&shift, &gain}) {
+            XS_CHECK(t->shape() == Dims{vc_.hidden_size}, "gemma4 vision: std_bias and std_scale must have shape [",
+                     vc_.hidden_size, "], got ", dims_to_string(t->shape()));
+        }
+        for (int64_t i = 0; i < vc_.hidden_size; ++i) {
+            shift.data<float>()[i] = -shift.data<float>()[i] / c;
+            gain.data<float>()[i] *= c;
+        }
+        return graph_.mul(graph_.add(x, graph_.constant(std::move(shift))), graph_.constant(std::move(gain)));
     }
 
     Value encoder_layer(int64_t i, Value h, Value patch_pos, Value freq) {
@@ -250,9 +269,6 @@ std::optional<VisionConfig> parse_vision_config(const nlohmann::json& config_jso
     const std::string where = "config.json vision_config";
     const std::string type = cfg::get_string(v, "model_type", where);
     if (type != "gemma4_vision") fail(where, ": model_type '", type, "' is not supported (supported: gemma4_vision)");
-    if (cfg::get_bool_or(v, "standardize", false, where)) {
-        fail(where, ": standardize (the 26B / 31B vision towers) is not supported yet");
-    }
     if (cfg::get_bool_or(v, "attention_bias", false, where)) fail(where, ": attention_bias is not supported");
     const std::string act = cfg::get_string(v, "hidden_activation", where);
     if (act != "gelu_pytorch_tanh") fail(where, ": hidden_activation '", act, "' is not supported");
@@ -270,6 +286,7 @@ std::optional<VisionConfig> parse_vision_config(const nlohmann::json& config_jso
     vc.max_soft_tokens = cfg::get_int_or(v, "default_output_length", 280, where);
     vc.rms_norm_eps = cfg::get_float(v, "rms_norm_eps", where);
     vc.clipped_linears = cfg::get_bool_or(v, "use_clipped_linears", false, where);
+    vc.standardize = cfg::get_bool_or(v, "standardize", false, where);
     if (v.contains("rope_parameters")) {
         const nlohmann::json& r = v.at("rope_parameters");
         const std::string rope_type = cfg::get_string(r, "rope_type", where + " rope_parameters");

@@ -73,6 +73,10 @@ struct ImportPlan {
     // output head and final norm), which the architecture checked against the model's shapes: not imported, since
     // the head reads the model's.
     std::vector<const gguf::TensorInfo*> copies;
+    // Tensors of a companion file the model does not read, with the reason (Gemma 4's audio tower in the mmproj file
+    // that also holds its vision tower): not imported, each named in the log.
+    std::vector<const gguf::TensorInfo*> left_out;
+    std::string left_out_why;
 };
 
 class Architecture {

@@ -534,7 +534,7 @@ HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& 
 
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
                      const graph::AttentionAttrs& attrs, const HostTensor* key_bias, const HostTensor* groups,
-                     const HostTensor* rel, const HostTensor* sink) {
+                     const HostTensor* rel, const HostTensor* sink, const HostTensor* reach) {
     check_f32(q, "attention q");
     check_f32(k_all, "attention k");
     check_f32(v_all, "attention v");
@@ -563,14 +563,23 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
     XS_CHECK(!relative ||
                  (rel->shape() == Dims{tokens, q_heads, attrs.rel_extent} && sink->shape() == Dims{tokens, q_heads}),
              "attention relative bias and sink do not fit ", tokens, " queries of ", q_heads, " heads");
+    XS_CHECK(attrs.reaching == (reach != nullptr) && (reach == nullptr || attrs.causal),
+             "attention reaching ahead is causal and needs each query's reach, and only it");
+    XS_CHECK(reach == nullptr || (reach->dtype() == DType::I32 && reach->numel() == tokens), "attention reach of ",
+             reach == nullptr ? 0 : reach->numel(), " for ", tokens, " queries");
+    const int32_t* ahead = reach != nullptr ? reach->data<int32_t>() : nullptr;
+    for (int64_t t = 0; ahead != nullptr && t < tokens; ++t) {
+        XS_CHECK(ahead[t] >= 0 && t + ahead[t] < tokens, "attention reach ", ahead[t], " of query ", t, " passes the ",
+                 tokens, " keys of the step");
+    }
     HostTensor out(DType::F32, q.shape());
     pool.parallel_for(tokens * q_heads, [&](int64_t item) {
         const int64_t t = item / q_heads;
         const int64_t h = item % q_heads;
         const int64_t pos = kv_len - tokens + t;
         int64_t first = attrs.sliding_window > 0 ? std::max<int64_t>(0, pos - attrs.sliding_window + 1) : 0;
-        int64_t last = attrs.causal ? pos : kv_len - 1;
-        if (attrs.sliding_window > 0) last = std::min(last, pos + attrs.sliding_window - 1);
+        int64_t last = attrs.causal ? pos + (ahead != nullptr ? ahead[t] : 0) : kv_len - 1;
+        if (attrs.sliding_window > 0 && !attrs.causal) last = std::min(last, pos + attrs.sliding_window - 1);
         if (attrs.anchored) {  // the step and the window before it, whichever the query
             first = std::max<int64_t>(0, kv_len - tokens - attrs.sliding_window);
             last = kv_len - 1;

@@ -29,6 +29,7 @@ APIs look; the numbers live here.
   - [Importing a GGUF file](#importing-a-gguf-file)
   - [Qwen3.5-4B GGUF](#qwen35-4b-gguf)
   - [Gemma 4 E2B GGUF](#gemma-4-e2b-gguf)
+  - [Gemma 4 26B-A4B GGUF](#gemma-4-26b-a4b-gguf)
   - [Qwen3.8-27B GGUF](#qwen38-27b-gguf)
   - [Ornith-1.5-35B-A3B GGUF](#ornith-15-35b-a3b-gguf)
   - [Inkling-2-Mini GGUF](#inkling-2-mini-gguf)
@@ -386,7 +387,9 @@ Measured: at q4, decode 84 tok/s, and 126 tok/s with its assistant (k = 2).
 
 ### Gemma 4 26B-A4B
 
-`google/gemma-4-26B-A4B-it` (`gemma4`, a mixture of experts). Text only for now. Drafter:
+`google/gemma-4-26B-A4B-it` (`gemma4`, a mixture of experts). Text and images: its vision tower standardizes the
+pooled soft tokens (std_bias, std_scale), and an image's tokens attend to each other both ways in the sliding layers
+(use_bidirectional_attention "vision"; the engine prefills an image in one step). Drafter:
 `google/gemma-4-26B-A4B-it-assistant`.
 
 Reference (its f16 weights do not fit a 24 GB card; there the q4 pack below is the way to run it):
@@ -406,11 +409,16 @@ xpu-serve serve ~/models/gemma-4-26B-A4B-it-q4 --device GPU --kv-dtype i8 \
 - Less VRAM: `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2` store the KV cache in fewer bits, each at a
   growing cost in accuracy; they need a head_dim that is a multiple of 128
   ([KV cache formats](#kv-cache-formats)).
-- A GGUF file of it (a Gemma 4 with experts) is refused by name.
+- Its GGUF files: [Gemma 4 26B-A4B GGUF](#gemma-4-26b-a4b-gguf).
 
-Measured: at q4, decode 67 tok/s, and 91 tok/s with its assistant (k = 2).
+Measured on the Arc Pro B60: at q4, decode 72.9 tok/s after a 4,096-token prompt (prefill 1,940 tok/s), and 91 tok/s
+with its assistant (k = 2). An image of 280 soft tokens is encoded in 0.27 s.
 
-Checked against Hugging Face on a tiny checkpoint of its layout (experts beside the MLP, K = V global layers).
+Against Hugging Face fp32 on the CPU (the q4 pack at f16): six text prompts at logit cosine 0.954 to 0.9997; four
+image prompts at 0.985 to 0.996, the vision tower's soft tokens at 0.99976 to 0.999995, the greedy answer equal on
+three of four ("The image contains a red circle, a blue square, and a green triangle."). On a tiny checkpoint of its
+layout (experts beside the MLP, K = V global layers, a standardizing tower, images both ways) at cosine 1, cpu-ref and
+the GPU; with the image's tokens causal instead, 0.88 to 0.985.
 
 ### Qwen3.5-4B
 
@@ -1100,8 +1108,9 @@ Measured (decode 58 to 99 tok/s over all its files):
 ### Gemma 4 E2B GGUF
 
 [unsloth/gemma-4-E2B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF), all 21 files, and its drafter
-files (`MTP/mtp-*.gguf`, the assistant). The text model only: a GGUF file holds no vision or audio tower, so images
-need the original checkpoint. Gemma 4 E4B's files import the same way.
+files (`MTP/mtp-*.gguf`, the assistant). Images through the repository's vision tower file (`mmproj-BF16.gguf`,
+which `-hf` takes along; its audio tower is left out): Q4_K_M with it described a test picture as "a red circle on the
+left and a blue square on the right". Gemma 4 E4B's files import the same way.
 
 Reference (the BF16 file is the original checkpoint's text model):
 
@@ -1139,6 +1148,22 @@ Measured:
 
 With the drafter from its `MTP/` files the text is the same, at 230 to 270 tok/s on the Q4_0 file (125 without) and
 200 to 235 on Q4_K_M (117), from session to session.
+
+### Gemma 4 26B-A4B GGUF
+
+[unsloth/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF): a `gemma4` file with
+experts (the router and its scales, the gate and up banks fused, full-attention layers taking their keys as values),
+imported as the checkpoint's layout; with `-hf` the repository's vision tower file (`mmproj-BF16.gguf`) comes along,
+so images work.
+
+```bash
+xpu-serve serve -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M --device GPU --kv-dtype i8
+```
+
+Measured on the Arc Pro B60 (UD-Q4_K_M, 17.1 GB of weights and 1.1 GB of tower): decode 62.4 tok/s after a
+4,096-token prompt, prefill 2,340 tok/s. Against Hugging Face fp32 of the original: six text prompts at logit cosine
+0.9967 to 0.99999; four image prompts at 0.9990 to 0.9997, the tower's soft tokens at 0.99976 or more, the greedy
+answer equal on three of four.
 
 ### Qwen3.8-27B GGUF
 

@@ -9,6 +9,7 @@
 
 #include "device_test_support.h"
 #include "quant/quant.h"
+#include "reaching_cases.h"
 #include "reference_ops.h"
 #include "util/error.h"
 
@@ -130,6 +131,34 @@ TEST_SUITE("device attention" * doctest::skip(!dev::enabled())) {
                     c.impl = impl;
                     CAPTURE(describe(c));
                     CHECK(attention_matches(c, static_cast<uint32_t>(head_dim + heads * 10 + kv_heads)));
+                }
+            }
+        }
+    }
+
+    TEST_CASE("reaching ahead (an image's rows both ways) on every lowering, with an f16 and a quantized cache") {
+        for (const test::reaching::Case& c : test::reaching::cases()) {
+            for (const std::string& impl : dev::attention_impls()) {
+                for (const bool quantized : {false, true}) {
+                    CAPTURE(test::reaching::describe(c));
+                    CAPTURE(impl);
+                    CAPTURE(quantized);
+                    SessionOptions options = dev::options(8192);
+                    options.extra["attention"] = impl;
+                    if (quantized) options.kv = kI8;
+                    const auto session = dev::backend().compile(test::reaching::graph_of(c), test::MemoryWeights{},
+                                                                options);
+                    test::reaching::run(c, *session, 71, [&](size_t step, const HostTensor& out,
+                                                             const Tensor64& expected, const Tensor64& planted) {
+                        CAPTURE(step);
+                        // int8 codes move the scores a little; the reference is over the exact values.
+                        const dev::Tolerance tol = quantized ? dev::Tolerance{0.05, 0.05} : kAttention;
+                        CHECK(dev::close(str_cat("reaching ", test::reaching::describe(c), " ", impl), out, expected,
+                                         tol));
+                        if (c.window > 0 && step == 1 && !quantized) {
+                            CHECK_FALSE(dev::close("planted", out, planted, tol));
+                        }
+                    });
                 }
             }
         }

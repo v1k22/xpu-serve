@@ -104,6 +104,8 @@ struct VisionConfig {
     double rms_norm_eps = 1e-6;
     double rope_theta = 100.0;
     bool clipped_linears = false;
+    // The pooled soft tokens standardized before the projection: (h - std_bias) * std_scale (26B-A4B, 31B).
+    bool standardize = false;
     float rescale_factor = 1.0f / 255.0f;  // pixel scale before the tower's own 2 * (x - 0.5)
     int64_t text_hidden_size = 0;
     int32_t image_token_id = -1;  // the placeholder the chat template renders, and every soft token

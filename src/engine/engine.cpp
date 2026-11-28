@@ -688,6 +688,7 @@ void Engine::prefill_chunk(Generation& g) {
     size_t len = std::min(n - pos, static_cast<size_t>(options_.prefill_chunk));
     const auto snapshot_at = static_cast<size_t>(std::max<int64_t>(0, g.request.snapshot_at));
     if (fixed_state_ && snapshot_at > pos && snapshot_at < pos + len) len = snapshot_at - pos;  // a chunk ends there
+    if (model_->info().media_whole_steps) len = whole_media_chunk(g.media_item, pos, len);
     const int64_t width = media_width();
     std::vector<const float*> rows(len, nullptr);
     bool any_rows = false;

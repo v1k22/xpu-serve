@@ -41,6 +41,14 @@ bool same_shape(const Dims& shape, const Dims& stored) {
     return std::equal(rest(shape), shape.end(), rest(stored), stored.end());
 }
 
+int32_t token_id(const gguf::File& file, std::string_view architecture, std::string_view text) {
+    const std::vector<std::string_view> tokens = file.get("tokenizer.ggml.tokens").strings();
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        if (tokens[i] == text) return static_cast<int32_t>(i);
+    }
+    fail(architecture, ": the vocabulary has no ", text);
+}
+
 int64_t positive(const gguf::File& file, std::string_view architecture, const std::string& key) {
     const int64_t v = file.get_int(key);
     if (v <= 0) fail(architecture, ": ", key, " is ", v);

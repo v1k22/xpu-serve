@@ -30,6 +30,7 @@ using xs::test::has;
 using xs::test::import_into;
 using xs::test::relative_gap;
 using xs::test::TempDir;
+using xs::test::TinyGemma4;
 using xs::test::values;
 
 namespace {
@@ -283,11 +284,54 @@ TEST_SUITE("gguf import gemma4") {
                                     }),
                   "tensor 'masked_embd_centroids.weight' has no counterpart in the model"));
         CHECK(has(assistant_refusal(work.path, [](GgufWriter& w) { w.u32("gemma4-assistant.expert_count", 4); }),
-                  "mixture-of-experts Gemma 4 (26B-A4B) is not supported yet"));
+                  "an assistant with experts is not supported"));
         xs::test::build_tiny_gemma4_assistant_gguf(work.path / "src", 9).write(work.path / "assistant.gguf");
         CHECK_THROWS_WITH_AS(
             import_into(work.path / "assistant.gguf", work.path / "with-mtp", work.path / "assistant.gguf"),
             doctest::Contains("gemma4-assistant: an MTP head in a file of its own (--mtp) is not supported"), Error);
+    }
+
+    // 26B-A4B's kind: experts beside every MLP (the router, its scales, the banks and the experts' norms) and
+    // full-attention layers without attn_v.
+    TEST_CASE("a tiny Gemma 4 with experts imports as the model its blocks decode to, its banks fused or apart") {
+        const TempDir work("xs_gguf_gemma4_moe_test");
+        const TinyGemma4 m = xs::test::tiny_gemma4_moe_gguf_model();
+        xs::test::build_tiny_gemma4_gguf(work.path / "fused", 11, m).write(work.path / "fused.gguf");
+        import_into(work.path / "fused.gguf", work.path / "pack");
+        const nlohmann::json config = nlohmann::json::parse(std::ifstream(work.path / "pack" / "config.json"));
+        const nlohmann::json original =
+            nlohmann::json::parse(std::ifstream(work.path / "fused" / "hf" / "config.json"));
+        for (const char* key : {"attention_k_eq_v", "enable_moe_block", "num_experts", "top_k_experts",
+                                "moe_intermediate_size", "hidden_size_per_layer_input", "num_kv_shared_layers",
+                                "num_global_key_value_heads", "layer_types"}) {
+            CAPTURE(key);
+            CHECK(config[key] == original[key]);
+        }
+        const auto pack = load_model(work.path / "pack");
+        const auto twin = load_model(work.path / "fused" / "twin");
+        CHECK(pack->weights().names() == twin->weights().names());
+        CHECK_FALSE(pack->weights().contains("model.layers.3.self_attn.v_proj.weight"));
+        CHECK(pack->weights().get("model.layers.1.experts.gate_up_proj").dtype == DType::Block);
+        CHECK(pack->weights().get("model.layers.1.router.per_expert_scale").dtype == DType::F32);
+        const auto reference = step_logits(*twin);
+        CHECK(relative_gap(step_logits(*pack), reference) == 0.0);
+        CHECK(xs::test::greedy(*pack, kPrompt, 8) == xs::test::greedy(*twin, kPrompt, 8));
+
+        // The banks apart (another converter's layout), from the same checkpoint: the same model.
+        xs::test::build_tiny_gemma4_gguf(work.path / "apart", 11, m, {.fused = false}).write(work.path / "apart.gguf");
+        import_into(work.path / "apart.gguf", work.path / "apart-pack");
+        const auto apart = load_model(work.path / "apart-pack");
+        CHECK(apart->weights().contains("model.layers.1.experts.gate_proj"));
+        CHECK_FALSE(apart->weights().contains("model.layers.1.experts.gate_up_proj"));
+        const auto apart_twin = load_model(work.path / "apart" / "twin");
+        const auto apart_logits = step_logits(*apart);
+        CHECK(relative_gap(apart_logits, step_logits(*apart_twin)) == 0.0);
+        CHECK(relative_gap(apart_logits, reference) == 0.0);  // the same blocks, a bank or two
+        // Planted: gate and up under each other's name is another model.
+        xs::test::build_tiny_gemma4_gguf(work.path / "swapped", 11, m, {.fused = false, .swap_gate_up = true})
+            .write(work.path / "swapped.gguf");
+        import_into(work.path / "swapped.gguf", work.path / "swapped-pack");
+        CHECK(relative_gap(step_logits(*load_model(work.path / "swapped-pack")), apart_logits) > 0.05);
     }
 
     TEST_CASE("gemma4: refusals name what is wrong") {
@@ -302,8 +346,9 @@ TEST_SUITE("gguf import gemma4") {
         CHECK(has(refusal(work.path, [](GgufWriter& w) { w.drop_tensor("blk.2.attn_k.weight"); }),
                   "gemma4: the file has no tensor for 'model.layers.2.self_attn.k_proj.weight' (block 2, sliding "
                   "attention)"));
-        CHECK(has(refusal(work.path, [](GgufWriter& w) { w.drop_tensor("blk.3.attn_v.weight"); }),
-                  "gemma4: block 3 has no attn_v.weight: values from the keys (attention_k_eq_v) are not supported"));
+        CHECK(has(refusal(work.path, [](GgufWriter& w) { w.drop_tensor("blk.2.attn_v.weight"); }),
+                  "gemma4: sliding-attention block 2 has no attn_v.weight (only full-attention layers take their keys "
+                  "as values)"));
         CHECK(has(refusal(work.path, [](GgufWriter& w) { w.drop_tensor("blk.5.layer_output_scale.weight"); }),
                   "no tensor for 'model.layers.5.layer_scalar' (block 5, full attention, KV-shared)"));
         CHECK(
@@ -311,7 +356,27 @@ TEST_SUITE("gguf import gemma4") {
                         [](GgufWriter& w) { w.f32_tensor("blk.1.attn_extra.weight", {128}, std::vector<float>(128)); }),
                 "tensor 'blk.1.attn_extra.weight' has no counterpart in block 1 (sliding attention)"));
         CHECK(has(refusal(work.path, [](GgufWriter& w) { w.u32("gemma4.expert_count", 8); }),
-                  "gemma4.expert_count: mixture-of-experts Gemma 4 (26B-A4B) is not supported yet"));
+                  "gemma4.expert_used_count"));  // the experts' three keys come together
+        // A file with experts and keys as values (26B-A4B's kind).
+        const auto moe_refusal = [&](auto change) {
+            return xs::test::refusal(
+                work.path,
+                [](const fs::path& src) {
+                    return xs::test::build_tiny_gemma4_gguf(src, 11, xs::test::tiny_gemma4_moe_gguf_model());
+                },
+                change);
+        };
+        CHECK(moe_refusal([](GgufWriter&) {}).empty());
+        CHECK(has(moe_refusal([](GgufWriter& w) {
+                  w.f32_tensor("blk.5.attn_v.weight", {256, 128}, std::vector<float>(256 * 128));
+              }),
+                  "1 of the 2 full-attention layers that compute their own KV have no attn_v.weight"));
+        CHECK(has(moe_refusal([](GgufWriter& w) { w.drop_tensor("blk.2.ffn_down_exps.scale"); }),
+                  "no tensor for 'model.layers.2.router.per_expert_scale'"));
+        CHECK(has(moe_refusal([](GgufWriter& w) {
+                  w.drop_value("gemma4.expert_used_count").u32("gemma4.expert_used_count", 9);
+              }),
+                  "gemma4.expert_used_count 9 of 4 experts"));
         CHECK(has(refusal(work.path, [](GgufWriter& w) { w.u32("gemma4.altup.num_inputs", 4); }),
                   "metadata 'gemma4.altup.num_inputs' is not read by this importer"));
         CHECK(has(refusal(work.path,

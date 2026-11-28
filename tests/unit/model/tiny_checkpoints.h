@@ -184,6 +184,10 @@ inline void write_tiny_qwen(const fs::path& dir, const TinyQwen& m, uint32_t see
 struct TinyGemma4 {
     int64_t vocab = 256, hidden = 128, ffn = 256, heads = 4, kv_heads = 1, global_kv_heads = 2;
     int64_t head_dim = 64, global_head_dim = 128, ple = 32, window = 8, shared = 2;
+    // 26B-A4B's kind: experts beside every layer's MLP (experts > 0, fused gate and up banks), and full-attention
+    // layers that take their keys as values (k_eq_v: no v_proj there).
+    int64_t experts = 0, top_k = 2, moe_ffn = 64;
+    bool k_eq_v = false;
     std::vector<std::string> layers{"sliding_attention", "sliding_attention", "sliding_attention",
                                     "full_attention",    "sliding_attention", "full_attention"};
     int64_t first_shared() const { return static_cast<int64_t>(layers.size()) - shared; }
@@ -209,9 +213,9 @@ inline void write_tiny_gemma4(const fs::path& dir, const TinyGemma4& m, uint32_t
         {"num_global_key_value_heads", m.global_kv_heads},
         {"head_dim", m.head_dim},
         {"global_head_dim", m.global_head_dim},
-        {"attention_k_eq_v", false},
+        {"attention_k_eq_v", m.k_eq_v},
         {"attention_bias", false},
-        {"enable_moe_block", false},
+        {"enable_moe_block", m.experts > 0},
         {"hidden_activation", "gelu_pytorch_tanh"},
         {"sliding_window", m.window},
         {"num_kv_shared_layers", m.shared},
@@ -226,6 +230,12 @@ inline void write_tiny_gemma4(const fs::path& dir, const TinyGemma4& m, uint32_t
         {"rope_parameters",
          {{"full_attention", {{"partial_rotary_factor", 0.25}, {"rope_theta", 1e6}, {"rope_type", "proportional"}}},
           {"sliding_attention", {{"rope_theta", 1e4}, {"rope_type", "default"}}}}}};
+    if (m.experts > 0) {
+        config["num_experts"] = m.experts;
+        config["top_k_experts"] = m.top_k;
+        config["moe_intermediate_size"] = m.moe_ffn;
+    }
+    if (m.ple == 0) config.erase("vocab_size_per_layer_input");
     std::ofstream(dir / "config.json") << config.dump(1);
 
     // Matrices at 1/sqrt(fan-in); norms and the layer scalars around 1, as Gemma 4's multiply by the weight itself.
@@ -238,9 +248,11 @@ inline void write_tiny_gemma4(const fs::path& dir, const TinyGemma4& m, uint32_t
         specs.push_back(TinyTensor{"model." + name, {width}, 0.5f, 1.5f});
     };
     matrix("embed_tokens.weight", {m.vocab, m.hidden});
-    specs.push_back(TinyTensor{"model.embed_tokens_per_layer.weight", {m.vocab, layers * m.ple}, -0.1f, 0.1f});
-    matrix("per_layer_model_projection.weight", {layers * m.ple, m.hidden});
-    norm("per_layer_projection_norm.weight", m.ple);
+    if (m.ple > 0) {
+        specs.push_back(TinyTensor{"model.embed_tokens_per_layer.weight", {m.vocab, layers * m.ple}, -0.1f, 0.1f});
+        matrix("per_layer_model_projection.weight", {layers * m.ple, m.hidden});
+        norm("per_layer_projection_norm.weight", m.ple);
+    }
     norm("norm.weight", m.hidden);
     for (int64_t i = 0; i < layers; ++i) {
         const std::string L = "layers." + std::to_string(i) + ".";
@@ -248,20 +260,36 @@ inline void write_tiny_gemma4(const fs::path& dir, const TinyGemma4& m, uint32_t
         const int64_t hd = full ? m.global_head_dim : m.head_dim, kv = full ? m.global_kv_heads : m.kv_heads;
         const int64_t ffn = i >= m.first_shared() ? 2 * m.ffn : m.ffn;
         for (const char* n : {"input_layernorm", "post_attention_layernorm", "pre_feedforward_layernorm",
-                              "post_feedforward_layernorm", "post_per_layer_input_norm"}) {
+                              "post_feedforward_layernorm"}) {
             norm(L + n + ".weight", m.hidden);
         }
+        if (m.ple > 0) norm(L + "post_per_layer_input_norm.weight", m.hidden);
         matrix(L + "self_attn.q_proj.weight", {m.heads * hd, m.hidden});
         matrix(L + "self_attn.k_proj.weight", {kv * hd, m.hidden});
-        matrix(L + "self_attn.v_proj.weight", {kv * hd, m.hidden});
+        if (!(m.k_eq_v && full)) matrix(L + "self_attn.v_proj.weight", {kv * hd, m.hidden});
         matrix(L + "self_attn.o_proj.weight", {m.hidden, m.heads * hd});
         norm(L + "self_attn.q_norm.weight", hd);
         norm(L + "self_attn.k_norm.weight", hd);
         matrix(L + "mlp.gate_proj.weight", {ffn, m.hidden});
         matrix(L + "mlp.up_proj.weight", {ffn, m.hidden});
         matrix(L + "mlp.down_proj.weight", {m.hidden, ffn});
-        matrix(L + "per_layer_input_gate.weight", {m.ple, m.hidden});
-        matrix(L + "per_layer_projection.weight", {m.hidden, m.ple});
+        if (m.ple > 0) {
+            matrix(L + "per_layer_input_gate.weight", {m.ple, m.hidden});
+            matrix(L + "per_layer_projection.weight", {m.hidden, m.ple});
+        }
+        if (m.experts > 0) {
+            // A wide router, so each token's experts win clearly.
+            const float r = 8.0f / std::sqrt(static_cast<float>(m.hidden));
+            specs.push_back(TinyTensor{"model." + L + "router.proj.weight", {m.experts, m.hidden}, -r, r});
+            norm(L + "router.scale", m.hidden);
+            norm(L + "router.per_expert_scale", m.experts);
+            matrix(L + "experts.gate_up_proj", {m.experts, 2 * m.moe_ffn, m.hidden});
+            matrix(L + "experts.down_proj", {m.experts, m.hidden, m.moe_ffn});
+            for (const char* n : {"pre_feedforward_layernorm_2", "post_feedforward_layernorm_1",
+                                  "post_feedforward_layernorm_2"}) {
+                norm(L + n + ".weight", m.hidden);
+            }
+        }
         specs.push_back(TinyTensor{"model." + L + "layer_scalar", {1}, 0.5f, 1.0f});
     }
     write_random(dir / "model.safetensors", specs, seed);

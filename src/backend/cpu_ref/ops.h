@@ -46,11 +46,12 @@ HostTensor dynamic_conv(const HostTensor& x, const HostTensor& w, const HostTens
 HostTensor gated_delta(ThreadPool& pool, const HostTensor& q, const HostTensor& k, const HostTensor& v,
                        const HostTensor& g, const HostTensor& beta, float qk_l2norm_eps, std::vector<float>& state);
 // `groups` [T] i32: the tokens' groups of attention in groups (AttentionAttrs::grouped), else null. `rel` [T, Hq, E]
-// and `sink` [T, Hq]: the relative bias and the sink of AttentionAttrs::rel_extent, else null.
+// and `sink` [T, Hq]: the relative bias and the sink of AttentionAttrs::rel_extent, else null. `reach` [T] i32: each
+// query's keys ahead (AttentionAttrs::reaching), else null.
 HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_all, const HostTensor& v_all,
                      const graph::AttentionAttrs& attrs, const HostTensor* key_bias = nullptr,
                      const HostTensor* groups = nullptr, const HostTensor* rel = nullptr,
-                     const HostTensor* sink = nullptr);
+                     const HostTensor* sink = nullptr, const HostTensor* reach = nullptr);
 HostTensor div(const HostTensor& a, const HostTensor& b);
 HostTensor softmax(const HostTensor& x);
 // (values f32, indices i32) of the k largest along the last axis, largest first; ties keep the lower index first.

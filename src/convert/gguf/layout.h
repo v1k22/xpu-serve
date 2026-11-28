@@ -64,6 +64,10 @@ void map_tensors(const std::vector<const gguf::TensorInfo*>& tensors, std::strin
 // Every tensor of `file`.
 void map_tensors(const gguf::File& file, std::string_view architecture, const Layout& layout, ImportPlan& plan);
 
+// The id of the token spelled `text` in the file's vocabulary (tokenizer.ggml.tokens); refuses by name a vocabulary
+// without it.
+int32_t token_id(const gguf::File& file, std::string_view architecture, std::string_view text);
+
 // Metadata `key`, an integer that must be positive.
 int64_t positive(const gguf::File& file, std::string_view architecture, const std::string& key);
 

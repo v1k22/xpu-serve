@@ -536,6 +536,10 @@ class CpuProgram {
                     return {out.reshaped(qs)};
                 }
                 if (a.grouped) return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, nullptr, &in(3))};
+                if (a.reaching) {
+                    return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, nullptr, nullptr, nullptr, nullptr,
+                                               &in(3))};
+                }
                 if (a.rel_extent > 0) {
                     const HostTensor rel = f32(3), sink = f32(4);
                     return {cpu_ref::attention(*pool_, f32(0), f32(1), f32(2), a, nullptr, nullptr, &rel, &sink)};

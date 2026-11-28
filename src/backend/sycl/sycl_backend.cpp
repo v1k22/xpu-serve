@@ -1435,7 +1435,8 @@ private:
                     const int64_t d = graph_.type(n.inputs[0]).shape.back();
                     XS_CHECK(d % 8 == 0 && d <= 512, where(i), ": head_dim ", d,
                              " is not supported (a multiple of 8, at most 512)");
-                    if (std::get<graph::AttentionAttrs>(n.attrs).grouped) {
+                    const auto& attrs = std::get<graph::AttentionAttrs>(n.attrs);
+                    if (attrs.grouped || attrs.reaching) {
                         need(3, dt(n.inputs[3]) == DType::I32, "i32");
                     } else {  // a key bias, or a relative bias and a sink
                         for (size_t k = 3; k < n.inputs.size(); ++k)
@@ -2853,6 +2854,8 @@ private:
                 s.block = a.block < s.tokens ? a.block : 0;  // one block: every key
                 if (a.grouped) {
                     s.groups = reinterpret_cast<const int32_t*>(in_ptr(3));
+                } else if (a.reaching) {
+                    s.reach = reinterpret_cast<const int32_t*>(in_ptr(3));
                 } else if (a.rel_extent > 0) {
                     s.rel = in_f32(3);
                     s.rel_extent = a.rel_extent;
@@ -2860,6 +2863,8 @@ private:
                 } else if (n.inputs.size() == 4) {
                     s.key_bias = in_f32(3);
                 }
+                XS_CHECK(s.reach == nullptr || seg_attn_ == nullptr, where(i),
+                         ": attention reaching ahead runs over one sequence's step, not segments of several");
                 if (seg_attn_ != nullptr) {  // every segment's queries over its sequence's cache (segment_tables)
                     const int64_t step_rows = s.tokens;
                     s.tokens = seg_max_tokens_;

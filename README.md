@@ -39,8 +39,8 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3, Inkling 2 Mini (a
   looped mixture of experts without rotary positions)
-- ✅ **Image input** (Gemma 4 E2B / E4B, Qwen3.5 / Qwen3.6 / Qwen3.8, Qwen3-Omni, Inkling 2 Mini), as base64 `data:`
-  URLs; from a GGUF file with its vision tower's file (`mmproj-*.gguf`) too
+- ✅ **Image input** (Gemma 4 E2B / E4B / 26B-A4B, Qwen3.5 / Qwen3.6 / Qwen3.8, Qwen3-Omni, Inkling 2 Mini), as base64
+  `data:` URLs; from a GGUF file with its vision tower's file (`mmproj-*.gguf`) too
 - ✅ **Audio and images in chat**: Qwen3-Omni-30B-A3B's thinker (text, audio and images in, text and tool calls
   out), as `input_audio` and `image_url` parts
 - ✅ **Speech recognition** (Qwen3-ASR) behind `/v1/audio/transcriptions` (json, text or streamed), OpenAI's
@@ -79,9 +79,8 @@ Not yet:
   where a conversation's messages ended: decision 0029); with `--spec` and a block drafter (DFlash, DSpine, DSpark),
   the drafts of several requests in one run (an MTP head's already are, and every drafter's verifies).
 - One model across two GPUs.
-- Timestamps and translation of speech; speech output; video input; images for Gemma 4 26B-A4B and SenseNova Loop,
-  and for a Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.
-- Gemma 4 26B-A4B from a GGUF file (a `gemma4` file with experts).
+- Timestamps and translation of speech; speech output; video input; images for SenseNova Loop, and for a
+  Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.
 - The prompt's log-probabilities (`echo`, `prompt_logprobs`), `best_of` and beam search, a rerank API.
 
 ## Supported models
@@ -90,8 +89,8 @@ Each model's recipe has its commands and numbers.
 
 | Model | Kind | Checkpoint | Runs from | Recipe |
 |---|---|---|---|---|
-| Gemma 4 E2B / E4B | language, images | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it` | original, q8 / q4 pack, GGUF (text) | [E2B](model_recipes.md#gemma-4-e2b), [E4B](model_recipes.md#gemma-4-e4b), [GGUF](model_recipes.md#gemma-4-e2b-gguf) |
-| Gemma 4 26B-A4B | language, MoE | `google/gemma-4-26B-A4B-it` | q4 pack | [recipe](model_recipes.md#gemma-4-26b-a4b) |
+| Gemma 4 E2B / E4B | language, images | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it` | original, q8 / q4 pack, GGUF | [E2B](model_recipes.md#gemma-4-e2b), [E4B](model_recipes.md#gemma-4-e4b), [GGUF](model_recipes.md#gemma-4-e2b-gguf) |
+| Gemma 4 26B-A4B | language, images, MoE | `google/gemma-4-26B-A4B-it`, `unsloth/gemma-4-26B-A4B-it-GGUF` | q4 pack, GGUF | [recipe](model_recipes.md#gemma-4-26b-a4b), [GGUF](model_recipes.md#gemma-4-26b-a4b-gguf) |
 | Qwen3.5-4B | language | `Qwen/Qwen3.5-4B` | original, q8 / q4 pack, GGUF | [recipe](model_recipes.md#qwen35-4b), [GGUF](model_recipes.md#qwen35-4b-gguf) |
 | Qwen3.5-9B | language | `Qwen/Qwen3.5-9B` | original, q8 / q4 pack | [recipe](model_recipes.md#qwen35-9b) |
 | SenseNova-Loop-9B | language | `sensenova/SenseNova-Loop-9B` (gated), `-Preview` | original, q8 / q4 pack | [recipe](model_recipes.md#sensenova-loop-9b) |

@@ -34,6 +34,9 @@ struct ModelInfo {
     int64_t media_width = 0;
     int64_t max_position = 0;     // longest context the model supports
     std::string dialect;          // chat::make_output_parser dialect
+    // An image's soft tokens attend to each other both ways (Gemma 4's use_bidirectional_attention "vision"): the
+    // engine prefills each image's run of them in one step, never cut by a chunk.
+    bool media_whole_steps = false;
     std::vector<int32_t> stop_token_ids;
     SamplingParams default_sampling;  // generation_config.json
 };

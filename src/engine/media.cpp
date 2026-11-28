@@ -84,4 +84,18 @@ PromptPositions rotary_positions(std::span<const int32_t> item, std::span<const 
     return out;
 }
 
+size_t whole_media_chunk(std::span<const int32_t> media_item, size_t pos, size_t len) {
+    const auto in_run = [&](size_t i) { return media_item[i] >= 0 && media_item[i - 1] == media_item[i]; };
+    XS_CHECK(pos == 0 || pos >= media_item.size() || !in_run(pos), "engine: a prefill step starts inside the soft ",
+             "tokens of media item ", media_item[pos], ", which this model reads in one step");
+    const size_t end = pos + len;
+    if (end >= media_item.size() || !in_run(end)) return len;  // the chunk ends at a run's end, or outside one
+    size_t start = end - 1;  // the run the chunk would cut: its start
+    while (start > pos && in_run(start)) --start;
+    if (start > pos) return start - pos;  // end the chunk before the run
+    size_t stop = end;  // the run starts the chunk: take all of it
+    while (stop < media_item.size() && in_run(stop)) ++stop;
+    return stop - pos;
+}
+
 }  // namespace xs

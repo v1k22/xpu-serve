@@ -4,6 +4,7 @@
 #include "backend/cpu_ref/cpu_backend.h"
 #include "backend_test_util.h"
 #include "quant/quant.h"
+#include "reaching_cases.h"
 #include "reference_ops.h"
 #include "util/error.h"
 
@@ -141,6 +142,43 @@ TEST_SUITE("cpu-ref attention") {
     TEST_CASE("head_dim 256 and 512") {
         check_steps({2, 1, 256, {1.0f / 16, 0, 0.0f}}, {3, 1}, 15);
         check_steps({2, 2, 512, {1.0f / 22.6f, 2, 0.0f}}, {3, 1}, 16);
+    }
+
+    TEST_CASE("reaching ahead: an image's rows see their run both ways, text causal, a window bounds the keys behind") {
+        for (const test::reaching::Case& c : test::reaching::cases()) {
+            CAPTURE(test::reaching::describe(c));
+            const auto session =
+                make_cpu_ref_backend()->compile(test::reaching::graph_of(c), test::MemoryWeights{}, {});
+            const auto check = [&](size_t step, const HostTensor& out, const Tensor64& expected,
+                                   const Tensor64& planted) {
+                CAPTURE(step);
+                CHECK(test::all_close(out, expected, kAtol, kRtol));
+                if (c.window > 0 && step == 1) CHECK_FALSE(test::all_close(out, planted, kAtol, kRtol));
+            };
+            test::reaching::run(c, *session, 61, check);
+        }
+        // Refusals: a reach past the step's keys; the op without its reach, or not causal.
+        test::reaching::Case c;
+        c.steps = {{4, {}}};
+        const auto session = make_cpu_ref_backend()->compile(test::reaching::graph_of(c), test::MemoryWeights{}, {});
+        TensorMap out;
+        test::TensorRng rng(3);
+        const TensorMap past_end{{"q", rng.uniform(DType::F32, {4, 4, 64})},
+                                 {"k", rng.uniform(DType::F32, {4, 2, 64})},
+                                 {"v", rng.uniform(DType::F32, {4, 2, 64})},
+                                 {"reach", test::make_tensor(DType::I32, {4}, std::vector<int32_t>{0, 3, 0, 0})}};
+        CHECK_THROWS_WITH_AS(session->run(past_end, out), doctest::Contains("passes the 4 keys of the step"), Error);
+        Graph g;
+        const Value q = g.input("q", DType::F32, {kT, 4, 64});
+        const int slot = g.add_kv_slot(2, 64, 0, "layer");
+        const auto [k_all, v_all] = g.kv_cache(slot, g.input("k", DType::F32, {kT, 2, 64}),
+                                               g.input("v", DType::F32, {kT, 2, 64}));
+        const Value reach = g.input("reach", DType::I32, {kT});
+        AttentionAttrs a;
+        a.reaching = true;
+        CHECK_THROWS_WITH_AS(g.attention(q, k_all, v_all, a), doctest::Contains("attention_reaching"), Error);
+        a.causal = false;
+        CHECK_THROWS_WITH_AS(g.attention_reaching(q, k_all, v_all, reach, a), doctest::Contains("is causal"), Error);
     }
 
     TEST_CASE("planted bugs: off-by-one window and missing scale must not match") {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch llama|qwen3|qwen3_moe|qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|lfm3|
+    python -I tests/parity/model/make_tiny.py --arch llama|qwen3|qwen3_moe|qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|gemma4_moe_vl|lfm3|
         sensenova_loop|qwen3_asr|inkling2_loop --tokenizer-from <dir> --out <dir>
     python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
         [--pooling mean|cls] [--normalize] [--max-seq-length N]
@@ -184,9 +184,56 @@ def gemma4_moe(vocab_size, source):
     """Gemma 4 26B-A4B's layout: five sliding layers then a full one, experts beside every layer's MLP (a router with
     per-expert scales), global layers with fewer KV heads whose values are the key projection, softcapped logits.
     The sliding window is shorter than the longest prompt, so the masks are exercised."""
-    from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+    from transformers import Gemma4ForCausalLM
 
-    config = Gemma4TextConfig(
+    return gemma4_weights(Gemma4ForCausalLM(gemma4_moe_text(vocab_size)))
+
+
+def gemma4_moe_vl(vocab_size, source):
+    """gemma4_moe's decoder with Gemma 4 26B-A4B's kind of vision tower (Gemma4ForConditionalGeneration): linears
+    without clipping, heads of 72 channels, the pooled soft tokens standardized (std_bias and std_scale away from 0
+    and 1, so a standardization left out shows), and an image's tokens attending to each other both ways in the
+    sliding layers (use_bidirectional_attention "vision"); the window (16) is shorter than an image, so its reach
+    ahead is not bounded by it."""
+    from transformers import Gemma4Config, Gemma4ForConditionalGeneration, Gemma4VisionConfig
+
+    with open(os.path.join(source, "config.json")) as f:
+        released = json.load(f)
+    ids = {k: released[k] for k in ("image_token_id", "boi_token_id", "eoi_token_id", "audio_token_id",
+                                    "boa_token_id", "eoa_token_id", "video_token_id") if k in released}
+    vision = Gemma4VisionConfig(
+        hidden_size=144, intermediate_size=192, num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=2,
+        head_dim=72, global_head_dim=72, patch_size=16, pooling_kernel_size=3, position_embedding_size=10240,
+        default_output_length=280, standardize=True, use_clipped_linears=False, rms_norm_eps=1e-6,
+        rope_parameters={"rope_type": "default", "rope_theta": 100.0})
+    text = gemma4_moe_text(vocab_size)
+    text.use_bidirectional_attention = "vision"  # 26B-A4B's: an image's tokens see each other in the sliding layers
+    config = Gemma4Config(text_config=text, vision_config=vision, audio_config=None, tie_word_embeddings=True,
+                          vision_soft_tokens_per_image=280, **ids)
+    model = gemma4_weights(Gemma4ForConditionalGeneration(config))
+    with torch.no_grad():
+        tower = model.model.vision_tower
+        tower.std_bias.normal_(0.0, 2.0)
+        tower.std_scale.uniform_(0.2, 0.8)
+    return model
+
+
+def gemma4_weights(model):
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("router.proj.weight"):
+                p.normal_(0.0, 40.0)  # decisive routing: a near tie could route differently at f16
+            elif name.endswith("router.per_expert_scale") or name.endswith("router.scale"):
+                p.uniform_(0.5, 1.5)
+            elif p.dim() == 1 and "norm" in name:
+                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
+    return model
+
+
+def gemma4_moe_text(vocab_size):
+    from transformers import Gemma4TextConfig
+
+    return Gemma4TextConfig(
         vocab_size=vocab_size, hidden_size=64, intermediate_size=48, num_hidden_layers=6, num_attention_heads=4,
         num_key_value_heads=2, num_global_key_value_heads=1, head_dim=32, global_head_dim=64, sliding_window=16,
         layer_types=["sliding_attention"] * 5 + ["full_attention"], hidden_size_per_layer_input=0,
@@ -197,16 +244,6 @@ def gemma4_moe(vocab_size, source):
                                             "rope_theta": 1000000.0},
                          "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}},
     )
-    model = Gemma4ForCausalLM(config)
-    with torch.no_grad():
-        for name, p in model.named_parameters():
-            if name.endswith("router.proj.weight"):
-                p.normal_(0.0, 40.0)  # decisive routing: a near tie could route differently at f16
-            elif name.endswith("router.per_expert_scale") or name.endswith("router.scale"):
-                p.uniform_(0.5, 1.5)
-            elif p.dim() == 1 and "norm" in name:
-                p.uniform_(0.5, 1.5)  # norms away from 1, so a skipped norm shows
-    return model
 
 
 def lfm3(vocab_size, source):
@@ -586,7 +623,7 @@ def perturbed(model):
 
 
 ARCHS = {"llama": llama, "qwen3": qwen3, "qwen3_moe": qwen3_moe, "qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "qwen3_5_vl": qwen3_5_vl, "qwen3_5_moe_vl": qwen3_5_moe_vl,
-         "gemma4_moe": gemma4_moe, "lfm3": lfm3, "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr,
+         "gemma4_moe": gemma4_moe, "gemma4_moe_vl": gemma4_moe_vl, "lfm3": lfm3, "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr,
          "qwen3_omni": qwen3_omni, "inkling2_loop": inkling2_loop, "bert": bert, "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}
 ENCODER_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]

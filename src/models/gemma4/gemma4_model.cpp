@@ -86,6 +86,7 @@ public:
             weights_ = std::move(target);
         }
         if (vision) load_vision(*vision);
+        info_.media_whole_steps = reaching();
         build_target(step_, Head::LastLogits);
         if (batch) build_target(batch_, Head::AllLogits);
         batched_ = batch;
@@ -125,6 +126,7 @@ public:
             }
         }
         if (ple_table_ != nullptr) inputs["ple"] = gather_ple_rows(ple_ids);
+        if (reaching()) inputs["media_reach"] = media_reach(embeddings, n);
     }
 
     const graph::Graph& prefill_graph() const override { return prefill_; }
@@ -147,6 +149,27 @@ public:
     }
 
 private:
+    // An image's soft tokens see each other both ways in the sliding layers (use_bidirectional_attention "vision").
+    bool reaching() const { return cfg_.bidirectional_vision && vision_ != nullptr; }
+
+    // Each row's reach (Graph::attention_reaching): within a run of image rows, the rows after it in the run; 0 for
+    // text. The engine keeps a run within one step (ModelInfo::media_whole_steps).
+    static HostTensor media_reach(std::span<const float* const> rows, int64_t n) {
+        HostTensor reach(DType::I32, {n});
+        int32_t* r = reach.data<int32_t>();
+        int64_t end = 0;  // the end of the run row i is in
+        for (int64_t i = n - 1; i >= 0; --i) {
+            const bool image = !rows.empty() && rows[static_cast<size_t>(i)] != nullptr;
+            if (!image) {
+                r[i] = 0;
+                continue;
+            }
+            if (i == n - 1 || rows[static_cast<size_t>(i + 1)] == nullptr) end = i + 1;
+            r[i] = static_cast<int32_t>(end - 1 - i);
+        }
+        return reach;
+    }
+
     enum class Head {
         LastLogits,           // the step graph
         AllLogits,            // a decode step of several requests (batch_graph)
@@ -264,6 +287,10 @@ private:
         const Value pos = g.input("positions", DType::I32, {kT});
         Value h = g.scale(g.gather(weight(g, w("embed_tokens.weight")), ids), embed_scale_);
         if (vision_ != nullptr) h = blocks::splice_media(g, h, cfg_.hidden_size);
+        // Images come in a prompt's prefill (the step and prefill graphs); every graph takes the input.
+        const Value reach_in = reaching() ? g.input("media_reach", DType::I32, {kT}) : Value{};
+        const bool prompt = head == Head::LastLogits || head == Head::LastLogitsAllHidden;
+        const Value reach = prompt ? reach_in : Value{};
         const Value per_layer = cfg_.ple_dim > 0 ? per_layer_inputs(g, h) : Value{};
         const Decoder d = decoder(g, cfg_, prefix_);
         std::vector<std::pair<Value, Value>> layer_kv(static_cast<size_t>(cfg_.num_layers));
@@ -273,7 +300,7 @@ private:
                 shared = &layer_kv[static_cast<size_t>(cfg_.kv_source_layer(i))];
                 XS_CHECK(shared->first.valid(), "gemma4: layer ", i, " shares the KV of a layer that has none");
             }
-            const LayerOut out = decoder_layer(g, d, i, h, pos, per_layer, shared);
+            const LayerOut out = decoder_layer(g, d, i, h, pos, per_layer, shared, reach);
             h = out.h;
             if (shared == nullptr) layer_kv[static_cast<size_t>(i)] = out.kv;
         }
@@ -361,9 +388,10 @@ private:
         std::pair<Value, Value> kv;  // the k / v its attention read
     };
 
-    // Layer i of decoder d; `shared`: the k / v it reads instead of making its own.
+    // Layer i of decoder d; `shared`: the k / v it reads instead of making its own; `reach`: each row's reach ahead
+    // in a sliding layer (an image's rows both ways), or invalid.
     LayerOut decoder_layer(Graph& g, const Decoder& d, int64_t i, Value h, Value pos, Value per_layer,
-                           const std::pair<Value, Value>* shared) const {
+                           const std::pair<Value, Value>* shared, Value reach = {}) const {
         const Config& c = *d.cfg;
         const std::string L = d.prefix + "layers." + std::to_string(i) + ".";
         const auto wt = [&](const std::string& suffix) { return weight(g, L + suffix); };
@@ -382,6 +410,7 @@ private:
         spec.attrs.sliding_window = kind == AttnKind::Sliding ? c.sliding_window : 0;
         spec.kv_window = spec.attrs.sliding_window;
         spec.kv_label = "layers." + std::to_string(i);
+        if (kind == AttnKind::Sliding) spec.reach = reach;
         blocks::AttentionParts parts;
         parts.q = proj("self_attn.q_proj.weight");
         parts.k = proj("self_attn.k_proj.weight");
@@ -418,7 +447,9 @@ private:
     }
 
     // Gemma4TextRouter + Gemma4TextExperts over the residual h of layer L: the router reads rms_norm(h) * scale /
-    // sqrt(hidden), the experts their own norm of h.
+    // sqrt(hidden), the experts their own norm of h. The gate and up banks come fused (experts.gate_up_proj: an
+    // expert's gate rows, then its up rows) or apart (experts.gate_proj and experts.up_proj: a GGUF import of a file
+    // that stores them so, each in its own format).
     Value experts(Graph& g, const Config& c, const std::string& L, Value h) const {
         Graph::Scope s(g, "experts");
         const auto e = static_cast<float>(c.rms_norm_eps);
@@ -435,13 +466,28 @@ private:
         parts.router = weight(g, L + "router.proj.weight");
         parts.router_x = g.rms_norm(h, g.constant(std::move(router_scale)), e);
         parts.expert_scale = weight(g, L + "router.per_expert_scale");
-        parts.gate_up = weight(g, L + "experts.gate_up_proj");
-        parts.down = weight(g, L + "experts.down_proj");
-        const int64_t inter = c.moe_intermediate_size;
-        XS_CHECK(g.type(parts.gate_up).shape == (Dims{c.num_experts, 2 * inter, c.hidden_size}) &&
-                     g.type(parts.down).shape == (Dims{c.num_experts, c.hidden_size, inter}),
-                 "gemma4: ", L, " expert banks have shapes ", dims_to_string(g.type(parts.gate_up).shape), " and ",
-                 dims_to_string(g.type(parts.down).shape));
+        const int64_t inter = c.moe_intermediate_size, n = c.num_experts, hidden = c.hidden_size;
+        const auto bank = [&](const std::string& name, const Dims& shape) {
+            const Value w = weight(g, L + "experts." + name);
+            XS_CHECK(g.type(w).shape == shape, "gemma4: ", L, "experts.", name, " has shape ",
+                     dims_to_string(g.type(w).shape), ", expected ", dims_to_string(shape));
+            return w;
+        };
+        const std::string E = L + "experts.";
+        const bool fused = weights_->contains(E + "gate_up_proj");
+        const bool apart = weights_->contains(E + "gate_proj") || weights_->contains(E + "up_proj");
+        if (fused && apart) {
+            fail("gemma4: ", E, " holds the fused bank (gate_up_proj) and the banks apart (gate_proj, up_proj)");
+        }
+        if (fused) {
+            parts.gate_up = bank("gate_up_proj", {n, 2 * inter, hidden});
+        } else if (apart) {
+            parts.gate = bank("gate_proj", {n, inter, hidden});
+            parts.up = bank("up_proj", {n, inter, hidden});
+        } else {
+            fail("gemma4: ", E, " has no gate and up banks (gate_up_proj, or gate_proj and up_proj)");
+        }
+        parts.down = bank("down_proj", {n, hidden, inter});
         return blocks::moe(g, g.rms_norm(h, weight(g, L + "pre_feedforward_layernorm_2.weight"), e), spec, parts);
     }
 
@@ -476,10 +522,7 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     const nlohmann::json& text = config_json.contains("text_config") ? config_json.at("text_config") : config_json;
     const auto pad_token_id = static_cast<int32_t>(cfg::get_int_or(text, "pad_token_id", 0, "config.json"));
     std::optional<VisionConfig> vision;
-    if (options.vision && cfg.bidirectional_vision) {
-        log::warn("gemma4: image tokens attend both ways in this model (use_bidirectional_attention: vision), which is "
-                  "not supported yet; text only");
-    } else if (options.vision) {
+    if (options.vision) {
         try {
             vision = parse_vision_config(config_json, dir, cfg.hidden_size);
         } catch (const Error& e) {

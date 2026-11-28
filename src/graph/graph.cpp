@@ -627,6 +627,7 @@ Value Graph::attention(Value q, Value k_all, Value v_all, const AttentionAttrs& 
     XS_CHECK(qs[1] % ks[1] == 0, "attention heads ", qs[1], " not a multiple of kv heads ", ks[1]);
     XS_CHECK(attrs.sliding_window >= 0 && attrs.softcap >= 0.0f && attrs.block >= 0, "invalid attention attributes");
     XS_CHECK(!attrs.grouped, "attention in groups takes the tokens' groups (attention_in_groups)");
+    XS_CHECK(!attrs.reaching, "attention reaching ahead takes each query's reach (attention_reaching)");
     XS_CHECK(attrs.rel_extent == 0, "attention with a relative bias takes it and its sink (attention_relative)");
     if (attrs.block > 0) {
         XS_CHECK(!attrs.causal && attrs.sliding_window == 0 && qs[0] > 0 && ks[0] == qs[0] && qs[0] % attrs.block == 0,
@@ -664,6 +665,23 @@ Value Graph::attention_relative(Value q, Value k_all, Value v_all, Value rel, Va
     n.attrs = attrs;
     n.inputs.push_back(rel);
     n.inputs.push_back(sink);
+    return out;
+}
+
+Value Graph::attention_reaching(Value q, Value k_all, Value v_all, Value reach, const AttentionAttrs& attrs) {
+    XS_CHECK(attrs.reaching && attrs.causal && attrs.block == 0 && !attrs.grouped && attrs.rel_extent == 0 &&
+                 !attrs.anchored,
+             "attention reaching ahead is causal, without a block, groups, a relative bias or an anchored window");
+    AttentionAttrs plain = attrs;
+    plain.reaching = false;
+    const Value out = attention(q, k_all, v_all, plain);
+    const TensorType& rt = type(reach);
+    XS_CHECK(type(q).shape.size() == 3 && rt.dtype == DType::I32 && rt.shape == (Dims{kT}),
+             "attention reach must be i32 [T] beside q [T, heads, head_dim], got ", dtype_name(rt.dtype),
+             shape_to_string(rt.shape), " (", where(reach), ")");
+    Node& n = nodes_[static_cast<size_t>(out.node)];
+    n.attrs = attrs;
+    n.inputs.push_back(reach);
     return out;
 }
 

@@ -154,11 +154,29 @@ inline TinyGemma4 tiny_gemma4_gguf_model() {
     return m;
 }
 
+// 26B-A4B's kind in miniature: experts beside every MLP, full-attention layers taking their keys as values, no
+// per-layer embeddings or KV-shared layers.
+inline TinyGemma4 tiny_gemma4_moe_gguf_model() {
+    TinyGemma4 m = tiny_gemma4_gguf_model();
+    m.ple = 0;
+    m.shared = 0;
+    m.experts = 4;
+    m.k_eq_v = true;
+    return m;
+}
+
+// How a file stores 26B-A4B's expert banks: gate and up fused (ffn_gate_up_exps, as the converter writes them now),
+// or apart (ffn_gate_exps, ffn_up_exps); `swap_gate_up` plants the two halves under each other's name.
+struct TinyGemma4Banks {
+    bool fused = true;
+    bool swap_gate_up = false;
+};
+
 // Writes, under `dir`: hf/ (the tiny checkpoint, its tokenizer and chat template), twin/ (the checkpoint the GGUF
 // stands for). Returns the GGUF's writer: the test writes the file, as it is or changed.
-inline GgufWriter build_tiny_gemma4_gguf(const std::filesystem::path& dir, uint32_t seed) {
+inline GgufWriter build_tiny_gemma4_gguf(const std::filesystem::path& dir, uint32_t seed,
+                                         const TinyGemma4& m = tiny_gemma4_gguf_model(), TinyGemma4Banks banks = {}) {
     namespace fs = std::filesystem;
-    const TinyGemma4 m = tiny_gemma4_gguf_model();
     write_tiny_gemma4(dir / "hf", m, seed);
     const nlohmann::json tokenizer = tiny_gemma4_tokenizer_json();
     std::ofstream(dir / "hf" / "tokenizer.json") << tokenizer.dump();
@@ -203,6 +221,11 @@ inline GgufWriter build_tiny_gemma4_gguf(const std::filesystem::path& dir, uint3
         .u32("gemma4.attention.value_length_swa", static_cast<uint32_t>(m.head_dim))
         .u32("gemma4.rope.dimension_count", static_cast<uint32_t>(m.global_head_dim))
         .u32("gemma4.rope.dimension_count_swa", static_cast<uint32_t>(m.head_dim));
+    if (m.experts > 0) {
+        w.u32("gemma4.expert_count", static_cast<uint32_t>(m.experts))
+            .u32("gemma4.expert_used_count", static_cast<uint32_t>(m.top_k))
+            .u32("gemma4.expert_feed_forward_length", static_cast<uint32_t>(m.moe_ffn));
+    }
     add_gemma4_tokenizer_metadata(w, tokenizer);
 
     const auto source = SafetensorsWeights::open_dir(dir / "hf");
@@ -225,10 +248,13 @@ inline GgufWriter build_tiny_gemma4_gguf(const std::filesystem::path& dir, uint3
 
     const std::string P = "model.";
     tensor("token_embd.weight", P + "embed_tokens.weight", {m.vocab, h}, Storage::Q8_0);
-    tensor("per_layer_token_embd.weight", P + "embed_tokens_per_layer.weight", {m.vocab, layers * m.ple},
-           Storage::Q4_0);
-    tensor("per_layer_model_proj.weight", P + "per_layer_model_projection.weight", {layers * m.ple, h}, Storage::BF16);
-    f32("per_layer_proj_norm.weight", P + "per_layer_projection_norm.weight", {m.ple});
+    if (m.ple > 0) {
+        tensor("per_layer_token_embd.weight", P + "embed_tokens_per_layer.weight", {m.vocab, layers * m.ple},
+               Storage::Q4_0);
+        tensor("per_layer_model_proj.weight", P + "per_layer_model_projection.weight", {layers * m.ple, h},
+               Storage::BF16);
+        f32("per_layer_proj_norm.weight", P + "per_layer_projection_norm.weight", {m.ple});
+    }
     f32("output_norm.weight", P + "norm.weight", {h});
     // Proportional RoPE: a factor of 1 for the rotated quarter of a full-attention head's pairs, 1e30 for the rest.
     std::vector<float> factors(static_cast<size_t>(m.global_head_dim / 2), 1e30f);
@@ -254,7 +280,7 @@ inline GgufWriter build_tiny_gemma4_gguf(const std::filesystem::path& dir, uint3
         } else {
             tensor(B + "attn_q.weight", L + "self_attn.q_proj.weight", q, next_block());
             tensor(B + "attn_k.weight", L + "self_attn.k_proj.weight", k, next_block());
-            tensor(B + "attn_v.weight", L + "self_attn.v_proj.weight", k, next_block());
+            if (!(m.k_eq_v && full(i))) tensor(B + "attn_v.weight", L + "self_attn.v_proj.weight", k, next_block());
         }
         tensor(B + "attn_output.weight", L + "self_attn.o_proj.weight", {h, m.heads * hd},
                i == 1 ? Storage::F16 : next_block());
@@ -266,10 +292,44 @@ inline GgufWriter build_tiny_gemma4_gguf(const std::filesystem::path& dir, uint3
         tensor(B + "ffn_up.weight", L + "mlp.up_proj.weight", {f, h}, next_block());
         tensor(B + "ffn_down.weight", L + "mlp.down_proj.weight", {h, f}, next_block());
         f32(B + "post_ffw_norm.weight", L + "post_feedforward_layernorm.weight", {h});
-        f32(B + "inp_gate.weight", L + "per_layer_input_gate.weight", {m.ple, h});
-        f32(B + "proj.weight", L + "per_layer_projection.weight", {h, m.ple});
-        f32(B + "post_norm.weight", L + "post_per_layer_input_norm.weight", {h});
+        if (m.ple > 0) {
+            f32(B + "inp_gate.weight", L + "per_layer_input_gate.weight", {m.ple, h});
+            f32(B + "proj.weight", L + "per_layer_projection.weight", {h, m.ple});
+            f32(B + "post_norm.weight", L + "post_per_layer_input_norm.weight", {h});
+        }
         f32(B + "layer_output_scale.weight", L + "layer_scalar", {1});
+        if (m.experts > 0) {
+            const int64_t n = m.experts, fe = m.moe_ffn;
+            f32(B + "ffn_gate_inp.weight", L + "router.proj.weight", {n, h});
+            f32(B + "ffn_gate_inp.scale", L + "router.scale", {h});
+            f32(B + "ffn_down_exps.scale", L + "router.per_expert_scale", {n});
+            f32(B + "pre_ffw_norm_2.weight", L + "pre_feedforward_layernorm_2.weight", {h});
+            f32(B + "post_ffw_norm_1.weight", L + "post_feedforward_layernorm_1.weight", {h});
+            f32(B + "post_ffw_norm_2.weight", L + "post_feedforward_layernorm_2.weight", {h});
+            const std::vector<float> gate_up = values(L + "experts.gate_up_proj");  // per expert: gate rows, up rows
+            if (banks.fused) {
+                b.put(B + "ffn_gate_up_exps.weight", {n, 2 * fe, h}, gate_up, Storage::Q4_0, same,
+                      {{L + "experts.gate_up_proj", {n, 2 * fe, h}}});
+            } else {
+                // Each half, expert by expert, in the fused bank's format (each row's blocks are the same); the
+                // twin keeps them apart as the import does.
+                std::vector<float> half[2];
+                const auto rows = static_cast<size_t>(fe * h);
+                for (int64_t x = 0; x < n; ++x) {
+                    const auto at = gate_up.begin() + static_cast<std::ptrdiff_t>(x * 2 * fe * h);
+                    for (int part = 0; part < 2; ++part) {
+                        const auto from = at + static_cast<std::ptrdiff_t>(part * rows);
+                        half[part].insert(half[part].end(), from, from + static_cast<std::ptrdiff_t>(rows));
+                    }
+                }
+                const int gate = banks.swap_gate_up ? 1 : 0;
+                b.put(B + "ffn_gate_exps.weight", {n, fe, h}, half[gate], Storage::Q4_0, same,
+                      {{L + "experts.gate_proj", {n, fe, h}}});
+                b.put(B + "ffn_up_exps.weight", {n, fe, h}, half[1 - gate], Storage::Q4_0, same,
+                      {{L + "experts.up_proj", {n, fe, h}}});
+            }
+            tensor(B + "ffn_down_exps.weight", L + "experts.down_proj", {n, h, fe}, Storage::Q8_0);
+        }
     }
 
     fs::create_directories(dir / "twin");

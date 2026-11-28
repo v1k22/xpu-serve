@@ -48,11 +48,11 @@ void check_general(const gguf::File& f, std::string_view type = "model") {
     }
 }
 
-// Every row of every tensor of the files goes into the pack exactly once, but for the derived ones and the copies,
-// which go nowhere.
+// Every row of every tensor of the files goes into the pack exactly once, but for the derived ones, the copies and
+// the ones left out, which go nowhere.
 void check_coverage(const std::vector<const gguf::File*>& files, const ImportPlan& plan) {
     std::map<const gguf::TensorInfo*, std::vector<std::pair<int64_t, int64_t>>> runs;
-    for (const auto* list : {&plan.derived, &plan.copies}) {
+    for (const auto* list : {&plan.derived, &plan.copies, &plan.left_out}) {
         for (const gguf::TensorInfo* t : *list)
             runs[t].emplace_back(0, t->rows());
     }
@@ -307,6 +307,10 @@ ImportReport import_gguf(const ImportOptions& o) {
     for (const gguf::TensorInfo* t : plan.copies) {
         log::info("gguf: ", t->name, " of ", o.mtp.filename().string(), " is left out: the head reads the model's");
     }
+    if (!plan.left_out.empty()) {
+        log::info("gguf: ", plan.left_out.size(), " tensors left out (", plan.left_out_why, "), from ",
+                  plan.left_out.front()->name, " to ", plan.left_out.back()->name);
+    }
 
     std::sort(plan.tensors.begin(), plan.tensors.end(),
               [](const PackTensor& a, const PackTensor& b) { return a.name < b.name; });
@@ -370,6 +374,7 @@ ImportReport import_gguf(const ImportOptions& o) {
     for (const gguf::File* f : files) {
         for (const gguf::TensorInfo& t : f->tensors()) {
             if (std::find(plan.copies.begin(), plan.copies.end(), &t) != plan.copies.end()) continue;
+            if (std::find(plan.left_out.begin(), plan.left_out.end(), &t) != plan.left_out.end()) continue;
             FormatShare& s = formats[t.type_name()];
             s.format = t.type_name();
             ++s.tensors;

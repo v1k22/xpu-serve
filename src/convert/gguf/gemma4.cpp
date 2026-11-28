@@ -12,12 +12,23 @@
 // - rope_freqs.weight is not the checkpoint's: llama.cpp's proportional RoPE for the full-attention layers, a factor
 //   of 1 for each rotated pair and 1e30 (no rotation) for the rest. It is checked and read as config.json's
 //   partial_rotary_factor, and not imported.
-// - the vision and audio towers are not in the file (llama.cpp writes them to an mmproj file of its own): the pack is
-//   the text model.
+// - the vision and audio towers are not in the file: llama.cpp writes them to an mmproj file of their own
+//   (projector type gemma4v), which `convert --mmproj` reads: the vision tower under the checkpoint's names
+//   (model.vision_tower.*, model.embed_vision.*), its patch embedding put back from a convolution's layout
+//   ([out, channel, y, x] to the checkpoint's [out, y, x, channel]); config.json as the release lays it out
+//   (text_config, vision_config, the image tokens) and the release's processor_config.json, with what llama.cpp
+//   fixes for the tower (RoPE theta 100, pooling 3 x 3, bicubic resizing, 280 soft tokens an image). An audio tower
+//   in the same file (E2B, E4B) is left out: the model serves no audio.
+// - 26B-A4B's experts: the router (ffn_gate_inp, its per-dimension scale ffn_gate_inp.scale), the banks (gate and up
+//   fused as ffn_gate_up_exps, gate rows first, or apart as ffn_gate_exps and ffn_up_exps; ffn_down_exps) with the
+//   router's per-expert scale stored as ffn_down_exps.scale, and the experts' own norms (pre_ffw_norm_2,
+//   post_ffw_norm_1, post_ffw_norm_2): mapped back by name, values unchanged.
+// - attention_k_eq_v (26B-A4B, 31B): the full-attention layers have no attn_v, their values being their keys.
 // - an assistant's centroid head (masked_embedding.*) is left out: llama.cpp's graph scores the whole vocabulary with
 //   the tied embedding, which is the assistant without ordered embeddings (use_ordered_embeddings false).
 
 #include <algorithm>
+#include <cmath>
 #include <set>
 
 #include "convert/gguf/architecture.h"
@@ -51,6 +62,9 @@ const std::set<std::string_view> kKnownKeys = {
     "rope.freq_base_swa",
     "rope.dimension_count",
     "rope.dimension_count_swa",
+    "expert_count",
+    "expert_used_count",
+    "expert_feed_forward_length",
 };
 const std::set<std::string_view> kAssistantKeys = {
     "embedding_length_out",  // the target's hidden size
@@ -68,6 +82,9 @@ struct Dimensions {
     int64_t shared = 0;         // num_kv_shared_layers: the last ones read an earlier layer's KV (all: an assistant)
     int64_t rotated_pairs = 0;  // of a full-attention head (rope_freqs); global_head_dim / 2 without the tensor
     int64_t backbone = 0;       // an assistant's target's hidden size
+    int64_t experts = 0, experts_used = 0, expert_ffn = 0;  // a mixture of experts beside every layer's MLP
+    bool k_eq_v = false;        // full-attention layers read their keys as values (no attn_v)
+    bool fused_gate_up = true;  // the expert banks' gate and up fused (ffn_gate_up_exps), or apart
     std::vector<bool> sliding;  // per layer
     std::vector<int64_t> layer_ffn;
 
@@ -99,8 +116,10 @@ Entries layer(const Dimensions& d, int64_t i) {
     const Piece v{A + "v_proj.weight", {kv * hd, h}};
     e["attn_q.weight"] = Entry{q.shape, {q}};
     e["attn_k.weight"] = Entry{k.shape, {k}, shared};  // a KV-shared layer's own k and v are never read
-    e["attn_v.weight"] = Entry{v.shape, {v}, shared};
-    e["attn_qkv.weight"] = Entry{{(d.heads + 2 * kv) * hd, h}, {q, k, v}, true};
+    if (!(d.k_eq_v && !sliding)) {
+        e["attn_v.weight"] = Entry{v.shape, {v}, shared};
+        e["attn_qkv.weight"] = Entry{{(d.heads + 2 * kv) * hd, h}, {q, k, v}, true};
+    }
     e["attn_output.weight"] = one({h, d.heads * hd}, A + "o_proj.weight");
     e["attn_q_norm.weight"] = one({hd}, A + "q_norm.weight");
     e["attn_k_norm.weight"] = one({hd}, A + "k_norm.weight");
@@ -117,7 +136,191 @@ Entries layer(const Dimensions& d, int64_t i) {
         e["post_norm.weight"] = one({h}, L + "post_per_layer_input_norm.weight");
     }
     e["layer_output_scale.weight"] = one({1}, L + "layer_scalar");
+    if (d.experts > 0) {
+        const int64_t n = d.experts, f = d.expert_ffn;
+        e["ffn_gate_inp.weight"] = one({n, h}, L + "router.proj.weight");
+        e["ffn_gate_inp.scale"] = one({h}, L + "router.scale");
+        e["ffn_down_exps.scale"] = one({n}, L + "router.per_expert_scale");
+        if (d.fused_gate_up) {
+            e["ffn_gate_up_exps.weight"] = one({n, 2 * f, h}, L + "experts.gate_up_proj");
+        } else {
+            e["ffn_gate_exps.weight"] = one({n, f, h}, L + "experts.gate_proj");
+            e["ffn_up_exps.weight"] = one({n, f, h}, L + "experts.up_proj");
+        }
+        e["ffn_down_exps.weight"] = one({n, h, f}, L + "experts.down_proj");
+        e["pre_ffw_norm_2.weight"] = one({h}, L + "pre_feedforward_layernorm_2.weight");
+        e["post_ffw_norm_1.weight"] = one({h}, L + "post_feedforward_layernorm_1.weight");
+        e["post_ffw_norm_2.weight"] = one({h}, L + "post_feedforward_layernorm_2.weight");
+    }
     return e;
+}
+
+// ---- The vision tower's file (llama.cpp's mmproj, projector type gemma4v)
+
+constexpr std::string_view kClip = "clip";
+const std::set<std::string_view> kClipKeys = {
+    "has_vision_encoder", "has_audio_encoder", "use_gelu", "projector_type", "vision.projector_type",
+    "vision.projection_dim", "vision.image_size", "vision.patch_size", "vision.embedding_length",
+    "vision.feed_forward_length", "vision.block_count", "vision.attention.head_count", "vision.image_mean",
+    "vision.image_std", "vision.attention.layer_norm_epsilon", "vision.projector.scale_factor",
+    // The audio tower's keys (E2B, E4B): read by no one here, its tensors left out.
+    "audio.projector_type", "audio.projection_dim", "audio.embedding_length", "audio.feed_forward_length",
+    "audio.block_count", "audio.attention.head_count", "audio.num_mel_bins", "audio.attention.layer_norm_epsilon",
+};
+
+struct VisionDimensions {
+    int64_t hidden = 0, width = 0, layers = 0, heads = 0, head_dim = 0, patch = 0, pooling = 3, positions = 0;
+    int64_t out = 0;
+    double eps = 1e-6;  // as config_number gives it
+    bool clipped = false;      // Gemma4ClippableLinear bounds beside every linear (E2B, E4B)
+    bool standardize = false;  // std_bias and std_scale (26B-A4B, 31B)
+};
+
+// The projector file against the model's hidden size: its dimensions, refusing by name a file that is not a Gemma 4
+// vision tower (or another model's), and settings the tower here does not read as the file means them.
+VisionDimensions vision_dimensions(const gguf::File& f, std::string_view arch, int64_t hidden) {
+    const std::string_view general = f.get_string("general.architecture");
+    const gguf::Value* type = f.find("clip.vision.projector_type");
+    if (type == nullptr) type = f.find("clip.projector_type");
+    if (general != kClip || type == nullptr || type->as_string() != "gemma4v") {
+        fail(arch, ": --mmproj: the file is not a Gemma 4 vision tower (general.architecture '", general,
+             "', projector type '", type != nullptr ? type->as_string() : std::string_view("none"),
+             "'; expected 'clip' and 'gemma4v')");
+    }
+    refuse_unknown_keys(f, kClip, kClipKeys);
+    const auto positive_of = [&](std::string_view rest) { return positive(f, kClip, str_cat("clip.", rest)); };
+    VisionDimensions v;
+    v.hidden = positive_of("vision.embedding_length");
+    v.width = positive_of("vision.feed_forward_length");
+    v.layers = positive_of("vision.block_count");
+    v.heads = positive_of("vision.attention.head_count");
+    v.patch = positive_of("vision.patch_size");
+    if (f.find("clip.vision.projector.scale_factor") != nullptr) {
+        v.pooling = positive_of("vision.projector.scale_factor");
+    }
+    v.out = positive_of("vision.projection_dim");
+    XS_CHECK(v.out == hidden, arch, ": --mmproj: the tower projects to ", v.out, ", the model's hidden size is ",
+             hidden, ": another model's file");
+    for (const auto& [key, want] :
+         {std::pair{"clip.vision.image_mean", 0.0}, std::pair{"clip.vision.image_std", 1.0}}) {
+        if (const gguf::Value* m = f.find(key)) {
+            for (const double x : m->floats()) {
+                XS_CHECK(x == want, arch, ": --mmproj: ", key, " is not ", want, " a channel (Gemma 4's processor ",
+                         "does not normalize)");
+            }
+        }
+    }
+    v.eps = config_number(f.get("clip.vision.attention.layer_norm_epsilon"));
+    const gguf::TensorInfo* norm = f.find_tensor("v.blk.0.attn_q_norm.weight");
+    XS_CHECK(norm != nullptr && norm->dims.size() == 1, arch, ": --mmproj: the file lacks v.blk.0.attn_q_norm.weight");
+    v.head_dim = norm->numel();
+    XS_CHECK(v.heads * v.head_dim == v.hidden, arch, ": --mmproj: ", v.heads, " heads of ", v.head_dim,
+             " for a width of ", v.hidden);
+    const gguf::TensorInfo* table = f.find_tensor("v.position_embd.weight");
+    XS_CHECK(table != nullptr && table->shape().size() == 3, arch,
+             ": --mmproj: the file lacks the position table v.position_embd.weight [2, positions, width]");
+    v.positions = table->shape()[1];
+    v.clipped = f.find_tensor("v.blk.0.attn_q.input_max") != nullptr;
+    v.standardize = f.find_tensor("v.std_bias") != nullptr;
+    return v;
+}
+
+// vision_config as the release's config.json has it.
+nlohmann::ordered_json vision_config(const VisionDimensions& v) {
+    nlohmann::ordered_json c;
+    c["model_type"] = "gemma4_vision";
+    c["hidden_size"] = v.hidden;
+    c["intermediate_size"] = v.width;
+    c["num_hidden_layers"] = v.layers;
+    c["num_attention_heads"] = v.heads;
+    c["num_key_value_heads"] = v.heads;
+    c["head_dim"] = v.head_dim;
+    c["global_head_dim"] = v.head_dim;
+    c["patch_size"] = v.patch;
+    c["pooling_kernel_size"] = v.pooling;
+    c["position_embedding_size"] = v.positions;
+    c["default_output_length"] = 280;
+    c["rms_norm_eps"] = v.eps;
+    c["use_clipped_linears"] = v.clipped;
+    c["standardize"] = v.standardize;
+    c["attention_bias"] = false;
+    c["hidden_activation"] = "gelu_pytorch_tanh";
+    c["rope_parameters"] = {{"rope_theta", 100.0}, {"rope_type", "default"}};
+    return c;
+}
+
+// The release's image processor (processor_config.json), which the file does not hold.
+nlohmann::ordered_json processor_config(const VisionDimensions& v) {
+    nlohmann::ordered_json p;
+    p["do_convert_rgb"] = true;
+    p["do_normalize"] = false;
+    p["do_rescale"] = true;
+    p["do_resize"] = true;
+    p["image_mean"] = {0.0, 0.0, 0.0};
+    p["image_std"] = {1.0, 1.0, 1.0};
+    p["image_processor_type"] = "Gemma4ImageProcessor";
+    p["image_seq_length"] = 280;
+    p["max_soft_tokens"] = 280;
+    p["patch_size"] = v.patch;
+    p["pooling_kernel_size"] = v.pooling;
+    p["resample"] = 3;  // bicubic
+    p["rescale_factor"] = 1.0 / 255.0;
+    return {{"image_processor", std::move(p)}, {"processor_class", "Gemma4Processor"}};
+}
+
+// The converter wrote the patch embedding [out, y * x * channel] as a convolution's [out, channel, y, x].
+std::vector<float> patch_back(const std::vector<float>& stored, const Dims& shape) {
+    const int64_t out = shape[0], ch = shape[1], ys = shape[2], xs = shape[3];
+    std::vector<float> back(stored.size());
+    for (int64_t o = 0; o < out; ++o)
+        for (int64_t c = 0; c < ch; ++c)
+            for (int64_t y = 0; y < ys; ++y)
+                for (int64_t x = 0; x < xs; ++x)
+                    back[static_cast<size_t>(((o * ys + y) * xs + x) * ch + c)] =
+                        stored[static_cast<size_t>(((o * ch + c) * ys + y) * xs + x)];
+    return back;
+}
+const FloatReorder kPatchBack{"a convolution's [out, channel, y, x] to [out, y, x, channel]", patch_back};
+
+Layout vision_layout(const VisionDimensions& v) {
+    const std::string P = "model.vision_tower.";
+    const int64_t h = v.hidden;
+    Layout l;
+    l.top["v.patch_embd.weight"] =
+        reordered({h, 3, v.patch, v.patch}, P + "patch_embedder.input_proj.weight", {h, v.patch * v.patch * 3},
+                  &kPatchBack);
+    l.top["v.position_embd.weight"] = one({2, v.positions, h}, P + "patch_embedder.position_embedding_table");
+    l.top["mm.input_projection.weight"] = one({v.out, h}, "model.embed_vision.embedding_projection.weight");
+    if (v.standardize) {
+        l.top["v.std_bias"] = one({h}, P + "std_bias");
+        l.top["v.std_scale"] = one({h}, P + "std_scale");
+    }
+    for (int64_t i = 0; i < v.layers; ++i) {
+        const std::string from = "v.blk." + std::to_string(i) + ".";
+        const std::string to = P + "encoder.layers." + std::to_string(i) + ".";
+        for (const auto& [a, b] :
+             {std::pair{"ln1", "input_layernorm"}, std::pair{"attn_post_norm", "post_attention_layernorm"},
+              std::pair{"ln2", "pre_feedforward_layernorm"}, std::pair{"ffn_post_norm", "post_feedforward_layernorm"}}) {
+            l.top[from + a + ".weight"] = one({h}, to + b + ".weight");
+        }
+        l.top[from + "attn_q_norm.weight"] = one({v.head_dim}, to + "self_attn.q_norm.weight");
+        l.top[from + "attn_k_norm.weight"] = one({v.head_dim}, to + "self_attn.k_norm.weight");
+        const auto linear = [&](const std::string& gguf, const std::string& hf, Dims shape) {
+            l.top[from + gguf + ".weight"] = one(shape, to + hf + ".linear.weight");
+            if (!v.clipped) return;
+            for (const char* bound : {"input_min", "input_max", "output_min", "output_max"}) {
+                l.top[from + gguf + "." + bound] = one({1}, to + hf + "." + bound);
+            }
+        };
+        linear("attn_q", "self_attn.q_proj", {h, h});
+        linear("attn_k", "self_attn.k_proj", {h, h});
+        linear("attn_v", "self_attn.v_proj", {h, h});
+        linear("attn_out", "self_attn.o_proj", {h, h});
+        linear("ffn_gate", "mlp.gate_proj", {v.width, h});
+        linear("ffn_up", "mlp.up_proj", {v.width, h});
+        linear("ffn_down", "mlp.down_proj", {h, v.width});
+    }
+    return l;
 }
 
 class Gemma4 final : public Architecture {
@@ -127,22 +330,10 @@ public:
     std::string_view name() const override { return assistant_ ? "gemma4-assistant" : "gemma4"; }
 
     ImportPlan plan(const gguf::File& f) const override {
-        for (const char* moe : {"expert_count", "expert_used_count", "expert_feed_forward_length"}) {
-            if (f.find(key(moe)) != nullptr) {
-                fail(name(), ": ", key(moe), ": mixture-of-experts Gemma 4 (26B-A4B) is not supported yet");
-            }
-        }
         std::set<std::string_view> known = kKnownKeys;
         if (assistant_) known.insert(kAssistantKeys.begin(), kAssistantKeys.end());
         refuse_unknown_keys(f, name(), known);
         const Dimensions d = dimensions(f);
-        for (int64_t i = 0; i < d.first_shared(); ++i) {
-            const std::string b = str_cat("blk.", i, ".");
-            if (f.find_tensor(b + "attn_k.weight") != nullptr && f.find_tensor(b + "attn_v.weight") == nullptr) {
-                fail(name(), ": block ", i, " has no attn_v.weight: values from the keys (attention_k_eq_v) are not ",
-                     "supported yet");
-            }
-        }
         ImportPlan plan;
         if (assistant_) {
             plan.config["architectures"] = {"Gemma4AssistantForCausalLM"};
@@ -159,6 +350,34 @@ public:
         }
         map_tensors(f, name(), layout(d), plan);
         return plan;
+    }
+
+    bool reads_projector() const override { return !assistant_; }
+
+    // The tower's tensors under the checkpoint's names, and config.json as the release lays it out: the text config,
+    // vision_config and the image tokens around it; the release's processor_config.json.
+    void add_projector(ImportPlan& p, const gguf::File& f, const gguf::File& projector) const override {
+        if (assistant_) Architecture::add_projector(p, f, projector);
+        const VisionDimensions v = vision_dimensions(projector, name(), positive(f, name(), key("embedding_length")));
+        nlohmann::ordered_json config;
+        config["architectures"] = {"Gemma4ForConditionalGeneration"};
+        config["model_type"] = "gemma4";
+        config["image_token_id"] = token_id(f, name(), "<|image|>");
+        config["boi_token_id"] = token_id(f, name(), "<|image>");
+        config["eoi_token_id"] = token_id(f, name(), "<image|>");
+        config["vision_soft_tokens_per_image"] = 280;
+        config["tie_word_embeddings"] = p.config.value("tie_word_embeddings", true);
+        config["text_config"] = std::move(p.config);
+        config["vision_config"] = vision_config(v);
+        p.config = std::move(config);
+        p.files["processor_config.json"] = processor_config(v);
+        // The vision tower's tensors; an audio tower's (a.*, mm.a.*) are left out.
+        std::vector<const gguf::TensorInfo*> vision;
+        for (const gguf::TensorInfo& t : projector.tensors()) {
+            (t.name.starts_with("a.") || t.name.starts_with("mm.a.") ? p.left_out : vision).push_back(&t);
+        }
+        if (!p.left_out.empty()) p.left_out_why = "the audio tower: the model serves no audio";
+        map_tensors(vision, kClip, vision_layout(v), p);
     }
 
 private:
@@ -281,7 +500,42 @@ private:
         if (const gguf::TensorInfo* freqs = f.find_tensor("rope_freqs.weight")) {
             d.rotated_pairs = rotated_pairs(*freqs, d.global_head_dim);
         }
+        experts_and_values(f, d);
         return d;
+    }
+
+    // The mixture of experts beside every layer's MLP (expert_count, its three keys together), and whether the
+    // full-attention layers take their keys as values: then none of them has attn_v, and every sliding one does.
+    void experts_and_values(const gguf::File& f, Dimensions& d) const {
+        const bool any = f.find(key("expert_count")) || f.find(key("expert_used_count")) ||
+                         f.find(key("expert_feed_forward_length"));
+        if (any) {
+            if (assistant_) fail(name(), ": ", key("expert_count"), ": an assistant with experts is not supported");
+            d.experts = positive(f, name(), key("expert_count"));
+            d.experts_used = positive(f, name(), key("expert_used_count"));
+            d.expert_ffn = positive(f, name(), key("expert_feed_forward_length"));
+            if (d.experts_used > d.experts) {
+                fail(name(), ": ", key("expert_used_count"), " ", d.experts_used, " of ", d.experts, " experts");
+            }
+            d.fused_gate_up = f.find_tensor("blk.0.ffn_gate_up_exps.weight") != nullptr;
+        }
+        int64_t without_v = 0, full = 0;
+        for (int64_t i = 0; i < d.first_shared(); ++i) {
+            const std::string b = str_cat("blk.", i, ".");
+            const bool has_v = f.find_tensor(b + "attn_v.weight") != nullptr || f.find_tensor(b + "attn_qkv.weight");
+            const bool sliding = d.sliding[static_cast<size_t>(i)];
+            full += sliding ? 0 : 1;
+            if (!has_v && sliding) {
+                fail(name(), ": sliding-attention block ", i, " has no attn_v.weight (only full-attention layers ",
+                     "take their keys as values)");
+            }
+            without_v += has_v ? 0 : 1;
+        }
+        if (without_v != 0 && without_v != full) {
+            fail(name(), ": ", without_v, " of the ", full, " full-attention layers that compute their own KV have no ",
+                 "attn_v.weight; Gemma 4 takes the keys as values in all of them (attention_k_eq_v) or none");
+        }
+        d.k_eq_v = without_v > 0;
     }
 
     // A decoder's KV-shared layers as llama.cpp's graph reads them (layer first_shared - 2 for a sliding one, - 1 for a
@@ -345,12 +599,21 @@ private:
         if (d.global_kv_heads != d.kv_heads) c["num_global_key_value_heads"] = d.global_kv_heads;
         c["head_dim"] = d.head_dim;
         c["global_head_dim"] = d.global_head_dim;
-        c["attention_k_eq_v"] = false;
+        c["attention_k_eq_v"] = d.k_eq_v;
         c["attention_bias"] = false;
-        c["enable_moe_block"] = false;
+        c["enable_moe_block"] = d.experts > 0;
+        if (d.experts > 0) {
+            c["num_experts"] = d.experts;
+            c["top_k_experts"] = d.experts_used;
+            c["moe_intermediate_size"] = d.expert_ffn;
+        }
         c["hidden_activation"] = "gelu_pytorch_tanh";
         c["sliding_window"] = positive(f, name(), key("attention.sliding_window"));
         c["num_kv_shared_layers"] = d.shared;
+        // An image's tokens attend to each other both ways in the sliding layers of every Gemma 4 but E2B and E4B
+        // (the ones with per-layer embeddings): the releases' use_bidirectional_attention, which llama.cpp applies
+        // to every gemma4 file but those two; the file does not say it.
+        if (!assistant_ && d.ple == 0) c["use_bidirectional_attention"] = "vision";
         c["hidden_size_per_layer_input"] = d.ple;
         if (d.ple > 0) c["vocab_size_per_layer_input"] = d.ple_vocab;
         c["rms_norm_eps"] = config_number(f.get(key("attention.layer_norm_rms_epsilon")));

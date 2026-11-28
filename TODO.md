@@ -296,7 +296,10 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Image input for Gemma 4 E-series: `image_url` data URLs, Hugging Face-exact preprocessing (torchvision-exact
       resize), the vision tower as a stateless graph (Clamp, Transpose, axial Rope, non-causal Attention), image rows
       spliced into prefill chunks, prefix cache keyed by image content
-- [ ] Vision towers with `standardize` (Gemma 4 26B / 31B); Qwen-VL style towers
+- [x] Vision towers with `standardize` (Gemma 4 26B / 31B: the pooled soft tokens standardized by std_bias and
+      std_scale), and an image's tokens attending to each other both ways in the sliding layers
+      (use_bidirectional_attention "vision": Graph::attention_reaching, an image kept in one prefill step)
+- [ ] Qwen-VL style towers
 - [ ] Audio input (Gemma 4 E-series audio tower, mel features) and video input
 - [ ] Remote image URLs behind an explicit opt-in (size and host limits)
 - [ ] Gemma 4 dense (12B, 31B) and E-series (E2B, E4B: PLE, KV-shared tail)
@@ -397,8 +400,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       (Ornith-1.5-35B-A3B Q4_K_M; model_recipes.md); the SYCL backend reads expert banks in every block format; `-hf`
       fetches the MTP head published apart from a `qwen35moe` file
 - [ ] GGUF: a `qwen35moe` file whose gate and up banks the converter fused (`--fuse-gate-up-exps`)
-- [ ] GGUF: more architectures (Gemma 4 26B-A4B (`gemma4` with experts), LFM3)
-- [ ] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file
+- [x] GGUF: Gemma 4 26B-A4B (`gemma4` with experts: the router and its scales, gate and up banks fused or apart,
+      full-attention layers taking their keys as values)
+- [ ] GGUF: LFM3
+- [x] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file (`gemma4v`: E2B's clipped linears, 26B-A4B's
+      standardization; an audio tower in the same file left out)
 - [x] GGUF: expert banks in block formats (a GEMV per expert or per pair up to 64 pairs; past them on the matrix
       engines, passes of up to 64 of an expert's pairs read from its codes: `expert_gemm_block_xmx`)
 - [x] GGUF: a matrix-engine GEMV over block formats (`gemv_block_xmx`, from 2 rows: a speculative verify)

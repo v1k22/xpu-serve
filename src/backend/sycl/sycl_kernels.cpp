@@ -439,6 +439,7 @@ struct AttentionRowsKernel {
     int64_t rel_extent;
     const float* sink;
     bool anchored;
+    const int32_t* reach;
     const AttentionSegment* segs;  // not null: segments of a step over several sequences (attention_rows_segments)
     int64_t seg_units;             // a segment's units (attention_rows_units of the launch's shape)
 
@@ -497,9 +498,11 @@ struct AttentionRowsKernel {
             head_row[g] = tk[g] * hq_n + h0 + g % heads;
             first[g] = anchored ? std::max<int64_t>(0, keys - toks - window)
                                 : window > 0 ? std::max<int64_t>(0, pos[g] - window + 1) : 0;
-            last[g] = anchored ? keys - 1
-                               : window > 0 ? std::min<int64_t>(causal ? pos[g] : keys - 1, pos[g] + window - 1)
-                                            : (causal ? pos[g] : keys - 1);
+            // Causal: the row's own position and its reach ahead (which no window bounds); else the keys or the window.
+            last[g] = anchored  ? keys - 1
+                      : causal  ? pos[g] + (reach != nullptr && tk[g] < toks ? reach[tk[g]] : 0)
+                      : window > 0 ? std::min<int64_t>(keys - 1, pos[g] + window - 1)
+                                   : keys - 1;
             if (tk[g] >= toks) last[g] = -1;
             if (last[g] >= first[g]) {
                 lo_all = std::min(lo_all, first[g]);
@@ -632,7 +635,7 @@ void attention_rows_launch(sycl::queue& q, const float* qp, const K& k, const V&
         syclex::nd_launch(h, sycl::nd_range<1>(static_cast<size_t>(count * units * split * Kernel::kWg), Kernel::kWg),
                           Kernel{qp, k, v, out, part, slm, s.q_heads, s.kv_heads, s.kv_len, s.tokens, s.window, split,
                                  layout.heads, s.scale, s.softcap, s.causal, s.key_bias, s.groups, s.rel, s.rel_extent,
-                                 s.sink, s.anchored, segs, units});
+                                 s.sink, s.anchored, s.reach, segs, units});
     });
 }
 
@@ -2325,6 +2328,7 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
     const float* sink = s.sink;
     const int64_t hq = s.q_heads;
     const bool anchored = s.anchored;
+    const int32_t* reach = s.reach;
     constexpr size_t kWg = 256;
     syclex::nd_launch(q, sycl::nd_range<1>(static_cast<size_t>(rows) * kWg, kWg), [=](sycl::nd_item<1> it) {
         const int64_t r = static_cast<int64_t>(it.get_group(0));
@@ -2335,10 +2339,10 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
         // visible keys, relative to k_lo: [lo, hi]
         int64_t lo = 0;
         int64_t hi = keys - 1;
-        if (causal) hi = std::min<int64_t>(hi, pos - k_lo);
+        if (causal) hi = std::min<int64_t>(hi, pos + (reach != nullptr ? reach[t0 + tl] : 0) - k_lo);
         if (window > 0 && !anchored) {  // an anchored window is the chunk's keys, every one
             lo = std::max<int64_t>(lo, pos - window + 1 - k_lo);
-            hi = std::min<int64_t>(hi, pos + window - 1 - k_lo);
+            if (!causal) hi = std::min<int64_t>(hi, pos + window - 1 - k_lo);  // keys ahead of a causal row: its reach
         }
         const float* sr = scores + r * keys;
         CT* pr = probs + r * keys;

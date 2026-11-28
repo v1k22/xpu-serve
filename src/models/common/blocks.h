@@ -100,6 +100,11 @@ Value splice_media(Graph& g, Value embedded, int64_t width);
 // Fills those inputs for a step of `n` tokens: `rows` is empty, or holds one entry per token, a row or null.
 void media_inputs(std::span<const float* const> rows, int64_t n, int64_t width, TensorMap& inputs);
 
+// ---- Weights read on the host
+
+// A float weight's values as f32 (F32, F16 or BF16; any shape), for constants the model computes from it.
+HostTensor float_values(const WeightStore& weights, const std::string& name);
+
 // ---- RMSNorm variants (plain x * w is Graph::rms_norm)
 
 // x * rsqrt(mean(x^2) + eps) * (1 + w): zero-centered norms (Qwen3.5); `1 + w` is read on the host as a constant.
@@ -144,6 +149,8 @@ struct AttentionSpec {
     graph::Value groups;          // [T] i32: attention in groups (attrs.grouped, no KV cache); invalid: none
     graph::Value rope_axes;       // [rotary / 2] i32: multimodal RoPE, the axis of pos each frequency reads (Rope's
                                   // pair_axes); invalid: none
+    graph::Value reach;           // [T] i32: causal attention whose query t also sees the step's next reach[t] keys
+                                  // (Graph::attention_reaching: an image's tokens both ways); invalid: none
 };
 
 struct AttentionParts {

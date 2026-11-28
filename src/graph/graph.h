@@ -219,6 +219,11 @@ struct StateAttrs {  // CausalConv, DynamicConv and GatedDelta: the slot that ca
 // sink [T, Hq] f32. Head h of query i adds rel[i, h, p_i - j] to its score of key j when p_i - j < rel_extent (a bias
 // by how far back the key sits), and its softmax runs over the visible keys and one more logit, sink[i, h], which has
 // no value: the keys' weights then sum to less than 1. No softcap.
+// Causal reaching ahead (`reaching`; the tokens of an image attending to each other both ways, Gemma 4's
+// use_bidirectional_attention "vision"): a fourth input, reach [T] i32 >= 0, lets query i also see the step's keys up
+// to reach[i] past its own position: key j is visible iff j <= p_i + reach[i] (and p_i + reach[i] < L) and, with a
+// sliding_window, p_i - j < sliding_window; the window does not bound the keys ahead. No block, groups, key bias or
+// relative bias.
 // scores = scale * q.k (f32); if softcap > 0: scores = softcap * tanh(scores / softcap); softmax in f32.
 struct AttentionAttrs {
     float scale = 1.0f;
@@ -229,6 +234,7 @@ struct AttentionAttrs {
     bool grouped = false;
     int64_t rel_extent = 0;
     bool anchored = false;
+    bool reaching = false;
 };
 
 using Attrs = std::variant<std::monostate, InputAttrs, WeightAttrs, ConstantAttrs, ScaleAttrs, SoftcapAttrs,
@@ -321,6 +327,9 @@ public:
     Value attention_relative(Value q, Value k_all, Value v_all, Value rel, Value sink, const AttentionAttrs& attrs);
     // Attention of the step's tokens in groups, groups [T] i32 (AttentionAttrs::grouped, not causal).
     Value attention_in_groups(Value q, Value k, Value v, Value groups, const AttentionAttrs& attrs);
+    // Causal attention whose query i also sees the step's keys up to reach[i] past its position, reach [T] i32
+    // (AttentionAttrs::reaching).
+    Value attention_reaching(Value q, Value k_all, Value v_all, Value reach, const AttentionAttrs& attrs);
     int add_conv_slot(int64_t channels, int64_t kernel, std::string label);
     Value causal_conv(int slot, Value x, Value w);
     // The slot is a conv slot of x's channels and w's taps (add_conv_slot).

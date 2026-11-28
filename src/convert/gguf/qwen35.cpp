@@ -484,15 +484,6 @@ Layout vision_layout(const VisionDimensions& v) {
     return l;
 }
 
-// The id of the token spelled `text` in the file's vocabulary.
-int32_t token_id(const gguf::File& f, std::string_view arch, std::string_view text) {
-    const std::vector<std::string_view> tokens = f.get("tokenizer.ggml.tokens").strings();
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        if (tokens[i] == text) return static_cast<int32_t>(i);
-    }
-    fail(arch, ": --mmproj: the vocabulary has no ", text);
-}
-
 class Qwen35 final : public Architecture {
 public:
     Qwen35(std::string_view name, Qwen35Mlp mlp) : name_(name), mlp_(mlp) {}

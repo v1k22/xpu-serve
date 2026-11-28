@@ -116,21 +116,29 @@ void media_inputs(std::span<const float* const> rows, int64_t n, int64_t width, 
     inputs["media_keep"] = std::move(keep);
 }
 
-Value rms_norm_one_plus(Graph& g, Value x, const WeightStore& weights, const std::string& name, float eps) {
+HostTensor float_values(const WeightStore& weights, const std::string& name) {
     const TensorView& w = weights.get(name);
-    XS_CHECK(is_float(w.dtype) && w.shape.size() == 1, "norm weight '", name, "' must be a float vector, got ",
-             dtype_name(w.dtype), dims_to_string(w.shape));
-    HostTensor scale(DType::F32, w.shape);
+    XS_CHECK(w.dtype == DType::F32 || w.dtype == DType::F16 || w.dtype == DType::BF16, "weight '", name,
+             "' must be F32, F16 or BF16 to be read on the host, got ", dtype_name(w.dtype));
+    HostTensor out(DType::F32, w.shape);
     const size_t n = static_cast<size_t>(w.numel());
-    float* s = scale.data<float>();
+    float* f = out.data<float>();
     if (w.dtype == DType::BF16) {
-        convert_bf16_to_f32(static_cast<const uint16_t*>(w.data), s, n);
+        convert_bf16_to_f32(static_cast<const uint16_t*>(w.data), f, n);
     } else if (w.dtype == DType::F16) {
-        convert_f16_to_f32(static_cast<const uint16_t*>(w.data), s, n);
+        convert_f16_to_f32(static_cast<const uint16_t*>(w.data), f, n);
     } else {
-        std::copy(static_cast<const float*>(w.data), static_cast<const float*>(w.data) + n, s);
+        std::copy(static_cast<const float*>(w.data), static_cast<const float*>(w.data) + n, f);
     }
-    for (size_t i = 0; i < n; ++i)
+    return out;
+}
+
+Value rms_norm_one_plus(Graph& g, Value x, const WeightStore& weights, const std::string& name, float eps) {
+    HostTensor scale = float_values(weights, name);
+    XS_CHECK(scale.shape().size() == 1, "norm weight '", name, "' must be a vector, got ",
+             dims_to_string(scale.shape()));
+    float* s = scale.data<float>();
+    for (int64_t i = 0; i < scale.numel(); ++i)
         s[i] += 1.0f;
     return g.rms_norm(x, g.constant(std::move(scale)), eps);
 }
@@ -222,8 +230,16 @@ AttentionOut attention(Graph& g, const AttentionSpec& s, const AttentionParts& p
             r.kv = {k, v};
         }
     }
-    Value o = s.groups.valid() ? g.attention_in_groups(q, r.kv.first, r.kv.second, s.groups, s.attrs)
-                               : g.attention(q, r.kv.first, r.kv.second, s.attrs);
+    Value o;
+    if (s.groups.valid()) {
+        o = g.attention_in_groups(q, r.kv.first, r.kv.second, s.groups, s.attrs);
+    } else if (s.reach.valid()) {
+        graph::AttentionAttrs reaching = s.attrs;
+        reaching.reaching = true;
+        o = g.attention_reaching(q, r.kv.first, r.kv.second, s.reach, reaching);
+    } else {
+        o = g.attention(q, r.kv.first, r.kv.second, s.attrs);
+    }
     if (p.head_gate) o = g.mul(o, g.reshape(g.sigmoid(p.head_gate(x)), {kT, s.heads, 1}));
     o = g.reshape(o, {kT, s.heads * hd});
     if (gate.valid()) o = g.mul(o, g.sigmoid(gate));

@@ -397,12 +397,12 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
         const int64_t cur = std::min(tc, s.tokens - t0);
         int64_t k_lo = 0;
         int64_t k_hi = s.kv_len;
-        if (s.causal) k_hi = past + t0 + cur;
+        if (s.causal) k_hi = s.reach != nullptr ? s.kv_len : past + t0 + cur;  // reaching: up to the step's last key
         if (s.anchored) {
             k_lo = std::max<int64_t>(0, past - s.window);
         } else if (s.window > 0) {
             k_lo = std::max<int64_t>(0, past + t0 - s.window + 1);
-            k_hi = std::min<int64_t>(k_hi, past + t0 + cur - 1 + s.window);
+            if (!s.causal) k_hi = std::min<int64_t>(k_hi, past + t0 + cur - 1 + s.window);
         }
         const int64_t keys = k_hi - k_lo;
         const int64_t rows = cur * group;

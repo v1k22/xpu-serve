@@ -27,4 +27,10 @@ struct PromptPositions {
 PromptPositions rotary_positions(std::span<const int32_t> item, std::span<const int64_t> row,
                                  std::span<const MediaInput> media);
 
+// The length of a prefill step from `pos` of at most `len` tokens that cuts no media item's run of soft tokens
+// (ModelInfo::media_whole_steps): `len` when its end falls outside a run, else up to the start of the run it would
+// cut, or, when that run starts the step, to the run's end (a step longer than `len`). `item[i]` is token i's media
+// item, -1 for text. Throws when `pos` falls inside a run.
+size_t whole_media_chunk(std::span<const int32_t> item, size_t pos, size_t len);
+
 }  // namespace xs
