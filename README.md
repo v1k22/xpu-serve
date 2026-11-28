@@ -39,10 +39,10 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3, Inkling 2 Mini (a
   looped mixture of experts without rotary positions)
-- ✅ **Image input** (Gemma 4 E2B / E4B / 26B-A4B, Qwen3.5 / Qwen3.6 / Qwen3.8, Qwen3-Omni, Inkling 2 Mini), as base64
-  `data:` URLs; from a GGUF file with its vision tower's file (`mmproj-*.gguf`) too
-- ✅ **Audio and images in chat**: Qwen3-Omni-30B-A3B's thinker (text, audio and images in, text and tool calls
-  out), as `input_audio` and `image_url` parts
+- ✅ **Image input** (Gemma 4 E2B / E4B / 12B / 26B-A4B / 31B, Qwen3.5 / Qwen3.6 / Qwen3.8, Qwen3-Omni, Inkling 2
+  Mini), as base64 `data:` URLs; from a GGUF file with its vision tower's file (`mmproj-*.gguf`) too
+- ✅ **Audio and images in chat**: Qwen3-Omni-30B-A3B's thinker and Gemma 4 12B (text, audio and images in, text
+  and tool calls out), as `input_audio` and `image_url` parts
 - ✅ **Speech recognition** (Qwen3-ASR) behind `/v1/audio/transcriptions` (json, text or streamed), OpenAI's
   realtime API (`/v1/realtime`: audio streamed over a WebSocket, turns found by voice activity) and as `input_audio`
   in chat: WAV, MP3 or FLAC, long audio cut at quiet points
@@ -91,6 +91,8 @@ Each model's recipe has its commands and numbers.
 |---|---|---|---|---|
 | Gemma 4 E2B / E4B | language, images | `google/gemma-4-E2B-it`, `google/gemma-4-E4B-it` | original, q8 / q4 pack, GGUF | [E2B](model_recipes.md#gemma-4-e2b), [E4B](model_recipes.md#gemma-4-e4b), [GGUF](model_recipes.md#gemma-4-e2b-gguf) |
 | Gemma 4 26B-A4B | language, images, MoE | `google/gemma-4-26B-A4B-it`, `unsloth/gemma-4-26B-A4B-it-GGUF` | q4 pack, GGUF | [recipe](model_recipes.md#gemma-4-26b-a4b), [GGUF](model_recipes.md#gemma-4-26b-a4b-gguf) |
+| Gemma 4 31B | language, images | `google/gemma-4-31B-it`, `unsloth/gemma-4-31B-it-GGUF` | q4 pack, GGUF (Q4) | [recipe](model_recipes.md#gemma-4-31b), [GGUF](model_recipes.md#gemma-4-31b-gguf) |
+| Gemma 4 12B | language, images, audio | `google/gemma-4-12b-it`, `unsloth/gemma-4-12b-it-GGUF` | q8 / q4 pack, GGUF | [recipe](model_recipes.md#gemma-4-12b), [GGUF](model_recipes.md#gemma-4-12b-gguf) |
 | Qwen3.5-4B | language | `Qwen/Qwen3.5-4B` | original, q8 / q4 pack, GGUF | [recipe](model_recipes.md#qwen35-4b), [GGUF](model_recipes.md#qwen35-4b-gguf) |
 | Qwen3.5-9B | language | `Qwen/Qwen3.5-9B` | original, q8 / q4 pack | [recipe](model_recipes.md#qwen35-9b) |
 | SenseNova-Loop-9B | language | `sensenova/SenseNova-Loop-9B` (gated), `-Preview` | original, q8 / q4 pack | [recipe](model_recipes.md#sensenova-loop-9b) |

@@ -403,6 +403,13 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] GGUF: Gemma 4 26B-A4B (`gemma4` with experts: the router and its scales, gate and up banks fused or apart,
       full-attention layers taking their keys as values)
 - [ ] GGUF: LFM3
+- [x] Gemma 4 31B (images, its GGUF files: Q4_K_M fits a 24 GB card at 8k tokens with an i8 cache) and Gemma 4 12B
+      (`gemma4_unified`: images and audio through embedders without a tower, an image's tokens both ways in every
+      layer, `suppress_tokens`; its GGUF files with the `gemma4uv` / `gemma4ua` projector)
+- [ ] KV memory for the sliding layers of attention-only models (Gemma 4): a slot keeps its whole context unless the
+      session has conv or recurrent state, which costs Gemma 4 31B most of its context on a 24 GB card (50 of its
+      60 layers slide over 1,024 tokens); keep their window and a snapshot for prefix reuse instead
+- [ ] Gemma 4 12B: video (frames of merged patches, timestamps), E2B's and E4B's audio (a conformer tower)
 - [x] GGUF: a Gemma 4 vision tower from llama.cpp's mmproj file (`gemma4v`: E2B's clipped linears, 26B-A4B's
       standardization; an audio tower in the same file left out)
 - [x] GGUF: expert banks in block formats (a GEMV per expert or per pair up to 64 pairs; past them on the matrix

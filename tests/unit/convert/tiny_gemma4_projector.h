@@ -80,4 +80,48 @@ inline GgufWriter tiny_gemma4_projector(int64_t out, TinyGemma4Tower kind = {}) 
     return w;
 }
 
+// Gemma 4 12B's projector file in miniature (projector types gemma4uv and gemma4ua, Gemma4UnifiedVisionAudioModel):
+// the image embedder without a tower, its dense layer's columns and first LayerNorm channel-major and its position
+// table's axes swapped, as the converter writes them, and the audio embedder's projection.
+inline constexpr int64_t kG4uEmbed = 32, kG4uPositions = 64, kG4uSamples = 640;
+inline constexpr int64_t kG4uMerged = 48 * 48 * 3;
+
+inline GgufWriter tiny_gemma4_unified_projector(int64_t out) {
+    GgufWriter w;
+    w.string("general.architecture", "clip").string("general.type", "mmproj");
+    w.boolean("clip.has_vision_encoder", true).string("clip.vision.projector_type", "gemma4uv");
+    w.u32("clip.vision.projection_dim", static_cast<uint32_t>(out)).u32("clip.vision.image_size", 224);
+    w.u32("clip.vision.patch_size", 16).u32("clip.vision.embedding_length", kG4uEmbed);
+    w.u32("clip.vision.feed_forward_length", 0).u32("clip.vision.block_count", 0);
+    w.u32("clip.vision.attention.head_count", 1);
+    w.f32s("clip.vision.image_mean", {0.0f, 0.0f, 0.0f}).f32s("clip.vision.image_std", {1.0f, 1.0f, 1.0f});
+    w.f32("clip.vision.attention.layer_norm_epsilon", 1e-6f);
+    w.boolean("clip.has_audio_encoder", true).string("clip.audio.projector_type", "gemma4ua");
+    w.u32("clip.audio.projection_dim", static_cast<uint32_t>(out)).u32("clip.audio.embedding_length", kG4uSamples);
+    w.u32("clip.audio.feed_forward_length", 0).u32("clip.audio.block_count", 0).u32("clip.audio.num_mel_bins", 128);
+    w.u32("clip.audio.attention.head_count", 1).f32("clip.audio.attention.layer_norm_epsilon", 1e-6f);
+    uint32_t seed = 29;
+    const auto vec = [&](const std::string& name, int64_t n, float base) {
+        std::vector<float> v = projector_noise(n, seed++, 0.2f);
+        for (float& x : v) x += base;
+        w.f32_tensor(name, {n}, v);
+    };
+    w.f32_tensor("v.patch_embd.weight", {kG4uMerged, kG4uEmbed},
+                 projector_noise(kG4uEmbed * kG4uMerged, seed++, 0.02f));
+    vec("v.patch_embd.bias", kG4uEmbed, 0.0f);
+    vec("v.patch_norm.1.weight", kG4uMerged, 1.0f);
+    vec("v.patch_norm.1.bias", kG4uMerged, 0.0f);
+    for (const char* n : {"v.patch_norm.2", "v.patch_norm.3"}) {
+        vec(std::string(n) + ".weight", kG4uEmbed, 1.0f);
+        vec(std::string(n) + ".bias", kG4uEmbed, 0.0f);
+    }
+    w.f32_tensor("v.position_embd.weight", {kG4uEmbed, kG4uPositions, 2},
+                 projector_noise(2 * kG4uPositions * kG4uEmbed, seed++, 0.5f));
+    w.tensor("mm.input_projection.weight", {kG4uEmbed, out}, kGgmlF16,
+             f16_bytes(projector_noise(out * kG4uEmbed, seed++, 0.2f)));
+    w.tensor("mm.a.input_projection.weight", {kG4uSamples, out}, kGgmlF16,
+             f16_bytes(projector_noise(out * kG4uSamples, seed++, 0.2f)));
+    return w;
+}
+
 }  // namespace xs::test

@@ -26,6 +26,7 @@
 #include "io/host_weights.h"
 #include "io/safetensors.h"
 #include "models/gemma4/gemma4.h"
+#include "models/model.h"
 
 using namespace xs;
 namespace fs = std::filesystem;
@@ -254,6 +255,70 @@ TEST_SUITE("gguf import gemma4 vision") {
         }
         CHECK(diff == 0.0);
         CHECK(planted > 1e-3 * scale);  // planted: the convolution's layout read as the checkpoint's
+    }
+
+    // Gemma 4 12B's file: both embedders, their layouts put back; the text config of the model whose images see
+    // themselves whole.
+    TEST_CASE("gemma4 --mmproj, 12B's embedders (gemma4uv, gemma4ua): put back, config.json as the release's") {
+        const TempDir work("xs_gguf_gemma4_vision_unified");
+        GgufWriter text =
+            xs::test::build_tiny_gemma4_gguf(work.path / "src", 11, xs::test::tiny_gemma4_moe_gguf_model());
+        const nlohmann::json tokenizer = xs::test::tiny_gemma4_tokenizer_json();
+        std::vector<std::string> tokens(tokenizer["model"]["vocab"].size());
+        for (const auto& item : tokenizer["model"]["vocab"].items()) {
+            tokens[item.value().template get<size_t>()] = item.key();
+        }
+        const std::vector<std::pair<int32_t, std::string>> marks = {
+            {kBoi, "<|image>"}, {kImage, "<|image|>"}, {kEoi, "<image|>"},
+            {12, "<|audio>"},   {13, "<|audio|>"},     {14, "<audio|>"}};
+        for (const auto& [id, mark] : marks) tokens[static_cast<size_t>(id)] = mark;
+        text.drop_value("tokenizer.ggml.tokens").strings("tokenizer.ggml.tokens", tokens);
+        text.write(work.path / "tiny.gguf");
+        const int64_t hidden = xs::test::tiny_gemma4_moe_gguf_model().hidden;
+        xs::test::tiny_gemma4_unified_projector(hidden).write(work.path / "mmproj.gguf");
+        gguf_import::ImportOptions o;
+        o.source = work.path / "tiny.gguf";
+        o.mmproj = work.path / "mmproj.gguf";
+        o.output = work.path / "pack";
+        gguf_import::import_gguf(o);
+
+        const nlohmann::json config = read_json(o.output / "config.json");
+        CHECK(config.at("model_type") == "gemma4_unified");
+        CHECK(config.at("text_config").at("model_type") == "gemma4_unified_text");
+        CHECK(config.at("audio_token_id") == 13);
+        CHECK(config.at("eoa_token_index") == 14);
+        CHECK(config.at("vision_config").at("mm_embed_dim") == xs::test::kG4uEmbed);
+        CHECK(config.at("vision_config").at("mm_posemb_size") == xs::test::kG4uPositions);
+        CHECK(config.at("audio_config").at("audio_embed_dim") == xs::test::kG4uSamples);
+
+        const auto pack = SafetensorsWeights::open_dir(o.output);
+        const gguf::File file(o.mmproj);
+        // The dense layer's column (row, column, channel) is the file's (channel, row, column).
+        const int64_t side = 48, d = xs::test::kG4uEmbed, cols = xs::test::kG4uMerged;
+        const std::vector<float> dense = f32_values(pack->get("model.vision_embedder.patch_dense.weight"));
+        const std::vector<float> stored = f32_values(file.find_tensor("v.patch_embd.weight")->view({d, cols}));
+        for (const auto& [r, ch, y, x] : {std::array<int64_t, 4>{0, 0, 0, 0}, std::array<int64_t, 4>{3, 2, 5, 7},
+                                          std::array<int64_t, 4>{d - 1, 1, side - 1, side - 2}}) {
+            CHECK(dense[static_cast<size_t>(r * cols + (y * side + x) * 3 + ch)] ==
+                  stored[static_cast<size_t>(r * cols + (ch * side + y) * side + x)]);
+        }
+        const std::vector<float> ln1 = f32_values(pack->get("model.vision_embedder.patch_ln1.weight"));
+        const std::vector<float> ln1_stored = f32_values(file.find_tensor("v.patch_norm.1.weight")->view({cols}));
+        CHECK(ln1[static_cast<size_t>((5 * side + 7) * 3 + 2)] ==
+              ln1_stored[static_cast<size_t>((2 * side + 5) * side + 7)]);
+        // The position table [positions, 2, width] from the file's [2, positions, width].
+        const std::vector<float> table = f32_values(pack->get("model.vision_embedder.pos_embedding"));
+        const std::vector<float> table_stored =
+            f32_values(file.find_tensor("v.position_embd.weight")->view({2, xs::test::kG4uPositions, d}));
+        CHECK(table[static_cast<size_t>((9 * 2 + 1) * d + 4)] ==
+              table_stored[static_cast<size_t>((1 * xs::test::kG4uPositions + 9) * d + 4)]);
+        CHECK(pack->get("model.embed_audio.embedding_projection.weight").shape ==
+              (Dims{hidden, xs::test::kG4uSamples}));
+        // The model loads its two embedders over the imported weights.
+        const auto model = load_model(o.output);
+        CHECK(model->vision() != nullptr);
+        CHECK(model->audio() != nullptr);
+        CHECK(model->info().media_whole_steps);
     }
 
     TEST_CASE("gemma4 --mmproj: refusals name what is wrong") {

@@ -57,6 +57,10 @@ struct Config {
     int64_t top_k_experts = 0;
     int64_t moe_intermediate_size = 0;
     bool bidirectional_vision = false;  // image tokens attend both ways (use_bidirectional_attention "vision")
+    // How (transformers' masks): Gemma 4's in the sliding layers alone, the window kept over an image's keys behind
+    // (create_masks_for_vision_model); Gemma 4 12B's (gemma4_unified_text) in every layer, an image seeing itself
+    // whole past the window (create_masks_for_generate with block_sequence_ids).
+    bool bidirectional_whole = false;
     int64_t max_position = 0;
     std::vector<AttnKind> layer_kinds;
     RopeConfig rope_sliding;
@@ -106,6 +110,10 @@ struct VisionConfig {
     bool clipped_linears = false;
     // The pooled soft tokens standardized before the projection: (h - std_bias) * std_scale (26B-A4B, 31B).
     bool standardize = false;
+    // Gemma 4 12B's embedder without a tower (gemma4_unified_vision): each soft token a merged patch of
+    // pooling_kernel x patch_size pixels a side, through LayerNorm, a dense layer, LayerNorm, a position row a side
+    // and LayerNorm; hidden_size is mm_embed_dim, position_embedding_size mm_posemb_size.
+    bool unified = false;
     float rescale_factor = 1.0f / 255.0f;  // pixel scale before the tower's own 2 * (x - 0.5)
     int64_t text_hidden_size = 0;
     int32_t image_token_id = -1;  // the placeholder the chat template renders, and every soft token
@@ -123,9 +131,29 @@ std::optional<VisionConfig> parse_vision_config(const nlohmann::json& config_jso
 // Returns {height, width}. Throws xs::Error for images that cannot fit.
 std::pair<int64_t, int64_t> image_target_size(int64_t height, int64_t width, const VisionConfig& vc);
 
-// The vision encoder over the checkpoint's weights; `prefix` is where vision_tower. and embed_vision. live.
+// The vision encoder over the checkpoint's weights; `prefix` is where vision_tower. (vision_embedder. for the
+// unified embedder) and embed_vision. live.
 std::unique_ptr<VisionEncoder> make_vision_encoder(const VisionConfig& vc, const WeightStore& weights,
                                                    const std::string& prefix);
+std::unique_ptr<VisionEncoder> make_unified_vision_encoder(const VisionConfig& vc, const WeightStore& weights,
+                                                           const std::string& prefix);
+
+// Gemma 4 12B's audio input (gemma4_unified_audio): no tower; each soft token is samples_per_token samples of 16 kHz
+// audio, RMS-normed and projected (embed_audio).
+struct AudioConfig {
+    int64_t samples_per_token = 0;  // audio_embed_dim
+    double rms_norm_eps = 1e-6;
+    int64_t text_hidden_size = 0;
+    int32_t audio_token_id = -1;  // the placeholder the chat template renders, and every soft token
+    int32_t boa_token_id = -1;
+    int32_t eoa_token_id = -1;
+};
+// The audio config of a checkpoint whose audio has no tower (gemma4_unified_audio), nullopt without one. Throws
+// xs::Error naming another audio model (E2B's and E4B's conformer is not read).
+std::optional<AudioConfig> parse_audio_config(const nlohmann::json& config_json, int64_t text_hidden_size);
+// `prefix` is where embed_audio. lives.
+std::unique_ptr<AudioEncoder> make_audio_encoder(const AudioConfig& ac, const WeightStore& weights,
+                                                 const std::string& prefix);
 
 std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
                             const LoadOptions& options);

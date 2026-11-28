@@ -496,11 +496,13 @@ struct AttentionRowsKernel {
             tk[g] = t0 + g / heads;
             pos[g] = keys - toks + tk[g];
             head_row[g] = tk[g] * hq_n + h0 + g % heads;
+            const bool reaches = reach != nullptr && tk[g] < toks;
             first[g] = anchored ? std::max<int64_t>(0, keys - toks - window)
                                 : window > 0 ? std::max<int64_t>(0, pos[g] - window + 1) : 0;
+            if (reaches) first[g] = std::max<int64_t>(0, std::min<int64_t>(first[g], pos[g] - reach[2 * tk[g]]));
             // Causal: the row's own position and its reach ahead (which no window bounds); else the keys or the window.
             last[g] = anchored  ? keys - 1
-                      : causal  ? pos[g] + (reach != nullptr && tk[g] < toks ? reach[tk[g]] : 0)
+                      : causal  ? pos[g] + (reaches ? reach[2 * tk[g] + 1] : 0)
                       : window > 0 ? std::min<int64_t>(keys - 1, pos[g] + window - 1)
                                    : keys - 1;
             if (tk[g] >= toks) last[g] = -1;
@@ -2339,9 +2341,10 @@ void attention_softmax(sycl::queue& q, const float* scores, CT* probs, const Att
         // visible keys, relative to k_lo: [lo, hi]
         int64_t lo = 0;
         int64_t hi = keys - 1;
-        if (causal) hi = std::min<int64_t>(hi, pos + (reach != nullptr ? reach[t0 + tl] : 0) - k_lo);
+        if (causal) hi = std::min<int64_t>(hi, pos + (reach != nullptr ? reach[2 * (t0 + tl) + 1] : 0) - k_lo);
         if (window > 0 && !anchored) {  // an anchored window is the chunk's keys, every one
-            lo = std::max<int64_t>(lo, pos - window + 1 - k_lo);
+            const int64_t back = reach != nullptr ? std::max<int64_t>(window - 1, reach[2 * (t0 + tl)]) : window - 1;
+            lo = std::max<int64_t>(lo, pos - back - k_lo);
             if (!causal) hi = std::min<int64_t>(hi, pos + window - 1 - k_lo);  // keys ahead of a causal row: its reach
         }
         const float* sr = scores + r * keys;

@@ -106,24 +106,40 @@ TEST_CASE("media input matches Hugging Face: features, encoder rows, prompt, log
             const xs::audio::Audio clip = xs::audio::decode(bytes_of(raw));
             REQUIRE(clip.sample_rate == c["sample_rate"].get<int>());
 
-            // The front end: resampling to 16 kHz and the log-mel features.
+            // The front end: resampling to 16 kHz and the log-mel features (a tower's), or the raw frames (Gemma 4
+            // 12B's, checked after prepare).
             const std::vector<float> pcm = clip.sample_rate == 16000
                                                ? clip.samples
                                                : xs::audio::resample(clip.samples, clip.sample_rate, 16000);
-            xs::audio::MelParams mel_params;
-            mel_params.min_length = manifest.value("mel_min_length", mel_params.min_length);
-            const xs::HostTensor mel = xs::audio::log_mel_spectrogram(pcm, mel_params);
-            const std::vector<float> ref_mel = read_f32(fixtures() / c["mel"].get<std::string>());
-            REQUIRE(mel.dim(1) == c["mel_frames"].get<int64_t>());
-            double mel_diff = 0;
-            for (size_t i = 0; i < ref_mel.size(); ++i) {
-                mel_diff = std::max(mel_diff, static_cast<double>(std::fabs(mel.data<float>()[i] - ref_mel[i])));
+            if (c.contains("mel")) {
+                xs::audio::MelParams mel_params;
+                mel_params.min_length = manifest.value("mel_min_length", mel_params.min_length);
+                const xs::HostTensor mel = xs::audio::log_mel_spectrogram(pcm, mel_params);
+                const std::vector<float> ref_mel = read_f32(fixtures() / c["mel"].get<std::string>());
+                REQUIRE(mel.dim(1) == c["mel_frames"].get<int64_t>());
+                double mel_diff = 0;
+                for (size_t i = 0; i < ref_mel.size(); ++i) {
+                    mel_diff = std::max(mel_diff, static_cast<double>(std::fabs(mel.data<float>()[i] - ref_mel[i])));
+                }
+                MESSAGE(name, ": ", clip.samples.size(), " samples at ", clip.sample_rate, " Hz, ", mel.dim(1),
+                        " mel frames, max |diff| ", mel_diff);
+                CHECK(mel_diff < 2e-3);
             }
-            MESSAGE(name, ": ", clip.samples.size(), " samples at ", clip.sample_rate, " Hz, ", mel.dim(1),
-                    " mel frames, max |diff| ", mel_diff);
-            CHECK(mel_diff < 2e-3);
 
             xs::MediaInput m = tower->prepare(clip);
+            if (c.contains("frames")) {
+                const xs::HostTensor& frames = m.runs.at(0).inputs.at("frames");
+                const std::vector<float> ref_frames = read_f32(fixtures() / c["frames"].get<std::string>());
+                REQUIRE(static_cast<size_t>(frames.numel()) == ref_frames.size());
+                double frame_diff = 0;
+                for (size_t i = 0; i < ref_frames.size(); ++i) {
+                    frame_diff = std::max(frame_diff,
+                                          static_cast<double>(std::fabs(frames.data<float>()[i] - ref_frames[i])));
+                }
+                MESSAGE(name, ": ", clip.samples.size(), " samples at ", clip.sample_rate, " Hz, ", frames.dim(0),
+                        " frames, max |diff| ", frame_diff);
+                CHECK(frame_diff < 1e-5);
+            }
             m.key = xs::audio::content_hash(clip);
             REQUIRE(m.num_tokens == c["rows"].get<int64_t>());
             encode(m, xs::Modality::Audio);

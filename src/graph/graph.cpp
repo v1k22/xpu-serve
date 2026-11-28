@@ -676,8 +676,8 @@ Value Graph::attention_reaching(Value q, Value k_all, Value v_all, Value reach, 
     plain.reaching = false;
     const Value out = attention(q, k_all, v_all, plain);
     const TensorType& rt = type(reach);
-    XS_CHECK(type(q).shape.size() == 3 && rt.dtype == DType::I32 && rt.shape == (Dims{kT}),
-             "attention reach must be i32 [T] beside q [T, heads, head_dim], got ", dtype_name(rt.dtype),
+    XS_CHECK(type(q).shape.size() == 3 && rt.dtype == DType::I32 && rt.shape == (Dims{kT, 2}),
+             "attention reach must be i32 [T, 2] beside q [T, heads, head_dim], got ", dtype_name(rt.dtype),
              shape_to_string(rt.shape), " (", where(reach), ")");
     Node& n = nodes_[static_cast<size_t>(out.node)];
     n.attrs = attrs;

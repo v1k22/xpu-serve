@@ -220,7 +220,7 @@ const TokenizerKind& find_kind(const gguf::File& file) {
 
 // tokenizer.ggml.* keys the import reads or knows to change nothing it writes; any other is refused by name.
 // (token_type_count is a model's number of token types, which its architecture checks.)
-constexpr std::array<std::string_view, 33> kKnownKeys = {
+constexpr std::array<std::string_view, 34> kKnownKeys = {
     "model",
     "pre",
     "tokens",
@@ -254,6 +254,7 @@ constexpr std::array<std::string_view, 33> kKnownKeys = {
     "clean_spaces",
     "token_type_count",
     "metaspace.prepend_scheme",
+    "suppress_tokens",  // generation_config.json's, which the import writes there (gguf_import.cpp)
 };
 
 bool starts_with(std::string_view s, std::string_view prefix) {

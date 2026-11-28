@@ -19,6 +19,10 @@
 //   (text_config, vision_config, the image tokens) and the release's processor_config.json, with what llama.cpp
 //   fixes for the tower (RoPE theta 100, pooling 3 x 3, bicubic resizing, 280 soft tokens an image). An audio tower
 //   in the same file (E2B, E4B) is left out: the model serves no audio.
+// - Gemma 4 12B's projector file (projector types gemma4uv and gemma4ua, Gemma4UnifiedVisionAudioModel): the
+//   embedders without a tower, for images and for audio, under model.vision_embedder.*, model.embed_vision.* and
+//   model.embed_audio.*. The converter laid the dense layer's columns and the first LayerNorm out channel-major
+//   (an im2col's order) and swapped the position table's first two axes: both put back.
 // - 26B-A4B's experts: the router (ffn_gate_inp, its per-dimension scale ffn_gate_inp.scale), the banks (gate and up
 //   fused as ffn_gate_up_exps, gate rows first, or apart as ffn_gate_exps and ffn_up_exps; ffn_down_exps) with the
 //   router's per-expert scale stored as ffn_down_exps.scale, and the experts' own norms (pre_ffw_norm_2,
@@ -323,6 +327,113 @@ Layout vision_layout(const VisionDimensions& v) {
     return l;
 }
 
+// ---- Gemma 4 12B's projector file (gemma4uv and gemma4ua)
+
+struct UnifiedDimensions {
+    int64_t embed = 0, patch = 0, pooling = 3, positions = 0, out = 0, samples = 0, audio_out = 0;
+    double eps = 1e-6, audio_eps = 1e-6;  // as config_number gives them
+};
+
+UnifiedDimensions unified_dimensions(const gguf::File& f, std::string_view arch, int64_t hidden) {
+    const auto positive_of = [&](std::string_view rest) { return positive(f, kClip, str_cat("clip.", rest)); };
+    const gguf::Value* audio = f.find("clip.audio.projector_type");
+    if (audio == nullptr || audio->as_string() != "gemma4ua") {
+        fail(arch, ": --mmproj: a gemma4uv vision embedder without its gemma4ua audio embedder");
+    }
+    refuse_unknown_keys(f, kClip, kClipKeys);
+    UnifiedDimensions u;
+    u.embed = positive_of("vision.embedding_length");
+    u.patch = positive_of("vision.patch_size");
+    if (f.find("clip.vision.projector.scale_factor") != nullptr) {
+        u.pooling = positive_of("vision.projector.scale_factor");
+    }
+    u.out = positive_of("vision.projection_dim");
+    u.samples = positive_of("audio.embedding_length");
+    u.audio_out = positive_of("audio.projection_dim");
+    XS_CHECK(u.out == hidden && u.audio_out == hidden, arch, ": --mmproj: the embedders project to ", u.out, " and ",
+             u.audio_out, ", the model's hidden size is ", hidden, ": another model's file");
+    u.eps = config_number(f.get("clip.vision.attention.layer_norm_epsilon"));
+    u.audio_eps = config_number(f.get("clip.audio.attention.layer_norm_epsilon"));
+    const gguf::TensorInfo* table = f.find_tensor("v.position_embd.weight");
+    XS_CHECK(table != nullptr && table->shape().size() == 3 && table->shape()[0] == 2, arch,
+             ": --mmproj: the file lacks the position table v.position_embd.weight [2, positions, width]");
+    u.positions = table->shape()[1];
+    return u;
+}
+
+// The converter's order of a merged patch's values (channel, row, column) back to the checkpoint's (row, column,
+// channel): value i of the file is value perm(i) of the checkpoint.
+int64_t merged_patch_index(int64_t i, int64_t side) {
+    const int64_t ch = i / (side * side), row = (i % (side * side)) / side, col = i % side;
+    return (row * side + col) * 3 + ch;
+}
+std::vector<float> patch_columns_back(const std::vector<float>& stored, const Dims& shape) {
+    const int64_t rows = shape[0], cols = shape[1];
+    const auto side = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(cols / 3))));
+    std::vector<float> back(stored.size());
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t i = 0; i < cols; ++i)
+            back[static_cast<size_t>(r * cols + merged_patch_index(i, side))] =
+                stored[static_cast<size_t>(r * cols + i)];
+    return back;
+}
+std::vector<float> patch_vector_back(const std::vector<float>& stored, const Dims& shape) {
+    return patch_columns_back(stored, {1, shape.back()});
+}
+std::vector<float> position_axes_back(const std::vector<float>& stored, const Dims& shape) {  // [2, P, D] -> [P, 2, D]
+    const int64_t axes = shape[0], positions = shape[1], width = shape[2];
+    std::vector<float> back(stored.size());
+    for (int64_t a = 0; a < axes; ++a)
+        for (int64_t p = 0; p < positions; ++p)
+            std::copy_n(stored.begin() + static_cast<std::ptrdiff_t>((a * positions + p) * width), width,
+                        back.begin() + static_cast<std::ptrdiff_t>((p * axes + a) * width));
+    return back;
+}
+const FloatReorder kPatchColumnsBack{"the dense layer's columns from channel-major", patch_columns_back};
+const FloatReorder kPatchVectorBack{"the LayerNorm's values from channel-major", patch_vector_back};
+const FloatReorder kPositionAxesBack{"the position table's axes swapped back", position_axes_back};
+
+nlohmann::ordered_json unified_vision_config(const UnifiedDimensions& u) {
+    nlohmann::ordered_json c;
+    c["model_type"] = "gemma4_unified_vision";
+    c["patch_size"] = u.patch;
+    c["pooling_kernel_size"] = u.pooling;
+    c["mm_embed_dim"] = u.embed;
+    c["mm_posemb_size"] = u.positions;
+    c["output_proj_dims"] = u.embed;
+    c["rms_norm_eps"] = u.eps;
+    return c;
+}
+
+nlohmann::ordered_json unified_audio_config(const UnifiedDimensions& u) {
+    nlohmann::ordered_json c;
+    c["model_type"] = "gemma4_unified_audio";
+    c["audio_embed_dim"] = u.samples;
+    c["output_proj_dims"] = u.samples;
+    c["rms_norm_eps"] = u.audio_eps;
+    return c;
+}
+
+Layout unified_layout(const UnifiedDimensions& u) {
+    const std::string P = "model.vision_embedder.";
+    const int64_t side = u.patch * u.pooling, merged = side * side * 3, d = u.embed;
+    Layout l;
+    l.top["v.patch_embd.weight"] = reordered({d, merged}, P + "patch_dense.weight", {d, merged}, &kPatchColumnsBack);
+    l.top["v.patch_embd.bias"] = one({d}, P + "patch_dense.bias");
+    l.top["v.patch_norm.1.weight"] = reordered({merged}, P + "patch_ln1.weight", {merged}, &kPatchVectorBack);
+    l.top["v.patch_norm.1.bias"] = reordered({merged}, P + "patch_ln1.bias", {merged}, &kPatchVectorBack);
+    for (const auto& [from, to] : {std::pair{"2", "patch_ln2"}, std::pair{"3", "pos_norm"}}) {
+        l.top[str_cat("v.patch_norm.", from, ".weight")] = one({d}, P + to + ".weight");
+        l.top[str_cat("v.patch_norm.", from, ".bias")] = one({d}, P + to + ".bias");
+    }
+    l.top["v.position_embd.weight"] =
+        reordered({2, u.positions, d}, P + "pos_embedding", {u.positions, 2, d}, &kPositionAxesBack);
+    l.top["mm.input_projection.weight"] = one({u.out, d}, "model.embed_vision.embedding_projection.weight");
+    l.top["mm.a.input_projection.weight"] =
+        one({u.audio_out, u.samples}, "model.embed_audio.embedding_projection.weight");
+    return l;
+}
+
 class Gemma4 final : public Architecture {
 public:
     explicit Gemma4(bool assistant) : assistant_(assistant) {}
@@ -358,6 +469,8 @@ public:
     // vision_config and the image tokens around it; the release's processor_config.json.
     void add_projector(ImportPlan& p, const gguf::File& f, const gguf::File& projector) const override {
         if (assistant_) Architecture::add_projector(p, f, projector);
+        const gguf::Value* type = projector.find("clip.vision.projector_type");
+        if (type != nullptr && type->as_string() == "gemma4uv") return add_unified(p, f, projector);
         const VisionDimensions v = vision_dimensions(projector, name(), positive(f, name(), key("embedding_length")));
         nlohmann::ordered_json config;
         config["architectures"] = {"Gemma4ForConditionalGeneration"};
@@ -381,6 +494,33 @@ public:
     }
 
 private:
+    // Gemma 4 12B's: its embedders for images and audio, config.json as the release lays it out
+    // (Gemma4UnifiedForConditionalGeneration; text_config of gemma4_unified_text, whose images see themselves whole).
+    void add_unified(ImportPlan& p, const gguf::File& f, const gguf::File& projector) const {
+        const UnifiedDimensions u = unified_dimensions(projector, name(), positive(f, name(), key("embedding_length")));
+        nlohmann::ordered_json text = std::move(p.config);
+        text["model_type"] = "gemma4_unified_text";
+        nlohmann::ordered_json config;
+        config["architectures"] = {"Gemma4UnifiedForConditionalGeneration"};
+        config["model_type"] = "gemma4_unified";
+        config["image_token_id"] = token_id(f, name(), "<|image|>");
+        config["boi_token_id"] = token_id(f, name(), "<|image>");
+        config["eoi_token_id"] = token_id(f, name(), "<image|>");
+        config["audio_token_id"] = token_id(f, name(), "<|audio|>");
+        config["boa_token_id"] = token_id(f, name(), "<|audio>");
+        config["eoa_token_index"] = token_id(f, name(), "<audio|>");
+        config["tie_word_embeddings"] = text.value("tie_word_embeddings", true);
+        config["text_config"] = std::move(text);
+        config["vision_config"] = unified_vision_config(u);
+        config["audio_config"] = unified_audio_config(u);
+        p.config = std::move(config);
+        VisionDimensions v;  // the processor's: Gemma 4's image processor, its sides a multiple of the merged patch
+        v.patch = u.patch;
+        v.pooling = u.pooling;
+        p.files["processor_config.json"] = processor_config(v);
+        map_tensors(projector, kClip, unified_layout(u), p);
+    }
+
     std::string key(std::string_view rest) const { return str_cat(name(), ".", rest); }
 
     // A positive per-layer value, written as one number or as an array of one per layer.

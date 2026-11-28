@@ -218,8 +218,9 @@ struct AttentionShape {
     // Not causal with a window: every query sees the step's keys and the `window` before the step (graph.h,
     // AttentionAttrs::anchored)
     bool anchored = false;
-    // [T] (causal): query i also sees the step's keys up to reach[i] past its position, which the window does not
-    // bound (graph.h, AttentionAttrs::reaching); null: none
+    // [T, 2] (causal): (back, ahead) a query: query i also sees the step's keys up to ahead past its position, which
+    // the window does not bound, and the keys back behind it past the window (graph.h, AttentionAttrs::reaching);
+    // null: none
     const int32_t* reach = nullptr;
 };
 // Whether query i sees key j under the tokens' groups (graph.h, AttentionAttrs::grouped).

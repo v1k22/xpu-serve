@@ -67,11 +67,14 @@ struct Compare {
     int argmax_ref = -1;
 };
 
+// A value both sides rule out (-inf: a token the model suppresses, generation_config's suppress_tokens) is left out of
+// the cosine and the difference; one side's -inf alone makes the difference infinite.
 inline Compare compare(std::span<const float> ours, std::span<const float> ref) {
     Compare c;
     REQUIRE(ours.size() == ref.size());
     double dot = 0, a2 = 0, b2 = 0;
     for (size_t i = 0; i < ref.size(); ++i) {
+        if (std::isinf(ours[i]) && ours[i] < 0 && std::isinf(ref[i]) && ref[i] < 0) continue;
         dot += static_cast<double>(ours[i]) * ref[i];
         a2 += static_cast<double>(ours[i]) * ours[i];
         b2 += static_cast<double>(ref[i]) * ref[i];

@@ -268,7 +268,30 @@ std::optional<VisionConfig> parse_vision_config(const nlohmann::json& config_jso
     const nlohmann::json& v = config_json.at("vision_config");
     const std::string where = "config.json vision_config";
     const std::string type = cfg::get_string(v, "model_type", where);
-    if (type != "gemma4_vision") fail(where, ": model_type '", type, "' is not supported (supported: gemma4_vision)");
+    if (type == "gemma4_unified_vision") {  // 12B's embedder without a tower
+        VisionConfig vc;
+        vc.unified = true;
+        vc.hidden_size = cfg::get_int(v, "mm_embed_dim", where);
+        vc.position_embedding_size = cfg::get_int(v, "mm_posemb_size", where);
+        vc.patch_size = cfg::get_int(v, "patch_size", where);
+        vc.pooling_kernel = cfg::get_int(v, "pooling_kernel_size", where);
+        vc.rms_norm_eps = cfg::get_float(v, "rms_norm_eps", where);
+        vc.max_soft_tokens = cfg::get_int_or(v, "num_soft_tokens", 280, where);
+        const int64_t out = cfg::get_int_or(v, "output_proj_dims", vc.hidden_size, where);
+        XS_CHECK(out == vc.hidden_size, where, ": output_proj_dims ", out, " differs from mm_embed_dim ",
+                 vc.hidden_size);
+        vc.text_hidden_size = text_hidden_size;
+        vc.image_token_id = token_id(config_json, "image_token_id");
+        vc.boi_token_id = token_id(config_json, "boi_token_id");
+        vc.eoi_token_id = token_id(config_json, "eoi_token_id");
+        read_image_processor(model_dir, vc);
+        XS_CHECK(vc.patch_size > 0 && vc.pooling_kernel > 0 && vc.max_soft_tokens > 0, where,
+                 ": patch_size, pooling_kernel_size and the soft-token budget must be positive");
+        return vc;
+    }
+    if (type != "gemma4_vision") {
+        fail(where, ": model_type '", type, "' is not supported (supported: gemma4_vision, gemma4_unified_vision)");
+    }
     if (cfg::get_bool_or(v, "attention_bias", false, where)) fail(where, ": attention_bias is not supported");
     const std::string act = cfg::get_string(v, "hidden_activation", where);
     if (act != "gelu_pytorch_tanh") fail(where, ": hidden_activation '", act, "' is not supported");
@@ -334,6 +357,7 @@ std::pair<int64_t, int64_t> image_target_size(int64_t height, int64_t width, con
 
 std::unique_ptr<VisionEncoder> make_vision_encoder(const VisionConfig& vc, const WeightStore& weights,
                                                    const std::string& prefix) {
+    if (vc.unified) return make_unified_vision_encoder(vc, weights, prefix);
     return std::make_unique<Gemma4Vision>(vc, weights, prefix);
 }
 

@@ -166,14 +166,15 @@ TEST_SUITE("cpu-ref attention") {
         const TensorMap past_end{{"q", rng.uniform(DType::F32, {4, 4, 64})},
                                  {"k", rng.uniform(DType::F32, {4, 2, 64})},
                                  {"v", rng.uniform(DType::F32, {4, 2, 64})},
-                                 {"reach", test::make_tensor(DType::I32, {4}, std::vector<int32_t>{0, 3, 0, 0})}};
+                                 {"reach", test::make_tensor(DType::I32, {4, 2},
+                                                             std::vector<int32_t>{0, 0, 0, 3, 0, 0, 0, 0})}};
         CHECK_THROWS_WITH_AS(session->run(past_end, out), doctest::Contains("passes the 4 keys of the step"), Error);
         Graph g;
         const Value q = g.input("q", DType::F32, {kT, 4, 64});
         const int slot = g.add_kv_slot(2, 64, 0, "layer");
         const auto [k_all, v_all] = g.kv_cache(slot, g.input("k", DType::F32, {kT, 2, 64}),
                                                g.input("v", DType::F32, {kT, 2, 64}));
-        const Value reach = g.input("reach", DType::I32, {kT});
+        const Value reach = g.input("reach", DType::I32, {kT, 2});
         AttentionAttrs a;
         a.reaching = true;
         CHECK_THROWS_WITH_AS(g.attention(q, k_all, v_all, a), doctest::Contains("attention_reaching"), Error);

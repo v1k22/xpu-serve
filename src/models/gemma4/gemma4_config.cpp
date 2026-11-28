@@ -83,6 +83,7 @@ Config parse_text(const nlohmann::json& config_json, const nlohmann::json& t, co
                                 ? cfg::get_int(t, "num_global_key_value_heads", where)
                                 : c.num_kv_heads;
     c.bidirectional_vision = t.contains("use_bidirectional_attention") && t.at("use_bidirectional_attention") == "vision";
+    c.bidirectional_whole = c.bidirectional_vision && t.value("model_type", "") == "gemma4_unified_text";
     if (cfg::get_bool_or(t, "enable_moe_block", false, where)) {
         c.num_experts = cfg::get_int(t, "num_experts", where);
         c.top_k_experts = cfg::get_int(t, "top_k_experts", where);

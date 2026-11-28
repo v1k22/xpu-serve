@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Reference outputs for models that read audio and images from Hugging Face transformers (test-only): Qwen3-ASR,
-Qwen3-Omni's thinker (text, audio and images in), and the Qwen3.5 family with its vision tower (qwen3_5,
-qwen3_5_moe: text and images in).
+Qwen3-Omni's thinker (text, audio and images in), the Qwen3.5 family with its vision tower (qwen3_5,
+qwen3_5_moe: text and images in), and Gemma 4 12B's audio (gemma4_unified: raw 640-sample frames, no tower; its
+images are hf_vision_reference.py's).
 
     python -I tests/parity/model/hf_media_reference.py --model-dir <checkpoint> --out <dir> [--audio a.wav ...]
         [--image a.png ...] [--gen 32] [--converted-out <dir>]
@@ -194,6 +195,70 @@ def write_wav_f32(path, rate, samples):
         f.write(header + data)
 
 
+
+def suppressed(model, logits):
+    """The logits as the model gives them to sampling: generation_config's suppress_tokens at -inf (transformers'
+    generate and vLLM's Gemma 4 rule them out; the engine does it in the graph)."""
+    ids = getattr(model.generation_config, "suppress_tokens", None)
+    if ids:
+        logits[..., ids] = float("-inf")
+    return logits
+
+def gemma4_unified(args):
+    """Gemma 4 12B's audio cases: the processor chunks the clip (brought to 16 kHz by torchaudio, the engine's
+    resampler) into 640-sample frames (<name>.frames.bin, float32 [frames, 640]), each frame one row through the
+    multimodal embedder (<name>.audio_rows.bin); the prompt the processor expands; last logits and greedy text."""
+    import torchaudio
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(args.model_dir)
+    model = AutoModelForImageTextToText.from_pretrained(args.model_dir, dtype=torch.float32,
+                                                        attn_implementation="eager").eval()
+    hidden = model.config.text_config.hidden_size
+    scale = torch.tensor(math.sqrt(hidden), dtype=torch.bfloat16).float()  # the engine rounds it as the checkpoint
+    model.model.language_model.embed_tokens.embed_scale.fill_(scale.item())
+    tok = processor.tokenizer
+    eos = model.generation_config.eos_token_id
+    eos = eos if isinstance(eos, list) else [eos]
+    clips = [(os.path.splitext(os.path.basename(p))[0], *read_wav(p)) for p in args.audio] or synthetic_clips()
+    manifest = {"model_dir": os.path.abspath(args.model_dir), "dtype": "float32", "cases": []}
+    for name, rate, samples in clips:
+        write_wav_f32(os.path.join(args.out, f"{name}.wav"), rate, samples)
+        pcm = torch.from_numpy(samples)
+        if rate != 16000:
+            pcm = torchaudio.functional.resample(pcm, rate, 16000)
+        messages = [{"role": "user", "content": [{"type": "audio"},
+                                                 {"type": "text", "text": "What do you hear? Answer in one sentence."}]}]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], audio=[pcm.numpy()], return_tensors="pt")
+        frames = inputs["input_features"][0][inputs["input_features_mask"][0]]
+        frames.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.frames.bin"))
+        with torch.no_grad():
+            rows = model.model.get_audio_features(inputs["input_features"], inputs["input_features_mask"],
+                                                  return_dict=True).pooler_output[0]
+            rows.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.audio_rows.bin"))
+            logits = suppressed(model, model(**inputs).logits[0, -1].float())
+            out = model.generate(**inputs, max_new_tokens=args.gen, do_sample=False, eos_token_id=eos,
+                                 repetition_penalty=1.0, output_scores=True, return_dict_in_generate=True)
+        ids = inputs["input_ids"][0].tolist()
+        greedy = out.sequences[0, len(ids):].tolist()
+        top = []
+        for step in out.scores:
+            values, indices = step[0].float().topk(5)
+            finite = step[0][torch.isfinite(step[0])].float()  # suppressed tokens are -inf
+            top.append({"ids": indices.tolist(), "logits": values.tolist(),
+                        "range": float(finite.max() - finite.min())})
+        logits.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.last_logits.bin"))
+        manifest["cases"].append({
+            "name": name, "wav": f"{name}.wav", "sample_rate": rate, "frames": f"{name}.frames.bin",
+            "audio_rows": f"{name}.audio_rows.bin", "rows": int(rows.shape[0]), "messages": messages,
+            "input_ids": ids, "last_logits": f"{name}.last_logits.bin", "greedy": greedy,
+            "greedy_text": tok.decode(greedy), "greedy_top": top})
+        print(f"{name}: {len(ids)} prompt tokens, {rows.shape[0]} audio rows -> {tok.decode(greedy)!r}", flush=True)
+    with open(os.path.join(args.out, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1, ensure_ascii=False)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
@@ -215,6 +280,8 @@ def main():
     vl = model_type in ("qwen3_5", "qwen3_5_moe")  # images, no audio
     if vl and args.audio:
         ap.error(f"{model_type} takes no audio")
+    if model_type == "gemma4_unified":
+        return gemma4_unified(args)
     if vl:
         from transformers import AutoModelForImageTextToText
 
@@ -309,7 +376,7 @@ def main():
                 inputs["feature_attention_mask" if omni else "input_features_mask"] = mask
                 case.update({"wav": f"{name}.wav", "sample_rate": rate, "mel": f"{name}.mel.bin", "mel_frames": frames,
                              "audio_rows": f"{name}.audio_rows.bin", "rows": int(rows.shape[0])})
-            logits = model(**inputs).logits[0, -1].float()
+            logits = suppressed(model, model(**inputs).logits[0, -1].float())
             out = model.generate(**inputs, max_new_tokens=args.gen, do_sample=False, eos_token_id=eos,
                                  repetition_penalty=1.0, output_scores=True, return_dict_in_generate=True)
         greedy = out.sequences[0, len(ids):].tolist()
@@ -317,8 +384,9 @@ def main():
         top = []
         for step in out.scores:
             values, indices = step[0].float().topk(5)
+            finite = step[0][torch.isfinite(step[0])].float()  # suppressed tokens are -inf
             top.append({"ids": indices.tolist(), "logits": values.tolist(),
-                        "range": float(step[0].max() - step[0].min())})
+                        "range": float(finite.max() - finite.min())})
         case["greedy_top"] = top
         logits.numpy().astype(np.float32).tofile(os.path.join(args.out, f"{name}.last_logits.bin"))
         case.update({"messages": messages, "input_ids": ids, "last_logits": f"{name}.last_logits.bin",

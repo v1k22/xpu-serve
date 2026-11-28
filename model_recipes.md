@@ -15,6 +15,8 @@ APIs look; the numbers live here.
   - [Gemma 4 E2B](#gemma-4-e2b)
   - [Gemma 4 E4B](#gemma-4-e4b)
   - [Gemma 4 26B-A4B](#gemma-4-26b-a4b)
+  - [Gemma 4 31B](#gemma-4-31b)
+  - [Gemma 4 12B](#gemma-4-12b)
   - [Qwen3.5-4B](#qwen35-4b)
   - [Qwen3.5-9B](#qwen35-9b)
   - [SenseNova-Loop-9B](#sensenova-loop-9b)
@@ -30,6 +32,8 @@ APIs look; the numbers live here.
   - [Qwen3.5-4B GGUF](#qwen35-4b-gguf)
   - [Gemma 4 E2B GGUF](#gemma-4-e2b-gguf)
   - [Gemma 4 26B-A4B GGUF](#gemma-4-26b-a4b-gguf)
+  - [Gemma 4 31B GGUF](#gemma-4-31b-gguf)
+  - [Gemma 4 12B GGUF](#gemma-4-12b-gguf)
   - [Qwen3.8-27B GGUF](#qwen38-27b-gguf)
   - [Ornith-1.5-35B-A3B GGUF](#ornith-15-35b-a3b-gguf)
   - [Inkling-2-Mini GGUF](#inkling-2-mini-gguf)
@@ -419,6 +423,61 @@ image prompts at 0.985 to 0.996, the vision tower's soft tokens at 0.99976 to 0.
 three of four ("The image contains a red circle, a blue square, and a green triangle."). On a tiny checkpoint of its
 layout (experts beside the MLP, K = V global layers, a standardizing tower, images both ways) at cosine 1, cpu-ref and
 the GPU; with the image's tokens causal instead, 0.88 to 0.985.
+
+### Gemma 4 31B
+
+`google/gemma-4-31B-it` (`gemma4`: 26B-A4B's layers without the experts, 60 of them). Text and images: 26B-A4B's
+standardizing vision tower, an image's tokens both ways in the sliding layers. No audio.
+
+```bash
+xpu-serve convert -hf google/gemma-4-31B-it --out ~/models/gemma-4-31B-it-q4 --quant q4
+xpu-serve serve ~/models/gemma-4-31B-it-q4 --device GPU --kv-dtype i8 --ctx 4096
+```
+
+- Memory is tight on a 24 GB card: its 50 sliding layers keep the whole context in the KV cache (901 KB a token at
+  f16, 457 KB with `--kv-dtype i8`), since the engine keeps a sliding layer's window alone only for models with
+  convolution or recurrent state. With the vision tower, the q4 pack (20.0 GiB) leaves room for 2,048 tokens at f16;
+  Unsloth's Q4_K_M ([Gemma 4 31B GGUF](#gemma-4-31b-gguf)) for 8,192 with `--kv-dtype i8`. `--no-vision` frees 1.1 GiB.
+
+Against Hugging Face fp32 on the CPU (the q4 pack at f16): six text prompts at logit cosine 0.905 to 0.9993; four
+image prompts at 0.984 to 0.992, the tower's soft tokens at 0.9996 or more, the greedy answer equal on three of four.
+
+### Gemma 4 12B
+
+`google/gemma-4-12b-it` (`gemma4_unified`): Gemma 4's dense decoder (48 layers) with images and audio but no tower
+for either. An image is cut into 48-pixel patches, each one soft token through LayerNorm, a dense layer, a position row
+a side and a projection; audio is cut into 40 ms frames of 640 samples at 16 kHz, each one soft token through a
+projection. An image's tokens attend to each other both ways in every layer, past the sliding window
+(transformers' masks for this model), and the engine prefills an image in one step. Its generation config rules out
+the end-of-image and end-of-audio tokens (`suppress_tokens`), which the model's logits set to -inf, as vLLM does.
+
+```bash
+xpu-serve convert -hf google/gemma-4-12b-it --out ~/models/gemma-4-12b-it-q8 --quant q8
+xpu-serve serve ~/models/gemma-4-12b-it-q8 --device GPU --kv-dtype i8
+```
+
+- The original's bf16 weights (23.9 GB) do not fit a 24 GB card; the q8 pack is 12.3 GB, the q4 pack 8.0 GB.
+- Audio in a request: an `input_audio` part (WAV, MP3 or FLAC), any sample rate.
+
+Measured on the Arc Pro B60 (decode of 128 tokens after a 4,096-token prompt, `--kv-dtype i8`):
+
+| | Decode | Prefill (4k tokens) |
+|---|---|---|
+| q8 pack | 27.0 tok/s | 1,670 tok/s |
+| q4 pack | 36.8 tok/s | 1,700 tok/s |
+
+Against Hugging Face fp32 on the CPU, at f16:
+
+| | Text (six prompts) | Images (four) | Audio (five clips) |
+|---|---|---|---|
+| original, cpu-ref f32 | | | cosine 1, greedy all equal |
+| q8 pack | 0.9993 to 0.99999, greedy equal on five | 0.9990 to 0.9998, greedy all equal | 0.953 to 0.9992 |
+| q4 pack | 0.940 to 0.9989 | 0.964 to 0.983 | 0.83 to 0.97 |
+
+The audio clips are tones, noise and chirps the model answers with little confidence: 8-bit weights move those answers
+more than they move images (llama.cpp's Q8_0 file: 0.970 to 0.9997). On a tiny checkpoint of its layout, images and
+audio at cosine 1 on cpu-ref and the GPU; with Gemma 4's rule for an image's tokens (the sliding layers alone, within
+the window) instead of this model's, 0.82 to 0.98.
 
 ### Qwen3.5-4B
 
@@ -1164,6 +1223,46 @@ Measured on the Arc Pro B60 (UD-Q4_K_M, 17.1 GB of weights and 1.1 GB of tower):
 4,096-token prompt, prefill 2,340 tok/s. Against Hugging Face fp32 of the original: six text prompts at logit cosine
 0.9967 to 0.99999; four image prompts at 0.9990 to 0.9997, the tower's soft tokens at 0.99976 or more, the greedy
 answer equal on three of four.
+
+### Gemma 4 31B GGUF
+
+[unsloth/gemma-4-31B-it-GGUF](https://huggingface.co/unsloth/gemma-4-31B-it-GGUF): a dense `gemma4` file, its
+full-attention layers taking their keys as values; with `-hf` the vision tower's file (`mmproj-BF16.gguf`, 1.1 GiB)
+comes along. What fits a 24 GB card (22.7 GiB):
+
+| File | Weights in use, with the tower | Context that fits | Decode | Prefill |
+|---|---|---|---|---|
+| Q4_K_M (17.1 GiB) | 18.9 GiB | 8,192 tokens with `--kv-dtype i8`, 4,096 at f16 | 15.7 tok/s | 670 tok/s (4k) |
+| Q5_K_M (20.2 GiB) | 22.0 GiB | none; 4,096 with `--no-vision --kv-dtype i8` | 13.9 tok/s | 700 tok/s (2k) |
+| Q6_K and larger | | does not fit | | |
+
+The Q4_K_S, Q4_1 and UD-Q4_K_XL files (16.2 to 17.8 GiB) are of Q4_K_M's size; they were not measured here.
+
+```bash
+xpu-serve serve -hf unsloth/gemma-4-31B-it-GGUF:Q4_K_M --device GPU --kv-dtype i8 --ctx 8192
+```
+
+Against Hugging Face fp32 of the original: Q4_K_M at logit cosine 0.947 to 0.9994 on six text prompts and 0.987 to
+0.992 on four image prompts, the greedy answer equal on all four; Q5_K_M at 0.990 to 0.9998 on the text prompts.
+
+### Gemma 4 12B GGUF
+
+[unsloth/gemma-4-12b-it-GGUF](https://huggingface.co/unsloth/gemma-4-12b-it-GGUF): the text model as a `gemma4`
+file; its `mmproj` file holds both embedders without a tower (projector types `gemma4uv` and `gemma4ua`), so `-hf`
+brings images and audio. Q8_0 (11.8 GiB) and Q4_K_M were measured; the BF16 file (22.2 GiB) leaves no room for the
+cache.
+
+```bash
+xpu-serve serve -hf unsloth/gemma-4-12b-it-GGUF:Q4_K_M --device GPU --kv-dtype i8
+```
+
+| File | Decode | Prefill (4k tokens) | Text vs HF fp32 | Images vs HF fp32 |
+|---|---|---|---|---|
+| Q8_0 | 26.5 tok/s | 1,670 tok/s | cosine 0.9988 to 0.99999 | |
+| Q4_K_M | 35.1 tok/s | 1,690 tok/s | 0.977 to 0.9995 | 0.989 to 0.995, greedy equal on three of four |
+
+With Q4_K_M and its projector the server described a test picture as "a red circle on the left and a blue square on
+the right".
 
 ### Qwen3.8-27B GGUF
 

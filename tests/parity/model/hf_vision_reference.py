@@ -80,6 +80,15 @@ def bf16(x):
     return torch.tensor(x, dtype=torch.float32).to(torch.bfloat16).to(torch.float32).item()
 
 
+
+def suppressed(model, logits):
+    """The logits as the model gives them to sampling: generation_config's suppress_tokens at -inf (transformers'
+    generate and vLLM's Gemma 4 rule them out; the engine does it in the graph)."""
+    ids = getattr(model.generation_config, "suppress_tokens", None)
+    if ids:
+        logits[..., ids] = float("-inf")
+    return logits
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", required=True)
@@ -117,6 +126,8 @@ def main():
     manifest = {"model_dir": os.path.abspath(args.model_dir), "dtype": "float32", "images": [], "cases": []}
     if inkling:
         manifest.update(pixel_range="signed", prefix_reuse=False)
+    if model.config.model_type == "gemma4_unified":  # merged patches in [0, 1]: what the embedder reads
+        manifest.update(pixel_range="as_read")
     for name in files if not inkling else []:
         feats = processor.image_processor(images=[pil[name]], return_tensors="pt")
         pos = feats["image_position_ids"][0]
@@ -157,7 +168,7 @@ def main():
         inputs = processor(text=text, images=[pil[n] for n in images], return_tensors="pt")
         ids = inputs["input_ids"][0].tolist()
         with torch.no_grad():
-            logits = model(**inputs).logits[0].float()
+            logits = suppressed(model, model(**inputs).logits[0].float())
             out = model.generate(**inputs, max_new_tokens=args.gen, do_sample=False, eos_token_id=eos)
         greedy = out[0, len(ids):].tolist()
         logits[-1].numpy().astype(np.float32).tofile(os.path.join(args.out, f"{case}.last_logits.bin"))

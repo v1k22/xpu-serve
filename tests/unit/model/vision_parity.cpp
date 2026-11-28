@@ -74,9 +74,11 @@ TEST_CASE("image input matches Hugging Face preprocessing, tower, logits and gre
         m.key = xs::image::content_hash(img);
         CHECK(m.num_tokens == im["soft_tokens"].get<int64_t>());
 
-        // The reference's pixel values are the tower's input ("signed"), or in [0, 1] where the tower's first step,
-        // 2 * (x - 0.5), is part of our input. Ours may hold more than the image's patches (a class token's rows).
-        const bool is_signed = manifest.value("pixel_range", "unit") == "signed";
+        // The reference's pixel values are the tower's input ("signed"; "as_read": Gemma 4 12B's merged patches in
+        // [0, 1]), or in [0, 1] where the tower's first step, 2 * (x - 0.5), is part of our input. Ours may hold more
+        // than the image's patches (a class token's rows).
+        const std::string range = manifest.value("pixel_range", "unit");
+        const bool is_signed = range == "signed" || range == "as_read";
         const xs::HostTensor& pixels = m.runs.at(0).inputs.at("pixels");
         const std::vector<float> ref_pixels = read_f32(fixtures() / im["pixels"].get<std::string>());
         REQUIRE(pixels.numel() >= static_cast<int64_t>(ref_pixels.size()));

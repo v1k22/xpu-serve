@@ -401,7 +401,7 @@ void attention(sycl::queue& q, Scratch& scratch, const QT* qp, const KV* k, cons
         if (s.anchored) {
             k_lo = std::max<int64_t>(0, past - s.window);
         } else if (s.window > 0) {
-            k_lo = std::max<int64_t>(0, past + t0 - s.window + 1);
+            k_lo = s.reach != nullptr ? 0 : std::max<int64_t>(0, past + t0 - s.window + 1);  // reaching: from the start
             if (!s.causal) k_hi = std::min<int64_t>(k_hi, past + t0 + cur - 1 + s.window);
         }
         const int64_t keys = k_hi - k_lo;

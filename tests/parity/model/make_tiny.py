@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch llama|qwen3|qwen3_moe|qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|gemma4_moe_vl|lfm3|
+    python -I tests/parity/model/make_tiny.py --arch llama|qwen3|qwen3_moe|qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|gemma4_moe_vl|gemma4_unified|lfm3|
         sensenova_loop|qwen3_asr|inkling2_loop --tokenizer-from <dir> --out <dir>
     python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
         [--pooling mean|cls] [--normalize] [--max-seq-length N]
@@ -215,6 +215,42 @@ def gemma4_moe_vl(vocab_size, source):
         tower = model.model.vision_tower
         tower.std_bias.normal_(0.0, 2.0)
         tower.std_scale.uniform_(0.2, 0.8)
+    return model
+
+
+def gemma4_unified(vocab_size, source):
+    """Gemma 4 12B's layout (Gemma4UnifiedForConditionalGeneration): a dense decoder of gemma4_moe's shape without
+    experts (K = V global layers, a softcapped head), images through the embedder without a tower (48-pixel merged
+    patches, LayerNorms away from 1 and 0, a position row a side; mm_embed_dim apart from the text's width, so the
+    projection between them shows) and both ways in the sliding layers, audio as 640-sample frames."""
+    from transformers import (Gemma4UnifiedAudioConfig, Gemma4UnifiedConfig, Gemma4UnifiedForConditionalGeneration,
+                              Gemma4UnifiedTextConfig, Gemma4UnifiedVisionConfig)
+
+    with open(os.path.join(source, "config.json")) as f:
+        released = json.load(f)
+    ids = {k: released[k] for k in ("image_token_id", "boi_token_id", "eoi_token_id", "audio_token_id",
+                                    "boa_token_id", "eoa_token_index", "video_token_id") if k in released}
+    text = Gemma4UnifiedTextConfig(
+        vocab_size=vocab_size, hidden_size=64, intermediate_size=48, num_hidden_layers=6, num_attention_heads=4,
+        num_key_value_heads=2, num_global_key_value_heads=1, head_dim=32, global_head_dim=64, sliding_window=16,
+        layer_types=["sliding_attention"] * 5 + ["full_attention"], hidden_size_per_layer_input=0,
+        attention_k_eq_v=True, final_logit_softcapping=30.0, max_position_embeddings=4096, tie_word_embeddings=True,
+        rms_norm_eps=1e-6, initializer_range=0.05, use_bidirectional_attention="vision",
+        rope_parameters={"full_attention": {"rope_type": "proportional", "partial_rotary_factor": 0.25,
+                                            "rope_theta": 1000000.0},
+                         "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}})
+    vision = Gemma4UnifiedVisionConfig(patch_size=16, pooling_kernel_size=3, mm_embed_dim=96, mm_posemb_size=64,
+                                       output_proj_dims=96, rms_norm_eps=1e-6)
+    audio = Gemma4UnifiedAudioConfig(audio_embed_dim=640, rms_norm_eps=1e-6, output_proj_dims=640)
+    config = Gemma4UnifiedConfig(text_config=text, vision_config=vision, audio_config=audio, tie_word_embeddings=True,
+                                 **ids)
+    model = gemma4_weights(Gemma4UnifiedForConditionalGeneration(config))
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "vision_embedder" in name and ("_ln" in name or "pos_norm" in name):
+                p.uniform_(0.5, 1.5) if name.endswith("weight") else p.uniform_(-0.3, 0.3)
+            elif name.endswith("pos_embedding"):
+                p.normal_(0.0, 0.5)
     return model
 
 
@@ -623,7 +659,7 @@ def perturbed(model):
 
 
 ARCHS = {"llama": llama, "qwen3": qwen3, "qwen3_moe": qwen3_moe, "qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "qwen3_5_vl": qwen3_5_vl, "qwen3_5_moe_vl": qwen3_5_moe_vl,
-         "gemma4_moe": gemma4_moe, "gemma4_moe_vl": gemma4_moe_vl, "lfm3": lfm3, "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr,
+         "gemma4_moe": gemma4_moe, "gemma4_moe_vl": gemma4_moe_vl, "gemma4_unified": gemma4_unified, "lfm3": lfm3, "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr,
          "qwen3_omni": qwen3_omni, "inkling2_loop": inkling2_loop, "bert": bert, "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}
 ENCODER_TOKENIZER_FILES = ["tokenizer.json", "tokenizer_config.json", "vocab.txt", "special_tokens_map.json"]

@@ -565,12 +565,13 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
              "attention relative bias and sink do not fit ", tokens, " queries of ", q_heads, " heads");
     XS_CHECK(attrs.reaching == (reach != nullptr) && (reach == nullptr || attrs.causal),
              "attention reaching ahead is causal and needs each query's reach, and only it");
-    XS_CHECK(reach == nullptr || (reach->dtype() == DType::I32 && reach->numel() == tokens), "attention reach of ",
-             reach == nullptr ? 0 : reach->numel(), " for ", tokens, " queries");
-    const int32_t* ahead = reach != nullptr ? reach->data<int32_t>() : nullptr;
-    for (int64_t t = 0; ahead != nullptr && t < tokens; ++t) {
-        XS_CHECK(ahead[t] >= 0 && t + ahead[t] < tokens, "attention reach ", ahead[t], " of query ", t, " passes the ",
-                 tokens, " keys of the step");
+    XS_CHECK(reach == nullptr || (reach->dtype() == DType::I32 && reach->numel() == 2 * tokens), "attention reach of ",
+             reach == nullptr ? 0 : reach->numel(), " values for ", tokens, " queries (two a query)");
+    const int32_t* bounds = reach != nullptr ? reach->data<int32_t>() : nullptr;  // (back, ahead) a query
+    for (int64_t t = 0; bounds != nullptr && t < tokens; ++t) {
+        XS_CHECK(bounds[2 * t] >= 0 && bounds[2 * t + 1] >= 0 && t + bounds[2 * t + 1] < tokens, "attention reach (",
+                 bounds[2 * t], ", ", bounds[2 * t + 1], ") of query ", t, " passes the ", tokens,
+                 " keys of the step");
     }
     HostTensor out(DType::F32, q.shape());
     pool.parallel_for(tokens * q_heads, [&](int64_t item) {
@@ -578,7 +579,8 @@ HostTensor attention(ThreadPool& pool, const HostTensor& q, const HostTensor& k_
         const int64_t h = item % q_heads;
         const int64_t pos = kv_len - tokens + t;
         int64_t first = attrs.sliding_window > 0 ? std::max<int64_t>(0, pos - attrs.sliding_window + 1) : 0;
-        int64_t last = attrs.causal ? pos + (ahead != nullptr ? ahead[t] : 0) : kv_len - 1;
+        if (bounds != nullptr) first = std::max<int64_t>(0, std::min(first, pos - bounds[2 * t]));
+        int64_t last = attrs.causal ? pos + (bounds != nullptr ? bounds[2 * t + 1] : 0) : kv_len - 1;
         if (attrs.sliding_window > 0 && !attrs.causal) last = std::min(last, pos + attrs.sliding_window - 1);
         if (attrs.anchored) {  // the step and the window before it, whichever the query
             first = std::max<int64_t>(0, kv_len - tokens - attrs.sliding_window);

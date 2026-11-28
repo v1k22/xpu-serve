@@ -1,9 +1,10 @@
 #pragma once
 
-// Causal attention reaching ahead (graph.h AttentionAttrs::reaching: an image's tokens attending to each other both
-// ways, Gemma 4's use_bidirectional_attention "vision"): steps through a KV cache whose rows carry their reach, text
-// rows causal; shared by the cpu-ref and device op tests. A step's runs are images: each row of one sees to the run's
-// end. With a window the keys behind a row are bounded and those ahead are not (planted: bounded both ways).
+// Causal attention reaching (graph.h AttentionAttrs::reaching: an image's tokens attending to each other both ways,
+// Gemma 4's use_bidirectional_attention "vision"): steps through a KV cache whose rows carry their reach, text rows
+// causal; shared by the cpu-ref and device op tests. A step's runs are images: each row of one sees to the run's
+// end; with `whole` (Gemma 4 12B) also back to the run's start past the window. With a window the keys ahead are not
+// bounded (planted: bounded both ways; with `whole`, the window kept over the keys behind).
 
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,7 @@ namespace xs::test::reaching {
 struct Case {
     int64_t heads = 4, kv_heads = 2, head_dim = 64;
     int64_t window = 0;
+    bool whole = false;  // a run's rows see back to its start past the window
     // A step: its length and its image runs, [first, end) each.
     struct Step {
         int64_t tokens;
@@ -39,15 +41,19 @@ inline graph::Graph graph_of(const Case& c) {
     a.scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
     a.sliding_window = c.window;
     a.reaching = true;
-    g.output("out", g.attention_reaching(q, k_all, v_all, g.input("reach", DType::I32, {graph::kT}), a));
+    g.output("out", g.attention_reaching(q, k_all, v_all, g.input("reach", DType::I32, {graph::kT, 2}), a));
     return g;
 }
 
-// Each row's reach: to its run's end inside an image run, 0 for text.
-inline std::vector<int32_t> reach_of(const Case::Step& s) {
-    std::vector<int32_t> r(static_cast<size_t>(s.tokens), 0);
+// Each row's reach, (back, ahead): to its run's end inside an image run (and back to its start with `whole`), 0 for
+// text.
+inline std::vector<int32_t> reach_of(const Case& c, const Case::Step& s) {
+    std::vector<int32_t> r(static_cast<size_t>(2 * s.tokens), 0);
     for (const auto& [first, end] : s.runs) {
-        for (int64_t i = first; i < end; ++i) r[static_cast<size_t>(i)] = static_cast<int32_t>(end - 1 - i);
+        for (int64_t i = first; i < end; ++i) {
+            if (c.whole) r[static_cast<size_t>(2 * i)] = static_cast<int32_t>(i - first);
+            r[static_cast<size_t>(2 * i + 1)] = static_cast<int32_t>(end - 1 - i);
+        }
     }
     return r;
 }
@@ -73,15 +79,15 @@ inline void run(const Case& c, Session& session, uint32_t seed,
         const HostTensor v = rng.uniform(DType::F32, {s.tokens, c.kv_heads, c.head_dim}, 2.0f);
         append(k_all, to_f64(k));
         append(v_all, to_f64(v));
-        const std::vector<int32_t> reach = reach_of(s);
+        const std::vector<int32_t> reach = reach_of(c, s);
         TensorMap out;
-        session.run({{"q", q}, {"k", k}, {"v", v}, {"reach", make_tensor(DType::I32, {s.tokens}, reach)}}, out);
+        session.run({{"q", q}, {"k", k}, {"v", v}, {"reach", make_tensor(DType::I32, {s.tokens, 2}, reach)}}, out);
         ref::AttentionSpec spec;
         spec.scale = 1.0 / std::sqrt(static_cast<double>(c.head_dim));
         spec.sliding_window = c.window;
         spec.reach = reach;
         const Tensor64 expected = ref::attention(to_f64(q), k_all, v_all, spec);
-        spec.reach_bounded = true;
+        (c.whole ? spec.back_ignored : spec.reach_bounded) = true;
         check(i, out.at("out"), expected, ref::attention(to_f64(q), k_all, v_all, spec));
     }
 }
@@ -97,11 +103,13 @@ inline std::vector<Case> cases() {
     one_kv.heads = 8;
     one_kv.kv_heads = 1;
     one_kv.head_dim = 256;
-    return {open, windowed, one_kv};
+    Case whole = windowed;  // the second image's last rows see its first, past the window
+    whole.whole = true;
+    return {open, windowed, one_kv, whole};
 }
 
 inline std::string describe(const Case& c) {
-    return str_cat("H", c.heads, "/", c.kv_heads, " D", c.head_dim, " w", c.window);
+    return str_cat("H", c.heads, "/", c.kv_heads, " D", c.head_dim, " w", c.window, c.whole ? " whole" : "");
 }
 
 }  // namespace xs::test::reaching

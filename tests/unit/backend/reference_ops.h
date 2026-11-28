@@ -356,10 +356,12 @@ struct AttentionSpec {
     int rel_sign = 1;
     // Not causal: every query sees the step's keys and the sliding_window before the step (AttentionAttrs::anchored).
     bool anchored = false;
-    // Causal reaching ahead (AttentionAttrs::reaching): empty, or one per query, the keys past its position it also
-    // sees. `reach_bounded` (planted-bug control) lets the window bound the keys ahead too.
+    // Causal reaching (AttentionAttrs::reaching): empty, or (back, ahead) per query, flattened: the keys past its
+    // position it also sees, and those behind it it sees past the window. Planted-bug controls: `reach_bounded` lets
+    // the window bound the keys ahead too; `back_ignored` keeps the window over the keys behind.
     std::vector<int32_t> reach;
     bool reach_bounded = false;
+    bool back_ignored = false;
 };
 
 // The groups of a state of lengths[0] tokens (group 0) and questions of lengths[1], lengths[2], ... after it (groups
@@ -392,13 +394,15 @@ inline Tensor64 attention(const Tensor64& q, const Tensor64& k, const Tensor64& 
             std::vector<double> scores(static_cast<size_t>(l_len), -std::numeric_limits<double>::infinity());
             for (int64_t j = 0; j < l_len; ++j) {
                 const int64_t reach = spec.sliding_window + spec.window_slack;
-                const int64_t ahead = spec.reach.empty() ? 0 : spec.reach[static_cast<size_t>(i)];
+                const int64_t behind =
+                    spec.reach.empty() || spec.back_ignored ? 0 : spec.reach[static_cast<size_t>(2 * i)];
+                const int64_t ahead = spec.reach.empty() ? 0 : spec.reach[static_cast<size_t>(2 * i + 1)];
                 const bool bounded = spec.reach_bounded && spec.sliding_window > 0 && j - p >= reach;
+                const bool in_window = spec.sliding_window == 0 || (!spec.reach.empty() && j <= p && p - j <= behind) ||
+                                       (p - j < reach && (spec.causal || spec.one_sided || j - p < reach));
                 const bool visible =
                     spec.anchored ? j >= l_len - t_len - spec.sliding_window :
-                    (!spec.causal || j <= p + ahead) && !bounded &&
-                    (spec.sliding_window == 0 || (p - j < reach && (spec.causal || spec.one_sided || j - p < reach))) &&
-                    group_visible(spec, i, j);
+                    (!spec.causal || j <= p + ahead) && !bounded && in_window && group_visible(spec, i, j);
                 if (!visible) continue;
                 double s = 0;
                 for (int64_t d = 0; d < dim; ++d)

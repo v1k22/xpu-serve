@@ -70,7 +70,7 @@ const MediaEncoder* Model::encoder(Modality m) const {
 }
 
 std::vector<std::string> supported_model_types() {
-    return {"gemma4",      "gemma4_text",  "inkling2_loop",    "lfm3",      "llama",          "qwen3",
+    return {"gemma4",      "gemma4_text",  "gemma4_unified",   "inkling2_loop", "lfm3",      "llama",          "qwen3",
             "qwen3_moe",   "qwen3_5",      "qwen3_5_text",     "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_asr",
             "qwen3_omni_moe", "sensenova_loop"};
 }
@@ -89,7 +89,9 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
     if (options.image_max_pixels > 0 && type != "qwen3_omni_moe") {
         fail("--image-max-pixels: ", type, "'s images are not sized by a pixel budget (Qwen3-VL's processor is)");
     }
-    if (type == "gemma4" || type == "gemma4_text") return gemma4::load(dir, config, options);
+    if (type == "gemma4" || type == "gemma4_text" || type == "gemma4_unified") {
+        return gemma4::load(dir, config, options);
+    }
     if (type == "qwen3_5" || type == "qwen3_5_text" || type == "qwen3_5_moe" || type == "qwen3_5_moe_text" ||
         type == "sensenova_loop") {
         return qwen3_5::load(dir, config, options);

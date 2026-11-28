@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <limits>
 
 #include "io/joined_weights.h"
 #include "models/common/blocks.h"
@@ -65,8 +66,9 @@ public:
     // `assistant`: the drafter's config and weights (under "assistant." in weights()), built when `speculation`.
     // `batch`: build batch_graph().
     Gemma4Model(Config cfg, ModelInfo info, std::unique_ptr<SafetensorsWeights> target, int32_t pad_token_id,
-                const std::optional<VisionConfig>& vision, std::optional<AssistantConfig> assistant,
-                std::unique_ptr<SafetensorsWeights> assistant_weights, bool batch)
+                const std::optional<VisionConfig>& vision, const std::optional<AudioConfig>& audio,
+                std::optional<AssistantConfig> assistant,
+                std::unique_ptr<SafetensorsWeights> assistant_weights, bool batch, std::vector<int32_t> suppress)
         : cfg_(std::move(cfg)),
           info_(std::move(info)),
           prefix_(probe_prefix(*target)),
@@ -85,7 +87,12 @@ public:
         } else {
             weights_ = std::move(target);
         }
+        suppress_ = std::move(suppress);
+        for (const int32_t t : suppress_) {
+            XS_CHECK(t >= 0 && t < cfg_.vocab_size, "gemma4: suppress_tokens holds ", t, ", outside the vocabulary");
+        }
         if (vision) load_vision(*vision);
+        if (audio) load_audio(*audio);
         info_.media_whole_steps = reaching();
         build_target(step_, Head::LastLogits);
         if (batch) build_target(batch_, Head::AllLogits);
@@ -105,6 +112,7 @@ public:
         return {w("embed_tokens_per_layer.weight")};
     }
     const VisionEncoder* vision() const override { return vision_.get(); }
+    const AudioEncoder* audio() const override { return audio_.get(); }
     const Speculation* speculation() const override { return assistant_ ? this : nullptr; }
     const graph::Graph* batch_graph() const override { return batched_ ? &batch_ : nullptr; }
 
@@ -114,10 +122,10 @@ public:
         XS_CHECK(n > 0, "gemma4: a step needs at least one token");
         XS_CHECK(embeddings.empty() || static_cast<int64_t>(embeddings.size()) == n, "gemma4: ", embeddings.size(),
                  " embedding entries for ", n, " tokens");
-        XS_CHECK(embeddings.empty() || vision_ != nullptr, "gemma4: embedding rows given, but vision is not loaded");
+        XS_CHECK(embeddings.empty() || media(), "gemma4: embedding rows given, but no media encoder is loaded");
         std::vector<int32_t> ple_ids(tokens.begin(), tokens.end());
         token_inputs(tokens, start_pos, 1, inputs);
-        if (vision_ != nullptr) {
+        if (media()) {
             // Rows replace the scaled token embedding; their per-layer embedding reads the pad token, as the
             // reference does for every multimodal position.
             blocks::media_inputs(embeddings, n, cfg_.hidden_size, inputs);
@@ -126,7 +134,9 @@ public:
             }
         }
         if (ple_table_ != nullptr) inputs["ple"] = gather_ple_rows(ple_ids);
-        if (reaching()) inputs["media_reach"] = media_reach(embeddings, n);
+        if (reaching()) {
+            inputs["media_reach"] = media_reach(tokens, embeddings, vision_->soft_token(), cfg_.bidirectional_whole);
+        }
     }
 
     const graph::Graph& prefill_graph() const override { return prefill_; }
@@ -149,23 +159,34 @@ public:
     }
 
 private:
+    bool media() const { return vision_ != nullptr || audio_ != nullptr; }
     // An image's soft tokens see each other both ways in the sliding layers (use_bidirectional_attention "vision").
     bool reaching() const { return cfg_.bidirectional_vision && vision_ != nullptr; }
 
-    // Each row's reach (Graph::attention_reaching): within a run of image rows, the rows after it in the run; 0 for
-    // text. The engine keeps a run within one step (ModelInfo::media_whole_steps).
-    static HostTensor media_reach(std::span<const float* const> rows, int64_t n) {
-        HostTensor reach(DType::I32, {n});
+    // Each row's reach (Graph::attention_reaching), (back, ahead): within a run of image rows (soft tokens `image`
+    // with their encoder rows), the rows after it in the run, and with `whole` those before it; 0 for text and audio.
+    // The engine keeps a run within one step (ModelInfo::media_whole_steps).
+    static HostTensor media_reach(std::span<const int32_t> tokens, std::span<const float* const> rows, int32_t image,
+                                  bool whole) {
+        const auto n = static_cast<int64_t>(tokens.size());
+        const auto is_image = [&](int64_t i) {
+            return !rows.empty() && rows[static_cast<size_t>(i)] != nullptr && tokens[static_cast<size_t>(i)] == image;
+        };
+        HostTensor reach(DType::I32, {n, 2});
         int32_t* r = reach.data<int32_t>();
-        int64_t end = 0;  // the end of the run row i is in
-        for (int64_t i = n - 1; i >= 0; --i) {
-            const bool image = !rows.empty() && rows[static_cast<size_t>(i)] != nullptr;
-            if (!image) {
-                r[i] = 0;
+        std::fill(r, r + 2 * n, 0);
+        for (int64_t start = 0; start < n;) {
+            if (!is_image(start)) {
+                ++start;
                 continue;
             }
-            if (i == n - 1 || rows[static_cast<size_t>(i + 1)] == nullptr) end = i + 1;
-            r[i] = static_cast<int32_t>(end - 1 - i);
+            int64_t end = start;
+            while (end < n && is_image(end)) ++end;
+            for (int64_t i = start; i < end; ++i) {
+                if (whole) r[2 * i] = static_cast<int32_t>(i - start);
+                r[2 * i + 1] = static_cast<int32_t>(end - 1 - i);
+            }
+            start = end;
         }
         return reach;
     }
@@ -200,11 +221,23 @@ private:
     // model.embed_vision.* beside model.language_model.*.
     void load_vision(const VisionConfig& vc) {
         const std::string vision_prefix = prefix_ == "model.language_model." ? "model." : prefix_;
-        if (!weights_->contains(vision_prefix + "vision_tower.patch_embedder.input_proj.weight")) {
+        const std::string first = vc.unified ? "vision_embedder.patch_dense.weight"
+                                             : "vision_tower.patch_embedder.input_proj.weight";
+        if (!weights_->contains(vision_prefix + first)) {
             log::warn("gemma4: config.json has a vision_config but the checkpoint has no vision weights; text only");
             return;
         }
         vision_ = make_vision_encoder(vc, *weights_, vision_prefix);
+    }
+
+    // 12B's audio, beside the decoder as its images are: model.embed_audio.*.
+    void load_audio(const AudioConfig& ac) {
+        const std::string audio_prefix = prefix_ == "model.language_model." ? "model." : prefix_;
+        if (!weights_->contains(audio_prefix + "embed_audio.embedding_projection.weight")) {
+            log::warn("gemma4: config.json has an audio_config but the checkpoint has no audio weights; no audio");
+            return;
+        }
+        audio_ = make_audio_encoder(ac, *weights_, audio_prefix);
     }
 
     // The assistant drafts for this target: same vocabulary, its queries fit the target's KV heads, and its
@@ -278,6 +311,12 @@ private:
         const std::string head = weights_->contains("lm_head.weight") ? "lm_head.weight" : w("embed_tokens.weight");
         Value logits = g.matmul(x, weight(g, head));
         if (cfg_.final_logit_softcap > 0.0) logits = g.softcap(logits, static_cast<float>(cfg_.final_logit_softcap));
+        if (!suppress_.empty()) {  // generation_config.json's suppress_tokens, never generated (vLLM's Gemma 4 too)
+            HostTensor bias(DType::F32, {cfg_.vocab_size});
+            std::fill(bias.data<float>(), bias.data<float>() + bias.numel(), 0.0f);
+            for (const int32_t t : suppress_) bias.data<float>()[t] = -std::numeric_limits<float>::infinity();
+            logits = g.add(logits, g.constant(std::move(bias)));
+        }
         return logits;
     }
 
@@ -286,9 +325,9 @@ private:
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
         Value h = g.scale(g.gather(weight(g, w("embed_tokens.weight")), ids), embed_scale_);
-        if (vision_ != nullptr) h = blocks::splice_media(g, h, cfg_.hidden_size);
+        if (media()) h = blocks::splice_media(g, h, cfg_.hidden_size);
         // Images come in a prompt's prefill (the step and prefill graphs); every graph takes the input.
-        const Value reach_in = reaching() ? g.input("media_reach", DType::I32, {kT}) : Value{};
+        const Value reach_in = reaching() ? g.input("media_reach", DType::I32, {kT, 2}) : Value{};
         const bool prompt = head == Head::LastLogits || head == Head::LastLogitsAllHidden;
         const Value reach = prompt ? reach_in : Value{};
         const Value per_layer = cfg_.ple_dim > 0 ? per_layer_inputs(g, h) : Value{};
@@ -410,7 +449,7 @@ private:
         spec.attrs.sliding_window = kind == AttnKind::Sliding ? c.sliding_window : 0;
         spec.kv_window = spec.attrs.sliding_window;
         spec.kv_label = "layers." + std::to_string(i);
-        if (kind == AttnKind::Sliding) spec.reach = reach;
+        if (kind == AttnKind::Sliding || c.bidirectional_whole) spec.reach = reach;
         blocks::AttentionParts parts;
         parts.q = proj("self_attn.q_proj.weight");
         parts.k = proj("self_attn.k_proj.weight");
@@ -507,6 +546,8 @@ private:
     std::optional<AssistantConfig> assistant_;
     HostTensor ordering_;  // the assistant's tokens per centroid, [centroids, vocab / centroids] i32
     std::unique_ptr<VisionEncoder> vision_;
+    std::unique_ptr<AudioEncoder> audio_;
+    std::vector<int32_t> suppress_;  // tokens the logits rule out
     graph::Graph step_, batch_, prefill_, verify_, draft_;
     bool batched_ = false;
     const TensorView* ple_table_ = nullptr;
@@ -515,6 +556,16 @@ private:
 };
 
 }  // namespace
+
+// generation_config.json's suppress_tokens: tokens the model is never to generate (Gemma 4 12B's end-of-image and
+// end-of-audio markers).
+static std::vector<int32_t> suppress_tokens(const std::filesystem::path& dir) {
+    const auto path = dir / "generation_config.json";
+    if (!std::filesystem::exists(path)) return {};
+    const nlohmann::json g = cfg::read_json(path);
+    if (!g.contains("suppress_tokens") || g.at("suppress_tokens").is_null()) return {};
+    return cfg::get_int_list(g, "suppress_tokens", "generation_config.json");
+}
 
 std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
                             const LoadOptions& options) {
@@ -528,6 +579,12 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
         } catch (const Error& e) {
             log::warn("gemma4: vision disabled, text only: ", e.what());
         }
+    }
+    std::optional<AudioConfig> audio;
+    try {
+        audio = parse_audio_config(config_json, cfg.hidden_size);
+    } catch (const Error& e) {
+        log::info("gemma4: no audio input: ", e.what());  // E2B's and E4B's conformer is not read
     }
 
     ModelInfo info;
@@ -559,7 +616,9 @@ std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::js
     }
     auto weights = SafetensorsWeights::open_dir(dir);
     return std::make_unique<Gemma4Model>(std::move(cfg), std::move(info), std::move(weights), pad_token_id, vision,
-                                         std::move(assistant), std::move(assistant_weights), options.batch);
+                                         audio,
+                                         std::move(assistant), std::move(assistant_weights), options.batch,
+                                         suppress_tokens(dir));
 }
 
 }  // namespace xs::gemma4

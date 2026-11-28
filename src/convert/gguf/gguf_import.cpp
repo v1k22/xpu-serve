@@ -161,10 +161,12 @@ void write_json(const fs::path& path, const Json& j, int indent) {
     if (!out) fail("gguf import: writing '", path.string(), "' failed");
 }
 
-// generation_config.json from general.sampling.*: the sampling defaults the engine reads, or nullopt when the file
-// has none (the model's defaults then apply, as for a checkpoint without the file).
+// generation_config.json from general.sampling.*: the sampling defaults the engine reads, and the tokens never to
+// generate (tokenizer.ggml.suppress_tokens, the checkpoint's suppress_tokens); nullopt when the file has none (the
+// model's defaults then apply, as for a checkpoint without the file).
 std::optional<nlohmann::ordered_json> generation_config(const gguf::File& f) {
     nlohmann::ordered_json g;
+    if (const gguf::Value* s = f.find("tokenizer.ggml.suppress_tokens")) g["suppress_tokens"] = s->ints();
     for (const auto& [key, name] :
          {std::pair{"temp", "temperature"}, std::pair{"top_k", "top_k"}, std::pair{"top_p", "top_p"},
           std::pair{"min_p", "min_p"}, std::pair{"penalty_repeat", "repetition_penalty"}}) {
