@@ -44,6 +44,9 @@ struct EngineOptions {
     // verify_rows / requests - 1, none when more requests decode than that). A step of up to 8 rows costs about one
     // row's on a discrete GPU (each weight read once); past it the rows add up, a mixture of experts' most.
     int64_t verify_rows = 8;
+    // Speculating in batched steps with a chain drafter: the drafts of the requests run as one run a depth, the
+    // session's program spec::kBatchDraft being the model's Speculation::batch_draft_graph.
+    bool batch_draft = false;
 };
 
 // The session's program that runs Model::batch_graph() (EngineOptions::batch), after the step graph.
@@ -153,6 +156,10 @@ private:
     // The drafts of a round of `g` after its pending token: up to `k`, none from the first its constraint refuses (a
     // target row masked by it never takes that draft), and the time drafting took.
     std::vector<int32_t> propose(Generation& g, int k, double& ms);
+    // The drafts of rounds of each of `gs` (up to `ks[i]` each, cut as propose() cuts them), their chain drafters' runs
+    // as one run a depth over the sequences (EngineOptions::batch_draft); each one's share of the time in `ms`.
+    std::vector<std::vector<int32_t>> propose_together(std::span<Generation* const> gs, std::span<const int> ks,
+                                                       std::vector<double>& ms);
     // One speculative round of `g` after its pending token (emitted, not yet cached): `k` drafts, one verify of them
     // all, acceptance and rollback. Returns the accepted drafts and the target's next token.
     std::vector<int32_t> spec_round(Generation& g, int k);

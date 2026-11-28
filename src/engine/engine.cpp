@@ -7,6 +7,7 @@
 
 #include "engine/media.h"
 #include "engine/sampler.h"
+#include "engine/spec/chain_drafter.h"
 #include "util/error.h"
 #include "util/log.h"
 #include "util/timer.h"
@@ -67,6 +68,10 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
                  spec->drafter_name(), " proposes");
         has_argmax_ = has_argmax_ && offers_argmax(spec->prefill_graph()) && offers_argmax(spec->verify_graph());
     }
+    XS_CHECK(!options_.batch_draft || (options_.batch && options_.spec_k > 0 && !options_.ngram &&
+                                       model_->speculation()->chain() != nullptr &&
+                                       model_->speculation()->batch_draft_graph() != nullptr),
+             "batched drafts need batched rounds of a chain drafter whose model offers its batch draft program");
     if (options_.batch && options_.spec_k > 0 && !options_.ngram) {
         XS_CHECK(model_->speculation()->verify_graph().segmented(), "model ", model_->info().id,
                  " was loaded without a verify graph of several requests (LoadOptions::batch)");
@@ -244,6 +249,75 @@ std::vector<int32_t> Engine::propose(Generation& g, int k, double& ms) {
         Timer checking;
         drafts.resize(g.constraint->allowed_prefix(drafts));
         g.result.stats.constraint_ms += checking.elapsed_ms();
+    }
+    return drafts;
+}
+
+std::vector<std::vector<int32_t>> Engine::propose_together(std::span<Generation* const> gs, std::span<const int> ks,
+                                                           std::vector<double>& ms) {
+    Timer timer;
+    std::vector<std::vector<int32_t>> drafts(gs.size());
+    std::vector<spec::ChainDrafter*> drafter(gs.size(), nullptr);
+    std::vector<size_t> active;  // the requests that draft at this depth
+    for (size_t i = 0; i < gs.size(); ++i) {
+        if (ks[i] <= 0) continue;
+        drafter[i] = sequences_[gs[i]->sequence].drafter->as_chain();
+        XS_CHECK(drafter[i] != nullptr, "batched drafts need chain drafters");
+        active.push_back(i);
+    }
+    // One run of the batch draft program over the inputs `in` of `active`, `rows` each; each one's draft from the last
+    // of its rows.
+    const auto run = [&](std::vector<TensorMap>& in, const std::vector<int64_t>& rows, bool first) {
+        std::map<std::string, std::vector<HostTensor>> parts;
+        std::vector<Segment> segments;
+        for (size_t j = 0; j < active.size(); ++j) {
+            for (auto& [name, t] : in[j]) parts[name].push_back(std::move(t));
+            segments.push_back({static_cast<int64_t>(gs[active[j]]->sequence), rows[j]});
+        }
+        TensorMap inputs, outputs;
+        for (auto& [name, list] : parts) inputs[name] = concat_rows(list);
+        session_->run_segments(spec::kBatchDraft, segments, inputs, outputs, {});
+        int64_t row = 0;
+        for (size_t j = 0; j < active.size(); ++j) {
+            TensorMap own;
+            for (const auto& [name, t] : outputs) own[name] = rows_of(t, row, rows[j]);
+            spec::ChainDrafter& d = *drafter[active[j]];
+            drafts[active[j]].push_back(first ? d.first(own, rows[j] - 1) : d.next(own, rows[j] - 1));
+            row += rows[j];
+        }
+    };
+    std::vector<TensorMap> in(active.size());
+    std::vector<int64_t> rows(active.size());
+    for (size_t j = 0; j < active.size(); ++j) {
+        select(gs[active[j]]->sequence);
+        rows[j] = drafter[active[j]]->begin(gs[active[j]]->token, in[j]);
+    }
+    run(in, rows, true);
+    for (int depth = 1;; ++depth) {
+        std::erase_if(active, [&](size_t i) { return ks[i] <= depth; });
+        if (active.empty()) break;
+        in.assign(active.size(), TensorMap{});
+        rows.assign(active.size(), 1);
+        for (size_t j = 0; j < active.size(); ++j) drafter[active[j]]->chained(depth, in[j]);
+        run(in, rows, false);
+    }
+    size_t drafting = 0;
+    for (size_t i = 0; i < gs.size(); ++i) {
+        if (drafter[i] == nullptr) continue;
+        select(gs[i]->sequence);
+        drafter[i]->end();
+        ++drafting;
+    }
+    const double each = drafting > 0 ? timer.elapsed_ms() / static_cast<double>(drafting) : 0.0;
+    for (size_t i = 0; i < gs.size(); ++i) {
+        if (drafter[i] == nullptr) continue;
+        ms[i] = each;
+        Generation& g = *gs[i];
+        if (g.constraint) {
+            Timer checking;
+            drafts[i].resize(g.constraint->allowed_prefix(drafts[i]));
+            g.result.stats.constraint_ms += checking.elapsed_ms();
+        }
     }
     return drafts;
 }
@@ -749,12 +823,20 @@ void Engine::decode_together(std::span<Generation* const> gs) {
     std::vector<Segment> segments;
     std::map<std::string, std::vector<HostTensor>> rows;
     bool logits = false;
+    std::vector<int> ks(gs.size(), 0);
+    for (size_t i = 0; i < gs.size() && speculating; ++i) ks[i] = std::min(round_drafts(*gs[i]), share);
+    std::vector<std::vector<int32_t>> together;  // the drafts of all, one run a depth
+    if (options_.batch_draft && std::count_if(ks.begin(), ks.end(), [](int k) { return k > 0; }) > 1) {
+        together = propose_together(gs, ks, draft_ms);
+    }
     for (size_t i = 0; i < gs.size(); ++i) {
         Generation& g = *gs[i];
         select(g.sequence);
         fed[i] = {g.token};
-        if (const int k = speculating ? std::min(round_drafts(g), share) : 0; k > 0) {
-            const std::vector<int32_t> drafts = propose(g, k, draft_ms[i]);
+        if (!together.empty()) {
+            fed[i].insert(fed[i].end(), together[i].begin(), together[i].end());
+        } else if (ks[i] > 0) {
+            const std::vector<int32_t> drafts = propose(g, ks[i], draft_ms[i]);
             fed[i].insert(fed[i].end(), drafts.begin(), drafts.end());
         }
         const auto at = static_cast<int64_t>(seq().cached.size());

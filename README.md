@@ -76,8 +76,8 @@ optimized one) and what was measured**; this page says what is supported and how
 Not yet:
 
 - A system prompt shared between users of a model with recurrent state (a prefix is copied between requests up to
-  where a conversation's messages ended: decision 0029); with `--spec`, the drafts of several requests in one step
-  (their verifies already are).
+  where a conversation's messages ended: decision 0029); with `--spec` and a block drafter (DFlash, DSpine, DSpark),
+  the drafts of several requests in one run (an MTP head's already are, and every drafter's verifies).
 - One model across two GPUs.
 - Timestamps and translation of speech; speech output; video input; images for Gemma 4 26B-A4B and SenseNova Loop,
   and for a Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.

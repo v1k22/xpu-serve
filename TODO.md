@@ -150,8 +150,11 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] Batched speculative rounds: the verifies of the requests in flight as one step, a segment of k + 1 rows each,
       sharing a budget of rows (decision 0028)
 - [x] A verify's stateful ops as one launch over the segments, each keeping its inputs for the truncate
-- [ ] The drafters' steps of several sequences as one (a draft program of every row's outputs; a block drafter's
-      attention within each segment's block)
+- [x] A chain drafter's steps of several sequences as one: the MTP head's program over every row's outputs
+      (`Speculation::batch_draft_graph`, a shortlist a row), one run a depth for all (`Engine::propose_together`);
+      Qwen3.5-4B with MTP, 4 requests: 161 to 178 tok/s in all on the B60
+- [ ] The same for a Gemma 4 assistant (it reads its target's KV: `KvRead` within segments) and for block drafters
+      (attention within each segment's block)
 - [x] One launch over a batched step's segments for its stateful ops: the convolutions, the gated delta rule, the KV
       appends and decode attention, each segment reading and writing its sequence's cache in any format (decision 0028)
 - [x] Prefix reuse for models with conv or recurrent state: a snapshot of the sequence's state where a chat's messages

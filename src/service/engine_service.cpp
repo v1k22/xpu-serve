@@ -120,6 +120,11 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
             log::info("the speculative rounds of up to ", engine_options.sequences,
                       " requests in flight verify as one step of up to ", engine_options.verify_rows,
                       " rows (fewer drafts as more requests decode)");
+            if (const graph::Graph* drafts = spec->chain() != nullptr ? spec->batch_draft_graph() : nullptr) {
+                programs.push_back(drafts);  // spec::kBatchDraft
+                engine_options.batch_draft = true;
+                log::info("their drafts run as one run of the drafter a depth");
+            }
         } else if (batch) {
             log::info("speculating, the ", engine_options.sequences, " requests in flight decode a round each in turn");
         }
@@ -165,6 +170,8 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
         session_options.max_step_tokens = {chunk, rounds * (engine_options.spec_k + 1)};
     } else if (speculate) {
         session_options.max_step_tokens = {0, chunk, rounds * (engine_options.spec_k + 1), 0};
+        // A batched draft run: each sequence's waiting pairs (a round's accepted tokens and its pending one).
+        if (engine_options.batch_draft) session_options.max_step_tokens.push_back(rounds * (engine_options.spec_k + 1));
     }
     if (engine_options.batch && !speculate) session_options.max_step_tokens.push_back(engine_options.sequences);
     Timer compile_timer;

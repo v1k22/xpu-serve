@@ -95,7 +95,11 @@ public:
         if (cfg_.mtp_layers != 1) fail("qwen3_5: an MTP head of ", cfg_.mtp_layers, " layers is not supported (1 is)");
         build_target(prefill_, Head::LastLogitsAllHidden);
         build_target(verify_, Head::AllLogitsAllHidden);
-        build_mtp(draft_, options.draft_shortlist);
+        build_mtp(draft_, options.draft_shortlist, /*every_row=*/false);
+        if (options.batch) {
+            draft_batch_.allow_segments();
+            build_mtp(draft_batch_, options.draft_shortlist, /*every_row=*/true);
+        }
         has_mtp_ = true;
     }
 
@@ -133,6 +137,9 @@ public:
     const graph::Graph& prefill_graph() const override { return prefill_; }
     const graph::Graph& verify_graph() const override { return verify_; }
     const graph::Graph& draft_graph() const override { return draft_; }
+    const graph::Graph* batch_draft_graph() const override {
+        return has_mtp_ && draft_batch_.segmented() ? &draft_batch_ : nullptr;
+    }
     const ChainDrafting* chain() const override { return block_ ? nullptr : this; }
     const BlockDrafting* block() const override { return block_.get(); }
     std::string_view drafter_name() const override { return block_ ? dflash::variant_name(block_->config().variant) : "mtp"; }
@@ -197,7 +204,8 @@ private:
 
     // `shortlist` > 0: the drafts pick among that many tokens (blocks::shortlist_head) instead of reading the whole
     // head, which is most of a draft step.
-    void build_mtp(Graph& g, int64_t shortlist) const {
+    // The MTP head's program: of the last pair, or (`every_row`) of every row, for the drafts of several sequences.
+    void build_mtp(Graph& g, int64_t shortlist, bool every_row) {
         const Decoder::Inputs in = dec_.inputs(g);
         const Value hidden = g.input("hidden", DType::F32, {kT, cfg_.hidden_size});
         Graph::Scope scope(g, "mtp");
@@ -205,14 +213,17 @@ private:
         const Value x = g.matmul(g.concat({e, dec_.norm(g, hidden, "mtp.pre_fc_norm_hidden.weight")}, 1),
                                  dec_.weight(g, "mtp.fc.weight"));
         const Value h = dec_.layer(g, "mtp.layers.0.", "mtp.layers.0", LayerKind::Full, x, in.pos, dec_.rope(g));
-        const Value last = dec_.norm(g, g.slice(h, 0, -1), "mtp.norm.weight");
+        const Value last = dec_.norm(g, every_row ? h : g.slice(h, 0, -1), "mtp.norm.weight");
         if (shortlist > 0 && shortlist < cfg_.vocab_size && cfg_.hidden_size % 32 == 0) {
-            Timer timer;
-            const quant::SignSketch sketch = quant::sign_sketch(weights_->get(dec_.lm_head_name()));
-            log::info("qwen3_5: drafts pick among ", shortlist, " of ", cfg_.vocab_size, " tokens (a one-bit sketch of ",
-                      "the head, ", sketch.signs.nbytes() >> 20, " MiB, built in ", static_cast<int>(timer.elapsed_ms()),
-                      " ms)");
-            const blocks::Shortlist s = blocks::shortlist_head(g, last, dec_.lm_head(g), sketch, shortlist);
+            if (!sketch_) {
+                Timer timer;
+                sketch_ = quant::sign_sketch(weights_->get(dec_.lm_head_name()));
+                log::info("qwen3_5: drafts pick among ", shortlist, " of ", cfg_.vocab_size, " tokens (a one-bit ",
+                          "sketch of the head, ", sketch_->signs.nbytes() >> 20, " MiB, built in ",
+                          static_cast<int>(timer.elapsed_ms()), " ms)");
+            }
+            const blocks::Shortlist s = every_row ? blocks::shortlist_head_rows(g, last, dec_.lm_head(g), *sketch_, shortlist)
+                                                  : blocks::shortlist_head(g, last, dec_.lm_head(g), *sketch_, shortlist);
             g.output("logits", s.logits);
             g.output("candidates", s.candidates);
         } else {
@@ -226,7 +237,8 @@ private:
     ModelInfo info_;
     std::unique_ptr<WeightStore> weights_;
     Decoder dec_;
-    graph::Graph step_, batch_, prefill_, verify_, draft_;
+    graph::Graph step_, batch_, prefill_, verify_, draft_, draft_batch_;
+    std::optional<quant::SignSketch> sketch_;  // of the head, which an MTP head's shortlist scores rows with
     bool batched_ = false;
     bool has_mtp_ = false;
     std::unique_ptr<dflash::Drafter> block_;  // a block drafter instead of the MTP head

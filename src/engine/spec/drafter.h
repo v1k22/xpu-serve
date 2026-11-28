@@ -17,8 +17,11 @@ namespace xs::spec {
 
 // The programs of a session speculating with the model's drafter (Speculation), in the order the engine compiles them.
 // A drafter without a program of its own (prompt lookup, ngram_drafter.h) prefills with the step graph and verifies
-// with the batch graph (EngineOptions::ngram).
-enum Program : size_t { kStep = 0, kPrefill = 1, kVerify = 2, kDraft = 3 };
+// with the batch graph (EngineOptions::ngram). kBatchDraft: a chain drafter's program over several sequences
+// (Speculation::batch_draft_graph), when the session holds it (EngineOptions::batch_draft).
+enum Program : size_t { kStep = 0, kPrefill = 1, kVerify = 2, kDraft = 3, kBatchDraft = 4 };
+
+class ChainDrafter;
 
 class Drafter {
 public:
@@ -40,6 +43,8 @@ public:
     // After reset(): the sequence holds `tokens` (-1 for a media item's), copied from another without a run of the
     // target. A drafter that reads only the tokens takes them; one that reads the target's outputs starts after them.
     virtual void adopt(std::span<const int32_t> /*tokens*/) {}
+    // A chain drafter, whose rounds can run in steps beside other sequences'; null for any other.
+    virtual ChainDrafter* as_chain() { return nullptr; }
 };
 
 // The runner of the model's way of drafting: over `session`, whose programs are in Program order.

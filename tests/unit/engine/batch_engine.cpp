@@ -1,7 +1,8 @@
 // Decode steps of the requests in flight run as one (EngineOptions::batch), on cpu-ref over a model with every kind of
 // state: each request emits the tokens and finish it gets alone, greedy or sampled, reading each row's argmax or the
 // logits, through stop tokens, token budgets, prefill chunks between decode steps and a request starting late; and
-// speculating with a chain or a block drafter, the rounds of all verified as one step.
+// speculating with a chain or a block drafter, the rounds of all verified as one step (a chain drafter's drafts of all
+// run as one run a depth too).
 #include <doctest/doctest.h>
 
 #include <vector>
@@ -39,6 +40,8 @@ TEST_CASE("decode steps of several requests run as one: each request's tokens an
             CAPTURE(batch);
             const auto engine = make_engine(d.spec_k, 3, argmax, d.block, 3, batch);
             CHECK(engine->options().batch == batch);
+            // A chain drafter's drafts of all run as one run a depth (its batch draft program).
+            CHECK(engine->options().batch_draft == (batch && d.spec_k > 0 && !d.block));
             std::vector<Engine::Handle> handles{*engine->start(a, {}), *engine->start(b, {})};
             std::vector<GenerateResult> got(3);
             std::vector<bool> finished(3, false);

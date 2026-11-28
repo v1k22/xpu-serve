@@ -90,7 +90,12 @@ public:
         if (batch_) verify_.allow_segments();  // speculating, the rounds of several requests verify as one step
         build_target(verify_, true, true);
         verify_.validate();
-        block_ ? build_block() : build_draft();
+        block_ ? build_block() : build_draft(draft_, false);
+        if (batch_ && !block_) {  // the chain drafter's runs over several sequences as one
+            draft_batch_.allow_segments();
+            build_draft(draft_batch_, true);
+            draft_batch_.validate();
+        }
     }
 
     const ModelInfo& info() const override { return info_; }
@@ -110,6 +115,7 @@ public:
     const Graph& prefill_graph() const override { return prefill_; }
     const Graph& verify_graph() const override { return verify_; }
     const Graph& draft_graph() const override { return draft_; }
+    const Graph* batch_draft_graph() const override { return batch_ && !block_ ? &draft_batch_ : nullptr; }
     const ChainDrafting* chain() const override { return block_ ? nullptr : this; }
     const BlockDrafting* block() const override { return block_ ? this : nullptr; }
     std::string_view drafter_name() const override { return block_ ? "tiny-block" : "tiny"; }
@@ -182,15 +188,15 @@ private:
         g.output("drafts", blocks::argmax_rows(g, g.matmul(rows, g.weight(weights_, "embed"))));
     }
 
-    void build_draft() {
-        Graph& g = draft_;
+    // `every_row`: the outputs of every row (the drafts of several sequences in one run), not the last's.
+    void build_draft(Graph& g, bool every_row) {
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
         const Value hidden = g.input("hidden", DType::F32, {kT, kHidden});
         Value h = g.add(g.gather(g.weight(weights_, "embed"), ids),
                         g.scale(g.matmul(hidden, g.weight(weights_, "draft.hidden")), kDraftMix));
         h = attention(g, "draft.", "draft", h, pos, kDraftMix);
-        const Value last = g.rms_norm(g.slice(h, 0, -1), 1e-6f);
+        const Value last = g.rms_norm(every_row ? h : g.slice(h, 0, -1), 1e-6f);
         g.output("logits", g.matmul(last, g.weight(weights_, "draft.head")));
         g.output("hidden", last);
     }
@@ -200,7 +206,7 @@ private:
     bool batch_ = false;
     test::MemoryWeights weights_;
     ModelInfo info_;
-    Graph step_, batch_graph_, prefill_, verify_, draft_;
+    Graph step_, batch_graph_, prefill_, verify_, draft_, draft_batch_;
 };
 
 // `batch`: the decode steps of the sequences in flight run as one (EngineOptions::batch): speculating, their
@@ -220,7 +226,9 @@ inline std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bo
     if (spec_k > 0) {
         programs.insert(programs.end(), {&model->prefill_graph(), &model->verify_graph(), &model->draft_graph()});
         options.rewind_tokens = spec_k + 1;
+        if (batch && model->batch_draft_graph() != nullptr) programs.push_back(model->batch_draft_graph());
     }
+    const bool batch_draft = spec_k > 0 && batch && model->batch_draft_graph() != nullptr;
     auto session = backend->compile(programs, model->weights(), options);
     EngineOptions engine;
     engine.max_context = options.max_context;
@@ -230,6 +238,7 @@ inline std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bo
     engine.batch = batch;
     engine.verify_rows = verify_rows;
     engine.adaptive_k = adaptive_k;
+    engine.batch_draft = batch_draft;
     return std::make_unique<Engine>(std::move(model), std::move(session), EncoderSessions{}, engine);
 }
 

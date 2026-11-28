@@ -33,6 +33,16 @@ Shortlist shortlist_head(Graph& g, Value x, Value head, const quant::SignSketch&
     return {g.matmul(x, g.gather(head, candidates)), candidates};
 }
 
+Shortlist shortlist_head_rows(Graph& g, Value x, Value head, const quant::SignSketch& sketch, int64_t count) {
+    Graph::Scope scope(g, "shortlist");
+    const Value scores = g.sign_matmul(x, g.constant(sketch.signs), g.constant(sketch.scales));  // [T, V]
+    const Value candidates = g.topk(scores, count).second;                                       // [T, count]
+    const int64_t hidden = g.type(x).shape.back();
+    const Value rows = g.gather(head, candidates);                                              // [T, count, hidden]
+    const Value logits = g.reduce_sum(g.mul(g.reshape(x, {graph::kT, 1, hidden}), rows), 2);   // [T, count]
+    return {logits, candidates};
+}
+
 Value argmax_rows(Graph& g, Value logits) {
     return g.reshape(g.topk(logits, 1).second, {g.type(logits).shape[0]});
 }

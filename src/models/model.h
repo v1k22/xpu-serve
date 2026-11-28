@@ -78,7 +78,8 @@ public:
 // A drafter that proposes one token a run (an MTP head, an assistant): Speculation::draft_graph takes pairs (the
 // target's "hidden" row of position i, the token at i + 1) and gives "logits" [1, n] and "hidden" [1, width] of the
 // last pair (the hidden the next chained step takes), where the logits are over the vocabulary or, when the graph has
-// an I32 "candidates" output [n], over the tokens it lists. The target's prefill and verify programs output "hidden":
+// an I32 "candidates" output [n], over the tokens it lists. Speculation::batch_draft_graph gives them for every row,
+// candidates [rows, n]. The target's prefill and verify programs output "hidden":
 // whatever the drafter takes of them, one row per token.
 class ChainDrafting {
 public:
@@ -125,6 +126,11 @@ public:
     virtual const graph::Graph& verify_graph() const = 0;
     // The drafter's program: what it takes and gives is its way of drafting, exactly one of the two below.
     virtual const graph::Graph& draft_graph() const = 0;
+    // A chain drafter's program over the next pairs of several sequences, a segment each (Graph::allow_segments), its
+    // outputs of every row ("logits" [rows, n], "candidates" [rows, n] when it picks among a shortlist, "hidden"): the
+    // drafts of several requests in one run. Null when the model was loaded without LoadOptions::batch, or its drafter
+    // reads across sequences (an assistant reads its target's KV).
+    virtual const graph::Graph* batch_draft_graph() const { return nullptr; }
     virtual const ChainDrafting* chain() const { return nullptr; }
     virtual const BlockDrafting* block() const { return nullptr; }
     // What drafts: "mtp", "assistant", "dflash", "dflash2", "dspine", "dspark".

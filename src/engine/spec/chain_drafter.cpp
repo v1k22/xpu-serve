@@ -66,24 +66,47 @@ void ChainDrafter::flush() {
 
 std::vector<int32_t> ChainDrafter::propose(int32_t pending, int k) {
     XS_CHECK(k >= 1, "spec: a round drafts at least one token");
+    TensorMap out;
+    begin(pending, inputs_);
+    session_.run(kDraft, inputs_, out);
+    std::vector<int32_t> drafts{first(out, 0)};
+    for (int s = 1; s < k; ++s) {
+        chained(s, inputs_);
+        session_.run(kDraft, inputs_, out);
+        drafts.push_back(next(out, 0));
+    }
+    end();
+    return drafts;
+}
+
+int64_t ChainDrafter::begin(int32_t pending, TensorMap& inputs) {
     XS_CHECK(rows() > 0 && static_cast<int64_t>(next_.size()) == rows() - 1, "spec: no target row to draft after");
     next_.push_back(pending);
-    const int64_t position = start_ + rows() - 1;  // of the last pair: chained drafts follow it
-    TensorMap out;
-    run_pairs(rows(), out);
-    std::vector<int32_t> drafts{pick(out)};
-    const int64_t kept = chain_.drafter_keeps_state() ? session_.num_cached(kDraft) : 0;
-    for (int s = 1; s < k; ++s) {
-        const HostTensor& h = out.at("hidden");
-        const int32_t token[] = {drafts.back()};
-        inputs_.clear();
-        chain_.prepare_draft(token, std::span<const float>(h.data<float>(), static_cast<size_t>(h.numel())), position,
-                            s, inputs_);
-        session_.run(kDraft, inputs_, out);
-        drafts.push_back(pick(out));
-    }
-    if (chain_.drafter_keeps_state()) session_.truncate(kDraft, kept);  // chained pairs were drafts, not the sequence
-    return drafts;
+    position_ = start_ + rows() - 1;  // of the last pair: chained drafts follow it
+    const int64_t n = rows();
+    // The pairs are the sequence's: the drafter keeps them; what the chained runs append is cut back.
+    kept_ = chain_.drafter_keeps_state() ? session_.num_cached(kDraft) + n : 0;
+    inputs.clear();
+    chain_.prepare_draft(std::span<const int32_t>(next_).first(static_cast<size_t>(n)),
+                        std::span<const float>(hidden_).first(static_cast<size_t>(n * width_)), start_, 0, inputs);
+    return n;
+}
+
+int32_t ChainDrafter::first(const TensorMap& out, int64_t row) {
+    drop(rows());
+    return take(out, row);
+}
+
+void ChainDrafter::chained(int depth, TensorMap& inputs) const {
+    const int32_t token[] = {last_};
+    inputs.clear();
+    chain_.prepare_draft(token, last_hidden_, position_, depth, inputs);
+}
+
+int32_t ChainDrafter::next(const TensorMap& out, int64_t row) { return take(out, row); }
+
+void ChainDrafter::end() {
+    if (chain_.drafter_keeps_state()) session_.truncate(kDraft, kept_);  // chained pairs were drafts, not the sequence
 }
 
 void ChainDrafter::truncate(int64_t n) {
@@ -112,17 +135,33 @@ void ChainDrafter::run_pairs(int64_t n, TensorMap& out) {
     chain_.prepare_draft(std::span<const int32_t>(next_).first(static_cast<size_t>(n)),
                         std::span<const float>(hidden_).first(static_cast<size_t>(n * width_)), start_, 0, inputs_);
     session_.run(kDraft, inputs_, out);
+    drop(n);
+}
+
+void ChainDrafter::drop(int64_t n) {
     hidden_.erase(hidden_.begin(), hidden_.begin() + n * width_);
-    next_.erase(next_.begin(), next_.begin() + n);
+    next_.erase(next_.begin(), next_.begin() + std::min(n, static_cast<int64_t>(next_.size())));
     start_ += n;
 }
 
-int32_t ChainDrafter::pick(const TensorMap& out) const {
+int32_t ChainDrafter::take(const TensorMap& out, int64_t row) {
     const HostTensor& logits = out.at("logits");
-    const float* l = logits.data<float>();
-    const auto best = std::max_element(l, l + logits.numel()) - l;
+    const HostTensor& hidden = out.at("hidden");
+    XS_CHECK(logits.rank() == 2 && row < logits.dim(0) && hidden.rank() == 2 && row < hidden.dim(0),
+             "spec: the drafter's outputs hold no row ", row);
+    const int64_t n = logits.dim(1);
+    const float* l = logits.data<float>() + row * n;
+    const auto best = std::max_element(l, l + n) - l;
     const auto it = out.find("candidates");
-    return static_cast<int32_t>(it == out.end() ? best : it->second.data<int32_t>()[best]);
+    if (it == out.end()) {
+        last_ = static_cast<int32_t>(best);
+    } else {  // [n] for the last pair's run, [rows, n] for every row's
+        const HostTensor& c = it->second;
+        last_ = c.data<int32_t>()[(c.rank() == 2 ? row * c.dim(1) : 0) + best];
+    }
+    const int64_t width = hidden.dim(1);
+    last_hidden_.assign(hidden.data<float>() + row * width, hidden.data<float>() + (row + 1) * width);
+    return last_;
 }
 
 }  // namespace xs::spec

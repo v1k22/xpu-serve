@@ -33,6 +33,10 @@ public:
             prefill_ = graph::with_low_rank(s->prefill_graph(), weights_, named, &used);
             verify_ = graph::with_low_rank(s->verify_graph(), weights_, named, &used);
             draft_ = graph::with_low_rank(s->draft_graph(), weights_, named, &used);
+            if (const graph::Graph* d = s->batch_draft_graph()) {
+                draft_batch_ = graph::with_low_rank(*d, weights_, named, &used);
+                draft_batched_ = true;
+            }
         }
         for (const auto& [weight, c] : named) {
             XS_CHECK(used.count(weight) != 0, "adapter: it changes ", weight, ", which no program of ",
@@ -61,6 +65,7 @@ public:
     const graph::Graph& prefill_graph() const override { return prefill_; }
     const graph::Graph& verify_graph() const override { return verify_; }
     const graph::Graph& draft_graph() const override { return draft_; }
+    const graph::Graph* batch_draft_graph() const override { return draft_batched_ ? &draft_batch_ : nullptr; }
     const ChainDrafting* chain() const override { return model_->speculation()->chain(); }
     const BlockDrafting* block() const override { return model_->speculation()->block(); }
     std::string_view drafter_name() const override { return model_->speculation()->drafter_name(); }
@@ -69,8 +74,9 @@ public:
 private:
     std::unique_ptr<Model> model_;
     JoinedWeights weights_;
-    graph::Graph step_, batch_, prefill_, verify_, draft_;
+    graph::Graph step_, batch_, prefill_, verify_, draft_, draft_batch_;
     bool batched_ = false;
+    bool draft_batched_ = false;
 };
 
 }  // namespace

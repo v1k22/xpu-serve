@@ -85,6 +85,8 @@ struct Shortlist {
     Value candidates;
 };
 Shortlist shortlist_head(Graph& g, Value x, Value head, const quant::SignSketch& sketch, int64_t count);
+// The same for each row of x [T, hidden]: candidates [T, count] and their logits [T, count].
+Shortlist shortlist_head_rows(Graph& g, Value x, Value head, const quant::SignSketch& sketch, int64_t count);
 
 // The index of each row's largest logit (ties to the lower index), [rows] i32: the "argmax" output a target program
 // offers beside "logits", so that greedy decoding never brings the logits back from the device.

@@ -310,6 +310,14 @@ For the dense model speculation pays up to four requests (81.0 against 39.6 for 
 costs 3 % at eight; for the mixture of experts it pays up to two (76.0 against 70.7) and costs from four on, so serve
 more than two users of Inkling-2-Mini without `--spec`.
 
+An MTP head drafts for all the requests in one run a depth (since 2026-11-28; before, a run a request): the same drafts,
+fewer launches. Chat prompts, 256 tokens, tok/s in all:
+
+| Model, MTP head | N = 2: a run each → one run | N = 4: a run each → one run |
+|---|---|---|
+| Qwen3.5-4B, bf16 (k = 3) | 116.5 → 126.5 | 161.4 → 178.4 |
+| Qwen3.8-27B, unsloth Q4_0 (k = 4) | 74.4 → 77.9 | 97.5 → 102.7 |
+
 ## Language models
 
 All of them are served behind the OpenAI API ([README](README.md#chat-completions)). Where a model thinks by
