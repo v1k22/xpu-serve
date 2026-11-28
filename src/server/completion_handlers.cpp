@@ -15,6 +15,7 @@
 #include "server/anthropic_request.h"
 #include "server/generation_run.h"
 #include "server/grammar_constraint.h"
+#include "server/tool_grammar.h"
 #include "server/openai_format.h"
 #include "server/openai_request.h"
 #include "server/response_format.h"
@@ -34,6 +35,7 @@ struct CompletionHandlers::Job {
     GenerationOptions options;
     std::string dialect;  // output parser; raw completions are always "plain"
     std::string prompt_tail;  // chat::prompt_tail of the prompt text: the parser's start state
+    size_t max_tool_calls = kAnyCalls;  // parallel_tool_calls false: the first call alone
 };
 
 namespace {
@@ -103,11 +105,41 @@ void log_summary(std::string_view id, const GenerationOutcome& outcome, bool has
 
 }  // namespace
 
+const grammar::Vocabulary& CompletionHandlers::vocabulary() const {
+    std::call_once(vocabulary_once_, [this] { vocabulary_ = grammar_vocabulary(service_.tokenizer()); });
+    return *vocabulary_;
+}
+
+std::shared_ptr<const OutputConstraint> CompletionHandlers::chat_constraint(const ChatRequest& chat,
+                                                                            std::string_view dialect,
+                                                                            std::string_view prompt_tail) const {
+    const ToolChoice& choice = chat.tool_choice;
+    const bool forced = choice.mode == ToolChoice::Mode::required || choice.mode == ToolChoice::Mode::named;
+    // A dialect without tool calls has a reply the format holds alone.
+    const bool or_answer = choice.mode == ToolChoice::Mode::automatic && chat.options.format && writes_tool_calls(dialect);
+    if (choice.mode == ToolChoice::Mode::automatic && !chat.options.format) {
+        // Strict tools: a call, once opened, is held to the tool's schema; the rest of the reply is free.
+        const std::optional<CallsAfterOpener> calls = strict_calls(dialect, chat.tools, vocabulary());
+        if (!calls) return nullptr;
+        return std::make_shared<OpenerConstraint>(calls->opener, calls->grammar, vocabulary_);
+    }
+    if (!forced && !or_answer) return output_constraint(chat.options, dialect, prompt_tail);
+    const chat::AnswerStart start = chat::answer_start(dialect, prompt_tail);
+    const ToolCalls calls{.tools = &chat.tools,
+                          .choice = choice,
+                          .parallel = chat.parallel_tool_calls,
+                          .answer = or_answer ? chat.options.format : nullptr,
+                          .answer_opening = start.opening};
+    // The grammar holds the dialect's whole syntax of calls (and the answer's opening): no tokens forced before it.
+    return std::make_shared<GrammarConstraint>(tool_call_grammar(dialect, calls, vocabulary()), vocabulary_,
+                                               start.reasoning_end, std::vector<int32_t>{});
+}
+
 std::shared_ptr<const OutputConstraint> CompletionHandlers::output_constraint(const GenerationOptions& options,
                                                                               std::string_view dialect,
                                                                               std::string_view prompt_tail) const {
     if (!options.format) return nullptr;
-    std::call_once(vocabulary_once_, [this] { vocabulary_ = grammar_vocabulary(service_.tokenizer()); });
+    vocabulary();
     const chat::AnswerStart start = chat::answer_start(dialect, prompt_tail);
     return std::make_shared<GrammarConstraint>(options.format, vocabulary_, start.reasoning_end,
                                                service_.tokenizer().encode(start.opening, /*parse_special=*/true));
@@ -163,15 +195,18 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
     request.media = std::move(p.media);
     request.snapshot_at = p.messages_end;
     const std::string_view tail = chat::prompt_tail(p.text);
-    request.constraint = output_constraint(chat.options, card.dialect, tail);
+    request.constraint = chat_constraint(chat, card.dialect, tail);
     const ResponseMeta meta{random_id("chatcmpl-"), card.id, unix_seconds_now()};
-    const bool usage = chat.options.include_usage, logprobs = chat.options.logprobs >= 0;
+    const ChatFormatOptions format{.include_usage = chat.options.include_usage,
+                                   .logprobs = chat.options.logprobs >= 0,
+                                   .named_call = chat.tool_choice.mode == ToolChoice::Mode::named};
     Job job{.id = meta.id,
-            .format = [meta, usage, logprobs] { return openai_chat_format(meta, usage, logprobs); },
+            .format = [meta, format] { return openai_chat_format(meta, format); },
             .request = std::move(request),
             .options = std::move(chat.options),
             .dialect = card.dialect,
-            .prompt_tail = std::string(tail)};
+            .prompt_tail = std::string(tail),
+            .max_tool_calls = chat.parallel_tool_calls ? kAnyCalls : 1};
     respond(job, req, res);
 }
 
@@ -183,13 +218,16 @@ void CompletionHandlers::messages(const httplib::Request& req, httplib::Response
     GenerateRequest request = make_generate_request(std::move(p.tokens), chat.options, card, "messages");
     request.media = std::move(p.media);
     request.snapshot_at = p.messages_end;
+    const std::string_view tail = chat::prompt_tail(p.text);
+    request.constraint = chat_constraint(chat, card.dialect, tail);
     const std::string id = random_id("msg_");
     Job job{.id = id,
             .format = [id, model = card.id, input_tokens] { return anthropic_format(id, model, input_tokens); },
             .request = std::move(request),
             .options = std::move(chat.options),
             .dialect = card.dialect,
-            .prompt_tail = std::string(chat::prompt_tail(p.text))};
+            .prompt_tail = std::string(tail),
+            .max_tool_calls = chat.parallel_tool_calls ? kAnyCalls : 1};
     respond(job, req, res);
 }
 
@@ -215,7 +253,7 @@ void CompletionHandlers::completion(const httplib::Request& req, httplib::Respon
     GenerateRequest request = make_generate_request(std::move(prompt), completion.options, card, "prompt");
     request.constraint = output_constraint(completion.options, "plain", tail);  // raw text: the answer starts at once
     Job job{.id = meta.id,
-            .format = [meta, usage, logprobs] { return openai_text_format(meta, usage, logprobs); },
+            .format = [meta, usage, logprobs] { return openai_text_format(meta, {.include_usage = usage, .logprobs = logprobs}); },
             .request = std::move(request),
             .options = std::move(completion.options),
             .dialect = "plain",
@@ -235,7 +273,8 @@ void CompletionHandlers::respond(const Job& job, const httplib::Request& req, ht
 }
 
 void CompletionHandlers::write_full(const Job& job, const httplib::Request& req, httplib::Response& res) const {
-    TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop);
+    TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop,
+                       job.max_tool_calls);
     OutputPiece message;
     const GenerationOutcome outcome = run_generation(
         service_, job.request, output,
@@ -259,7 +298,8 @@ bool CompletionHandlers::write_stream(const Job& job, const httplib::Request& re
 
     GenerationOutcome outcome;
     try {
-        TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop);
+        TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail),
+                           job.options.stop, job.max_tool_calls);
         outcome = run_generation(
             service_, job.request, output, [&](const OutputPiece& piece) { return send(format->delta(piece)); },
             [&] { return !req.is_connection_closed(); });

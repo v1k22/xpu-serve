@@ -350,10 +350,13 @@ TEST_SUITE("server.http") {
                                  400)["error"];
         CHECK(e["param"] == "response_format.json_schema.schema.properties.age.minimum");
         CHECK(e["message"] == "'response_format.json_schema.schema.properties.age.minimum' is not supported");
-        const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}});
-        CHECK(post_json(client, "/v1/chat/completions", chat_body({{"response_format", format}, {"tools", tools}}),
-                        400)["error"]["param"] == "response_format");
         CHECK(service.calls() == calls);
+        // Beside tools a dialect without calls has a reply the format holds alone; a forced call it cannot write.
+        const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}});
+        post_json(client, "/v1/chat/completions", chat_body({{"response_format", format}, {"tools", tools}}));
+        CHECK(service.last_request().constraint != nullptr);
+        CHECK(post_json(client, "/v1/chat/completions", chat_body({{"tools", tools}, {"tool_choice", "required"}}),
+                        400)["error"]["param"] == "tool_choice");
     }
 
     TEST_CASE("response_format after a prompt that leaves the model thinking: held once the thought closes") {

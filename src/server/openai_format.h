@@ -74,9 +74,15 @@ nlohmann::json text_usage_chunk_json(const ResponseMeta& meta, const GenerateSta
 nlohmann::json model_list_json(std::string_view id, int64_t context_length, int64_t created);
 nlohmann::json model_list_json(const ModelCard& card, int64_t created);
 
-// OpenAI's chat completions and text completions as a ResponseFormat: chunks, a usage chunk when `include_usage`, then
-// [DONE]. `logprobs`: the request asked for log-probabilities, which the pieces carry.
-std::unique_ptr<ResponseFormat> openai_chat_format(ResponseMeta meta, bool include_usage, bool logprobs = false);
-std::unique_ptr<ResponseFormat> openai_text_format(ResponseMeta meta, bool include_usage, bool logprobs = false);
+struct ChatFormatOptions {
+    bool include_usage = false;  // a usage chunk before [DONE]
+    bool logprobs = false;       // the request asked for log-probabilities, which the pieces carry
+    bool named_call = false;     // tool_choice named a function: its call ends with finish_reason "stop" (OpenAI's)
+};
+
+// OpenAI's chat completions and text completions as a ResponseFormat: chunks, a usage chunk when asked for, then
+// [DONE].
+std::unique_ptr<ResponseFormat> openai_chat_format(ResponseMeta meta, ChatFormatOptions options);
+std::unique_ptr<ResponseFormat> openai_text_format(ResponseMeta meta, ChatFormatOptions options);
 
 }  // namespace xs::server

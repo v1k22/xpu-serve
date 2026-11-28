@@ -43,4 +43,18 @@ private:
     std::shared_ptr<const Spec> spec_;
 };
 
+// A generation free but for its calls: once it writes the marker `opener`, what follows is held to `grammar` until the
+// grammar is complete (a call to its closer), then it is free again (tool_choice "auto" with strict tools).
+class OpenerConstraint final : public OutputConstraint {
+public:
+    OpenerConstraint(int32_t opener, std::shared_ptr<const grammar::Grammar> grammar,
+                     std::shared_ptr<const grammar::Vocabulary> vocabulary);
+    std::unique_ptr<TokenConstraint> start() const override;
+
+private:
+    int32_t opener_;
+    std::shared_ptr<const grammar::Grammar> grammar_;
+    std::shared_ptr<const grammar::Vocabulary> vocabulary_;
+};
+
 }  // namespace xs::server

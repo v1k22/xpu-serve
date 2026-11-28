@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 
 #include "grammar/matcher.h"
 #include "tokenizer/tokenizer.h"
@@ -123,7 +124,60 @@ private:
     Position at_;
 };
 
+// Free, or inside a call since its opener (the matcher of the call's grammar). One automaton for all of a generation's
+// calls: each starts from its start state.
+class AfterOpener final : public TokenConstraint {
+public:
+    AfterOpener(int32_t opener, std::shared_ptr<grammar::Automaton> automaton)
+        : opener_(opener), automaton_(std::move(automaton)) {}
+
+    bool mask(std::span<float> logits) override {
+        if (!call_) return true;
+        const grammar::TokenSet& allowed = call_->allowed();
+        keep_only(allowed, logits);
+        return allowed.count() > 0;
+    }
+    void accept(int32_t token) override {
+        XS_CHECK(allows(call_, token), "tool call: token ", token, " is not what the call's grammar allows next");
+        advance(call_, token);
+    }
+    bool complete() const override { return !call_; }
+    size_t allowed_prefix(std::span<const int32_t> tokens) const override {
+        std::optional<grammar::Matcher> at = call_;
+        size_t n = 0;
+        for (; n < tokens.size() && allows(at, tokens[n]); ++n) advance(at, tokens[n]);
+        return n;
+    }
+
+private:
+    static bool allows(const std::optional<grammar::Matcher>& at, int32_t token) {
+        return !at || at->allows(token);
+    }
+    void advance(std::optional<grammar::Matcher>& at, int32_t token) const {
+        if (!at) {
+            if (token == opener_) at.emplace(automaton_);
+            return;
+        }
+        at->accept_token(token);
+        if (at->complete()) at.reset();  // the call's closer: free again
+    }
+
+    int32_t opener_;
+    std::shared_ptr<grammar::Automaton> automaton_;
+    std::optional<grammar::Matcher> call_;  // inside a call
+};
+
 }  // namespace
+
+OpenerConstraint::OpenerConstraint(int32_t opener, std::shared_ptr<const grammar::Grammar> grammar,
+                                   std::shared_ptr<const grammar::Vocabulary> vocabulary)
+    : opener_(opener), grammar_(std::move(grammar)), vocabulary_(std::move(vocabulary)) {
+    XS_CHECK(grammar_ && vocabulary_, "tool call: a constraint without its grammar or vocabulary");
+}
+
+std::unique_ptr<TokenConstraint> OpenerConstraint::start() const {
+    return std::make_unique<AfterOpener>(opener_, std::make_shared<grammar::Automaton>(grammar_, vocabulary_));
+}
 
 std::shared_ptr<const grammar::Vocabulary> grammar_vocabulary(const tok::Tokenizer& tokenizer) {
     std::vector<grammar::Vocabulary::Token> tokens(static_cast<size_t>(tokenizer.vocab_size()));

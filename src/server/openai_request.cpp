@@ -1,5 +1,6 @@
 #include "server/openai_request.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 
@@ -234,25 +235,79 @@ json parse_messages(const json& body, std::vector<MediaPart>& media) {
     return messages;
 }
 
-bool tools_disabled(const json& body) {
-    const json* v = fields::find(body, "tool_choice");
-    if (v == nullptr) return false;
-    if (v->is_string() && v->get<std::string>() == "auto") return false;
-    if (v->is_string() && v->get<std::string>() == "none") return true;
-    if (v->is_object() || (v->is_string() && v->get<std::string>() == "required")) {
-        reject("tool_choice", "'tool_choice' only supports \"auto\" and \"none\" for now");
-    }
-    reject("tool_choice", "'tool_choice' must be \"auto\" or \"none\"");
-}
-
+// tools: an array of {"type": "function", "function": {"name", "description", "parameters", "strict"}}.
 json parse_tools(const json& body) {
     const json* v = fields::find(body, "tools");
-    if (v != nullptr && !v->is_array()) reject("tools", "'tools' must be an array");
-    for (size_t i = 0; v != nullptr && i < v->size(); ++i) {
-        if (!(*v)[i].is_object()) reject("tools", str_cat("'tools[", i, "]' must be an object"));
+    if (v == nullptr) return nullptr;
+    if (!v->is_array()) reject("tools", "'tools' must be an array");
+    for (size_t i = 0; i < v->size(); ++i) {
+        const std::string param = str_cat("tools[", i, "]");
+        const json& tool = (*v)[i];
+        if (!tool.is_object()) reject(param, str_cat("'", param, "' must be an object"));
+        const json* type = fields::find(tool, "type");
+        if (type != nullptr && *type != "function") {
+            reject(param + ".type", str_cat("'", param, ".type' must be \"function\""));
+        }
+        const json* function = fields::find(tool, "function");
+        if (function == nullptr || !function->is_object()) {
+            reject(param + ".function", str_cat("'", param, ".function' must be an object"));
+        }
+        const json* name = fields::find(*function, "name");
+        if (name == nullptr || !name->is_string() || name->get<std::string>().empty()) {
+            reject(param + ".function.name", str_cat("'", param, ".function.name' must be a non-empty string"));
+        }
+        fields::boolean(*function, "strict", param + ".function.strict");
+        const json* parameters = fields::find(*function, "parameters");
+        if (parameters != nullptr && !parameters->is_object()) {
+            reject(param + ".function.parameters", str_cat("'", param, ".function.parameters' must be an object"));
+        }
     }
-    if (tools_disabled(body) || v == nullptr || v->empty()) return nullptr;
-    return *v;
+    return v->empty() ? json(nullptr) : *v;
+}
+
+// tool_choice: "none", "auto", "required" or {"type": "function", "function": {"name": ...}}, resolved as vLLM does:
+// with tools and no tool_choice, auto; without tools, none (anything but none or auto is then refused).
+ToolChoice parse_tool_choice(const json& body, const json& tools) {
+    const json* v = fields::find(body, "tool_choice");
+    ToolChoice c;
+    c.mode = tools.is_null() ? ToolChoice::Mode::none : ToolChoice::Mode::automatic;
+    if (v == nullptr) return c;
+    if (v->is_string()) {
+        const std::string& s = v->get_ref<const std::string&>();
+        if (s == "none" || (s == "auto" && tools.is_null())) {
+            c.mode = ToolChoice::Mode::none;
+            return c;
+        }
+        if (s == "auto") return c;
+        if (s != "required") {
+            reject("tool_choice", str_cat("invalid value for 'tool_choice': '", s, "'; it must be \"none\", \"auto\", ",
+                                          "\"required\" or a named function"));
+        }
+        c.mode = ToolChoice::Mode::required;
+    } else if (v->is_object()) {
+        const json* type = fields::find(*v, "type");
+        if (type == nullptr || *type != "function") {
+            reject("tool_choice", "'tool_choice' as an object must be {\"type\": \"function\", \"function\": {\"name\": ...}}");
+        }
+        const json* function = fields::find(*v, "function");
+        if (function == nullptr || !function->is_object()) {
+            reject("tool_choice.function", "'tool_choice.function' must be an object with the function's 'name'");
+        }
+        const json* name = fields::find(*function, "name");
+        if (name == nullptr || !name->is_string() || name->get<std::string>().empty()) {
+            reject("tool_choice.function.name", "'tool_choice.function.name' must be a non-empty string");
+        }
+        c.mode = ToolChoice::Mode::named;
+        c.name = name->get<std::string>();
+    } else {
+        reject("tool_choice", "'tool_choice' must be a string or an object");
+    }
+    if (tools.is_null()) reject("tool_choice", "when using 'tool_choice', 'tools' must be set");
+    if (c.mode == ToolChoice::Mode::named &&
+        std::none_of(tools.begin(), tools.end(), [&](const json& t) { return t["function"]["name"] == c.name; })) {
+        reject("tool_choice", str_cat("the tool '", c.name, "' in 'tool_choice' is none of the 'tools'"));
+    }
+    return c;
 }
 
 std::string parse_prompt(const json& body) {
@@ -276,6 +331,10 @@ ChatRequest parse_chat_request(const json& body, const SamplingParams& defaults)
     ChatRequest r;
     r.messages = parse_messages(body, r.media);
     r.tools = parse_tools(body);
+    r.tool_choice = parse_tool_choice(body, r.tools);
+    if (r.tool_choice.mode == ToolChoice::Mode::none) r.tools = nullptr;  // tool_choice none: the model sees no tools
+    r.parallel_tool_calls = !fields::find(body, "parallel_tool_calls") ||
+                            fields::boolean(body, "parallel_tool_calls", "parallel_tool_calls");
     const json* kwargs = fields::object(body, "chat_template_kwargs");
     r.template_kwargs = kwargs != nullptr ? *kwargs : json::object();
     // OpenAI's reasoning_effort reaches the template under its own name (Inkling 2's reads it), unless the kwargs
@@ -288,9 +347,10 @@ ChatRequest parse_chat_request(const json& body, const SamplingParams& defaults)
     }
     r.options = parse_generation_options(body, defaults);
     r.options.logprobs = parse_chat_logprobs(body);
-    if (r.options.format && !r.tools.is_null()) {
-        reject("response_format", "'response_format' beside 'tools' is not supported yet: a reply is either held to "
-                                  "the format or free to call a tool");
+    const bool forced = r.tool_choice.mode == ToolChoice::Mode::required || r.tool_choice.mode == ToolChoice::Mode::named;
+    if (r.options.format && forced) {
+        reject("response_format", "'response_format' is not supported beside a 'tool_choice' that forces a call: the "
+                                  "reply is the call");
     }
     return r;
 }

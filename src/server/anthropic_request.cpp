@@ -123,14 +123,6 @@ void add_message(const json& m, size_t index, json& out, std::vector<MediaPart>&
 }
 
 json parse_tools(const json& body) {
-    bool none = false;
-    if (const json* choice = fields::object(body, "tool_choice")) {
-        const json* type = fields::find(*choice, "type");
-        none = type != nullptr && *type == "none";
-        if (!none && (type == nullptr || *type != "auto")) {
-            reject("tool_choice", "'tool_choice' supports {\"type\": \"auto\"} and {\"type\": \"none\"} for now");
-        }
-    }
     const json* v = fields::find(body, "tools");
     if (v == nullptr) return nullptr;
     if (!v->is_array()) reject("tools", "'tools' must be an array");
@@ -144,14 +136,54 @@ json parse_tools(const json& body) {
         }
         const json* name = t.is_object() ? fields::find(t, "name") : nullptr;
         const json* schema = t.is_object() ? fields::find(t, "input_schema") : nullptr;
-        if (name == nullptr || !name->is_string() || schema == nullptr || !schema->is_object()) {
+        if (name == nullptr || !name->is_string() || name->get<std::string>().empty() || schema == nullptr ||
+            !schema->is_object()) {
             reject(param, str_cat("'", param, "' needs a string 'name' and an object 'input_schema'"));
         }
         json function{{"name", *name}, {"parameters", *schema}};
         if (const json* d = fields::find(t, "description")) function["description"] = *d;
+        if (fields::boolean(t, "strict", param + ".strict")) function["strict"] = true;
         tools.push_back(json{{"type", "function"}, {"function", std::move(function)}});
     }
-    return none || tools.empty() ? json(nullptr) : tools;
+    return tools.empty() ? json(nullptr) : tools;
+}
+
+// tool_choice {"type": "auto" | "any" | "tool" (with "name") | "none", "disable_parallel_tool_use"}: any is OpenAI's
+// required, tool a named function. Without tools, none.
+ToolChoice parse_tool_choice(const json& body, const json& tools, bool& parallel) {
+    ToolChoice c;
+    c.mode = tools.is_null() ? ToolChoice::Mode::none : ToolChoice::Mode::automatic;
+    const json* choice = fields::object(body, "tool_choice");
+    if (choice == nullptr) return c;
+    const json* type = fields::find(*choice, "type");
+    const std::string t = type != nullptr && type->is_string() ? type->get<std::string>() : "";
+    if (t == "none") {
+        c.mode = ToolChoice::Mode::none;
+    } else if (t == "any") {
+        c.mode = ToolChoice::Mode::required;
+    } else if (t == "tool") {
+        const json* name = fields::find(*choice, "name");
+        if (name == nullptr || !name->is_string() || name->get<std::string>().empty()) {
+            reject("tool_choice.name", "'tool_choice.name' is required when its type is 'tool'");
+        }
+        c.mode = ToolChoice::Mode::named;
+        c.name = name->get<std::string>();
+    } else if (t != "auto") {
+        reject("tool_choice.type", "'tool_choice.type' must be \"auto\", \"any\", \"tool\" or \"none\"");
+    }
+    parallel = !fields::boolean(*choice, "disable_parallel_tool_use", "tool_choice.disable_parallel_tool_use");
+    if (c.mode == ToolChoice::Mode::none || tools.is_null()) {
+        if (c.mode == ToolChoice::Mode::required || c.mode == ToolChoice::Mode::named) {
+            reject("tool_choice", "'tool_choice' of type 'any' or 'tool' needs 'tools'");
+        }
+        c.mode = ToolChoice::Mode::none;
+        return c;
+    }
+    if (c.mode == ToolChoice::Mode::named &&
+        std::none_of(tools.begin(), tools.end(), [&](const json& tool) { return tool["function"]["name"] == c.name; })) {
+        reject("tool_choice.name", str_cat("the tool '", c.name, "' in 'tool_choice' is none of the 'tools'"));
+    }
+    return c;
 }
 
 }  // namespace
@@ -169,6 +201,8 @@ ChatRequest parse_messages_request(const json& body, const SamplingParams& defau
     }
     for (size_t i = 0; i < messages->size(); ++i) add_message((*messages)[i], i, r.messages, r.media);
     r.tools = parse_tools(body);
+    r.tool_choice = parse_tool_choice(body, r.tools, r.parallel_tool_calls);
+    if (r.tool_choice.mode == ToolChoice::Mode::none) r.tools = nullptr;
     r.template_kwargs = json::object();
     if (const json* thinking = fields::object(body, "thinking")) {
         const json* type = fields::find(*thinking, "type");

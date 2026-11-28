@@ -165,6 +165,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       `/health`
 - [ ] `/metrics` (Prometheus): requests, tokens, latency, speculative acceptance
 - [x] Gemma 4 tool-call and reasoning dialect (`chat/`)
+- [x] `tool_choice` required and named functions, `parallel_tool_calls`, strict tools, `response_format` beside tools
+      (calls or the answer): the calls held to each dialect's own syntax (docs/decisions/0035); Anthropic's `any` /
+      `tool`
 - [x] One summary log line per request
 - [x] E2E tests with an OpenAI client: streaming, tools, stop strings, cancellation, concurrency
 - **Done when:** E2E suite passes; a multi-turn agent session shows prefix-cache hits; 64k context runs on B390

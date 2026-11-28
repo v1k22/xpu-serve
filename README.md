@@ -82,8 +82,7 @@ Not yet:
 - Timestamps and translation of speech; speech output; video input; images for Gemma 4 26B-A4B and SenseNova Loop,
   and for a Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.
 - Gemma 4 26B-A4B from a GGUF file (a `gemma4` file with experts).
-- `response_format` beside `tools`, the prompt's log-probabilities (`echo`, `prompt_logprobs`), `n` above 1, a rerank
-  API.
+- The prompt's log-probabilities (`echo`, `prompt_logprobs`), `n` above 1, a rerank API.
 
 ## Supported models
 
@@ -326,7 +325,12 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
 ```
 
 - **Streaming** (`"stream": true`, server-sent events; `stream_options.include_usage` adds the usage chunk).
-- **Tool calls**: `tools` with `tool_choice` `auto` or `none`; calls come back as `tool_calls`, also streamed.
+- **Tool calls**: `tools` with `tool_choice` `auto`, `none`, `required` or a named function
+  (`{"type": "function", "function": {"name": ...}}`), and `parallel_tool_calls`; calls come back as `tool_calls`,
+  also streamed. A forced call is held to the model's own call syntax token by token (Qwen 3.5's XML parameters,
+  Qwen 3's JSON, Gemma 4's arguments, Inkling 2's messages), after its reasoning when the prompt leaves it thinking; a
+  strict tool's arguments (`"strict": true`) follow its `parameters` schema, also under `auto` once the model opens a
+  call; a named function ends with `finish_reason` `stop`, as OpenAI's does. docs/decisions/0035.
 - **Thinking**: a model's reasoning comes back as `reasoning_content`, apart from `content`;
   `chat_template_kwargs` reaches the chat template (`{"enable_thinking": false}` turns thinking off where a model
   thinks by default), and so does `reasoning_effort` under its own name (Inkling 2's template reads it).
@@ -341,8 +345,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   to the schema token by token, and can end only once it is whole. With thinking on, the reasoning is free and the
   answer after it is held. Schemas in OpenAI's strict subset (types, properties in their order, required,
   `additionalProperties: false`, items, enum, const, anyOf, `$ref` / `$defs`, recursive ones too); any other keyword
-  is refused with a 400 naming its path (`response_format.json_schema.schema.properties.age.minimum`); not beside
-  `tools` yet. docs/decisions/0033.
+  is refused with a 400 naming its path (`response_format.json_schema.schema.properties.age.minimum`). Beside `tools`
+  with `tool_choice` `auto` the reply is tool calls or the formatted answer; beside a forced call it is refused.
+  docs/decisions/0033.
 - **Log-probabilities**: `logprobs: true` with `top_logprobs` (0 to 20) on chat completions, `logprobs` (0 to 20) on
   text completions, in OpenAI's shapes, streamed with each chunk's tokens. Each is the log-softmax of the model's
   row before penalties and temperature (vLLM's default), after a `response_format` grammar masked it (a masked
@@ -370,7 +375,8 @@ curl -s http://127.0.0.1:8080/v1/messages -H 'Content-Type: application/json' -d
 - **Streaming** (`"stream": true`): `message_start`, each block's `content_block_start`, `_delta` (`text_delta`,
   `thinking_delta`, `input_json_delta`) and `_stop`, then `message_delta` and `message_stop`.
 - **Requests**: `system` (a string or text blocks); `text`, base64 `image`, `tool_use`, `tool_result` and `thinking`
-  blocks; `tools` with `input_schema`, `tool_choice` `auto` or `none`; `thinking` `enabled` or `disabled` (off the
+  blocks; `tools` with `input_schema` (and `strict`), `tool_choice` `auto`, `any`, `tool` (with `name`) or `none` and
+  `disable_parallel_tool_use` (forced calls held as on the OpenAI route); `thinking` `enabled` or `disabled` (off the
   way the model's template turns it off); `temperature`, `top_p`, `top_k`, `stop_sequences`, `max_tokens`
   (required). Server tools, documents and image URLs are refused by name, in the API's error shape.
 

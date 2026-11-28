@@ -58,10 +58,20 @@ struct MediaPart {
 // Request JSON keeps the client's key order: chat templates can print it (tool schemas, tool-call arguments).
 using RequestJson = nlohmann::ordered_json;
 
+// tool_choice as a request resolves it, vLLM's way: with tools, "auto" unless it says otherwise; without them, none.
+struct ToolChoice {
+    enum class Mode { none, automatic, required, named };
+    Mode mode = Mode::none;
+    std::string name;  // named: the function the reply calls
+};
+
 struct ChatRequest {
     RequestJson messages;         // validated: non-empty array of objects with a string "role"; media parts are
                                   // reduced to {"type": "image"} or {"type": "audio"}, their bytes are in `media`
-    RequestJson tools;            // array, or null when absent, empty or tool_choice is "none"
+    RequestJson tools;            // array, or null when absent, empty or tool_choice is "none"; each tool an object
+                                  // whose "function" has a string "name"
+    ToolChoice tool_choice;
+    bool parallel_tool_calls = true;  // false: one call at most
     RequestJson template_kwargs;  // chat_template_kwargs, always an object
     std::vector<MediaPart> media;    // in message order, then part order
     GenerationOptions options;

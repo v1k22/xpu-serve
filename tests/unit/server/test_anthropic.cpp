@@ -111,7 +111,23 @@ TEST_CASE("anthropic request: thinking on and off, tool_choice none, and what is
     refused(no_max, "max_tokens");
     CHECK_NOTHROW(xs::server::parse_messages_request(no_max, {}, "plain", /*count_only=*/true));
     refused(base({{"tools", RequestJson::array({{{"type", "web_search_20250305"}, {"name", "w"}}})}}), "tools[0]");
-    refused(base({{"tool_choice", {{"type", "any"}}}}), "tool_choice");
+    refused(base({{"tool_choice", {{"type", "any"}}}}), "tool_choice");  // without tools
+    // any is OpenAI's required, tool a named function; disable_parallel_tool_use one call; a strict tool kept so.
+    using Mode = xs::server::ToolChoice::Mode;
+    CHECK(parse(base({{"tools", tools}})).tool_choice.mode == Mode::automatic);
+    CHECK(parse(base({{"tools", tools}, {"tool_choice", {{"type", "any"}}}})).tool_choice.mode == Mode::required);
+    const auto named = parse(base({{"tools", tools}, {"tool_choice", {{"type", "tool"}, {"name", "f"}}}}));
+    CHECK(named.tool_choice.mode == Mode::named);
+    CHECK(named.tool_choice.name == "f");
+    CHECK(named.parallel_tool_calls);
+    CHECK_FALSE(parse(base({{"tools", tools}, {"tool_choice", {{"type", "auto"}, {"disable_parallel_tool_use", true}}}}))
+                    .parallel_tool_calls);
+    RequestJson strict = tools;
+    strict[0]["strict"] = true;
+    CHECK(parse(base({{"tools", strict}})).tools[0]["function"]["strict"] == true);
+    refused(base({{"tools", tools}, {"tool_choice", {{"type", "tool"}}}}), "tool_choice.name");
+    refused(base({{"tools", tools}, {"tool_choice", {{"type", "tool"}, {"name", "g"}}}}), "tool_choice.name");
+    refused(base({{"tools", tools}, {"tool_choice", {{"type", "sometimes"}}}}), "tool_choice.type");
     refused(base({{"messages", RequestJson::array({{{"role", "user"},
                                                     {"content", RequestJson::array({{{"type", "document"}}})}}})}}),
             "messages[0].content[0]");

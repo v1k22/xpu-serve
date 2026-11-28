@@ -90,6 +90,47 @@ TEST_SUITE("server.request") {
         CHECK(parse_chat_request(chat_body(json::object()), {}).template_kwargs == json::object());
     }
 
+    TEST_CASE("tool_choice resolved as vLLM does: auto with tools, none without; required and named functions") {
+        using Mode = xs::server::ToolChoice::Mode;
+        const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}},
+                                        {{"type", "function"}, {"function", {{"name", "g"}, {"strict", true}}}}});
+        const auto choice = [&](json extra) { return parse_chat_request(chat_body(extra), {}).tool_choice; };
+        CHECK(choice({{"tools", tools}}).mode == Mode::automatic);
+        CHECK(choice({{"tools", tools}, {"tool_choice", nullptr}}).mode == Mode::automatic);
+        CHECK(choice({{"tools", tools}, {"tool_choice", "none"}}).mode == Mode::none);
+        CHECK(choice({{"tools", tools}, {"tool_choice", "required"}}).mode == Mode::required);
+        const auto named = choice({{"tools", tools}, {"tool_choice", {{"type", "function"}, {"function", {{"name", "g"}}}}}});
+        CHECK(named.mode == Mode::named);
+        CHECK(named.name == "g");
+        CHECK(choice(json::object()).mode == Mode::none);
+        CHECK(choice({{"tool_choice", "auto"}}).mode == Mode::none);    // auto without tools: none
+        CHECK(choice({{"tools", json::array()}, {"tool_choice", "auto"}}).mode == Mode::none);
+        CHECK(parse_chat_request(chat_body({{"tools", tools}}), {}).parallel_tool_calls);
+        CHECK_FALSE(parse_chat_request(chat_body({{"tools", tools}, {"parallel_tool_calls", false}}), {})
+                        .parallel_tool_calls);
+        // Refused, each by its field.
+        CHECK(rejected_param(chat_body({{"tool_choice", "required"}})) == "tool_choice");  // no tools
+        CHECK(rejected_param(chat_body({{"tools", tools}, {"tool_choice", "always"}})) == "tool_choice");
+        CHECK(rejected_param(chat_body({{"tools", tools}, {"tool_choice", {{"type", "function"}}}})) ==
+              "tool_choice.function");
+        CHECK(rejected_param(chat_body({{"tools", tools}, {"tool_choice", {{"type", "function"}, {"function", json::object()}}}})) ==
+              "tool_choice.function.name");
+        CHECK(rejected_param(chat_body({{"tools", tools}, {"tool_choice", {{"type", "function"}, {"function", {{"name", "h"}}}}}})) ==
+              "tool_choice");
+        CHECK(rejected_param(chat_body({{"tools", tools}, {"tool_choice", {{"type", "allowed_tools"}}}})) == "tool_choice");
+        CHECK(rejected_param(chat_body({{"tools", tools}, {"parallel_tool_calls", "no"}})) == "parallel_tool_calls");
+        CHECK(rejected_param(chat_body({{"tools", json::array({{{"type", "function"}}})}})) == "tools[0].function");
+        CHECK(rejected_param(chat_body({{"tools", json::array({{{"type", "function"}, {"function", {{"name", 3}}}}})}})) ==
+              "tools[0].function.name");
+        CHECK(rejected_param(chat_body({{"tools", json::array({{{"type", "web"}, {"function", {{"name", "f"}}}}})}})) ==
+              "tools[0].type");
+        // A format beside a forced call is refused; beside auto it is the reply's other way.
+        const json format = {{"type", "json_object"}};
+        CHECK(rejected_param(chat_body({{"tools", tools}, {"tool_choice", "required"}, {"response_format", format}})) ==
+              "response_format");
+        CHECK(rejected_param(chat_body({{"tools", tools}, {"response_format", format}})) == "<accepted>");
+    }
+
     TEST_CASE("invalid fields are rejected by name") {
         CHECK(rejected_param({{"model", "m"}}) == "messages");
         CHECK(rejected_param(chat_body({{"messages", json::array()}})) == "messages");
@@ -111,7 +152,6 @@ TEST_SUITE("server.request") {
         CHECK(rejected_param(chat_body({{"stream_options", {{"include_usage", 1}}}})) ==
               "stream_options.include_usage");
         CHECK(rejected_param(chat_body({{"tools", "f"}})) == "tools");
-        CHECK(rejected_param(chat_body({{"tool_choice", "required"}})) == "tool_choice");
         CHECK(rejected_param(chat_body({{"tool_choice", "sometimes"}})) == "tool_choice");
         CHECK(rejected_param(chat_body({{"chat_template_kwargs", "x"}})) == "chat_template_kwargs");
         // reasoning_effort is a template variable of its own name; the kwargs' value wins.
@@ -213,8 +253,8 @@ TEST_SUITE("server.request") {
         }
         CHECK(rejected_param(with_schema(json::array({1}))) == "response_format.json_schema.schema");
         const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}});
-        CHECK(rejected_param(chat_body({{"response_format", {{"type", "json_object"}}}, {"tools", tools}})) ==
-              "response_format");
+        CHECK(rejected_param(chat_body({{"response_format", {{"type", "json_object"}}}, {"tools", tools},
+                                        {"tool_choice", "required"}})) == "response_format");
     }
 
     TEST_CASE("completion prompt is a string or a one-string array") {

@@ -209,8 +209,9 @@ std::string_view finish_of(const GenerationOutcome& o, bool has_tool_calls) {
 
 class ChatFormat final : public ResponseFormat {
 public:
-    ChatFormat(ResponseMeta meta, bool include_usage, bool logprobs)
-        : meta_(std::move(meta)), include_usage_(include_usage), logprobs_(logprobs) {}
+    ChatFormat(ResponseMeta meta, ChatFormatOptions options)
+        : meta_(std::move(meta)), include_usage_(options.include_usage), logprobs_(options.logprobs),
+          named_call_(options.named_call) {}
     std::string opening() override {
         return sse_event(chat_chunk_json(meta_, {{"role", "assistant"}, {"content", ""}}));
     }
@@ -223,7 +224,8 @@ public:
         return event;
     }
     std::string closing(const GenerationOutcome& o) override {
-        std::string out = sse_event(chat_chunk_json(meta_, json::object(), finish_of(o, has_tool_calls())));
+        std::string out =
+            sse_event(chat_chunk_json(meta_, json::object(), finish_of(o, has_tool_calls() && !named_call_)));
         if (include_usage_) out += sse_event(chat_usage_chunk_json(meta_, o.result.stats));
         return out + std::string(kSseDone);
     }
@@ -231,20 +233,22 @@ public:
         return sse_event(error_body(message, "server_error")) + std::string(kSseDone);
     }
     json body(const OutputPiece& output, const GenerationOutcome& o) override {
-        return chat_completion_json(meta_, output.delta, finish_of(o, !output.delta.tool_calls.empty()),
-                                    o.result.stats, logprobs_ ? chat_logprobs_json(output.logprobs) : json(nullptr));
+        return chat_completion_json(meta_, output.delta,
+                                    finish_of(o, !output.delta.tool_calls.empty() && !named_call_), o.result.stats,
+                                    logprobs_ ? chat_logprobs_json(output.logprobs) : json(nullptr));
     }
 
 private:
     ResponseMeta meta_;
     bool include_usage_;
     bool logprobs_;
+    bool named_call_;
 };
 
 class TextFormat final : public ResponseFormat {
 public:
-    TextFormat(ResponseMeta meta, bool include_usage, bool logprobs)
-        : meta_(std::move(meta)), include_usage_(include_usage), logprobs_(logprobs) {}
+    TextFormat(ResponseMeta meta, ChatFormatOptions options)
+        : meta_(std::move(meta)), include_usage_(options.include_usage), logprobs_(options.logprobs) {}
     std::string opening() override { return {}; }
     std::string delta(const OutputPiece& piece) override {
         json logprobs = logprobs_ ? text_logprobs_json(piece.logprobs, offset_) : json(nullptr);
@@ -273,12 +277,12 @@ private:
 
 }  // namespace
 
-std::unique_ptr<ResponseFormat> openai_chat_format(ResponseMeta meta, bool include_usage, bool logprobs) {
-    return std::make_unique<ChatFormat>(std::move(meta), include_usage, logprobs);
+std::unique_ptr<ResponseFormat> openai_chat_format(ResponseMeta meta, ChatFormatOptions options) {
+    return std::make_unique<ChatFormat>(std::move(meta), options);
 }
 
-std::unique_ptr<ResponseFormat> openai_text_format(ResponseMeta meta, bool include_usage, bool logprobs) {
-    return std::make_unique<TextFormat>(std::move(meta), include_usage, logprobs);
+std::unique_ptr<ResponseFormat> openai_text_format(ResponseMeta meta, ChatFormatOptions options) {
+    return std::make_unique<TextFormat>(std::move(meta), options);
 }
 
 }  // namespace xs::server

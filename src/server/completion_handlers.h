@@ -46,6 +46,12 @@ private:
     std::shared_ptr<const OutputConstraint> output_constraint(const GenerationOptions& options,
                                                               std::string_view dialect,
                                                               std::string_view prompt_tail) const;
+    // A chat reply's constraint: its tool calls in the dialect's syntax when tool_choice forces one (required, a
+    // named function) or "auto" sits beside a response_format (the calls or the formatted answer), else
+    // output_constraint's.
+    std::shared_ptr<const OutputConstraint> chat_constraint(const ChatRequest& chat, std::string_view dialect,
+                                                            std::string_view prompt_tail) const;
+    const grammar::Vocabulary& vocabulary() const;
     void respond(const Job& job, const httplib::Request& req, httplib::Response& res) const;
     void write_full(const Job& job, const httplib::Request& req, httplib::Response& res) const;
     // Returns false when the client went away before the stream was complete.
