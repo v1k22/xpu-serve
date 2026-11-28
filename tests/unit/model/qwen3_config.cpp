@@ -1,5 +1,5 @@
-// The Qwen3 decoder's config (qwen3): a mixture of experts, which of its layers are sparse, and what is refused by
-// name.
+// The Qwen3 decoder's config (qwen3, qwen3_moe): a mixture of experts (num_experts, or num_local_experts as
+// transformers 5 writes it), which of its layers are sparse, and what is refused by name.
 #include <doctest/doctest.h>
 
 #include <nlohmann/json.hpp>
@@ -48,6 +48,9 @@ TEST_SUITE("qwen3 config") {
         json dense = moe_config();
         dense.erase("num_experts");
         CHECK(xs::qwen3::parse_config(dense, "text_config").num_experts == 0);
+        json renamed = dense;  // transformers 5 writes num_local_experts
+        renamed["num_local_experts"] = 64;
+        CHECK(xs::qwen3::parse_config(renamed, "text_config").num_experts == 64);
         json bad = moe_config();
         bad["num_experts_per_tok"] = 200;
         CHECK_THROWS_WITH_AS(xs::qwen3::parse_config(bad, "text_config"), doctest::Contains("num_experts_per_tok"),

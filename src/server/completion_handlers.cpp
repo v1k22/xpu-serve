@@ -136,7 +136,7 @@ std::shared_ptr<const OutputConstraint> CompletionHandlers::chat_constraint(cons
                                     chat.parallel_tool_calls, ":", or_answer ? chat.options.format_key : "", ":",
                                     start.opening, ":", chat.tools.dump());
     return std::make_shared<GrammarConstraint>(tool_call_grammar(dialect, calls, vocabulary()), vocabulary_,
-                                               start.reasoning_end, std::vector<int32_t>{}, automata_, key);
+                                               answer_gate(start, {}), automata_, key);
 }
 
 std::shared_ptr<const OutputConstraint> CompletionHandlers::output_constraint(const GenerationOptions& options,
@@ -145,9 +145,22 @@ std::shared_ptr<const OutputConstraint> CompletionHandlers::output_constraint(co
     if (!options.format) return nullptr;
     vocabulary();
     const chat::AnswerStart start = chat::answer_start(dialect, prompt_tail);
-    return std::make_shared<GrammarConstraint>(options.format, vocabulary_, start.reasoning_end,
-                                               service_.tokenizer().encode(start.opening, /*parse_special=*/true),
-                                               automata_, options.format_key);
+    return std::make_shared<GrammarConstraint>(
+        options.format, vocabulary_,
+        answer_gate(start, service_.tokenizer().encode(start.opening, /*parse_special=*/true)), automata_,
+        options.format_key);
+}
+
+AnswerGate CompletionHandlers::answer_gate(const chat::AnswerStart& start, std::vector<int32_t> opening) const {
+    AnswerGate gate{.reasoning_end = start.reasoning_end, .opening = std::move(opening)};
+    // A thought's opener that is no marker token of this vocabulary: no thought before the answer.
+    if (!start.thought_open.empty()) {
+        if (const auto open = vocabulary().marker(start.thought_open)) {
+            gate.thought_open = *open;
+            gate.thought_close = start.thought_close;
+        }
+    }
+    return gate;
 }
 
 CompletionHandlers::Prompt CompletionHandlers::chat_prompt(const ChatRequest& chat) const {

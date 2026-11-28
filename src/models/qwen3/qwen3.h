@@ -2,10 +2,12 @@
 
 // The Qwen3 text decoder (Hugging Face model_type "qwen3" and "qwen3_moe"; transformers models/qwen3/ and
 // qwen3_moe/): GQA attention with RMS-normed q and k per head and RoPE over the whole head, a SwiGLU MLP or a mixture
-// of SwiGLU experts (a softmax router's top k, renormalized; no shared expert), RMSNorm (x * w). Here as the decoder
-// of models that read it (Qwen3-ASR, Qwen3-Omni's thinker); it is not served as a language model of its own yet.
+// of SwiGLU experts (a softmax router's top k, renormalized; no shared expert), RMSNorm (x * w). The decoder of the
+// models that read it (Qwen3-ASR, Qwen3-Omni's thinker), and a language model of its own (load).
 
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <functional>
 #include <span>
 #include <string>
@@ -16,6 +18,7 @@
 #include "engine/types.h"
 #include "graph/graph.h"
 #include "io/safetensors.h"
+#include "models/model.h"
 #include "tensor/tensor.h"
 
 namespace xs::qwen3 {
@@ -95,5 +98,9 @@ private:
     std::string lm_head_;
     bool three_axes_;
 };
+
+// Qwen3 as a language model (model_type qwen3, qwen3_moe; experts stored one by one joined into banks).
+std::unique_ptr<Model> load(const std::filesystem::path& dir, const nlohmann::json& config_json,
+                            const LoadOptions& options);
 
 }  // namespace xs::qwen3

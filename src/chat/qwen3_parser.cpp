@@ -221,9 +221,12 @@ public:
 
     std::string_view reasoning_end() const override { return mode_ == Mode::reasoning ? kThinkClose : ""; }
 
+    Thought own_thought() const override { return own_thought_ ? Thought{kThinkOpen, kThinkClose} : Thought{}; }
+
 private:
     // The generation prompt ends inside "<think>\n" (thinking on) or after "</think>\n\n" (thinking off, or a
-    // prefilled reply); whichever of the two markers comes last in the open assistant turn decides the start.
+    // prefilled reply); whichever of the two markers comes last in the open assistant turn decides the start. Qwen 3's
+    // template writes neither with thinking on: the model opens its thought itself.
     void start_after(std::string_view prompt_tail) {
         constexpr std::string_view turn = "<|im_start|>";
         if (const size_t last_turn = prompt_tail.rfind(turn); last_turn != std::string_view::npos) {
@@ -232,7 +235,10 @@ private:
         }
         const size_t open = prompt_tail.rfind(kThinkOpen);
         const size_t close = prompt_tail.rfind(kThinkClose);
-        if (open == std::string_view::npos && close == std::string_view::npos) return;
+        if (open == std::string_view::npos && close == std::string_view::npos) {
+            own_thought_ = prompt_tail.starts_with("<|im_start|>assistant");
+            return;
+        }
         if (close == std::string_view::npos || (open != std::string_view::npos && open > close)) {
             mode_ = Mode::reasoning;
         }
@@ -327,6 +333,7 @@ private:
     }
 
     const CallFormat format_;
+    bool own_thought_ = false;  // the assistant turn is open with no thought marker in it
     const std::string id_prefix_;  // random per response; the call counter makes ids unique within it
     size_t calls_made_ = 0;
     Mode mode_ = Mode::content;

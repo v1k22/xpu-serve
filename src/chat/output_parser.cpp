@@ -41,7 +41,10 @@ DirectAnswer direct_answer(std::string_view dialect) {
 }
 
 AnswerStart answer_start(std::string_view dialect, std::string_view prompt_tail) {
-    return {std::string(make_output_parser(dialect, prompt_tail)->reasoning_end()), direct_answer(dialect).opening};
+    const auto parser = make_output_parser(dialect, prompt_tail);
+    const OutputParser::Thought own = parser->own_thought();
+    return {std::string(parser->reasoning_end()), std::string(own.open), std::string(own.close),
+            direct_answer(dialect).opening};
 }
 
 }  // namespace xs::chat

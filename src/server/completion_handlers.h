@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include "chat/output_parser.h"
 #include "engine/service.h"
 #include "server/grammar_constraint.h"
 #include "server/openai_request.h"
@@ -56,6 +57,8 @@ private:
     // output_constraint's.
     std::shared_ptr<const OutputConstraint> chat_constraint(const ChatRequest& chat, std::string_view dialect,
                                                             std::string_view prompt_tail) const;
+    // `start` in this model's tokens, the answer's opening as `opening`.
+    AnswerGate answer_gate(const chat::AnswerStart& start, std::vector<int32_t> opening) const;
     const grammar::Vocabulary& vocabulary() const;
     void respond(const Job& job, const httplib::Request& req, httplib::Response& res) const;
     void write_full(const Job& job, const httplib::Request& req, httplib::Response& res) const;

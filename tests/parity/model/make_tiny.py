@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|lfm3|
+    python -I tests/parity/model/make_tiny.py --arch qwen3|qwen3_moe|qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|lfm3|
         sensenova_loop|qwen3_asr|inkling2_loop --tokenizer-from <dir> --out <dir>
     python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
         [--pooling mean|cls] [--normalize] [--max-seq-length N]
@@ -52,6 +52,38 @@ def qwen3_5_moe_text(vocab_size):
         shared_expert_intermediate_size=48, max_position_embeddings=4096, tie_word_embeddings=False,
         rms_norm_eps=1e-6, initializer_range=0.05,
         rope_parameters={"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25})
+
+
+def qwen3(vocab_size, source):
+    """Dense Qwen3 with Qwen3-8B's ratios: four query heads per KV head, q and k normed per head, an untied head;
+    its norms away from 1, so a skipped one shows."""
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+
+    config = Qwen3Config(vocab_size=vocab_size, hidden_size=64, intermediate_size=160, num_hidden_layers=3,
+                         num_attention_heads=4, num_key_value_heads=1, head_dim=32, max_position_embeddings=4096,
+                         rope_theta=1000000.0, rms_norm_eps=1e-6, tie_word_embeddings=False, initializer_range=0.05)
+    return off_one_norms(Qwen3ForCausalLM(config))
+
+
+def qwen3_moe(vocab_size, source):
+    """Qwen3's mixture of experts, as Qwen3-30B-A3B: eight experts, two a token, renormalized; a dense first layer
+    (mlp_only_layers), so both kinds of layer run. Saved with each expert's tensors apart, as the release stores them."""
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    config = Qwen3MoeConfig(vocab_size=vocab_size, hidden_size=64, intermediate_size=128, moe_intermediate_size=32,
+                            num_experts=8, num_experts_per_tok=2, norm_topk_prob=True, decoder_sparse_step=1,
+                            mlp_only_layers=[0], num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2,
+                            head_dim=32, max_position_embeddings=4096, rope_theta=1000000.0, rms_norm_eps=1e-6,
+                            tie_word_embeddings=False, initializer_range=0.05)
+    return decisive_routers(off_one_norms(Qwen3MoeForCausalLM(config)))
+
+
+def off_one_norms(model):
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if p.dim() == 1 and "norm" in name:
+                p.uniform_(0.5, 1.5)
+    return model
 
 
 def decisive_routers(model):
@@ -538,7 +570,7 @@ def perturbed(model):
     return model.eval()
 
 
-ARCHS = {"qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "qwen3_5_vl": qwen3_5_vl, "qwen3_5_moe_vl": qwen3_5_moe_vl,
+ARCHS = {"qwen3": qwen3, "qwen3_moe": qwen3_moe, "qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "qwen3_5_vl": qwen3_5_vl, "qwen3_5_moe_vl": qwen3_5_moe_vl,
          "gemma4_moe": gemma4_moe, "lfm3": lfm3, "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr,
          "qwen3_omni": qwen3_omni, "inkling2_loop": inkling2_loop, "bert": bert, "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}
@@ -693,6 +725,25 @@ def drafter(kind, target_dir, dflash_repo, out, layer_types=None):
     print(f"{kind} drafter: {sum(v.numel() for v in tensors.values()) / 1e6:.1f} M parameters -> {out}")
 
 
+def split_experts(path):
+    """Rewrites fused expert banks (what transformers 5 saves) as one tensor an expert and projection, as Qwen3's MoE
+    releases store them; per-expert tensors are left as they are."""
+    tensors = load_file(path)
+    for name in list(tensors):
+        m = re.match(r"(.*\.mlp\.experts)\.(gate_up_proj|down_proj)$", name)
+        if not m:
+            continue
+        bank = tensors.pop(name)
+        for e in range(bank.shape[0]):
+            if m.group(2) == "down_proj":
+                tensors[f"{m.group(1)}.{e}.down_proj.weight"] = bank[e].contiguous()
+            else:
+                half = bank.shape[1] // 2
+                tensors[f"{m.group(1)}.{e}.gate_proj.weight"] = bank[e, :half].contiguous()
+                tensors[f"{m.group(1)}.{e}.up_proj.weight"] = bank[e, half:].contiguous()
+    save_file(tensors, path, metadata={"format": "pt"})
+
+
 def fuse_experts(path):
     """Rewrites per-expert tensors (what save_pretrained writes) as the fused banks the released checkpoints ship:
     experts.gate_up_proj [E, 2 I, H] (gate rows first) and experts.down_proj [E, H, I]."""
@@ -754,6 +805,8 @@ def main():
         released_omni_layout(args.out)  # experts stay one tensor each, as the release has them
     elif args.arch == "inkling2_loop":
         released_inkling2_layout(args.out, model.released_config)
+    elif args.arch == "qwen3_moe":
+        split_experts(weights)  # Qwen3-30B-A3B's release: each expert's gate_proj, up_proj and down_proj apart
     else:
         fuse_experts(weights)
     if args.arch == "qwen3_asr":

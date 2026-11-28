@@ -370,10 +370,33 @@ TEST_SUITE("chat qwen3_5 parser prompt tail") {
                 CHECK(on.opening.empty());
             }
             for (const std::string name : {"thinking_off", "reasoning_content_after_last_user"}) {
-                CHECK(xs::chat::answer_start(dialect, rendered_prompt(name)).reasoning_end.empty());
+                const xs::chat::AnswerStart off = xs::chat::answer_start(dialect, rendered_prompt(name));
+                CHECK(off.reasoning_end.empty());
+                CHECK(off.thought_open.empty());
             }
         }
         CHECK(xs::chat::answer_start("plain", kThinkingOn).reasoning_end.empty());  // raw completions: at once
+    }
+
+    // Qwen 3's template leaves the turn open with thinking on; the model writes <think> itself.
+    TEST_CASE("qwen3: with thinking on the model may open its own thought before the answer") {
+        for (const std::string name : {"thinking_on", "user_only", "tool_call_object_arguments"}) {
+            CAPTURE(name);
+            const std::string prompt = rendered_prompt(name, "qwen3");
+            REQUIRE(prompt.ends_with("<|im_start|>assistant\n"));
+            const xs::chat::AnswerStart on = xs::chat::answer_start("qwen3", prompt);
+            CHECK(on.reasoning_end.empty());
+            CHECK(on.thought_open == "<think>");
+            CHECK(on.thought_close == "</think>");
+            const Collected c = parse_every_way("<think>\nHmm.\n</think>\n\nYes.", prompt, "qwen3");
+            CHECK(c.reasoning == "Hmm.");
+            CHECK(c.content == "Yes.");
+        }
+        for (const std::string name : {"thinking_off", "assistant_prefill"}) {
+            CAPTURE(name);
+            CHECK(xs::chat::answer_start("qwen3", rendered_prompt(name, "qwen3")).thought_open.empty());
+        }
+        CHECK(xs::chat::answer_start("qwen3", "").thought_open.empty());  // no assistant turn: a raw completion
     }
 
     TEST_CASE("a prefilled reply after its reasoning, or without one, continues in content") {

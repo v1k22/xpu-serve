@@ -1,6 +1,6 @@
 """Renders chat-template parity cases with Hugging Face for the C++ ChatTemplate test.
 
-Usage: python -I tests/parity/chat/gen_cases.py gemma4=<model_dir> qwen3_5=<model_dir> lfm3=<model_dir> ...
+Usage: python -I tests/parity/chat/gen_cases.py gemma4=<model_dir> qwen3_5=<model_dir> qwen3=<model_dir> lfm3=<model_dir> ...
 Writes tests/fixtures/chat/<set>_cases.json for each set named. A model dir needs only its chat template
 (chat_template.jinja, or chat_template.json) and tokenizer_config.json (plus tokenizer.json, or vocab.json and
 merges.txt, for AutoTokenizer): the Hugging Face checkpoint named in tests/fixtures/chat/<set>/SOURCE, or for lfm3
@@ -653,9 +653,17 @@ def qwen3_asr_cases():
     ], None, True, {}
 
 
+def qwen3_cases():
+    """Qwen 3.5's turns that Qwen 3's template renders: its messages' content is text, never a list of parts."""
+    for case in qwen3_5_cases():
+        if all(not isinstance(m.get("content"), list) for m in case[1]):
+            yield case
+
+
 SETS = {
     "gemma4": lambda: itertools.chain(cases(), openai_cases()),
     "qwen3_5": qwen3_5_cases,
+    "qwen3": qwen3_cases,
     "lfm3": lfm3_cases,
     "qwen3_asr": qwen3_asr_cases,
 }
@@ -673,8 +681,12 @@ def write_set(name, model):
     template = processor_template(model)
     out = []
     for case_name, messages, tools, add_gen, extra in SETS[name]():
-        expected = tok.apply_chat_template(openai_to_hf(messages), chat_template=template, tools=tools,
-                                           add_generation_prompt=add_gen, tokenize=False, **extra)
+        try:
+            expected = tok.apply_chat_template(openai_to_hf(messages), chat_template=template, tools=tools,
+                                               add_generation_prompt=add_gen, tokenize=False, **extra)
+        except Exception as e:  # a turn this model's template does not render: not a case of its set
+            print(f"skipped {case_name}: the template fails on it ({type(e).__name__}: {e})")
+            continue
         out.append({"name": case_name, "messages": messages, "tools": tools, "add_generation_prompt": add_gen,
                     "extra": extra, "expected": expected})
     names = [c["name"] for c in out]

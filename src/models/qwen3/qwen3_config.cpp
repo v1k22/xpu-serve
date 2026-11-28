@@ -29,8 +29,9 @@ Config parse_config(const nlohmann::json& t, const std::string& where) {
     c.tie_word_embeddings = cfg::get_bool_or(t, "tie_word_embeddings", false, where);
     XS_CHECK(c.num_heads % c.num_kv_heads == 0, where, ": num_attention_heads ", c.num_heads,
              " is not a multiple of num_key_value_heads ", c.num_kv_heads);
-    if (t.contains("num_experts") && !t.at("num_experts").is_null()) {
-        c.num_experts = cfg::get_int(t, "num_experts", where);
+    // num_experts in the released configs; num_local_experts as transformers 5 writes them.
+    for (const char* key : {"num_experts", "num_local_experts"}) {
+        if (c.num_experts == 0 && t.contains(key) && !t.at(key).is_null()) c.num_experts = cfg::get_int(t, key, where);
     }
     if (c.num_experts > 0) {
         c.experts_per_token = cfg::get_int(t, "num_experts_per_tok", where);

@@ -22,6 +22,7 @@ APIs look; the numbers live here.
   - [Ornith-1.5-35B-A3B](#ornith-15-35b-a3b)
   - [Qwen3.8-27B](#qwen38-27b)
   - [LFM3-1.7B](#lfm3-17b)
+  - [Qwen3 (0.6B to 32B, 30B-A3B)](#qwen3-06b-to-32b-30b-a3b)
   - [Inkling-2-Mini](#inkling-2-mini)
 - [GGUF imports](#gguf-imports)
   - [Importing a GGUF file](#importing-a-gguf-file)
@@ -743,6 +744,58 @@ Measured:
 Prefill 12,000 tok/s. Run to 64k tokens of context. MMLU-Pro (25 questions): 60 %.
 
 Checked against Hugging Face fp32 logits and greedy text (the checkpoint's own modeling code).
+
+### Qwen3 (0.6B to 32B, 30B-A3B)
+
+`Qwen/Qwen3-0.6B` to `Qwen/Qwen3-32B` (`qwen3`) and `Qwen/Qwen3-30B-A3B` (`qwen3_moe`, a mixture of experts, 3B of
+its 30B parameters active a token; its experts stored one by one, joined into banks at load), Apache-2.0. Text. They
+think by default; `"chat_template_kwargs": {"enable_thinking": false}` turns that off. The 2507 releases
+(`-Instruct-2507`, `-Thinking-2507`) are the same model types. No drafter is published; prompt lookup
+(`--spec ngram`) works with any of them.
+
+Reference:
+
+```bash
+xpu-serve serve -hf Qwen/Qwen3-8B --device GPU
+```
+
+Optimized (Qwen3-8B at q8 keeps the original's answers; the MoE needs q4 to fit a 24 GB card):
+
+```bash
+xpu-serve convert -hf Qwen/Qwen3-8B --out ~/models/Qwen3-8B-q8 --quant q8
+xpu-serve serve ~/models/Qwen3-8B-q8 --device GPU --kv-dtype i8
+xpu-serve convert -hf Qwen/Qwen3-30B-A3B --out ~/models/Qwen3-30B-A3B-q4 --quant q4
+xpu-serve serve ~/models/Qwen3-30B-A3B-q4 --device GPU --kv-dtype i8
+```
+
+- Less VRAM: `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2` store the KV cache in fewer bits, each at a
+  growing cost in accuracy ([KV cache formats](#kv-cache-formats)).
+- Closer to the original at q4: `--method awq` on `convert` (2 minutes for Qwen3-8B on the B60) moves the logits
+  about half as far as round to nearest.
+- With thinking on, a forced tool call (`tool_choice` required or named) or a `response_format` waits for the
+  thought to close: Qwen 3's template leaves `<think>` to the model, which may open it before the answer.
+
+Measured on the Arc Pro B60 (decode of 128 tokens after a 4,096-token prompt, and that prompt's prefill):
+
+| | Decode | Prefill (4k tokens) |
+|---|---|---|
+| Qwen3-8B, f16 | 20.1 tok/s | 2,880 tok/s |
+| Qwen3-8B, q8 pack | 33.9 tok/s | 2,440 tok/s |
+| Qwen3-8B, q4 pack | 51.0 tok/s | 2,470 tok/s |
+| Qwen3-30B-A3B, q4 pack | 55.5 tok/s | 1,800 tok/s |
+
+Against Hugging Face fp32 on the CPU, six prompts (last-token logits; greedy tokens of 32):
+
+| | Logits cosine | Greedy tokens equal |
+|---|---|---|
+| Qwen3-0.6B, f16 and f32 | 1 | 32 of 32 on all six |
+| Qwen3-8B, f16 | 0.99999 or more | 32 of 32 on all six |
+| Qwen3-8B, q8 pack | 0.9991 to 0.99997 | 32 of 32 on all six |
+| Qwen3-8B, q4 pack | 0.896 to 0.995 | 4 to 32 |
+| Qwen3-8B, q4 AWQ pack | 0.951 to 0.9993 | 1 to 32 |
+| Qwen3-30B-A3B, q4 pack | 0.770 to 0.997 | 13 to 32 |
+
+The model code: tiny dense and MoE checkpoints against Hugging Face at cosine 1 (cpu-ref and the GPU, f32).
 
 ### Inkling-2-Mini
 

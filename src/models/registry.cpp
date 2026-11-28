@@ -17,6 +17,7 @@
 #include "models/pi05/pi05.h"
 #include "models/policy.h"
 #include "models/pplx_decider/pplx_decider.h"
+#include "models/qwen3/qwen3.h"
 #include "models/qwen3_5/qwen3_5.h"
 #include "models/qwen3_asr/qwen3_asr.h"
 #include "models/qwen3_omni/qwen3_omni.h"
@@ -68,8 +69,9 @@ const MediaEncoder* Model::encoder(Modality m) const {
 }
 
 std::vector<std::string> supported_model_types() {
-    return {"gemma4",      "gemma4_text",      "inkling2_loop", "lfm3",           "qwen3_5",       "qwen3_5_text",
-            "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_asr",     "qwen3_omni_moe", "sensenova_loop"};
+    return {"gemma4",      "gemma4_text",  "inkling2_loop",    "lfm3",      "qwen3",          "qwen3_moe",
+            "qwen3_5",     "qwen3_5_text", "qwen3_5_moe",      "qwen3_5_moe_text", "qwen3_asr", "qwen3_omni_moe",
+            "sensenova_loop"};
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOptions& options) {
@@ -78,6 +80,11 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
     const std::string type = cfg::get_string(config, "model_type", "config.json");
     // Inkling 2's released checkpoints are quantized their own way, which its loader checks.
     if (type != "inkling2_loop") cfg::check_quantization(config);
+    // A block drafter's config names the model type of its layers (DFlash's: qwen3), not a model of its own.
+    if (config.contains("dflash_config")) {
+        fail("'", dir.string(), "' is a block drafter checkpoint: it drafts for the model it was trained with ",
+             "(--drafter beside that model; convert --target)");
+    }
     if (options.image_max_pixels > 0 && type != "qwen3_omni_moe") {
         fail("--image-max-pixels: ", type, "'s images are not sized by a pixel budget (Qwen3-VL's processor is)");
     }
@@ -87,16 +94,13 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
         return qwen3_5::load(dir, config, options);
     }
     if (type == "lfm3") return lfm3::load(dir, config, options);
+    if (type == "qwen3" || type == "qwen3_moe") return qwen3::load(dir, config, options);
     if (type == "inkling2_loop") return inkling2::load(dir, config, options);
     if (type == "qwen3_asr") return qwen3_asr::load(dir, config, options);
     if (type == "qwen3_omni_moe") return qwen3_omni::load(dir, config, options);
     if (is_embedding_type(type)) {
         fail("model_type '", type, "' is served as an embedding model, from a sentence-transformers checkpoint ",
              "(modules.json with a Pooling module); '", dir.string(), "' has none");
-    }
-    if (config.contains("dflash_config")) {
-        fail("'", dir.string(), "' is a block drafter checkpoint: it drafts for the model it was trained with ",
-             "(--drafter beside that model; convert --target)");
     }
     std::string list;
     for (const auto& t : supported_model_types()) list += (list.empty() ? "" : ", ") + t;

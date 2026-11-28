@@ -360,7 +360,10 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       for d1 only); conv-window snapshots for prefix
       reuse after a turn with reasoning; the small ops of a q4 decode step (119 norms and 48 residual adds rank
       right after the matmuls under `XS_SYCL_PROFILE`)
-- [ ] Qwen 3 dense and MoE: the "add a model in one PR" test; write `docs/adding-a-model.md` from the experience
+- [x] Qwen 3 dense and MoE (`qwen3`, `qwen3_moe`) served alone, from the decoder Qwen3-ASR and Qwen3-Omni read:
+      the "add a model in one PR" test, written up in `docs/adding-a-model.md`; a thought Qwen 3 opens itself before a
+      forced tool call or a format (`OutputParser::own_thought`, `AnswerGate`)
+- [ ] Qwen 3: its GGUF files (`qwen3`, `qwen3moe` architectures of the importer)
 - [ ] Llama 3
 - [ ] Import MLX-affine packs
 - [x] Import GGUF files (`convert <file.gguf> <out-dir>`): architecture `qwen35`, tensors kept in their block formats

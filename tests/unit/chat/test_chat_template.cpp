@@ -90,6 +90,20 @@ TEST_SUITE("chat template") {
         }
     }
 
+    TEST_CASE("qwen3 renders byte-identical to Hugging Face") {
+        const auto tmpl = xs::chat::ChatTemplate::load(kChatFixtures / "qwen3");
+        const ordered_json cases = read_ordered_json(kChatFixtures / "qwen3_cases.json");
+        REQUIRE(cases.size() >= 30);
+        for (const ordered_json& c : cases) {
+            const std::string name = c["name"].get<std::string>();
+            CAPTURE(name);
+            std::string rendered;
+            CHECK_NOTHROW(
+                rendered = tmpl->render(c["messages"], c["tools"], c["add_generation_prompt"].get<bool>(), c["extra"]));
+            CHECK(rendered == c["expected"].get<std::string>());
+        }
+    }
+
     // Qwen3-ASR's template comes as chat_template.json; image and audio parts reach it as {"type": "image"} and
     // {"type": "audio"}.
     TEST_CASE("qwen3_asr renders byte-identical to Hugging Face") {

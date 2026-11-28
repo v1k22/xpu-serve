@@ -32,11 +32,13 @@ void keep_only(const grammar::TokenSet& allowed, std::span<float> logits) {
     std::fill(logits.data() + n, logits.data() + logits.size(), kMasked);
 }
 
-// Where a generation's output stands: still reasoning (the last bytes it wrote, where the marker may be starting),
-// writing the opening, or inside the grammar.
+// Where a generation's output stands: free to open a thought of its own or to start the answer, still reasoning
+// (until `until`; the last bytes it wrote, where the marker may be starting), writing the opening, or inside the
+// grammar.
 struct Position {
-    enum class Stage : uint8_t { reasoning, opening, grammar };
+    enum class Stage : uint8_t { may_think, reasoning, opening, grammar };
     Stage stage = Stage::grammar;
+    const std::string* until = nullptr;
     std::string tail;
     size_t opened = 0;
     grammar::Matcher matcher;
@@ -49,20 +51,19 @@ public:
 
     bool mask(std::span<float> logits) override {
         switch (at_.stage) {
+            case Position::Stage::may_think: {  // the answer's first token, or the thought's opener
+                const auto open = static_cast<size_t>(spec_->gate.thought_open);
+                const float kept = open < logits.size() ? logits[open] : kMasked;
+                const bool any = answer_mask(logits);
+                if (open >= logits.size()) return any;
+                logits[open] = kept;
+                return true;
+            }
             case Position::Stage::reasoning:
                 return true;
-            case Position::Stage::opening: {
-                const auto next = static_cast<size_t>(spec_->opening[at_.opened]);
-                const float kept = next < logits.size() ? logits[next] : kMasked;
-                std::fill(logits.begin(), logits.end(), kMasked);
-                if (next < logits.size()) logits[next] = kept;
-                return next < logits.size();
-            }
-            case Position::Stage::grammar: {
-                const grammar::TokenSet& allowed = at_.matcher.allowed();
-                keep_only(allowed, logits);
-                return allowed.count() > 0;
-            }
+            case Position::Stage::opening:
+            case Position::Stage::grammar:
+                return answer_mask(logits);
         }
         return false;
     }
@@ -82,12 +83,34 @@ public:
     }
 
 private:
+    // The answer's mask: its opening's next token, or the grammar's.
+    bool answer_mask(std::span<float> logits) const {
+        if (answer_stage(at_) == Position::Stage::opening) {
+            const auto next = static_cast<size_t>(spec_->gate.opening[at_.opened]);
+            const float kept = next < logits.size() ? logits[next] : kMasked;
+            std::fill(logits.begin(), logits.end(), kMasked);
+            if (next < logits.size()) logits[next] = kept;
+            return next < logits.size();
+        }
+        const grammar::TokenSet& allowed = at_.matcher.allowed();
+        keep_only(allowed, logits);
+        return allowed.count() > 0;
+    }
+
+    // Where the answer starts: its opening, if any, else the grammar.
+    Position::Stage answer_stage(const Position& p) const {
+        if (p.stage != Position::Stage::may_think) return p.stage;
+        return spec_->gate.opening.empty() ? Position::Stage::grammar : Position::Stage::opening;
+    }
+
     bool allows(const Position& p, int32_t token) const {
-        switch (p.stage) {
+        if (p.stage == Position::Stage::may_think && token == spec_->gate.thought_open) return true;
+        switch (answer_stage(p)) {
+            case Position::Stage::may_think:
             case Position::Stage::reasoning:
                 return true;
             case Position::Stage::opening:
-                return token == spec_->opening[p.opened];
+                return token == spec_->gate.opening[p.opened];
             case Position::Stage::grammar:
                 return p.matcher.allows(token);
         }
@@ -96,10 +119,20 @@ private:
 
     void advance(Position& p, int32_t token) const {
         const grammar::Vocabulary& v = *spec_->vocabulary;
+        if (p.stage == Position::Stage::may_think) {
+            if (token == spec_->gate.thought_open) {
+                p.stage = Position::Stage::reasoning;
+                p.until = &spec_->gate.thought_close;
+                return;
+            }
+            p.stage = answer_stage(p);
+        }
         switch (p.stage) {
+            case Position::Stage::may_think:
+                return;
             case Position::Stage::reasoning: {
                 if (token >= 0 && token < v.size()) p.tail += v.bytes(token);
-                const std::string& marker = spec_->reasoning_end;
+                const std::string& marker = *p.until;
                 const size_t at = p.tail.find(marker);
                 if (at == std::string::npos) {
                     if (p.tail.size() >= marker.size()) p.tail.erase(0, p.tail.size() - marker.size() + 1);
@@ -107,12 +140,12 @@ private:
                 }
                 const std::string rest = p.tail.substr(at + marker.size());  // what the token wrote after the marker
                 p.tail.clear();
-                p.stage = spec_->opening.empty() ? Position::Stage::grammar : Position::Stage::opening;
+                p.stage = spec_->gate.opening.empty() ? Position::Stage::grammar : Position::Stage::opening;
                 if (p.stage == Position::Stage::grammar) p.matcher.accept_bytes(rest);
                 return;
             }
             case Position::Stage::opening:
-                if (++p.opened == spec_->opening.size()) p.stage = Position::Stage::grammar;
+                if (++p.opened == spec_->gate.opening.size()) p.stage = Position::Stage::grammar;
                 return;
             case Position::Stage::grammar:
                 p.matcher.accept_token(token);
@@ -214,21 +247,26 @@ std::shared_ptr<const grammar::Vocabulary> grammar_vocabulary(const tok::Tokeniz
 }
 
 GrammarConstraint::GrammarConstraint(std::shared_ptr<const grammar::Grammar> grammar,
-                                     std::shared_ptr<const grammar::Vocabulary> vocabulary, std::string reasoning_end,
-                                     std::vector<int32_t> opening, std::shared_ptr<AutomatonCache> automata,
-                                     std::string key)
-    : spec_(std::make_shared<const Spec>(Spec{std::move(grammar), std::move(vocabulary), std::move(reasoning_end),
-                                              std::move(opening), std::move(automata), std::move(key)})) {
+                                     std::shared_ptr<const grammar::Vocabulary> vocabulary, AnswerGate gate,
+                                     std::shared_ptr<AutomatonCache> automata, std::string key)
+    : spec_(std::make_shared<const Spec>(Spec{std::move(grammar), std::move(vocabulary), std::move(gate),
+                                              std::move(automata), std::move(key)})) {
     XS_CHECK(spec_->grammar && spec_->vocabulary, "response_format: a constraint without its grammar or vocabulary");
+    XS_CHECK(spec_->gate.thought_open < 0 || !spec_->gate.thought_close.empty(),
+             "response_format: a thought's opener without its closer");
 }
 
 std::unique_ptr<TokenConstraint> GrammarConstraint::start() const {
     auto automaton = spec_->automata ? spec_->automata->get(spec_->key, spec_->grammar, spec_->vocabulary)
                                      : std::make_shared<grammar::Automaton>(spec_->grammar, spec_->vocabulary);
     Position at{.matcher = grammar::Matcher(std::move(automaton))};
-    if (!spec_->reasoning_end.empty()) {
+    const AnswerGate& gate = spec_->gate;
+    if (!gate.reasoning_end.empty()) {
         at.stage = Position::Stage::reasoning;
-    } else if (!spec_->opening.empty()) {
+        at.until = &gate.reasoning_end;
+    } else if (gate.thought_open >= 0) {
+        at.stage = Position::Stage::may_think;
+    } else if (!gate.opening.empty()) {
         at.stage = Position::Stage::opening;
     }
     return std::make_unique<Answer>(spec_, std::move(at));

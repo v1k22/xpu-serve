@@ -41,24 +41,34 @@ private:
     size_t most_;
 };
 
-// A generation's output: free until the model has written `reasoning_end` (empty: from the start; the engine keeps the
-// stop tokens out meanwhile, since the answer is still to come), then the tokens of `opening`, then whatever the
+// Where the answer starts in a generation's output (chat::answer_start in the model's tokens).
+struct AnswerGate {
+    // The prompt left a thought open: the output is free until the model has written this marker (the engine keeps
+    // the stop tokens out meanwhile, since the answer is still to come).
+    std::string reasoning_end;
+    // Else the model may open a thought of its own first with this marker token (none: -1), free until it writes
+    // `thought_close`; or start the answer at once.
+    int32_t thought_open = -1;
+    std::string thought_close;
+    // Then these tokens, before the grammar's.
+    std::vector<int32_t> opening;
+};
+
+// A generation's output: free while `gate` says the model reasons, then the tokens of its opening, then whatever the
 // grammar allows, token by token, until it is complete.
 class GrammarConstraint final : public OutputConstraint {
 public:
     // `automata` and `key`: where the grammar's automaton is kept, and its name there (none: one a generation).
     GrammarConstraint(std::shared_ptr<const grammar::Grammar> grammar,
-                      std::shared_ptr<const grammar::Vocabulary> vocabulary, std::string reasoning_end,
-                      std::vector<int32_t> opening, std::shared_ptr<AutomatonCache> automata = nullptr,
-                      std::string key = {});
+                      std::shared_ptr<const grammar::Vocabulary> vocabulary, AnswerGate gate,
+                      std::shared_ptr<AutomatonCache> automata = nullptr, std::string key = {});
     std::unique_ptr<TokenConstraint> start() const override;
 
     // What each generation's constraint reads, shared by them.
     struct Spec {
         std::shared_ptr<const grammar::Grammar> grammar;
         std::shared_ptr<const grammar::Vocabulary> vocabulary;
-        std::string reasoning_end;
-        std::vector<int32_t> opening;
+        AnswerGate gate;
         std::shared_ptr<AutomatonCache> automata;
         std::string key;
     };

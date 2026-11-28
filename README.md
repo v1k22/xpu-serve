@@ -99,6 +99,7 @@ Each model's recipe has its commands and numbers.
 | Qwen3.8-27B | language | `Qwen/Qwen3.8-27B`, `Qwen/Qwen3.8-27B-FP8` | q4 pack, GGUF | [recipe](model_recipes.md#qwen38-27b), [GGUF](model_recipes.md#qwen38-27b-gguf) |
 | Ornith-1.5-35B-A3B | language, MoE | `ornith-ai/Ornith-1.5-35B-A3B`, `-FP8`, `-GGUF` | q4 pack, GGUF Q4_K_M | [recipe](model_recipes.md#ornith-15-35b-a3b), [GGUF](model_recipes.md#ornith-15-35b-a3b-gguf) |
 | LFM3-1.7B | language | `LiquidAI/LFM3-1.7B` | original, q8 / q4 pack | [recipe](model_recipes.md#lfm3-17b) |
+| Qwen3-0.6B to 32B, Qwen3-30B-A3B | language (30B-A3B: MoE) | `Qwen/Qwen3-8B`, `Qwen/Qwen3-30B-A3B`, ... | original, q8 / q4 pack | [recipe](model_recipes.md#qwen3-06b-to-32b-30b-a3b) |
 | Inkling-2-Mini | language, MoE | `thinkingmachines/Inkling-2-Mini`, `unsloth/Inkling-2-Mini-GGUF` | q8 / q4 pack, GGUF | [recipe](model_recipes.md#inkling-2-mini), [GGUF](model_recipes.md#inkling-2-mini-gguf) |
 | Inkling-2-Mini Uncensored | language, MoE | `AtomicChat/Inkling-2-Mini-Uncensored-GGUF` | GGUF Q4_K, IQ3_S, IQ2_M | [GGUF](model_recipes.md#inkling-2-mini-uncensored-gguf) |
 | Clef-Flash | decision | `Cloudflare/clef-flash` | original, q8 / q4 pack, GGUF | [recipe](model_recipes.md#clef-flash) |
