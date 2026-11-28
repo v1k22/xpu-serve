@@ -37,8 +37,11 @@ struct GenerationOptions {
     std::vector<std::string> stop;
     bool stream = false;
     bool include_usage = false;  // stream_options.include_usage
-    // response_format json_object or json_schema: the grammar the answer is held to; null for free text.
+    // response_format json_object or json_schema, or structured_outputs (json, regex, choice, grammar,
+    // json_object): the grammar the answer is held to; null for free text. `format_key` names it (requests holding to
+    // the same grammar share its automaton).
     std::shared_ptr<const grammar::Grammar> format;
+    std::string format_key;
     // Each generated token's log-probability with this many alternatives beside it (chat: logprobs and top_logprobs;
     // text completions: logprobs); -1: none.
     int logprobs = -1;
@@ -58,6 +61,12 @@ struct MediaPart {
     std::string param;  // where it came from, e.g. "messages[1].content[0]", for error messages
     Modality modality = Modality::Image;
     std::vector<uint8_t> bytes;
+};
+
+// A grammar the answer is held to, and the text that names it.
+struct OutputFormat {
+    std::shared_ptr<const grammar::Grammar> grammar;
+    std::string key;
 };
 
 // Request JSON keeps the client's key order: chat templates can print it (tool schemas, tool-call arguments).

@@ -115,6 +115,32 @@ TEST_SUITE("server.grammar_constraint") {
         e->accept(kEnd);
         CHECK(left(*e).size() == 260);
     }
+
+    TEST_CASE("the automata of grammars kept by name: requests held to one grammar share its states and masks") {
+        server::AutomatonCache cache(2);
+        const auto object = grammar::json_object_grammar();
+        const auto v = vocabulary();
+        const auto a = cache.get("json_object", object, v);
+        CHECK(cache.get("json_object", object, v) == a);
+        CHECK(cache.get("", object, v) != a);  // unnamed: not kept
+        const auto b = cache.get("other", grammar::json_object_grammar(), v);
+        CHECK(b != a);
+        CHECK(cache.get("json_object", object, v) == a);
+        cache.get("third", object, v);  // past the bound the least recently used goes: "other"
+        CHECK(cache.get("other", object, v) != b);
+        // Two generations of one constraint walk one automaton: the second finds the states the first made.
+        GrammarConstraint shared(object, v, "", {}, std::make_shared<server::AutomatonCache>(), "json_object");
+        const auto first = shared.start();
+        std::vector<float> logits(static_cast<size_t>(v->size()), 0.0f);
+        const std::vector<int32_t> doc = bytes_of("{\"a\": [1, {\"b\": null}]}");
+        for (const int32_t t : doc) {
+            first->mask(logits);
+            first->accept(t);
+        }
+        CHECK(first->complete());
+        const auto second = shared.start();
+        CHECK(second->allowed_prefix(doc) == doc.size());
+    }
 }
 
 }  // namespace xs

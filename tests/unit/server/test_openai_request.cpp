@@ -263,6 +263,44 @@ TEST_SUITE("server.request") {
                                         {"tool_choice", "required"}})) == "response_format");
     }
 
+    TEST_CASE("structured_outputs: one of json, regex, choice, grammar, json_object; the rest refused by name") {
+        const auto format = [](json so) { return parse_chat_request(chat_body({{"structured_outputs", so}}), {}).options; };
+        CHECK(format({{"regex", "[0-9]{3}"}}).format != nullptr);
+        CHECK(format({{"regex", "[0-9]{3}"}}).format_key == "regex:[0-9]{3}");
+        CHECK(format({{"choice", json::array({"yes", "no"})}}).format != nullptr);
+        CHECK(format({{"grammar", "root ::= \"a\" | \"b\""}}).format != nullptr);
+        CHECK(format({{"json_object", true}}).format_key == "json_object");
+        CHECK(format({{"json", {{"type", "integer"}}}}).format != nullptr);
+        CHECK(format({{"json", R"({"type": "boolean"})"}}).format != nullptr);  // a schema as text
+        CHECK(format({{"json", nullptr}, {"regex", "a"}}).format != nullptr);    // null counts as absent
+        CHECK(parse_completion_request({{"prompt", "x"}, {"structured_outputs", {{"regex", "a+"}}}}, {}).options.format);
+        const auto refused = [](json body) { return rejected_param(chat_body(body)); };
+        CHECK(refused({{"structured_outputs", {{"regex", "a"}, {"choice", json::array({"a"})}}}}) == "structured_outputs");
+        CHECK(refused({{"structured_outputs", json::object()}}) == "structured_outputs");
+        CHECK(refused({{"structured_outputs", {{"structural_tag", "{}"}}}}) == "structured_outputs.structural_tag");
+        CHECK(refused({{"structured_outputs", {{"regex", "a"}, {"disable_any_whitespace", true}}}}) ==
+              "structured_outputs.disable_any_whitespace");
+        CHECK(refused({{"structured_outputs", {{"json_object", false}}}}) == "structured_outputs.json_object");
+        CHECK(refused({{"structured_outputs", {{"choice", json::array()}}}}) == "structured_outputs.choice");
+        CHECK(refused({{"structured_outputs", {{"regex", "a(?=b)"}}}}) == "structured_outputs.regex");
+        CHECK(refused({{"structured_outputs", {{"grammar", "start: \"a\""}}}}) == "structured_outputs.grammar");  // Lark
+        CHECK(refused({{"structured_outputs", {{"grammar", "root ::= missing"}}}}) == "structured_outputs.grammar");
+        CHECK(refused({{"structured_outputs", {{"json", {{"type", "integer"}, {"minimum", 1}}}}}}) ==
+              "structured_outputs.json.minimum");
+        CHECK(refused({{"structured_outputs", {{"regex", "a"}}}, {"response_format", {{"type", "json_object"}}}}) ==
+              "structured_outputs");
+        for (const char* removed : {"guided_json", "guided_regex", "guided_choice", "guided_grammar",
+                                    "guided_decoding_backend", "guided_whitespace_pattern"}) {
+            CAPTURE(removed);
+            CHECK(refused({{removed, "x"}}) == removed);
+        }
+        try {
+            parse_chat_request(chat_body({{"structured_outputs", {{"regex", "a(?=b)"}}}}), {});
+        } catch (const InvalidRequest& e) {
+            CHECK(std::string(e.what()) == "'structured_outputs.regex' has a lookahead, which is not supported (offset 1)");
+        }
+    }
+
     TEST_CASE("completion prompt is a string or a one-string array") {
         CHECK(parse_completion_request({{"prompt", "abc"}}, {}).prompt == "abc");
         CHECK(parse_completion_request({{"prompt", json::array({"xyz"})}}, {}).prompt == "xyz");

@@ -121,7 +121,8 @@ std::shared_ptr<const OutputConstraint> CompletionHandlers::chat_constraint(cons
         // Strict tools: a call, once opened, is held to the tool's schema; the rest of the reply is free.
         const std::optional<CallsAfterOpener> calls = strict_calls(dialect, chat.tools, vocabulary());
         if (!calls) return nullptr;
-        return std::make_shared<OpenerConstraint>(calls->opener, calls->grammar, vocabulary_);
+        return std::make_shared<OpenerConstraint>(calls->opener, calls->grammar, vocabulary_, automata_,
+                                                  str_cat("strict calls:", dialect, ":", chat.tools.dump()));
     }
     if (!forced && !or_answer) return output_constraint(chat.options, dialect, prompt_tail);
     const chat::AnswerStart start = chat::answer_start(dialect, prompt_tail);
@@ -131,8 +132,11 @@ std::shared_ptr<const OutputConstraint> CompletionHandlers::chat_constraint(cons
                           .answer = or_answer ? chat.options.format : nullptr,
                           .answer_opening = start.opening};
     // The grammar holds the dialect's whole syntax of calls (and the answer's opening): no tokens forced before it.
+    const std::string key = str_cat("tool calls:", dialect, ":", static_cast<int>(choice.mode), ":", choice.name, ":",
+                                    chat.parallel_tool_calls, ":", or_answer ? chat.options.format_key : "", ":",
+                                    start.opening, ":", chat.tools.dump());
     return std::make_shared<GrammarConstraint>(tool_call_grammar(dialect, calls, vocabulary()), vocabulary_,
-                                               start.reasoning_end, std::vector<int32_t>{});
+                                               start.reasoning_end, std::vector<int32_t>{}, automata_, key);
 }
 
 std::shared_ptr<const OutputConstraint> CompletionHandlers::output_constraint(const GenerationOptions& options,
@@ -142,7 +146,8 @@ std::shared_ptr<const OutputConstraint> CompletionHandlers::output_constraint(co
     vocabulary();
     const chat::AnswerStart start = chat::answer_start(dialect, prompt_tail);
     return std::make_shared<GrammarConstraint>(options.format, vocabulary_, start.reasoning_end,
-                                               service_.tokenizer().encode(start.opening, /*parse_special=*/true));
+                                               service_.tokenizer().encode(start.opening, /*parse_special=*/true),
+                                               automata_, options.format_key);
 }
 
 CompletionHandlers::Prompt CompletionHandlers::chat_prompt(const ChatRequest& chat) const {

@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <limits>
+#include <set>
 
 #include "grammar/json_schema.h"
+#include "grammar/text_grammars.h"
 #include "server/request_fields.h"
 #include "util/base64.h"
 #include "util/error.h"
@@ -73,21 +76,33 @@ int parse_choices(const json& body, const SamplingParams& sampling) {
     return static_cast<int>(*n);
 }
 
+// A schema compiled, or refused at its keyword's path below `param`.
+OutputFormat schema_format(const json& schema, const std::string& param) {
+    try {
+        return {grammar::json_schema_grammar(schema), "json_schema:" + schema.dump()};
+    } catch (const grammar::GrammarError& e) {
+        const std::string at = e.path().empty() ? param : str_cat(param, ".", e.path());
+        reject(at, str_cat("'", at, "' ", e.what()));
+    }
+}
+
+OutputFormat any_object_format() {
+    static const std::shared_ptr<const grammar::Grammar> any_object = grammar::json_object_grammar();
+    return {any_object, "json_object"};
+}
+
 // response_format: {"type": "text"}, {"type": "json_object"}, or {"type": "json_schema", "json_schema": {"name",
 // "schema", "strict", "description"}}. A schema the grammar compiler does not take is refused at the keyword's path.
-std::shared_ptr<const grammar::Grammar> parse_response_format(const json& body) {
+OutputFormat parse_response_format(const json& body) {
     const json* v = fields::object(body, "response_format");
-    if (v == nullptr) return nullptr;
+    if (v == nullptr) return {};
     const json* type = fields::find(*v, "type");
     if (type == nullptr || !type->is_string()) {
         reject("response_format.type", "'response_format.type' must be a string");
     }
     const std::string t = type->get<std::string>();
-    if (t == "text") return nullptr;
-    if (t == "json_object") {
-        static const std::shared_ptr<const grammar::Grammar> any_object = grammar::json_object_grammar();
-        return any_object;
-    }
+    if (t == "text") return {};
+    if (t == "json_object") return any_object_format();
     if (t != "json_schema") {
         reject("response_format.type",
                str_cat("unknown response_format type '", t, "' (text, json_object and json_schema are known)"));
@@ -107,11 +122,100 @@ std::shared_ptr<const grammar::Grammar> parse_response_format(const json& body) 
     const json* schema = fields::find(*spec, "schema");
     constexpr std::string_view kSchema = "response_format.json_schema.schema";
     if (schema == nullptr) reject(std::string(kSchema), str_cat("'", kSchema, "' is required"));
-    try {
-        return grammar::json_schema_grammar(*schema);
-    } catch (const grammar::GrammarError& e) {
-        const std::string param = e.path().empty() ? std::string(kSchema) : str_cat(kSchema, ".", e.path());
-        reject(param, str_cat("'", param, "' ", e.what()));
+    return schema_format(*schema, std::string(kSchema));
+}
+
+// A grammar in Lark's syntax, which vLLM tells from EBNF by the absence of `::=` (comments aside).
+bool lark_like(std::string_view grammar) {
+    size_t at = 0;
+    while (at < grammar.size()) {
+        const size_t end = std::min(grammar.find('\n', at), grammar.size());
+        std::string_view line = grammar.substr(at, end - at);
+        for (const std::string_view comment : {"#", "//"}) {
+            if (const size_t c = line.find(comment); c != std::string_view::npos) line = line.substr(0, c);
+        }
+        if (line.find("::=") != std::string_view::npos) return false;
+        at = end + 1;
+    }
+    return true;
+}
+
+// vLLM's structured_outputs: exactly one of json (a schema, or its text), regex, choice, grammar (EBNF, xgrammar's
+// dialect) and json_object. Its other constraints and options are refused by name.
+OutputFormat parse_structured_outputs(const json& body) {
+    const json* v = fields::object(body, "structured_outputs");
+    if (v == nullptr) return {};
+    const std::set<std::string> kinds = {"json", "regex", "choice", "grammar", "json_object"};
+    std::vector<std::string> given;
+    for (const auto& [key, value] : v->items()) {
+        if (value.is_null()) continue;
+        const std::string param = "structured_outputs." + key;
+        if (key == "structural_tag") reject(param, str_cat("'", param, "' is not supported"));
+        if (!kinds.contains(key)) {
+            reject(param, str_cat("'", param, "' is not supported (json, regex, choice, grammar and json_object are)"));
+        }
+        given.push_back(key);
+    }
+    if (given.size() != 1) {
+        reject("structured_outputs", "'structured_outputs' must hold exactly one of json, regex, choice, grammar and "
+                                     "json_object");
+    }
+    const std::string& kind = given.front();
+    const std::string param = "structured_outputs." + kind;
+    const json& value = v->at(kind);
+    const auto compiled = [&](const std::function<std::shared_ptr<const grammar::Grammar>()>& compile,
+                              std::string key) -> OutputFormat {
+        try {
+            return {compile(), std::move(key)};
+        } catch (const grammar::GrammarError& e) {
+            reject(param, str_cat("'", param, "' ", e.what(), e.path().empty() ? "" : str_cat(" (", e.path(), ")")));
+        }
+    };
+    if (kind == "json") {
+        if (value.is_string()) {
+            const json schema = json::parse(value.get<std::string>(), nullptr, /*allow_exceptions=*/false);
+            if (schema.is_discarded()) reject(param, str_cat("'", param, "' holds a string that is not JSON"));
+            return schema_format(schema, param);
+        }
+        return schema_format(value, param);
+    }
+    if (kind == "json_object") {
+        if (!value.is_boolean() || !value.get<bool>()) reject(param, str_cat("'", param, "' must be true if set"));
+        return any_object_format();
+    }
+    if (kind == "regex") {
+        if (!value.is_string()) reject(param, str_cat("'", param, "' must be a string"));
+        const std::string pattern = value.get<std::string>();
+        return compiled([&] { return grammar::regex_grammar(pattern); }, "regex:" + pattern);
+    }
+    if (kind == "choice") {
+        if (!value.is_array() || value.empty()) reject(param, str_cat("'", param, "' must be a non-empty array of strings"));
+        std::vector<std::string> options;
+        for (const json& o : value) {
+            if (!o.is_string()) reject(param, str_cat("'", param, "' must be a non-empty array of strings"));
+            options.push_back(o.get<std::string>());
+        }
+        return compiled([&] { return grammar::choice_grammar(options); }, "choice:" + value.dump());
+    }
+    // grammar
+    if (!value.is_string() || value.get<std::string>().empty()) {
+        reject(param, str_cat("'", param, "' must be a non-empty string"));
+    }
+    const std::string text = value.get<std::string>();
+    if (lark_like(text)) {
+        reject(param, str_cat("'", param, "' reads as a Lark grammar (no '::='), which is not supported: write EBNF, ",
+                              "rules as name ::= body with a 'root' rule"));
+    }
+    return compiled([&] { return grammar::ebnf_grammar(text); }, "grammar:" + text);
+}
+
+// The constraint fields vLLM removed (they now do nothing there): refused, pointing to structured_outputs.
+void refuse_guided_fields(const json& body) {
+    for (const char* name : {"guided_json", "guided_regex", "guided_choice", "guided_grammar", "guided_whitespace_pattern",
+                             "guided_decoding_backend"}) {
+        if (fields::find(body, name) != nullptr) {
+            reject(name, str_cat("'", name, "' is not supported: use 'structured_outputs' (vLLM removed the guided_ fields)"));
+        }
     }
 }
 
@@ -153,7 +257,15 @@ GenerationOptions parse_generation_options(const json& body, const SamplingParam
     if (const json* so = fields::object(body, "stream_options")) {
         o.include_usage = fields::boolean(*so, "include_usage", "stream_options.include_usage");
     }
-    o.format = parse_response_format(body);
+    refuse_guided_fields(body);
+    OutputFormat format = parse_response_format(body);
+    OutputFormat structured = parse_structured_outputs(body);
+    if (format.grammar && structured.grammar) {
+        reject("structured_outputs", "give 'response_format' or 'structured_outputs', not both");
+    }
+    if (structured.grammar) format = std::move(structured);
+    o.format = std::move(format.grammar);
+    o.format_key = std::move(format.key);
     return o;
 }
 

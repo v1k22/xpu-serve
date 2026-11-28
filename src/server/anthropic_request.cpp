@@ -5,6 +5,7 @@
 #include <string>
 
 #include "chat/output_parser.h"
+#include "grammar/json_schema.h"
 #include "server/request_fields.h"
 #include "util/base64.h"
 
@@ -186,6 +187,46 @@ ToolChoice parse_tool_choice(const json& body, const json& tools, bool& parallel
     return c;
 }
 
+// output_config: format {"type": "json_schema", "schema"} (Anthropic's JSON outputs) and effort (the template's
+// reasoning_effort). The deprecated beta field output_format is refused by name, as Anthropic's API does without
+// its beta header.
+void parse_output_config(const json& body, ChatRequest& r) {
+    if (fields::find(body, "output_format") != nullptr) {
+        reject("output_format", "'output_format' is the deprecated beta field: use 'output_config.format'");
+    }
+    const json* config = fields::object(body, "output_config");
+    if (config == nullptr) return;
+    for (const auto& [key, value] : config->items()) {
+        if (key != "format" && key != "effort" && !value.is_null()) {
+            reject("output_config." + key, str_cat("'output_config.", key, "' is not supported"));
+        }
+    }
+    if (const json* effort = fields::find(*config, "effort")) {
+        if (!effort->is_string()) reject("output_config.effort", "'output_config.effort' must be a string");
+        if (!r.template_kwargs.contains("reasoning_effort")) r.template_kwargs["reasoning_effort"] = *effort;
+    }
+    const json* format = fields::find(*config, "format");
+    if (format == nullptr) return;
+    if (!format->is_object()) reject("output_config.format", "'output_config.format' must be an object");
+    const json* type = fields::find(*format, "type");
+    if (type == nullptr || *type != "json_schema") {
+        reject("output_config.format.type", "'output_config.format.type' must be \"json_schema\"");
+    }
+    const json* schema = fields::find(*format, "schema");
+    if (schema == nullptr) reject("output_config.format.schema", "'output_config.format.schema' is required");
+    try {
+        r.options.format = grammar::json_schema_grammar(*schema);
+        r.options.format_key = "json_schema:" + schema->dump();
+    } catch (const grammar::GrammarError& e) {
+        const std::string at = e.path().empty() ? "output_config.format.schema" : "output_config.format.schema." + e.path();
+        reject(at, str_cat("'", at, "' ", e.what()));
+    }
+    const ToolChoice::Mode mode = r.tool_choice.mode;
+    if (mode == ToolChoice::Mode::required || mode == ToolChoice::Mode::named) {
+        reject("output_config.format", "'output_config.format' is not supported beside a 'tool_choice' that forces a call");
+    }
+}
+
 }  // namespace
 
 ChatRequest parse_messages_request(const json& body, const SamplingParams& defaults, std::string_view dialect,
@@ -226,6 +267,7 @@ ChatRequest parse_messages_request(const json& body, const SamplingParams& defau
         }
     }
     o.stream = fields::boolean(body, "stream", "stream");
+    parse_output_config(body, r);
     return r;
 }
 

@@ -348,6 +348,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   is refused with a 400 naming its path (`response_format.json_schema.schema.properties.age.minimum`). Beside `tools`
   with `tool_choice` `auto` the reply is tool calls or the formatted answer; beside a forced call it is refused.
   docs/decisions/0033.
+- **vLLM's structured outputs**: `structured_outputs` with one of `json` (a schema), `regex` (the whole answer
+  matches it; lookaround and backreferences refused), `choice` (one of the strings), `grammar` (EBNF as xgrammar
+  reads it, GBNF's syntax, with a `root` rule; Lark refused) or `json_object`. vLLM's removed `guided_*` fields are
+  refused by name. Requests held to the same grammar share its automaton, so the masks one request computed serve the
+  next. docs/decisions/0036.
 - **Log-probabilities**: `logprobs: true` with `top_logprobs` (0 to 20) on chat completions, `logprobs` (0 to 20) on
   text completions, in OpenAI's shapes, streamed with each chunk's tokens. Each is the log-softmax of the model's
   row before penalties and temperature (vLLM's default), after a `response_format` grammar masked it (a masked
@@ -382,7 +387,9 @@ curl -s http://127.0.0.1:8080/v1/messages -H 'Content-Type: application/json' -d
   blocks; `tools` with `input_schema` (and `strict`), `tool_choice` `auto`, `any`, `tool` (with `name`) or `none` and
   `disable_parallel_tool_use` (forced calls held as on the OpenAI route); `thinking` `enabled` or `disabled` (off the
   way the model's template turns it off); `temperature`, `top_p`, `top_k`, `stop_sequences`, `max_tokens`
-  (required). Server tools, documents and image URLs are refused by name, in the API's error shape.
+  (required); `output_config` with `format` `{"type": "json_schema", "schema"}` (JSON outputs, held as
+  `response_format` is; the beta `output_format` is refused) and `effort`. Server tools, documents and image URLs
+  are refused by name, in the API's error shape.
 
 ### Transcriptions
 

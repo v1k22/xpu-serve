@@ -169,14 +169,36 @@ private:
 
 }  // namespace
 
+std::shared_ptr<grammar::Automaton> AutomatonCache::get(const std::string& key,
+                                                        const std::shared_ptr<const grammar::Grammar>& grammar,
+                                                        const std::shared_ptr<const grammar::Vocabulary>& vocabulary) {
+    if (key.empty()) return std::make_shared<grammar::Automaton>(grammar, vocabulary);
+    std::lock_guard lock(mutex_);
+    for (auto it = kept_.begin(); it != kept_.end(); ++it) {
+        if (it->first != key) continue;
+        kept_.splice(kept_.begin(), kept_, it);
+        return kept_.front().second;
+    }
+    kept_.emplace_front(key, std::make_shared<grammar::Automaton>(grammar, vocabulary));
+    if (kept_.size() > most_) kept_.pop_back();
+    return kept_.front().second;
+}
+
 OpenerConstraint::OpenerConstraint(int32_t opener, std::shared_ptr<const grammar::Grammar> grammar,
-                                   std::shared_ptr<const grammar::Vocabulary> vocabulary)
-    : opener_(opener), grammar_(std::move(grammar)), vocabulary_(std::move(vocabulary)) {
+                                   std::shared_ptr<const grammar::Vocabulary> vocabulary,
+                                   std::shared_ptr<AutomatonCache> automata, std::string key)
+    : opener_(opener),
+      grammar_(std::move(grammar)),
+      vocabulary_(std::move(vocabulary)),
+      automata_(std::move(automata)),
+      key_(std::move(key)) {
     XS_CHECK(grammar_ && vocabulary_, "tool call: a constraint without its grammar or vocabulary");
 }
 
 std::unique_ptr<TokenConstraint> OpenerConstraint::start() const {
-    return std::make_unique<AfterOpener>(opener_, std::make_shared<grammar::Automaton>(grammar_, vocabulary_));
+    auto automaton = automata_ ? automata_->get(key_, grammar_, vocabulary_)
+                               : std::make_shared<grammar::Automaton>(grammar_, vocabulary_);
+    return std::make_unique<AfterOpener>(opener_, std::move(automaton));
 }
 
 std::shared_ptr<const grammar::Vocabulary> grammar_vocabulary(const tok::Tokenizer& tokenizer) {
@@ -193,14 +215,17 @@ std::shared_ptr<const grammar::Vocabulary> grammar_vocabulary(const tok::Tokeniz
 
 GrammarConstraint::GrammarConstraint(std::shared_ptr<const grammar::Grammar> grammar,
                                      std::shared_ptr<const grammar::Vocabulary> vocabulary, std::string reasoning_end,
-                                     std::vector<int32_t> opening)
-    : spec_(std::make_shared<const Spec>(
-          Spec{std::move(grammar), std::move(vocabulary), std::move(reasoning_end), std::move(opening)})) {
+                                     std::vector<int32_t> opening, std::shared_ptr<AutomatonCache> automata,
+                                     std::string key)
+    : spec_(std::make_shared<const Spec>(Spec{std::move(grammar), std::move(vocabulary), std::move(reasoning_end),
+                                              std::move(opening), std::move(automata), std::move(key)})) {
     XS_CHECK(spec_->grammar && spec_->vocabulary, "response_format: a constraint without its grammar or vocabulary");
 }
 
 std::unique_ptr<TokenConstraint> GrammarConstraint::start() const {
-    Position at{.matcher = grammar::Matcher(std::make_shared<grammar::Automaton>(spec_->grammar, spec_->vocabulary))};
+    auto automaton = spec_->automata ? spec_->automata->get(spec_->key, spec_->grammar, spec_->vocabulary)
+                                     : std::make_shared<grammar::Automaton>(spec_->grammar, spec_->vocabulary);
+    Position at{.matcher = grammar::Matcher(std::move(automaton))};
     if (!spec_->reasoning_end.empty()) {
         at.stage = Position::Stage::reasoning;
     } else if (!spec_->opening.empty()) {

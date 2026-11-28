@@ -9,10 +9,15 @@
 #include <vector>
 
 #include "engine/service.h"
+#include "server/grammar_constraint.h"
 #include "server/openai_request.h"
 
 namespace xs::grammar {
 class Vocabulary;
+}
+
+namespace xs::server {
+class AutomatonCache;
 }
 
 namespace xs::server {
@@ -61,6 +66,8 @@ private:
     // The model's tokens as grammars read them, built for the first request with a format.
     mutable std::once_flag vocabulary_once_;
     mutable std::shared_ptr<const grammar::Vocabulary> vocabulary_;
+    // The automata of the grammars requests hold to, shared by requests holding to the same one.
+    std::shared_ptr<AutomatonCache> automata_ = std::make_shared<AutomatonCache>();
 };
 
 }  // namespace xs::server

@@ -128,6 +128,25 @@ TEST_CASE("anthropic request: thinking on and off, tool_choice none, and what is
     refused(base({{"tools", tools}, {"tool_choice", {{"type", "tool"}}}}), "tool_choice.name");
     refused(base({{"tools", tools}, {"tool_choice", {{"type", "tool"}, {"name", "g"}}}}), "tool_choice.name");
     refused(base({{"tools", tools}, {"tool_choice", {{"type", "sometimes"}}}}), "tool_choice.type");
+    // JSON outputs: output_config.format's schema held as response_format's; the beta output_format refused.
+    const RequestJson schema = {{"type", "object"}, {"properties", {{"n", {{"type", "integer"}}}}}, {"required", {"n"}},
+                                {"additionalProperties", false}};
+    const auto formatted = parse(base({{"output_config", {{"format", {{"type", "json_schema"}, {"schema", schema}}},
+                                                          {"effort", "low"}}}}));
+    CHECK(formatted.options.format != nullptr);
+    CHECK(formatted.options.format_key == "json_schema:" + schema.dump());
+    CHECK(formatted.template_kwargs["reasoning_effort"] == "low");
+    refused(base({{"output_format", {{"type", "json_schema"}, {"schema", schema}}}}), "output_format");
+    refused(base({{"output_config", {{"format", {{"type", "json_object"}}}}}}), "output_config.format.type");
+    refused(base({{"output_config", {{"format", {{"type", "json_schema"}}}}}}), "output_config.format.schema");
+    refused(base({{"output_config", {{"verbosity", "high"}}}}), "output_config.verbosity");
+    RequestJson bad = schema;
+    bad["properties"]["n"]["minimum"] = 0;
+    refused(base({{"output_config", {{"format", {{"type", "json_schema"}, {"schema", bad}}}}}}),
+            "output_config.format.schema.properties.n.minimum");
+    refused(base({{"tools", tools}, {"tool_choice", {{"type", "any"}}},
+                  {"output_config", {{"format", {{"type", "json_schema"}, {"schema", schema}}}}}}),
+            "output_config.format");
     refused(base({{"messages", RequestJson::array({{{"role", "user"},
                                                     {"content", RequestJson::array({{{"type", "document"}}})}}})}}),
             "messages[0].content[0]");
