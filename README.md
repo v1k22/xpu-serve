@@ -33,9 +33,9 @@ optimized one) and what was measured**; this page says what is supported and how
 
 - ✅ **Models straight from the Hugging Face Hub**: `-hf org/name`, or `-hf org/name:QUANT` for a GGUF file, into
   the Hugging Face cache (shared with huggingface_hub), resumable and checked
-- ✅ **OpenAI-compatible server**: `/v1/chat/completions` (streaming, tool calls, thinking, structured outputs),
-  `/v1/completions`, `/v1/models`; and Anthropic's Messages API, `/v1/messages` (content blocks, tools, thinking,
-  streamed events)
+- ✅ **OpenAI-compatible server**: `/v1/chat/completions` (streaming, tool calls, thinking, structured outputs,
+  log-probabilities), `/v1/completions`, `/v1/models`; and Anthropic's Messages API, `/v1/messages` (content blocks,
+  tools, thinking, streamed events)
 - ✅ **Language models**: Gemma 4 (E2B, E4B, 26B-A4B), Qwen3.5 / Qwen3.6 / Qwen3.8 (dense and mixture of experts),
   Ornith-1.5-35B-A3B, SenseNova-Loop-9B (layers run in a loop inside hyper-connections), LFM3, Inkling 2 Mini (a
   looped mixture of experts without rotary positions)
@@ -82,7 +82,8 @@ Not yet:
 - Timestamps and translation of speech; speech output; video input; images for Gemma 4 26B-A4B and SenseNova Loop,
   and for a Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.
 - Gemma 4 26B-A4B from a GGUF file (a `gemma4` file with experts).
-- `response_format` beside `tools`, `logprobs`, `n` above 1, a rerank API.
+- `response_format` beside `tools`, the prompt's log-probabilities (`echo`, `prompt_logprobs`), `n` above 1, a rerank
+  API.
 
 ## Supported models
 
@@ -342,6 +343,12 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   `additionalProperties: false`, items, enum, const, anyOf, `$ref` / `$defs`, recursive ones too); any other keyword
   is refused with a 400 naming its path (`response_format.json_schema.schema.properties.age.minimum`); not beside
   `tools` yet. docs/decisions/0033.
+- **Log-probabilities**: `logprobs: true` with `top_logprobs` (0 to 20) on chat completions, `logprobs` (0 to 20) on
+  text completions, in OpenAI's shapes, streamed with each chunk's tokens. Each is the log-softmax of the model's
+  row before penalties and temperature (vLLM's default), after a `response_format` grammar masked it (a masked
+  token's is -9999); speculating or not, they are the same. A token that leaves a character unfinished reads as
+  `""` and the one that finishes it carries the whole character, as vLLM writes them; `bytes` are the token's own.
+  The prompt's (`echo`, `prompt_logprobs`) are refused by name.
 - A response carries `usage` and `timings`. One choice per request (`n` is 1); audio or video parts are refused by
   name.
 

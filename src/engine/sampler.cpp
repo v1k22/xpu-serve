@@ -6,6 +6,8 @@
 #include <numeric>
 #include <unordered_map>
 
+#include "util/error.h"
+
 namespace xs {
 namespace {
 uint64_t make_seed(const SamplingParams& p) { return p.seed ? *p.seed : std::random_device{}(); }
@@ -129,6 +131,39 @@ double Sampler::distribution(std::span<const float> logits) {
     }
     order_.resize(weights_.size());
     return kept;
+}
+
+TokenLogprobs token_logprobs(std::span<const float> logits, int32_t token, int top) {
+    XS_CHECK(token >= 0 && static_cast<size_t>(token) < logits.size(), "logprobs of token ", token, " of ",
+             logits.size());
+    const float max_logit = *std::max_element(logits.begin(), logits.end());
+    double sum = 0.0;
+    for (const float l : logits) sum += std::exp(static_cast<double>(l) - max_logit);
+    const double log_norm = max_logit + std::log(sum);
+    const auto logprob = [&](size_t t) { return static_cast<float>(static_cast<double>(logits[t]) - log_norm); };
+    TokenLogprobs out;
+    out.logprob = logprob(static_cast<size_t>(token));
+    // The `top` best by logit (then by id), kept in a heap whose root is the worst of them.
+    const auto better = [&](int32_t a, int32_t b) {
+        const float la = logits[static_cast<size_t>(a)], lb = logits[static_cast<size_t>(b)];
+        return la > lb || (la == lb && a < b);
+    };
+    const size_t k = std::min(logits.size(), static_cast<size_t>(std::max(top, 0)));
+    std::vector<int32_t> best;
+    best.reserve(k + 1);
+    for (size_t t = 0; t < logits.size() && k > 0; ++t) {
+        const auto id = static_cast<int32_t>(t);
+        if (best.size() == k && !better(id, best.front())) continue;
+        best.push_back(id);
+        std::push_heap(best.begin(), best.end(), better);
+        if (best.size() > k) {
+            std::pop_heap(best.begin(), best.end(), better);
+            best.pop_back();
+        }
+    }
+    std::sort(best.begin(), best.end(), better);
+    for (const int32_t id : best) out.top.emplace_back(id, logprob(static_cast<size_t>(id)));
+    return out;
 }
 
 }  // namespace xs

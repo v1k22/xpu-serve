@@ -4,6 +4,7 @@
 #include <chrono>
 #include <deque>
 #include <exception>
+#include <iterator>
 #include <thread>
 #include <utility>
 
@@ -28,30 +29,38 @@ GenerateResult generate_or_error(InferenceService& service, const GenerateReques
 
 }  // namespace
 
+void append_piece(OutputPiece& into, OutputPiece from) {
+    append_delta(into.delta, std::move(from.delta));
+    into.logprobs.insert(into.logprobs.end(), std::make_move_iterator(from.logprobs.begin()),
+                         std::make_move_iterator(from.logprobs.end()));
+}
+
 GenerationOutcome run_generation(InferenceService& service, const GenerateRequest& request, TokenOutput& output,
-                                 const std::function<bool(const chat::ParsedDelta&)>& on_delta,
+                                 const std::function<bool(const OutputPiece&)>& on_piece,
                                  const std::function<bool()>& client_alive) {
     std::atomic<bool> client_gone = false;
-    Channel<chat::ParsedDelta> channel;
+    Channel<OutputPiece> channel;
     GenerateResult result;
+    LogprobTexts texts(service.tokenizer());
 
-    const TokenCallback on_token = [&](int32_t token) {
+    const TokenCallback on_token = [&](int32_t token, const TokenLogprobs* logprobs) {
         if (client_gone.load()) return false;
-        chat::ParsedDelta delta = output.push(token);
-        if (!delta.empty()) channel.push(std::move(delta));
+        OutputPiece piece{output.push(token), {}};
+        if (logprobs != nullptr) piece.logprobs.push_back(texts.entry(token, *logprobs));
+        if (!piece.empty()) channel.push(std::move(piece));
         return !output.stop_string_hit();
     };
     std::jthread worker([&] {
         result = generate_or_error(service, request, on_token);
-        if (chat::ParsedDelta rest = output.finish(); !rest.empty()) channel.push(std::move(rest));
+        if (OutputPiece rest{output.finish(), {}}; !rest.empty()) channel.push(std::move(rest));
         channel.close();
     });
 
-    std::deque<chat::ParsedDelta> batch;
+    std::deque<OutputPiece> batch;
     auto next_alive_check = std::chrono::steady_clock::now() + kAlivePollInterval;
     while (channel.wait_take(batch, kAlivePollInterval)) {
-        for (const chat::ParsedDelta& delta : batch) {
-            if (!client_gone && !on_delta(delta)) client_gone = true;
+        for (const OutputPiece& piece : batch) {
+            if (!client_gone && !on_piece(piece)) client_gone = true;
         }
         if (const auto now = std::chrono::steady_clock::now(); now >= next_alive_check) {
             if (!client_gone && !client_alive()) client_gone = true;

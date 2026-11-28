@@ -7,6 +7,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "audio/audio.h"
@@ -68,6 +69,17 @@ struct GenerateRequest {
     // What the output must follow (engine/constraint.h); null: anything. A constrained request needs a stop token, the
     // only way its output can end once complete.
     std::shared_ptr<const OutputConstraint> constraint;
+    // Each generated token's log-probability, with this many of the most likely tokens' beside it (TokenLogprobs);
+    // -1: none. Such a request reads its rows' logits, not their argmax.
+    int logprobs = -1;
+};
+
+// A generated token's log-probability and the most likely tokens' at its position (GenerateRequest::logprobs): the
+// log-softmax of the row it came from, after the request's output constraint masked the row and before penalties,
+// temperature and the sampler's cuts (vLLM's raw_logprobs). A masked token's is -infinity.
+struct TokenLogprobs {
+    float logprob = 0.0f;
+    std::vector<std::pair<int32_t, float>> top;  // the most likely tokens, most likely first (ties: the lower id)
 };
 
 enum class FinishReason { Stop, Length, Cancelled, Error };
@@ -134,8 +146,9 @@ struct TranscriptionResult {
 using TextCallback = std::function<bool(std::string_view delta)>;
 
 
-// Called on the engine thread for every generated token (stop tokens are not passed). Return false to stop
-// generation (finish = Cancelled); the caller uses this for stop strings and client disconnects.
-using TokenCallback = std::function<bool(int32_t token)>;
+// Called on the engine thread for every generated token (stop tokens are not passed), with its log-probabilities when
+// the request asked for them (null otherwise). Return false to stop generation (finish = Cancelled); the caller uses
+// this for stop strings and client disconnects.
+using TokenCallback = std::function<bool(int32_t token, const TokenLogprobs* logprobs)>;
 
 }  // namespace xs

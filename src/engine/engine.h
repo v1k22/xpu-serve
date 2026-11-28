@@ -187,6 +187,7 @@ private:
     TensorMap inputs_;
     TensorMap outputs_;
     std::vector<float> stop_logits_;  // constrain()'s scratch
+    std::vector<float> row_copy_;     // target_token()'s: a row before the sampler's penalties change it
     // The model has conv or recurrent state: a prefix is kept whole or from the sequence's snapshot, taken at
     // GenerateRequest::snapshot_at.
     bool fixed_state_ = false;

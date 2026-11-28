@@ -105,6 +105,34 @@ std::shared_ptr<const grammar::Grammar> parse_response_format(const json& body) 
     }
 }
 
+// Fields of vLLM's log-probability extensions, which this server does not take.
+void refuse_logprob_extensions(const json& body) {
+    for (const char* name : {"prompt_logprobs", "logprob_token_ids", "return_tokens_as_token_ids"}) {
+        if (fields::find(body, name) != nullptr) {
+            reject(name, str_cat("'", name, "' is not supported: only the generated tokens' log-probabilities are"));
+        }
+    }
+}
+
+// Chat's logprobs (a boolean) and top_logprobs (0 to kMaxLogprobs alternatives a token, with logprobs on).
+int parse_chat_logprobs(const json& body) {
+    refuse_logprob_extensions(body);
+    const bool on = fields::boolean(body, "logprobs", "logprobs");
+    const auto top = fields::integer(body, "top_logprobs", 0, kMaxLogprobs);
+    if (top.has_value() && *top > 0 && !on) {
+        reject("top_logprobs", "when using 'top_logprobs', 'logprobs' must be set to true");
+    }
+    return on ? static_cast<int>(top.value_or(0)) : -1;
+}
+
+// A text completion's logprobs: 0 to kMaxLogprobs alternatives a token; absent: none. echo is refused.
+int parse_text_logprobs(const json& body) {
+    refuse_logprob_extensions(body);
+    if (fields::boolean(body, "echo", "echo")) reject("echo", "'echo' is not supported: the reply holds the completion only");
+    const auto n = fields::integer(body, "logprobs", 0, kMaxLogprobs);
+    return n.has_value() ? static_cast<int>(*n) : -1;
+}
+
 GenerationOptions parse_generation_options(const json& body, const SamplingParams& defaults) {
     check_single_choice(body);
     GenerationOptions o;
@@ -259,6 +287,7 @@ ChatRequest parse_chat_request(const json& body, const SamplingParams& defaults)
         }
     }
     r.options = parse_generation_options(body, defaults);
+    r.options.logprobs = parse_chat_logprobs(body);
     if (r.options.format && !r.tools.is_null()) {
         reject("response_format", "'response_format' beside 'tools' is not supported yet: a reply is either held to "
                                   "the format or free to call a tool");
@@ -270,6 +299,7 @@ CompletionRequest parse_completion_request(const json& body, const SamplingParam
     CompletionRequest r;
     r.prompt = parse_prompt(body);
     r.options = parse_generation_options(body, defaults);
+    r.options.logprobs = parse_text_logprobs(body);
     return r;
 }
 

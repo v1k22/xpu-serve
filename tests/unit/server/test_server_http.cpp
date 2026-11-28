@@ -258,6 +258,60 @@ TEST_SUITE("server.http") {
         CHECK(events.back()["usage"]["prompt_tokens"] == 6);
     }
 
+    TEST_CASE("logprobs: each generated token's, in the body and in the stream, chat and text completions") {
+        xs::test::FakeService service;
+        RunningServer server(service);
+        auto client = server.client();
+        // The fake's i-th token has logprob -i / 10 and alternatives the next byte values, each 1 less likely.
+        const json r = post_json(client, "/v1/chat/completions", chat_body({{"logprobs", true}, {"top_logprobs", 2}}));
+        CHECK(service.last_request().logprobs == 2);
+        const json& content = r["choices"][0]["logprobs"]["content"];
+        REQUIRE(content.size() == 6);  // "Hello!"
+        CHECK(content[0]["token"] == "H");
+        CHECK(content[0]["logprob"].get<double>() == doctest::Approx(-0.1));
+        CHECK(content[0]["bytes"] == json::array({'H'}));
+        CHECK(content[5]["token"] == "!");
+        CHECK(content[5]["logprob"].get<double>() == doctest::Approx(-0.6));
+        REQUIRE(content[1]["top_logprobs"].size() == 2);
+        CHECK(content[1]["top_logprobs"][0]["token"] == "e");
+        CHECK(content[1]["top_logprobs"][1]["token"] == "f");
+        CHECK(content[1]["top_logprobs"][1]["logprob"].get<double>() == doctest::Approx(-1.2));
+        // Not asked for: null.
+        CHECK(post_json(client, "/v1/chat/completions", chat_body())["choices"][0]["logprobs"].is_null());
+        CHECK(service.last_request().logprobs == -1);
+
+        // Streamed: each chunk with its tokens' entries, all six in order.
+        const auto events = post_sse(client, "/v1/chat/completions", chat_body({{"logprobs", true}, {"stream", true}}));
+        std::string tokens;
+        for (const json& e : events) {
+            if (e["choices"].empty() || e["choices"][0]["logprobs"].is_null()) continue;
+            for (const json& entry : e["choices"][0]["logprobs"]["content"]) {
+                tokens += entry["token"].get<std::string>();
+                CHECK(entry["top_logprobs"].empty());
+            }
+        }
+        CHECK(tokens == "Hello!");
+        CHECK(streamed_content(events) == "Hello!");
+
+        // A text completion: OpenAI's legacy shape, the token among its alternatives, offsets in characters.
+        service.reply = "world";
+        const json t = post_json(client, "/v1/completions", {{"prompt", "x"}, {"logprobs", 1}});
+        const json& lp = t["choices"][0]["logprobs"];
+        CHECK(lp["tokens"] == json::array({"w", "o", "r", "l", "d"}));
+        CHECK(lp["token_logprobs"][4].get<double>() == doctest::Approx(-0.5));
+        CHECK(lp["text_offset"] == json::array({0, 1, 2, 3, 4}));
+        CHECK(lp["top_logprobs"][0].size() == 1);  // the token is its own most likely alternative here
+        CHECK(lp["top_logprobs"][0]["w"].get<double>() == doctest::Approx(-0.1));
+        const auto text_events =
+            post_sse(client, "/v1/completions", {{"prompt", "x"}, {"logprobs", 0}, {"stream", true}});
+        json offsets = json::array();
+        for (const json& e : text_events) {
+            if (e["choices"].empty() || e["choices"][0]["logprobs"].is_null()) continue;
+            for (const json& o : e["choices"][0]["logprobs"]["text_offset"]) offsets.push_back(o);
+        }
+        CHECK(offsets == json::array({0, 1, 2, 3, 4}));  // continued across chunks
+    }
+
     TEST_CASE("response_format: the answer held to the schema; a keyword it does not take refused by its path") {
         xs::test::FakeService service;
         service.reply = R"({"age": 7})";

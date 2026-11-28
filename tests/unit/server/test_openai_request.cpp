@@ -123,6 +123,44 @@ TEST_SUITE("server.request") {
         CHECK(rejected_param(chat_body({{"reasoning_effort", 3}})) == "reasoning_effort");
     }
 
+    TEST_CASE("logprobs: chat's logprobs and top_logprobs, a text completion's count, vLLM's extensions refused") {
+        CHECK(parse_chat_request(chat_body(json::object()), {}).options.logprobs == -1);
+        CHECK(parse_chat_request(chat_body({{"logprobs", true}}), {}).options.logprobs == 0);
+        CHECK(parse_chat_request(chat_body({{"logprobs", true}, {"top_logprobs", 5}}), {}).options.logprobs == 5);
+        CHECK(parse_chat_request(chat_body({{"logprobs", false}, {"top_logprobs", 0}}), {}).options.logprobs == -1);
+        CHECK(parse_chat_request(chat_body({{"logprobs", true}, {"top_logprobs", nullptr}}), {}).options.logprobs == 0);
+        CHECK(rejected_param(chat_body({{"top_logprobs", 3}})) == "top_logprobs");  // without logprobs: true
+        CHECK(rejected_param(chat_body({{"logprobs", true}, {"top_logprobs", 21}})) == "top_logprobs");
+        CHECK(rejected_param(chat_body({{"logprobs", true}, {"top_logprobs", -1}})) == "top_logprobs");
+        CHECK(rejected_param(chat_body({{"logprobs", 2}})) == "logprobs");
+        CHECK(rejected_param(chat_body({{"prompt_logprobs", 1}})) == "prompt_logprobs");
+        CHECK(rejected_param(chat_body({{"logprob_token_ids", json::array({1})}})) == "logprob_token_ids");
+        CHECK(rejected_param(chat_body({{"return_tokens_as_token_ids", true}})) == "return_tokens_as_token_ids");
+        const auto text = [](json extra) {
+            json body = {{"prompt", "x"}};
+            body.update(extra);
+            return parse_completion_request(body, {}).options.logprobs;
+        };
+        const auto text_param = [](json extra) {
+            json body = {{"prompt", "x"}};
+            body.update(extra);
+            try {
+                parse_completion_request(body, {});
+            } catch (const InvalidRequest& e) {
+                return e.param();
+            }
+            return std::string("<accepted>");
+        };
+        CHECK(text(json::object()) == -1);
+        CHECK(text({{"logprobs", 0}}) == 0);
+        CHECK(text({{"logprobs", 20}}) == 20);
+        CHECK(text({{"echo", false}}) == -1);
+        CHECK(text_param({{"logprobs", 21}}) == "logprobs");
+        CHECK(text_param({{"logprobs", true}}) == "logprobs");
+        CHECK(text_param({{"echo", true}}) == "echo");
+        CHECK(text_param({{"prompt_logprobs", 0}}) == "prompt_logprobs");
+    }
+
     TEST_CASE("response_format: text is free; json_object and json_schema hold the answer to a grammar") {
         CHECK(parse_chat_request(chat_body({{"response_format", {{"type", "text"}}}}), {}).options.format == nullptr);
         CHECK(parse_chat_request(chat_body(json::object()), {}).options.format == nullptr);

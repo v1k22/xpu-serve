@@ -52,7 +52,8 @@ public:
                event("ping", {{"type", "ping"}});
     }
 
-    std::string delta(const chat::ParsedDelta& d) override {
+    std::string delta(const OutputPiece& piece) override {
+        const chat::ParsedDelta& d = piece.delta;
         std::string out;
         if (!d.reasoning.empty()) {
             out += open(Block::Thinking, {{"type", "thinking"}, {"thinking", ""}, {"signature", ""}});
@@ -87,7 +88,8 @@ public:
         return close() + event("error", anthropic_error_body("api_error", message));
     }
 
-    json body(const chat::ParsedDelta& output, const GenerationOutcome& o) override {
+    json body(const OutputPiece& piece, const GenerationOutcome& o) override {
+        const chat::ParsedDelta& output = piece.delta;
         json content = json::array();
         if (!output.reasoning.empty()) {
             content.push_back({{"type", "thinking"}, {"thinking", output.reasoning}, {"signature", ""}});

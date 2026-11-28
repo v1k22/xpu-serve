@@ -39,7 +39,13 @@ struct GenerationOptions {
     bool include_usage = false;  // stream_options.include_usage
     // response_format json_object or json_schema: the grammar the answer is held to; null for free text.
     std::shared_ptr<const grammar::Grammar> format;
+    // Each generated token's log-probability with this many alternatives beside it (chat: logprobs and top_logprobs;
+    // text completions: logprobs); -1: none.
+    int logprobs = -1;
 };
+
+// The most alternatives a token's log-probability is given with (vLLM's default --max-logprobs).
+inline constexpr int kMaxLogprobs = 20;
 
 // A media part of a chat message: an image from its data: URL, an audio clip from input_audio's base64 (the bytes
 // of the file, not yet decoded).

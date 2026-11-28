@@ -404,7 +404,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] Ollama `/api/chat` and `/api/generate`
 - [x] Constrained decoding: `response_format` `json_object` and `json_schema` (a byte grammar, masks from a trie of
       the vocabulary; after the reasoning a prompt leaves open; batched and speculative); docs/decisions/0033
-- [ ] logprobs
+- [x] logprobs: `logprobs` / `top_logprobs` on chat, `logprobs` on text completions, streamed; vLLM's raw_logprobs
+      (after a grammar's mask, before penalties); same with drafts verified
+- [ ] The prompt's log-probabilities (`echo`, `prompt_logprobs`)
 - **Done when:** each item lands as one PR with its parity and E2E tests.
 
 ### Model enablement checklist

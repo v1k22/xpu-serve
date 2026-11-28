@@ -4,6 +4,7 @@
 // run without one; batched beside a free request, each request as it runs alone.
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <string>
@@ -244,6 +245,32 @@ TEST_CASE("constrained: without a stop token it cannot end, and a constraint tha
     CHECK(stuck.finish == FinishReason::Error);
     CHECK(stuck.error.find("allows no token") != std::string::npos);
     CHECK(engine->generate(greedy({1, 2, 3}, 4), {}).finish == FinishReason::Length);  // the sequence still serves
+}
+
+TEST_CASE("constrained with log-probabilities: the row as the constraint left it, masked tokens at -infinity") {
+    GenerateRequest r = constrained({1, 7, 3, 12}, 64, json_output(kSchema));
+    r.logprobs = static_cast<int>(test::TinySpecModel::kVocab);  // the whole row
+    std::vector<TokenLogprobs> got;
+    const GenerateResult result = make_engine(0, 8)->generate(r, [&](int32_t, const TokenLogprobs* lp) {
+        got.push_back(*lp);
+        return true;
+    });
+    check_of_schema(result);
+    REQUIRE(got.size() == result.tokens.size());
+    int masked = 0;
+    for (const TokenLogprobs& lp : got) {
+        CHECK(std::isfinite(lp.logprob));
+        double total = 0.0;
+        for (const auto& [id, value] : lp.top) {
+            if (std::isinf(value)) {
+                ++masked;
+            } else {
+                total += std::exp(static_cast<double>(value));
+            }
+        }
+        CHECK(total == doctest::Approx(1.0));  // renormalized over the tokens the grammar allows
+    }
+    CHECK(masked > 0);
 }
 
 }  // namespace xs

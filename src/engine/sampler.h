@@ -25,8 +25,10 @@ public:
 
     // False when sample() and verify() return the largest logit's index whatever the history (greedy, no penalties):
     // a row's argmax then stands for its logits.
-    bool needs_logits() const {
-        return !greedy() || params_.repetition_penalty != 1.0f || params_.presence_penalty != 0.0f ||
+    bool needs_logits() const { return !greedy() || penalizes(); }
+    // sample() and verify() change the logits they are given (the penalties).
+    bool penalizes() const {
+        return params_.repetition_penalty != 1.0f || params_.presence_penalty != 0.0f ||
                params_.frequency_penalty != 0.0f;
     }
 
@@ -44,5 +46,8 @@ private:
     std::vector<int32_t> order_;   // scratch: candidate token ids
     std::vector<double> weights_;  // scratch: their weights
 };
+
+// The log-softmax of `logits` at `token`, and the `top` most likely tokens' (TokenLogprobs).
+TokenLogprobs token_logprobs(std::span<const float> logits, int32_t token, int top);
 
 }  // namespace xs

@@ -291,7 +291,7 @@ TranscriptionResult EngineService::transcribe(const TranscriptionRequest& reques
             sent = piece_text.size();
             return !on_text || on_text(delta);
         };
-        const GenerateResult r = generate(g, [&](int32_t token) {
+        const GenerateResult r = generate(g, [&](int32_t token, const TokenLogprobs*) {
             reply += decoder.push(token);
             return pass_on(false);
         });

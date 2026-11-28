@@ -129,7 +129,7 @@ TEST_CASE("anthropic format: a stream of blocks, each opened, filled and closed 
     more.content = " there";
     call.tool_calls.push_back({"call_1", "look", R"({"q":1})"});
     std::string stream = f->opening();  // one call after another: the order of a + b's operands is unspecified
-    for (const auto* d : {&think, &text, &more, &call}) stream += f->delta(*d);
+    for (const auto* d : {&think, &text, &more, &call}) stream += f->delta({*d, {}});
     xs::server::GenerationOutcome o;
     o.result.finish = xs::FinishReason::Stop;
     o.result.stats.prompt_tokens = 12;
@@ -159,17 +159,17 @@ TEST_CASE("anthropic format: a stream of blocks, each opened, filled and closed 
     xs::chat::ParsedDelta all = think;
     all.content = "Hi there";
     all.tool_calls = call.tool_calls;
-    const json body = xs::server::anthropic_format("msg_1", "m", 12)->body(all, o);
+    const json body = xs::server::anthropic_format("msg_1", "m", 12)->body({all, {}}, o);
     CHECK(body["content"].size() == 3);
     CHECK(body["content"][2]["input"] == json{{"q", 1}});
     CHECK(body["stop_reason"] == "tool_use");
     // A stop sequence names itself; a budget spent is max_tokens.
     o.stop_string_hit = true;
     o.stop_string = "END";
-    const json stopped = xs::server::anthropic_format("msg_2", "m", 1)->body(text, o);
+    const json stopped = xs::server::anthropic_format("msg_2", "m", 1)->body({text, {}}, o);
     CHECK(stopped["stop_reason"] == "stop_sequence");
     CHECK(stopped["stop_sequence"] == "END");
     o.stop_string_hit = false;
     o.result.finish = xs::FinishReason::Length;
-    CHECK(xs::server::anthropic_format("msg_3", "m", 1)->body(text, o)["stop_reason"] == "max_tokens");
+    CHECK(xs::server::anthropic_format("msg_3", "m", 1)->body({text, {}}, o)["stop_reason"] == "max_tokens");
 }

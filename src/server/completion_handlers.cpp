@@ -72,6 +72,7 @@ GenerateRequest make_generate_request(std::vector<int32_t> prompt, const Generat
     r.prompt = std::move(prompt);
     r.sampling = options.sampling;
     r.stop_token_ids = card.stop_token_ids;
+    r.logprobs = options.logprobs;
     return r;
 }
 
@@ -164,9 +165,9 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
     const std::string_view tail = chat::prompt_tail(p.text);
     request.constraint = output_constraint(chat.options, card.dialect, tail);
     const ResponseMeta meta{random_id("chatcmpl-"), card.id, unix_seconds_now()};
-    const bool usage = chat.options.include_usage;
+    const bool usage = chat.options.include_usage, logprobs = chat.options.logprobs >= 0;
     Job job{.id = meta.id,
-            .format = [meta, usage] { return openai_chat_format(meta, usage); },
+            .format = [meta, usage, logprobs] { return openai_chat_format(meta, usage, logprobs); },
             .request = std::move(request),
             .options = std::move(chat.options),
             .dialect = card.dialect,
@@ -209,12 +210,12 @@ void CompletionHandlers::completion(const httplib::Request& req, httplib::Respon
         throw InvalidRequest(str_cat("could not tokenize the prompt: ", e.what()), "prompt");
     }
     const ResponseMeta meta{random_id("cmpl-"), card.id, unix_seconds_now()};
-    const bool usage = completion.options.include_usage;
+    const bool usage = completion.options.include_usage, logprobs = completion.options.logprobs >= 0;
     const std::string_view tail = chat::prompt_tail(completion.prompt);
     GenerateRequest request = make_generate_request(std::move(prompt), completion.options, card, "prompt");
     request.constraint = output_constraint(completion.options, "plain", tail);  // raw text: the answer starts at once
     Job job{.id = meta.id,
-            .format = [meta, usage] { return openai_text_format(meta, usage); },
+            .format = [meta, usage, logprobs] { return openai_text_format(meta, usage, logprobs); },
             .request = std::move(request),
             .options = std::move(completion.options),
             .dialect = "plain",
@@ -235,15 +236,15 @@ void CompletionHandlers::respond(const Job& job, const httplib::Request& req, ht
 
 void CompletionHandlers::write_full(const Job& job, const httplib::Request& req, httplib::Response& res) const {
     TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop);
-    chat::ParsedDelta message;
+    OutputPiece message;
     const GenerationOutcome outcome = run_generation(
         service_, job.request, output,
-        [&](const chat::ParsedDelta& delta) {
-            append_delta(message, delta);
+        [&](const OutputPiece& piece) {
+            append_piece(message, piece);
             return true;
         },
         [&] { return !req.is_connection_closed(); });
-    log_summary(job.id, outcome, !message.tool_calls.empty());
+    log_summary(job.id, outcome, !message.delta.tool_calls.empty());
     if (outcome.client_gone) return;
     if (outcome.result.finish == FinishReason::Error) fail(outcome.result.error);
     res.set_content(job.format()->body(message, outcome).dump(), "application/json");
@@ -260,7 +261,7 @@ bool CompletionHandlers::write_stream(const Job& job, const httplib::Request& re
     try {
         TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop);
         outcome = run_generation(
-            service_, job.request, output, [&](const chat::ParsedDelta& delta) { return send(format->delta(delta)); },
+            service_, job.request, output, [&](const OutputPiece& piece) { return send(format->delta(piece)); },
             [&] { return !req.is_connection_closed(); });
     } catch (const std::exception& e) {
         outcome.result.finish = FinishReason::Error;

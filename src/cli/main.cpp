@@ -550,7 +550,7 @@ std::string run_turn(EngineService& service, std::string_view prompt_text, const
         }
         std::fflush(stdout);
     };
-    const GenerateResult r = service.generate(req, [&](int32_t token) {
+    const GenerateResult r = service.generate(req, [&](int32_t token, const TokenLogprobs*) {
         const std::string text = decoder.push(token);
         raw += text;
         print(parser->feed(text));

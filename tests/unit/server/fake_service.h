@@ -111,7 +111,16 @@ public:
             }
             std::this_thread::sleep_for(token_delay);
             result.tokens.push_back(token);
-            if (!on_token(token)) {
+            // Log-probabilities a test can predict: the i-th token's is -(i + 1) / 10; its alternatives are the next
+            // byte values, each 1 less likely.
+            TokenLogprobs lp;
+            if (request.logprobs >= 0) {
+                lp.logprob = -0.1f * static_cast<float>(result.tokens.size());
+                for (int j = 0; j < request.logprobs; ++j) {
+                    lp.top.emplace_back((token + j) % 256, lp.logprob - static_cast<float>(j));
+                }
+            }
+            if (!on_token(token, request.logprobs >= 0 ? &lp : nullptr)) {
                 result.finish = FinishReason::Cancelled;
                 cancelled = true;
                 break;

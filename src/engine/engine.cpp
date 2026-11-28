@@ -100,6 +100,9 @@ struct Engine::Generation {
     int64_t max_new = 0;
     int32_t token = 0;           // the next token to emit
     std::deque<int32_t> ready;   // tokens a speculative round produced, not emitted yet
+    // GenerateRequest::logprobs: those of the tokens produced and not emitted yet (the pending token and `ready`, and
+    // a stop token or the last round's surplus never emitted), in the order they were produced and are emitted.
+    std::deque<TokenLogprobs> logprobs;
     spec::Acceptance acceptance;  // of its drafts (EngineOptions::adaptive_k)
     Timer decode_timer;          // from the first emitted token
 };
@@ -193,9 +196,17 @@ int32_t Engine::target_token(Generation& g, int64_t row, std::span<const int32_t
     const std::span<float> values(logits.data<float>() + row * vocab, static_cast<size_t>(vocab));
     if (g.constraint) constrain(g, values);
     Sampler& sampler = *g.sampler;
+    // Log-probabilities read the row as the constraint left it, before the sampler's penalties change it.
+    const bool logprobs = g.request.logprobs >= 0;
+    std::span<const float> row_seen = values;
+    if (logprobs && sampler.penalizes()) {
+        row_copy_.assign(values.begin(), values.end());
+        row_seen = row_copy_;
+    }
     const std::vector<int32_t>& prompt = g.request.prompt;
     const int32_t t = draft != nullptr ? sampler.verify(values, prompt, generated, *draft)
                                        : sampler.sample(values, prompt, generated);
+    if (logprobs) g.logprobs.push_back(token_logprobs(row_seen, t, g.request.logprobs));
     const std::vector<int32_t>& stops = g.request.stop_token_ids;
     if (g.constraint && std::find(stops.begin(), stops.end(), t) == stops.end()) {
         Timer timer;
@@ -443,6 +454,13 @@ std::optional<Engine::Handle> Engine::start(const GenerateRequest& request, Toke
         g.done = true;
         return h;
     }
+    if (g.request.logprobs > model_->info().vocab_size) {
+        result.finish = FinishReason::Error;
+        result.error = str_cat("log-probabilities of ", g.request.logprobs, " tokens a position, of a vocabulary of ",
+                               model_->info().vocab_size);
+        g.done = true;
+        return h;
+    }
     if (g.request.constraint && g.request.stop_token_ids.empty()) {
         result.finish = FinishReason::Error;
         result.error = "a constrained request needs a stop token to end on";
@@ -505,7 +523,7 @@ std::optional<Engine::Handle> Engine::start(const GenerateRequest& request, Toke
         g.sampler = std::make_unique<Sampler>(g.request.sampling);
         g.acceptance = acceptance_;  // what the requests before it showed, until its own rounds show otherwise
         if (g.request.constraint) g.constraint = g.request.constraint->start();
-        g.argmax_only = has_argmax_ && !g.sampler->needs_logits() && !g.constraint;
+        g.argmax_only = has_argmax_ && !g.sampler->needs_logits() && !g.constraint && g.request.logprobs < 0;
         argmax_only_ = g.argmax_only;
         Timer timer;
         take_prefix(g.keys);
@@ -645,7 +663,13 @@ bool Engine::emit(Generation& g) {
     if (result.tokens.empty()) g.decode_timer.reset();
     result.tokens.push_back(g.token);
     result.stats.decode_ms = g.decode_timer.elapsed_ms();
-    if (g.on_token && !g.on_token(g.token)) {
+    std::optional<TokenLogprobs> logprobs;
+    if (g.request.logprobs >= 0) {
+        XS_CHECK(!g.logprobs.empty(), "no log-probabilities for token ", g.token, " of a request that asked for them");
+        logprobs = std::move(g.logprobs.front());
+        g.logprobs.pop_front();
+    }
+    if (g.on_token && !g.on_token(g.token, logprobs ? &*logprobs : nullptr)) {
         result.finish = FinishReason::Cancelled;
         g.done = true;
         return false;
