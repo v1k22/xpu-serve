@@ -363,6 +363,30 @@ TEST_SUITE("server.request") {
         CHECK(param_of({{"type", "audio_url"}, {"audio_url", {{"url", "https://example.com/a.wav"}}}}) == where);
     }
 
+    TEST_CASE("an assistant message's reasoning: vLLM's field first, reasoning_content after; both for the template") {
+        const auto messages = [](json assistant) {
+            return json::array({{{"role", "user"}, {"content", "hi"}, {"reasoning", "not mine"}}, assistant,
+                                {{"role", "user"}, {"content", "and?"}}});
+        };
+        const auto read = [&](json assistant) {
+            return parse_chat_request(chat_body({{"messages", messages(std::move(assistant))}}), {}).messages;
+        };
+        json m = read({{"role", "assistant"}, {"content", "yes"}, {"reasoning", "r1"}, {"reasoning_content", "old"}});
+        CHECK(m[1]["reasoning"] == "r1");
+        CHECK(m[1]["reasoning_content"] == "r1");
+        CHECK_FALSE(m[0].contains("reasoning"));  // another role's: vLLM drops it
+        m = read({{"role", "assistant"}, {"content", "yes"}, {"reasoning", nullptr}, {"reasoning_content", "old"}});
+        CHECK(m[1]["reasoning"] == "old");
+        CHECK(m[1]["reasoning_content"] == "old");
+        m = read({{"role", "assistant"}, {"content", "yes"}});
+        CHECK_FALSE(m[1].contains("reasoning"));
+        CHECK_FALSE(m[1].contains("reasoning_content"));
+        CHECK(rejected_param(chat_body({{"messages", messages({{"role", "assistant"}, {"reasoning", 3}})}})) ==
+              "messages[1].reasoning");
+        const json listed = {{"role", "assistant"}, {"reasoning_content", {1}}};
+        CHECK(rejected_param(chat_body({{"messages", messages(listed)}})) == "messages[1].reasoning_content");
+    }
+
     TEST_CASE("request JSON keeps the client's key order, which templates can print") {
         const auto body = parse_json_body(
             R"({"messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "function", "function":

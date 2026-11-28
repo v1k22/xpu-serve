@@ -112,7 +112,10 @@ void add_message(const json& m, size_t index, json& out, std::vector<MediaPart>&
     }
     if (*role == "assistant") {
         json a{{"role", "assistant"}, {"content", text}};
-        if (!thinking.empty()) a["reasoning_content"] = thinking;
+        if (!thinking.empty()) {
+            a["reasoning"] = thinking;
+            a["reasoning_content"] = thinking;
+        }
         if (!calls.empty()) a["tool_calls"] = std::move(calls);
         out.push_back(std::move(a));
     } else if (!parts.empty()) {

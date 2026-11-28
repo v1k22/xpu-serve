@@ -116,7 +116,10 @@ json timings_json(const GenerateStats& stats) {
 
 json chat_choice_json(int index, const chat::ParsedDelta& message, std::string_view finish_reason, json logprobs) {
     json msg = {{"role", "assistant"}, {"content", message.content}};
-    if (!message.reasoning.empty()) msg["reasoning_content"] = message.reasoning;
+    if (!message.reasoning.empty()) {  // vLLM's field, and the one it had before (still read by many clients)
+        msg["reasoning"] = message.reasoning;
+        msg["reasoning_content"] = message.reasoning;
+    }
     if (!message.tool_calls.empty()) {
         json calls = json::array();
         for (const chat::ToolCall& call : message.tool_calls) calls.push_back(tool_call_json(call));
@@ -152,7 +155,10 @@ GenerateStats response_stats(std::span<const GenerationOutcome> outcomes) {
 
 json chat_delta_json(const chat::ParsedDelta& delta, int first_tool_index) {
     json out = json::object();
-    if (!delta.reasoning.empty()) out["reasoning_content"] = delta.reasoning;
+    if (!delta.reasoning.empty()) {
+        out["reasoning"] = delta.reasoning;
+        out["reasoning_content"] = delta.reasoning;
+    }
     if (!delta.content.empty()) out["content"] = delta.content;
     if (!delta.tool_calls.empty()) {
         json calls = json::array();

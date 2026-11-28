@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <set>
 
 #include "grammar/json_schema.h"
@@ -314,6 +315,27 @@ std::vector<uint8_t> input_audio_bytes(const json& part, const std::string& para
     return std::move(*bytes);
 }
 
+// An assistant message's thinking, as `reasoning` (vLLM's field) or `reasoning_content` (its earlier one): a string,
+// `reasoning` winning when both are given. As in vLLM, the template sees it under both names, and another role's
+// message under neither.
+void reasoning_of(json& m, const std::string& param) {
+    std::optional<std::string> text;
+    for (const char* key : {"reasoning_content", "reasoning"}) {
+        const json* v = fields::find(m, key);
+        if (v == nullptr || v->is_null()) continue;
+        if (!v->is_string()) reject(param + "." + key, str_cat("'", param, ".", key, "' must be a string"));
+        text = v->get<std::string>();
+    }
+    if (!text) return;
+    if (m.at("role") != "assistant") {
+        m.erase("reasoning");
+        m.erase("reasoning_content");
+        return;
+    }
+    m["reasoning"] = *text;
+    m["reasoning_content"] = *text;
+}
+
 // Validates messages and takes the media items out of their content parts.
 json parse_messages(const json& body, std::vector<MediaPart>& media) {
     const json* v = fields::find(body, "messages");
@@ -328,6 +350,7 @@ json parse_messages(const json& body, std::vector<MediaPart>& media) {
         if (role == nullptr || !role->is_string()) {
             reject(param + ".role", str_cat("'", param, ".role' must be a string"));
         }
+        reasoning_of(m, param);
         auto content = m.find("content");
         if (content == m.end() || !content->is_array()) continue;
         for (size_t j = 0; j < content->size(); ++j) {

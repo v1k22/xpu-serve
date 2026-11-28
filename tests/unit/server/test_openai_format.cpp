@@ -56,6 +56,7 @@ TEST_SUITE("server.format") {
         CHECK(c["id"] == "chatcmpl-1");
         CHECK(c["choices"][0]["message"]["content"] == "hi");
         CHECK_FALSE(c["choices"][0]["message"].contains("reasoning_content"));
+        CHECK_FALSE(c["choices"][0]["message"].contains("reasoning"));
         CHECK_FALSE(c["choices"][0]["message"].contains("tool_calls"));
         CHECK(c.contains("timings"));
 
@@ -63,6 +64,7 @@ TEST_SUITE("server.format") {
         msg.tool_calls.push_back({"call_1", "get_weather", R"({"city":"Paris"})"});
         c = chat_completion_json(kMeta, msg, "tool_calls", stats());
         const json& m = c["choices"][0]["message"];
+        CHECK(m["reasoning"] == "thinking");  // vLLM's field
         CHECK(m["reasoning_content"] == "thinking");
         CHECK(m["tool_calls"][0]["id"] == "call_1");
         CHECK(m["tool_calls"][0]["type"] == "function");
@@ -92,6 +94,7 @@ TEST_SUITE("server.format") {
         const json chunk = chat_chunk_json(kMeta, chat_delta_json(d, 0));
         CHECK(chunk["object"] == "chat.completion.chunk");
         CHECK(chunk["choices"][0]["delta"]["content"] == "a");
+        CHECK(chunk["choices"][0]["delta"]["reasoning"] == "r");
         CHECK(chunk["choices"][0]["delta"]["reasoning_content"] == "r");
         CHECK(chunk["choices"][0]["finish_reason"].is_null());
         CHECK(chat_chunk_json(kMeta, json::object(), "length")["choices"][0]["finish_reason"] == "length");

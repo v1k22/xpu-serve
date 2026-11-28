@@ -927,8 +927,8 @@ experts, 8 a token) whose layers 6 to 17 run three times, 48 layer runs a token,
 tower (an image is one token per 40 x 40 pixels, not resized), and so does a GGUF file's import, from the
 repository's `mmproj-BF16.gguf`, which `-hf` fetches with it. Its drafter (DSpark) is
 inside the checkpoint and its packs, and a file of its GGUF repository ([DSpark](#dspark-inkling-2s-drafter)). Its
-thinking comes back as `reasoning_content` and its tool calls as `tool_calls`; a request's `reasoning_effort` (none,
-minimal, low, medium, high, xhigh, max) sets how much it thinks, 0.9 (high) when left out.
+thinking comes back as `reasoning` (and `reasoning_content`) and its tool calls as `tool_calls`; a request's
+`reasoning_effort` (none, minimal, low, medium, high, xhigh, max) sets how much it thinks, 0.9 (high) when left out.
 
 Reference: the release stores its experts in NVFP4 and MXFP8, which a backend holds as f16 (49 GiB): more than a 24 GB
 card or an Arc B390 has. The release's own values on one device are its lossless GGUF file, UD-Q8_K_XL (21.3 GiB: the

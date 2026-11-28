@@ -77,6 +77,7 @@ TEST_CASE("anthropic request: system, blocks, tool use and results, thinking and
     CHECK(r.messages[1]["content"][1] == RequestJson{{"type", "image"}});
     REQUIRE(r.media.size() == 1);
     CHECK(r.media[0].bytes == std::vector<uint8_t>{1, 2, 3});
+    CHECK(r.messages[2]["reasoning"] == "Hmm.");
     CHECK(r.messages[2]["reasoning_content"] == "Hmm.");
     CHECK(r.messages[2]["content"] == "Let me check.");
     CHECK(r.messages[2]["tool_calls"][0]["function"] == RequestJson{{"name", "look"}, {"arguments", {{"q", 1}}}});

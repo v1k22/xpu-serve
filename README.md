@@ -334,9 +334,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   Qwen 3's JSON, Gemma 4's arguments, Inkling 2's messages), after its reasoning when the prompt leaves it thinking; a
   strict tool's arguments (`"strict": true`) follow its `parameters` schema, also under `auto` once the model opens a
   call; a named function ends with `finish_reason` `stop`, as OpenAI's does. docs/decisions/0035.
-- **Thinking**: a model's reasoning comes back as `reasoning_content`, apart from `content`;
-  `chat_template_kwargs` reaches the chat template (`{"enable_thinking": false}` turns thinking off where a model
-  thinks by default), and so does `reasoning_effort` under its own name (Inkling 2's template reads it).
+- **Thinking**: a model's reasoning comes back apart from `content`, as `reasoning` (vLLM's field) and as
+  `reasoning_content` (its earlier one), in a message and in a stream's deltas; an assistant message sent back may
+  carry it under either name (`reasoning` first), and the chat template sees both. `chat_template_kwargs` reaches the
+  chat template (`{"enable_thinking": false}` turns thinking off where a model thinks by default), and so does
+  `reasoning_effort` under its own name (Inkling 2's template reads it).
 - **Images**: `image_url` parts with a base64 `data:` URL (PNG, JPEG, BMP or GIF); the server does not fetch remote
   URLs. `--image-max-pixels` bounds the size Qwen3-Omni's processor resizes an image to (its tokens and memory).
 - **Audio**: `input_audio` parts (`{"data": <base64>, "format": "wav" | "mp3" | "flac"}`), for a model that takes
