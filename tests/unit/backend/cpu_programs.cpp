@@ -5,16 +5,17 @@
 namespace {
 
 // `kv`: how the KV cache stores its keys and values (f32 by default).
-xs::test::session::Env cpu_env(const xs::quant::KvFormats& kv = {}) {
+xs::test::session::Env cpu_env(const xs::quant::KvFormats& kv = {}, bool window_kv = false) {
     xs::test::session::Env env;
-    env.compile = [kv](std::span<const xs::graph::Graph* const> programs, const xs::WeightStore& w, int64_t rewind,
-                       int64_t sequences) {
+    env.compile = [kv, window_kv](std::span<const xs::graph::Graph* const> programs, const xs::WeightStore& w,
+                                  int64_t rewind, int64_t sequences) {
         static const auto backend = xs::make_cpu_ref_backend();
         xs::SessionOptions o;
         o.precision = xs::DType::F32;
         o.rewind_tokens = rewind;
         o.sequences = sequences;
         o.kv = kv;
+        o.window_kv = window_kv;
         return backend->compile(programs, w, o);
     };
     return env;
@@ -73,5 +74,16 @@ TEST_SUITE("cpu-ref programs") {
             CAPTURE(kv);
             xs::test::session::segments(cpu_env(xs::quant::parse_kv_formats(kv)), 128);
         }
+    }
+    TEST_CASE("attention alone (window_kv: this backend keeps every key): steps, cuts, snapshots, copies, segments") {
+        namespace s = xs::test::session;
+        using Layer = s::AttentionLayer;
+        const s::Env env = cpu_env({}, true);
+        s::windowed_slot<Layer>(env);
+        s::state_snapshot<Layer>(env);
+        for (const int64_t window : {0, 6}) s::copy_prefix<Layer>(env, window);
+        s::sequences<Layer>(env);
+        s::segments<Layer>(env);
+        s::segments_truncate<Layer>(env);
     }
 }

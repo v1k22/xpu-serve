@@ -36,14 +36,17 @@ public:
     static constexpr float kMix = 4.0f;        // how much the target's layers move the hidden state
     static constexpr float kDraftMix = 0.15f;  // how much the drafter's
     static constexpr int64_t kBlockDrafts = 4;   // of the block drafter, after the pending token
+    static constexpr int64_t kWindow = 4;        // of the target's attention, `sliding`
 
     // `argmax`: the target programs also output each row's argmax (what greedy decoding reads instead of the logits).
     // `block`: the drafter proposes a block a run instead of a token (BlockDrafting): the target's prefill and verify
     // programs append a context row per token to its KV slot, and its program attends over them and its own block.
     // It is handed its guesses, right except after every third token, and gives them back unless its state is off.
     // `batch`: a batch graph too (Model::batch_graph), and a verify graph that allows segments.
-    explicit TinySpecModel(bool argmax = false, bool block = false, bool batch = false)
-        : argmax_(argmax), block_(block), batch_(batch) {
+    // `sliding`: the target is its attention layer alone, over a sliding window of kWindow tokens (no conv or
+    // recurrent state: a model such as Gemma 4).
+    explicit TinySpecModel(bool argmax = false, bool block = false, bool batch = false, bool sliding = false)
+        : argmax_(argmax), block_(block), batch_(batch), sliding_(sliding) {
         test::TensorRng rng(7);
         const HostTensor embed = rng.uniform(DType::F32, {kVocab, kHidden});
         HostTensor head(DType::F32, {kVocab, kHidden}), draft_head(DType::F32, {kVocab, kHidden});
@@ -139,15 +142,18 @@ public:
 private:
     Value freq(Graph& g) const { return g.constant(test::make_tensor(DType::F32, {kDim / 2}, std::vector<float>{1.0f, 0.1f, 0.01f, 0.001f})); }
 
-    // Attention over its own KV slot (`label`), added to h at `mix`.
-    Value attention(Graph& g, const std::string& p, const std::string& label, Value h, Value pos, float mix) const {
+    // Attention over its own KV slot (`label`, within a sliding `window` when not 0), added to h at `mix`.
+    Value attention(Graph& g, const std::string& p, const std::string& label, Value h, Value pos, float mix,
+                    int64_t window = 0) const {
         const Value x = g.rms_norm(h, 1e-6f);
         const auto w = [&](const char* n) { return g.weight(weights_, p + n); };
         const Value q = g.rope(g.reshape(g.matmul(x, w("q")), {kT, kHeads, kDim}), pos, freq(g));
         const Value k = g.rope(g.reshape(g.matmul(x, w("k")), {kT, 1, kDim}), pos, freq(g));
         const auto [k_all, v_all] =
-            g.kv_cache(g.add_kv_slot(1, kDim, 0, label), k, g.reshape(g.matmul(x, w("v")), {kT, 1, kDim}));
-        const Value a = g.attention(q, k_all, v_all, {1.0f / std::sqrt(float{kDim})});
+            g.kv_cache(g.add_kv_slot(1, kDim, window, label), k, g.reshape(g.matmul(x, w("v")), {kT, 1, kDim}));
+        graph::AttentionAttrs attrs{1.0f / std::sqrt(float{kDim})};
+        attrs.sliding_window = window;
+        const Value a = g.attention(q, k_all, v_all, attrs);
         return g.add(h, g.scale(g.matmul(g.reshape(a, {kT, kHeads * kDim}), w("o")), mix));
     }
 
@@ -155,6 +161,10 @@ private:
         const Value ids = g.input("token_ids", DType::I32, {kT});
         const Value pos = g.input("positions", DType::I32, {kT});
         Value h = g.gather(g.weight(weights_, "embed"), ids);
+        if (sliding_) {
+            finish_target(g, attention(g, "attn.", "attn", h, pos, kMix, kWindow), pos, all_logits, hidden_out);
+            return;
+        }
         const Value x = g.rms_norm(h, 1e-6f);
         const int64_t kd = kHeads * kDim;
         const Value qkv = g.silu(g.causal_conv(g.add_conv_slot(3 * kd, kKernel, "conv"),
@@ -165,7 +175,11 @@ private:
         const Value o = g.gated_delta(g.add_recurrent_slot(kHeads, kDim, kDim, "delta"), part(0), part(1), part(2),
                                       decay, beta, 1e-6f);
         h = g.add(h, g.scale(g.matmul(g.reshape(o, {kT, kd}), g.weight(weights_, "out")), kMix));
-        h = attention(g, "attn.", "attn", h, pos, kMix);
+        finish_target(g, attention(g, "attn.", "attn", h, pos, kMix), pos, all_logits, hidden_out);
+    }
+
+    // The target's outputs from its last hidden state `h`.
+    void finish_target(Graph& g, Value h, Value pos, bool all_logits, bool hidden_out) const {
         const Value hidden = g.rms_norm(h, 1e-6f);
         const Value logits = g.matmul(all_logits ? hidden : g.slice(hidden, 0, -1), g.weight(weights_, "lm_head"));
         g.output("logits", logits);
@@ -204,6 +218,7 @@ private:
     bool argmax_ = false;
     bool block_ = false;
     bool batch_ = false;
+    bool sliding_ = false;
     test::MemoryWeights weights_;
     ModelInfo info_;
     Graph step_, batch_graph_, prefill_, verify_, draft_, draft_batch_;
@@ -212,17 +227,21 @@ private:
 // `batch`: the decode steps of the sequences in flight run as one (EngineOptions::batch): speculating, their
 // verifies, of up to `verify_rows` rows (EngineOptions::verify_rows).
 // `adaptive_k`: each round's drafts chosen by the engine (EngineOptions::adaptive_k), up to spec_k.
+// `sliding`: the model's target is attention alone over a sliding window (TinySpecModel), its session keeping only
+// that window when `window_kv` (EngineOptions::window_kv; cpu-ref keeps every key, and the engine reuses a prefix as
+// if it did not).
 inline std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argmax = false, bool block = false,
                                            int64_t sequences = 1, bool batch = false, int64_t verify_rows = 64,
-                                           bool adaptive_k = false) {
+                                           bool adaptive_k = false, bool sliding = false, bool window_kv = false) {
     static const auto backend = make_cpu_ref_backend();
-    auto model = std::make_unique<TinySpecModel>(argmax, block, batch);
+    auto model = std::make_unique<TinySpecModel>(argmax, block, batch, sliding);
     std::vector<const Graph*> programs{&model->graph()};
     if (batch && spec_k == 0) programs.push_back(model->batch_graph());
     SessionOptions options;
     options.precision = DType::F32;
     options.max_context = 256;
     options.sequences = sequences;
+    options.window_kv = window_kv;
     if (spec_k > 0) {
         programs.insert(programs.end(), {&model->prefill_graph(), &model->verify_graph(), &model->draft_graph()});
         options.rewind_tokens = spec_k + 1;
@@ -239,6 +258,7 @@ inline std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bo
     engine.verify_rows = verify_rows;
     engine.adaptive_k = adaptive_k;
     engine.batch_draft = batch_draft;
+    engine.window_kv = window_kv;
     return std::make_unique<Engine>(std::move(model), std::move(session), EncoderSessions{}, engine);
 }
 

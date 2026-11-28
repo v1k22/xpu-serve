@@ -62,7 +62,7 @@ bool env_flag(const char* name) {
 }
 
 // Live USM device allocations of this process (all sessions), for out-of-memory reports.
-std::atomic<size_t> g_device_bytes{0};
+std::atomic<size_t> g_device_bytes{0};  // sycl_device_bytes()
 
 // Bytes as GiB with one decimal, for messages.
 std::string gib(int64_t bytes) {
@@ -400,6 +400,7 @@ public:
           precision_(options.precision),
           kv_format_(options.kv),
           max_context_(options.max_context),
+          window_kv_(options.window_kv),
           profiling_(env_flag("XS_SYCL_PROFILE")),
           sync_(env_flag("XS_SYCL_SYNC")),
           trace_(env_flag("XS_SYCL_TRACE")) {
@@ -1160,14 +1161,17 @@ private:
         return shared_.kv[kv_slot_[static_cast<size_t>(std::get<graph::KvCacheAttrs>(n.attrs).slot)]].base;
     }
     // Whether a slot keeps only its sliding window: one that attention alone reads, in a session whose conv or
-    // recurrent state already rules out cutting the sequence back before its last step (truncate), so no later step
-    // reads the keys before that window.
+    // recurrent state already rules out cutting the sequence back before its last step (truncate), or that was asked
+    // to (SessionOptions::window_kv), so no later step reads the keys before that window.
     bool keeps_window(const SharedKv& s) const {
-        return s.spec.sliding_window > 0 && s.attention_only && !shared_.fixed.empty();
+        return s.spec.sliding_window > 0 && s.attention_only && (window_kv_ || !shared_.fixed.empty());
     }
-    // A slot's capacity at its largest: the context, or its window and a step of `step` tokens.
+    // Rows a slot that keeps its window alone holds past its window and a step: it moves its window back to the front
+    // of its buffers once in so many tokens, not at every step.
+    static constexpr int64_t kWindowSlack = 256;
+    // A slot's capacity at its largest: the context, or its window, a step of `step` tokens and kWindowSlack.
     int64_t kv_capacity(const SharedKv& s, int64_t step, int64_t context) const {
-        return keeps_window(s) ? std::min(context, s.spec.sliding_window + step) : context;
+        return keeps_window(s) ? std::min(context, s.spec.sliding_window + step + kWindowSlack) : context;
     }
 
     // Bytes a token takes in each buffer of a slot.
@@ -2152,8 +2156,9 @@ private:
     }
 
     // Room for a step that brings the slots to `tokens` tokens. A slot grows by doubling; one that keeps only its
-    // sliding window (keeps_window) instead moves the window before the step to the front of buffers a window
-    // larger than the step needs, so it moves again only a window of tokens later.
+    // sliding window (keeps_window) instead moves the window before the step to the front of its buffers, in place
+    // when they hold it and the step (as kv_capacity sized them for the steps reserved: memory stays as billed), else
+    // into buffers kWindowSlack rows larger than they need, so it moves again only that many tokens later.
     void ensure_kv_capacity(int64_t tokens) {
         for (size_t slot : kv_slot_) {
             SharedKv& s = shared_.kv[slot];
@@ -2161,7 +2166,11 @@ private:
             if (tokens - s.base <= b.capacity) continue;
             const int64_t window = keeps_window(s) ? s.spec.sliding_window : 0;
             const int64_t base = window > 0 ? std::max(s.base, s.len - window) : 0;
-            const int64_t cap = std::min(max_context_, window > 0 ? tokens - base + window
+            if (window > 0 && tokens - base <= b.capacity) {
+                slide_window(s, base);
+                continue;
+            }
+            const int64_t cap = std::min(max_context_, window > 0 ? tokens - base + kWindowSlack
                                                                   : std::max({tokens, 2 * b.capacity, int64_t{1024}}));
             const KvTokenBytes bytes = kv_token_bytes(b);
             const int64_t len = s.len - base;  // tokens kept
@@ -2185,6 +2194,20 @@ private:
             b.capacity = cap;
             s.base = base;
         }
+    }
+
+    // Moves a windowed slot's rows from token `base` on (base > s.base) to the front of its own buffers, in pieces no
+    // longer than the distance they move, so that no piece overlaps where it lands (the queue runs them in order).
+    void slide_window(SharedKv& s, int64_t base) {
+        const int64_t shift = base - s.base, rows = s.len - base;
+        for_each_stream(s.buf, [&](const DeviceBuffer& buf, int64_t per_token) {
+            char* data = buf.get();
+            for (int64_t r = 0; r < rows; r += shift) {
+                const int64_t n = std::min(shift, rows - r);
+                q_.memcpy(data + r * per_token, data + (shift + r) * per_token, static_cast<size_t>(n * per_token));
+            }
+        });
+        s.base = base;
     }
 
     Dims resolve(const Dims& dims, const Step& step) const {
@@ -3242,6 +3265,7 @@ private:
     const DType precision_;
     const quant::KvFormats kv_format_;  // of the KV slots that only attention reads (SessionOptions::kv)
     const int64_t max_context_;
+    const bool window_kv_;  // SessionOptions::window_kv
     const bool profiling_;
     const bool sync_;  // XS_SYCL_SYNC=1: wait after every op and name the op a device error comes from
     const bool trace_;  // XS_SYCL_TRACE=1 with XS_SYCL_SYNC=1: print every op before it runs
@@ -3582,5 +3606,7 @@ private:
 std::unique_ptr<Backend> make_sycl_backend() {
     return std::make_unique<SyclBackend>();
 }
+
+size_t sycl_device_bytes() { return g_device_bytes.load(); }
 
 }  // namespace xs

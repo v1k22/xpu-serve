@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <type_traits>
 #include <vector>
 
 #include "backend_test_util.h"
@@ -35,6 +36,7 @@ struct Env {
 // window, when given one), each fed from its own inputs.
 struct HybridLayer {
     static constexpr int64_t kChannels = 24, kKernel = 4, kHk = 2, kHv = 4, kDk = 32, kDv = 16, kHkv = 2, kD = 32;
+    static constexpr const char* kOutputs[] = {"conv", "gdn", "attn"};
     MemoryWeights weights;
     Graph graph;
 
@@ -97,11 +99,42 @@ struct HybridLayer {
     }
 };
 
+// HybridLayer's attention alone (a session without conv or recurrent state), with the same inputs of attention.
+struct AttentionLayer {
+    static constexpr const char* kOutputs[] = {"attn"};
+    MemoryWeights weights;
+    Graph graph;
+
+    // As HybridLayer's; `dk` is of no use here.
+    explicit AttentionLayer(int64_t window = 0, bool segments = false, int64_t /*dk*/ = HybridLayer::kDk,
+                            int64_t d = HybridLayer::kD) {
+        constexpr int64_t kHkv = HybridLayer::kHkv;
+        if (segments) graph.allow_segments();
+        const int kv = graph.add_kv_slot(kHkv, d, window, "attn");
+        const Value ak = graph.input("ak", DType::F32, {kT, kHkv, d});
+        const auto [k_all, v_all] = graph.kv_cache(kv, ak, graph.input("av", DType::F32, {kT, kHkv, d}));
+        graph::AttentionAttrs attrs{0.2f};
+        attrs.sliding_window = window;
+        graph.output("attn", graph.attention(graph.input("aq", DType::F32, {kT, 2 * kHkv, d}), k_all, v_all, attrs));
+        graph.validate();
+    }
+
+    // HybridLayer's inputs of attention (the same draws as theirs).
+    static TensorMap inputs(TensorRng& rng, int64_t tokens, int64_t dk = HybridLayer::kDk,
+                            int64_t d = HybridLayer::kD) {
+        TensorMap all = HybridLayer::inputs(rng, tokens, dk, d), in;
+        for (const char* name : {"ak", "av", "aq"}) in[name] = std::move(all.at(name));
+        return in;
+    }
+    static TensorMap head(const TensorMap& in, int64_t n) { return HybridLayer::head(in, n); }
+};
+
+// Every output `b` holds, in `a` too.
 inline bool outputs_close(const TensorMap& a, const TensorMap& b, const Env& env) {
     bool ok = true;
-    for (const char* name : {"conv", "gdn", "attn"}) {
+    for (const auto& [name, want] : b) {
         CAPTURE(name);
-        const bool close = all_close(a.at(name), b.at(name), env.atol, env.rtol);
+        const bool close = all_close(a.at(name), want, env.atol, env.rtol);
         CHECK(close);
         ok = ok && close;
     }
@@ -238,9 +271,10 @@ inline void undo_last_step(const Env& env) {
 // A KV slot with a sliding window beside conv and recurrent state, which rule out cutting the sequence back before
 // its last step: a backend may then keep only the window's keys. Over many steps, far past a few windows, with
 // steps undone whole and cut inside, attention gives what it gives over every token kept.
+template <class Layer = HybridLayer>
 inline void windowed_slot(const Env& env) {
     const int64_t window = 6;
-    const HybridLayer layer(window);
+    const Layer layer(window);
     const Graph* programs[] = {&layer.graph};
     TensorRng rng(45);
     const auto session = env.compile(programs, layer.weights, 4, 1);
@@ -258,7 +292,7 @@ inline void windowed_slot(const Env& env) {
                           Step{1, 1}, Step{30, 30}, Step{4, 3},  Step{1, 1}, Step{1, 1}, Step{12, 0}, Step{2, 2}}) {
         CAPTURE(cached);
         CAPTURE(s.tokens);
-        const TensorMap in = HybridLayer::inputs(rng, s.tokens);
+        const TensorMap in = Layer::inputs(rng, s.tokens);
         TensorMap out;
         session->run(in, out);
         ks.push_back(in.at("ak").clone());
@@ -271,7 +305,7 @@ inline void windowed_slot(const Env& env) {
             ks.pop_back();
             vs.pop_back();
             if (s.keep > 0) {
-                const TensorMap kept = HybridLayer::head(in, s.keep);
+                const TensorMap kept = Layer::head(in, s.keep);
                 ks.push_back(kept.at("ak").clone());
                 vs.push_back(kept.at("av").clone());
             }
@@ -279,9 +313,10 @@ inline void windowed_slot(const Env& env) {
         cached += s.keep;
         CHECK(session->num_cached() == cached);
     }
-    CHECK_THROWS_AS(session->truncate(cached - 3), xs::Error);  // before the last step
+    // before the last step: conv state cannot (a slot that keeps its window alone may hold what that needs, or not)
+    if constexpr (std::is_same_v<Layer, HybridLayer>) CHECK_THROWS_AS(session->truncate(cached - 3), xs::Error);
     session->truncate(0);
-    const TensorMap in = HybridLayer::inputs(rng, 9);
+    const TensorMap in = Layer::inputs(rng, 9);
     TensorMap out;
     session->run(in, out);
     CHECK(all_close(out.at("attn"), ref::attention(to_f64(in.at("aq")), to_f64(in.at("ak")), to_f64(in.at("av")), spec),
@@ -369,8 +404,9 @@ inline void shared_kv_slot(const Env& env) {
 
 // Three sequences of one session, each with its conv, recurrent and KV state, run in turns: each gives what a session
 // of its own gives over the same steps; reset and truncate touch the current one alone.
+template <class Layer = HybridLayer>
 inline void sequences(const Env& env) {
-    const HybridLayer layer(6);
+    const Layer layer(6);
     const Graph* programs[] = {&layer.graph};
     const auto shared = env.compile(programs, layer.weights, 0, 3);
     TensorRng rng(9);
@@ -379,7 +415,7 @@ inline void sequences(const Env& env) {
     const std::vector<std::pair<int, int64_t>> turns = {{0, 5}, {1, 3}, {0, 1}, {2, 7}, {1, 1}, {0, 2}, {2, 1}, {1, 4}};
     for (const auto& [s, tokens] : turns) {
         CAPTURE(s);
-        const TensorMap in = HybridLayer::inputs(rng, tokens);
+        const TensorMap in = Layer::inputs(rng, tokens);
         TensorMap got, want;
         shared->use(s);
         shared->run(in, got);
@@ -393,7 +429,7 @@ inline void sequences(const Env& env) {
     CHECK(shared->num_cached() == 0);
     shared->use(2);
     CHECK(shared->num_cached() == 8);
-    const TensorMap in = HybridLayer::inputs(rng, 2);
+    const TensorMap in = Layer::inputs(rng, 2);
     TensorMap got, want;
     shared->run(in, got);
     alone[2]->run(in, want);
@@ -405,8 +441,9 @@ inline void sequences(const Env& env) {
 // of its own gives over the same steps, its rows in the segments' order; the current sequence stays current; a step
 // that fails leaves every sequence as it was; a program that does not allow segments, and a sequence twice, are
 // refused. `d`: attention's head width (128 for a TurboQuant cache).
+template <class Layer = HybridLayer>
 inline void segments(const Env& env, int64_t d = HybridLayer::kD) {
-    const HybridLayer layer(6, true, 64, d);
+    const Layer layer(6, true, 64, d);
     const Graph* programs[] = {&layer.graph};
     const auto shared = env.compile(programs, layer.weights, 0, 3);
     TensorRng rng(13);
@@ -418,10 +455,10 @@ inline void segments(const Env& env, int64_t d = HybridLayer::kD) {
         std::vector<TensorMap> parts;
         TensorMap want_all;
         for (const Segment& s : segs) {
-            parts.push_back(HybridLayer::inputs(rng, s.tokens, 64, d));
+            parts.push_back(Layer::inputs(rng, s.tokens, 64, d));
             TensorMap want;
             alone[static_cast<size_t>(s.sequence)]->run(parts.back(), want);
-            for (const char* name : {"conv", "gdn", "attn"}) {
+            for (const char* name : Layer::kOutputs) {
                 want_all[name] = want_all.count(name) == 0 ? want.at(name)
                                                            : concat_rows(std::vector{want_all.at(name), want.at(name)});
             }
@@ -457,7 +494,7 @@ inline void segments(const Env& env, int64_t d = HybridLayer::kD) {
 
     // A step whose second segment fails: the first one's sequence is as it was, the next step agrees.
     shared->use(0);
-    const TensorMap in = HybridLayer::inputs(rng, 2, 64, d);
+    const TensorMap in = Layer::inputs(rng, 2, 64, d);
     TensorMap got;
     const Segment bad[] = {{2, 1}, {7, 1}};
     CHECK_THROWS_AS(shared->run_segments(0, bad, in, got, {}), xs::Error);
@@ -466,7 +503,7 @@ inline void segments(const Env& env, int64_t d = HybridLayer::kD) {
     const Segment twice[] = {{1, 1}, {1, 1}};
     CHECK_THROWS_AS(shared->run_segments(0, twice, in, got, {}), xs::Error);
 
-    const HybridLayer plain(6, false, 64, d);
+    const Layer plain(6, false, 64, d);
     const Graph* plain_programs[] = {&plain.graph};
     const auto refused = env.compile(plain_programs, plain.weights, 0, 2);
     const Segment two[] = {{0, 1}, {1, 1}};
@@ -477,19 +514,20 @@ inline void segments(const Env& env, int64_t d = HybridLayer::kD) {
 // went far past it again (one of them cut back): what follows is what a session that never ran those steps gives, and
 // a second restore after more steps too. With a KV slot that keeps every key, restoring a snapshot whose tokens the
 // slot no longer holds is refused and changes nothing.
+template <class Layer = HybridLayer>
 inline void state_snapshot(const Env& env, int64_t d = HybridLayer::kD) {
-    const HybridLayer layer(6, false, 64, d);
+    const Layer layer(6, false, 64, d);
     const Graph* programs[] = {&layer.graph};
     const auto session = env.compile(programs, layer.weights, 4, 1);
     TensorRng rng(5);
-    const TensorMap prefix = HybridLayer::inputs(rng, 9, 64, d);
+    const TensorMap prefix = Layer::inputs(rng, 9, 64, d);
     TensorMap out;
     session->run(prefix, out);
     const StateSnapshot snapshot = session->save_state(0);
     CHECK(snapshot.tokens == 9);
     for (int restore = 0; restore < 2; ++restore) {
         CAPTURE(restore);
-        for (const int64_t t : {5, 8, 3}) session->run(HybridLayer::inputs(rng, t, 64, d), out);
+        for (const int64_t t : {5, 8, 3}) session->run(Layer::inputs(rng, t, 64, d), out);
         session->truncate(session->num_cached() - 2);
         session->restore_state(0, snapshot);
         CHECK(session->num_cached() == 9);
@@ -497,19 +535,19 @@ inline void state_snapshot(const Env& env, int64_t d = HybridLayer::kD) {
         TensorMap want;
         plain->run(prefix, want);
         for (const int64_t t : {2, 7, 1}) {
-            const TensorMap next = HybridLayer::inputs(rng, t, 64, d);
+            const TensorMap next = Layer::inputs(rng, t, 64, d);
             session->run(next, out);
             plain->run(next, want);
             CHECK(outputs_close(out, want, env));
         }
     }
 
-    const HybridLayer full(0, false, 64, d);  // its KV slot keeps every key
+    const Layer full(0, false, 64, d);  // its KV slot keeps every key
     const Graph* full_programs[] = {&full.graph};
     const auto cut = env.compile(full_programs, full.weights, 0, 1);
     cut->run(prefix, out);
     const StateSnapshot early = cut->save_state(0);
-    cut->run(HybridLayer::inputs(rng, 4, 64, d), out);
+    cut->run(Layer::inputs(rng, 4, 64, d), out);
     cut->truncate(0);
     CHECK_THROWS_AS(cut->restore_state(0, early), xs::Error);
     CHECK(cut->num_cached() == 0);
@@ -519,19 +557,20 @@ inline void state_snapshot(const Env& env, int64_t d = HybridLayer::kD) {
 // there) goes on as a session that ran that prefix itself, whatever it held before; the other goes on unchanged, past
 // the snapshot. With a sliding window (`window`) shorter than the prefix and without one. Copying from the current
 // sequence, or more tokens than the source holds, is refused.
+template <class Layer = HybridLayer>
 inline void copy_prefix(const Env& env, int64_t window, int64_t d = HybridLayer::kD) {
-    const HybridLayer layer(window, false, 64, d);
+    const Layer layer(window, false, 64, d);
     const Graph* programs[] = {&layer.graph};
     const auto session = env.compile(programs, layer.weights, 0, 2);
     TensorRng rng(17);
-    const TensorMap prefix = HybridLayer::inputs(rng, 9, 64, d), more = HybridLayer::inputs(rng, 4, 64, d);
+    const TensorMap prefix = Layer::inputs(rng, 9, 64, d), more = Layer::inputs(rng, 4, 64, d);
     TensorMap out;
     session->use(0);
     session->run(prefix, out);
     const StateSnapshot snapshot = session->save_state(0);
     session->run(more, out);
     session->use(1);
-    session->run(HybridLayer::inputs(rng, 3, 64, d), out);
+    session->run(Layer::inputs(rng, 3, 64, d), out);
     CHECK_THROWS_AS(session->copy_prefix(0, 1, 2), xs::Error);
     CHECK_THROWS_AS(session->copy_prefix(0, 0, 14), xs::Error);
     session->copy_prefix(0, 0, 9);
@@ -544,7 +583,7 @@ inline void copy_prefix(const Env& env, int64_t window, int64_t d = HybridLayer:
     source->run(prefix, want);
     source->run(more, want);
     for (const int64_t t : {2, 7, 1}) {
-        const TensorMap next = HybridLayer::inputs(rng, t, 64, d), other = HybridLayer::inputs(rng, t, 64, d);
+        const TensorMap next = Layer::inputs(rng, t, 64, d), other = Layer::inputs(rng, t, 64, d);
         session->use(1);
         session->run(next, out);
         own->run(next, want);
@@ -559,15 +598,16 @@ inline void copy_prefix(const Env& env, int64_t window, int64_t d = HybridLayer:
 // Speculative rounds of several sequences at once: a step of segments of up to rewind_tokens tokens each, then each
 // sequence cut back inside its own segment (truncate with it selected), gives each sequence what a session of its own
 // gives over the same steps and cuts; a cut that keeps nothing of the step and one that keeps all of it included.
+template <class Layer = HybridLayer>
 inline void segments_truncate(const Env& env, int64_t d = HybridLayer::kD) {
-    const HybridLayer layer(6, true, 64, d);
+    const Layer layer(6, true, 64, d);
     const Graph* programs[] = {&layer.graph};
     const auto shared = env.compile(programs, layer.weights, 4, 3);
     std::vector<std::unique_ptr<Session>> alone;
     for (int s = 0; s < 3; ++s) alone.push_back(env.compile(programs, layer.weights, 4, 1));
     TensorRng rng(29);
     for (int s = 0; s < 3; ++s) {
-        const TensorMap in = HybridLayer::inputs(rng, 2 + 3 * s, 64, d);
+        const TensorMap in = Layer::inputs(rng, 2 + 3 * s, 64, d);
         TensorMap got, want;
         shared->use(s);
         shared->run(in, got);
@@ -577,7 +617,7 @@ inline void segments_truncate(const Env& env, int64_t d = HybridLayer::kD) {
     const auto round = [&](std::vector<Segment> segs, std::vector<int64_t> keep) {
         CAPTURE(segs.size());
         std::vector<TensorMap> parts;
-        for (const Segment& s : segs) parts.push_back(HybridLayer::inputs(rng, s.tokens, 64, d));
+        for (const Segment& s : segs) parts.push_back(Layer::inputs(rng, s.tokens, 64, d));
         TensorMap in, got;
         for (const auto& [name, t] : parts[0]) {
             std::vector<HostTensor> rows;
@@ -591,7 +631,7 @@ inline void segments_truncate(const Env& env, int64_t d = HybridLayer::kD) {
             Session& own = *alone[static_cast<size_t>(segs[i].sequence)];
             TensorMap want, mine;
             own.run(parts[i], want);
-            for (const char* name : {"conv", "gdn", "attn"}) mine[name] = rows_of(got.at(name), row, segs[i].tokens);
+            for (const char* name : Layer::kOutputs) mine[name] = rows_of(got.at(name), row, segs[i].tokens);
             CHECK(outputs_close(mine, want, env));
             row += segs[i].tokens;
             shared->use(segs[i].sequence);

@@ -213,6 +213,7 @@ TEST_CASE("media input matches Hugging Face: features, encoder rows, prompt, log
     // Greedy continuations through the engine, which encodes the media itself.
     xs::EngineOptions eo;
     eo.max_context = 4096;
+    eo.window_kv = xs::test::parity_window_kv();
     xs::Engine engine(std::move(model), std::move(session), std::move(sessions), eo);
     size_t k = 0;
     for (const auto& c : manifest["cases"]) {

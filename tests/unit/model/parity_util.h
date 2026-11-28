@@ -50,13 +50,19 @@ inline std::filesystem::path model_fixtures() {
     return env_or("XS_PARITY_FIXTURES", std::string(XS_SOURCE_DIR) + "/tests/fixtures/generated/" + model_type);
 }
 
-// The session a parity test compiles: XS_PARITY_DEVICE, XS_PARITY_PRECISION (f32 by default), XS_PARITY_KV_DTYPE.
+// XS_PARITY_WINDOW_KV=1: the decoder's session keeps only the window of its sliding KV slots, and the engine reuses
+// prefixes accordingly (SessionOptions::window_kv, EngineOptions::window_kv).
+inline bool parity_window_kv() { return env_or("XS_PARITY_WINDOW_KV", "0") == "1"; }
+
+// The session a parity test compiles: XS_PARITY_DEVICE, XS_PARITY_PRECISION (f32 by default), XS_PARITY_KV_DTYPE,
+// XS_PARITY_WINDOW_KV.
 inline SessionOptions parity_options() {
     SessionOptions options;
     options.device = env_or("XS_PARITY_DEVICE", "");
     options.precision = env_or("XS_PARITY_PRECISION", "f32") == "f32" ? DType::F32 : DType::F16;
     options.max_context = 4096;
     options.kv = quant::parse_kv_formats(env_or("XS_PARITY_KV_DTYPE", "auto"));
+    options.window_kv = parity_window_kv();
     return options;
 }
 

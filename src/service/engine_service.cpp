@@ -74,8 +74,17 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
                   "; using ", info.max_position);
         engine_options.max_context = info.max_position;
     }
+    const auto& slots = model->graph().kv_slots();
+    engine_options.window_kv = options.window_kv && std::any_of(slots.begin(), slots.end(), [](const graph::KvSlot& k) {
+                                   return k.sliding_window > 0;
+                               });
     SessionOptions session_options = options.session;
     session_options.max_context = engine_options.max_context;
+    session_options.window_kv = engine_options.window_kv;
+    if (engine_options.window_kv && !model->graph().has_fixed_state()) {
+        log::info("the sliding attention layers keep their window alone in the KV cache; a prompt's prefix is reused ",
+                  "from the end of a chat's messages (--sliding-kv full keeps every key and reuses any prefix)");
+    }
     session_options.sequences = engine_options.sequences;
 
     // Speculating, the session also runs the model's prefill, verify and draft programs (spec::Program order) and

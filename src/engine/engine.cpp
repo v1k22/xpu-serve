@@ -45,7 +45,7 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
     XS_CHECK(options_.verify_rows >= 1, "verify_rows must be positive, got ", options_.verify_rows);
     XS_CHECK(options_.sequences >= 1, "an engine of ", options_.sequences, " sequences");
     sequences_.resize(static_cast<size_t>(options_.sequences));
-    fixed_state_ = model_->graph().has_fixed_state();
+    snapshot_prefix_ = model_->graph().has_fixed_state() || options_.window_kv;
     const auto offers_argmax = [](const graph::Graph& g) {
         return std::any_of(g.outputs().begin(), g.outputs().end(), [](const auto& o) { return o.name == "argmax"; });
     };
@@ -387,14 +387,15 @@ int64_t Engine::usable_prefix(const Sequence& q, const std::vector<PositionKey>&
     // At least the last prompt token must run, because its logits pick the first new token.
     const int64_t keep = std::min<int64_t>(common, static_cast<int64_t>(keys.size()) - 1);
     if (keep <= 0) return 0;
-    if (keep == static_cast<int64_t>(cached.size()) || !fixed_state_) return keep;
-    // Conv and recurrent state cannot be cut back into the sequence: only to its snapshot.
+    if (keep == static_cast<int64_t>(cached.size()) || !snapshot_prefix_) return keep;
+    // Conv and recurrent state, and a KV slot that keeps its window alone, cannot be cut back into the sequence: only
+    // to its snapshot.
     return q.snapshot && q.snapshot->tokens <= keep ? q.snapshot->tokens : 0;
 }
 
 namespace {
 
-// A copy costs the prefix's KV copied on the device and, with conv or recurrent state, a snapshot restored from host
+// A copy costs the prefix's KV copied on the device and, with a snapshot prefix, a snapshot restored from host
 // memory (tens of ms): worth it from this many tokens more than the request's own sequence keeps.
 constexpr int64_t kCopyGain = 64;
 
@@ -405,7 +406,7 @@ int64_t Engine::copyable_prefix(const Sequence& q, const std::vector<PositionKey
     const auto common = static_cast<int64_t>(
         std::mismatch(cached.begin(), cached.end(), keys.begin(), keys.end()).first - cached.begin());
     const int64_t keep = std::min<int64_t>(common, static_cast<int64_t>(keys.size()) - 1);
-    if (!fixed_state_) return std::max<int64_t>(keep, 0);
+    if (!snapshot_prefix_) return std::max<int64_t>(keep, 0);
     return q.snapshot && q.snapshot->tokens <= keep ? q.snapshot->tokens : 0;
 }
 
@@ -424,9 +425,9 @@ void Engine::take_prefix(const std::vector<PositionKey>& keys) {
     Timer timer;
     reset_sequence();
     session_->copy_prefix(state_program(), static_cast<int64_t>(donor), tokens);
-    if (fixed_state_) session_->restore_state(state_program(), *sequences_[donor].snapshot);
+    if (snapshot_prefix_) session_->restore_state(state_program(), *sequences_[donor].snapshot);
     seq().cached.assign(keys.begin(), keys.begin() + tokens);
-    seq().snapshot = fixed_state_ ? sequences_[donor].snapshot : nullptr;
+    seq().snapshot = snapshot_prefix_ ? sequences_[donor].snapshot : nullptr;
     if (seq().drafter) {
         std::vector<int32_t> copied(static_cast<size_t>(tokens));
         std::transform(keys.begin(), keys.begin() + tokens, copied.begin(),
@@ -445,7 +446,7 @@ int64_t Engine::reuse_prefix(const std::vector<PositionKey>& prompt_keys) {
         return 0;
     }
     if (keep < static_cast<int64_t>(cached.size())) {
-        if (fixed_state_) {
+        if (snapshot_prefix_) {
             Timer restoring;
             session_->restore_state(state_program(), *seq().snapshot);
             log::debug("engine: restored sequence ", current_, "'s state at ", keep, " tokens in ",
@@ -687,7 +688,8 @@ void Engine::prefill_chunk(Generation& g) {
     const size_t pos = g.fed;
     size_t len = std::min(n - pos, static_cast<size_t>(options_.prefill_chunk));
     const auto snapshot_at = static_cast<size_t>(std::max<int64_t>(0, g.request.snapshot_at));
-    if (fixed_state_ && snapshot_at > pos && snapshot_at < pos + len) len = snapshot_at - pos;  // a chunk ends there
+    // a chunk ends at the snapshot point
+    if (snapshot_prefix_ && snapshot_at > pos && snapshot_at < pos + len) len = snapshot_at - pos;
     if (model_->info().media_whole_steps) len = whole_media_chunk(g.media_item, pos, len);
     const int64_t width = media_width();
     std::vector<const float*> rows(len, nullptr);
@@ -704,7 +706,7 @@ void Engine::prefill_chunk(Generation& g) {
             std::span<const RotaryPosition>(g.positions).subspan(pos, len),
             any_rows ? std::span<const float* const>(rows) : std::span<const float* const>());
     g.fed += len;
-    if (fixed_state_ && g.fed == snapshot_at) {
+    if (snapshot_prefix_ && g.fed == snapshot_at) {
         Timer saving;
         seq().snapshot = std::make_shared<const StateSnapshot>(session_->save_state(state_program()));
         log::debug("engine: saved sequence ", g.sequence, "'s state at ", snapshot_at, " tokens (",

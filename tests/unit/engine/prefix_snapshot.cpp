@@ -3,9 +3,13 @@
 // point its predecessor named (GenerateRequest::snapshot_at) starts from there and gives the tokens it gets from the
 // start; one departing before that point, or after a request that named none, starts over; of two free sequences a
 // request takes the one it can use the most of; and one whose own sequence offers less takes another's prefix as a
-// copy, the other going on unchanged. Without a drafter and with one of each kind.
+// copy, the other going on unchanged. Without a drafter and with one of each kind. A model of attention alone whose
+// session keeps only its sliding window (EngineOptions::window_kv) reuses a prefix the same way; keeping every key,
+// it reuses any.
 #include <doctest/doctest.h>
 
+#include <memory>
+#include <utility>
 #include <vector>
 
 #include "tiny_engine.h"
@@ -29,17 +33,37 @@ struct Drafting {
 };
 constexpr Drafting kDraftings[] = {{0, false}, {2, false}, {3, true}};
 
+struct Kind {
+    const char* name;
+    bool sliding;  // attention alone over a sliding window, the session keeping that window alone
+};
+constexpr Kind kKinds[] = {{"conv and recurrent state", false}, {"a sliding window kept alone", true}};
+
+// Every kind of model with every drafting.
+std::vector<std::pair<Kind, Drafting>> cases() {
+    std::vector<std::pair<Kind, Drafting>> out;
+    for (const Kind& k : kKinds) {
+        for (const Drafting& d : kDraftings) out.emplace_back(k, d);
+    }
+    return out;
+}
+
+std::unique_ptr<Engine> make(const Kind& k, const Drafting& d, int64_t chunk, int64_t sequences = 1) {
+    return make_engine(d.spec_k, chunk, false, d.block, sequences, false, 64, false, k.sliding, k.sliding);
+}
+
 }  // namespace
 
 TEST_CASE("a prompt that departs from the cache after the snapshot point starts from the snapshot") {
-    for (const Drafting d : kDraftings) {
+    for (const auto& [k, d] : cases()) {
         for (const int64_t chunk : {int64_t{3}, int64_t{64}}) {
+            CAPTURE(k.name);
             CAPTURE(d.spec_k);
             CAPTURE(chunk);
             const auto fresh = [&](const GenerateRequest& r) {
-                return make_engine(d.spec_k, chunk, false, d.block)->generate(r, {});
+                return make(k, d, chunk)->generate(r, {});
             };
-            const auto engine = make_engine(d.spec_k, chunk, false, d.block);
+            const auto engine = make(k, d, chunk);
             // A conversation: each turn's messages, then a generation prompt (13, 14) the next turn renders otherwise.
             const GenerateRequest a = turn({1, 2, 3, 4, 5, 6, 7, 8, 13, 14}, 6, 8);
             CHECK(engine->generate(a, {}).tokens == fresh(a).tokens);
@@ -72,9 +96,10 @@ TEST_CASE("a prompt that departs from the cache after the snapshot point starts 
 }
 
 TEST_CASE("of two free sequences a request takes the one whose prefix it can use, a snapshot's included") {
-    for (const Drafting d : kDraftings) {
+    for (const auto& [k, d] : cases()) {
+        CAPTURE(k.name);
         CAPTURE(d.spec_k);
-        const auto engine = make_engine(d.spec_k, 64, false, d.block, 2);
+        const auto engine = make(k, d, 64, 2);
         // a: a conversation that saved its state after its 8 tokens of messages; o: a prompt that shares 10 tokens
         // with the next one, but no snapshot, so they are of no use to a prompt departing inside its cache.
         const GenerateRequest a = turn({1, 2, 3, 4, 5, 6, 7, 8, 13, 14}, 4, 8);
@@ -93,7 +118,7 @@ TEST_CASE("of two free sequences a request takes the one whose prefix it can use
         const GenerateRequest b = turn({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 5, 13, 14}, 5, 11);
         const GenerateResult got_b = engine->generate(b, {});
         CHECK(got_b.stats.cached_tokens == 8);
-        CHECK(got_b.tokens == make_engine(d.spec_k, 64, false, d.block)->generate(b, {}).tokens);
+        CHECK(got_b.tokens == make(k, d, 64)->generate(b, {}).tokens);
     }
 }
 
@@ -106,13 +131,14 @@ TEST_CASE("a request takes a busy sequence's prefix as a copy when its own offer
             p.insert(p.end(), tail.begin(), tail.end());
             return p;
         };
-        for (const Drafting d : kDraftings) {
+        for (const auto& [k, d] : cases()) {
             CAPTURE(shared);
+            CAPTURE(k.name);
             CAPTURE(d.spec_k);
             const auto fresh = [&](const GenerateRequest& r) {
-                return make_engine(d.spec_k, 32, false, d.block)->generate(r, {});
+                return make(k, d, 32)->generate(r, {});
             };
-            const auto engine = make_engine(d.spec_k, 32, false, d.block, 2);
+            const auto engine = make(k, d, 32, 2);
             const GenerateRequest a = turn(with({13, 14}), 4, shared);
             const GenerateResult got_a = engine->generate(a, {});
             // e extends a's whole cache, so it takes a's sequence (keeping its snapshot), and is still decoding when
@@ -138,6 +164,21 @@ TEST_CASE("a request takes a busy sequence's prefix as a copy when its own offer
             CHECK(got_c.tokens == fresh(c).tokens);
             CHECK(engine->finish(*he).tokens == fresh(e).tokens);
         }
+    }
+}
+
+TEST_CASE("attention alone keeping every key reuses any shared prefix; keeping its window, from the snapshot") {
+    for (const bool window_kv : {false, true}) {
+        CAPTURE(window_kv);
+        const auto fresh = [&] { return make_engine(0, 64, false, false, 1, false, 64, false, true, window_kv); };
+        const auto engine = fresh();
+        const GenerateRequest a = turn({1, 2, 3, 4, 5, 6, 7, 8, 13, 14}, 6, 8);
+        engine->generate(a, {});
+        // Departing before the snapshot point: 5 tokens shared.
+        const GenerateRequest e = turn({1, 2, 3, 4, 5, 0, 0, 13, 14}, 4, 7);
+        const GenerateResult got_e = engine->generate(e, {});
+        CHECK(got_e.stats.cached_tokens == (window_kv ? 0 : 5));
+        CHECK(got_e.tokens == fresh()->generate(e, {}).tokens);
     }
 }
 

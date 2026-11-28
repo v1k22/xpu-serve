@@ -36,6 +36,11 @@ struct SessionOptions {
     // Steps of up to this many tokens can be cut back to any point inside them (truncate), conv and recurrent state
     // included: the verify step of speculative decoding (k + 1 tokens). 0: a step is kept or dropped whole.
     int64_t rewind_tokens = 0;
+    // A KV slot of a sliding window that attention alone reads keeps that window and room for a step, not the whole
+    // sequence, in a session without conv or recurrent state too (with such state it always does): truncate then
+    // cuts it back only as far as it holds the window before the cut (the last step at least), and a prefix comes
+    // back through a snapshot (save_state), which holds that window. A backend may keep every key (cpu-ref does).
+    bool window_kv = false;
     // Per program, in compile's order: the most tokens one step of it feeds (a prefill chunk, a verify). A backend that
     // sizes its device memory reserves at compile time what such steps over a cache of max_context tokens need, and
     // the cache itself, and refuses the context by name when they do not fit. Empty: nothing reserved ahead (memory
@@ -103,7 +108,8 @@ public:
     // Keeps the first `n` tokens of the slots `program` writes (n <= num_cached(program)). Conv and recurrent state
     // (Graph::has_fixed_state) summarize the sequence: it keeps 0 tokens, all of them, the tokens before the last
     // step (that step undone whole, whatever its size), or, after a step of at most SessionOptions::rewind_tokens
-    // tokens, any count from before that step on; anything else throws.
+    // tokens, any count from before that step on; anything else throws. A KV slot that keeps only its window
+    // (SessionOptions::window_kv) goes back no further than the window it holds before `n`.
     virtual void truncate(size_t program, int64_t n) = 0;
     void truncate(int64_t n) { truncate(0, n); }
     // A snapshot of the slots `program` writes, of the current sequence as it stands (StateSnapshot).

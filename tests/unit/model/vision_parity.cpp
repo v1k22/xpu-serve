@@ -55,6 +55,7 @@ TEST_CASE("image input matches Hugging Face preprocessing, tower, logits and gre
     options.device = env_or("XS_PARITY_DEVICE", "");
     options.precision = f32 ? xs::DType::F32 : xs::DType::F16;
     options.max_context = 4096;
+    options.window_kv = xs::test::parity_window_kv();
     const auto backend = xs::make_backend(backend_name);
     auto vision_session = backend->compile(vision.programs(), model->weights(), options);
     const int64_t hidden = model->info().hidden_size;
@@ -180,6 +181,7 @@ TEST_CASE("image input matches Hugging Face preprocessing, tower, logits and gre
     // 97 tokens so chunk boundaries fall inside images; both must reproduce the reference.
     xs::EngineOptions eo;
     eo.max_context = 4096;
+    eo.window_kv = xs::test::parity_window_kv();
     xs::EncoderSessions encoders;
     encoders[static_cast<size_t>(xs::Modality::Image)] = std::move(vision_session);
     xs::Engine engine(std::move(model), std::move(session), std::move(encoders), eo);
@@ -209,8 +211,9 @@ TEST_CASE("image input matches Hugging Face preprocessing, tower, logits and gre
 
     // The prefix cache tells images apart by their pixels: the same prompt with a different image key reuses only the
     // text before the image; the same request again reuses everything but the last token. Not for a model whose
-    // sessions cannot be cut back to a prefix.
-    if (!manifest.value("prefix_reuse", true)) return;
+    // sessions cannot be cut back to a prefix, nor for one keeping its sliding window alone (a snapshot's prefix
+    // only: prefix_snapshot.cpp).
+    if (!manifest.value("prefix_reuse", true) || xs::test::parity_window_kv()) return;
     const Case& k = cases.front();
     const auto first_image =
         std::find(k.prompt.begin(), k.prompt.end(), engine.model().vision()->soft_token()) - k.prompt.begin();

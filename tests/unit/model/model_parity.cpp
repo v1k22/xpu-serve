@@ -71,6 +71,7 @@ TEST_CASE("model matches Hugging Face logits and greedy output" * doctest::skip(
     // continuation includes the stop token when one was produced, so it is compared like any other token.
     xs::EngineOptions eo;
     eo.max_context = 4096;
+    eo.window_kv = xs::test::parity_window_kv();
     xs::Engine engine(std::move(model), std::move(session), xs::EncoderSessions{}, eo);
     for (const auto& c : manifest["cases"]) {
         if (c.contains("wav")) continue;

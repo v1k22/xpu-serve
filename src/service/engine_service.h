@@ -31,6 +31,9 @@ struct ServiceOptions {
     EngineOptions engine;  // spec_k: 0 is off, kDraftersCount the drafter's own
     std::string model_id;  // empty = the model directory name
     bool vision = true;    // load the vision encoder when the checkpoint has one
+    // A model with sliding attention layers keeps only their window in its KV cache (EngineOptions::window_kv): a
+    // prefix then comes back from the snapshot at the end of a chat's messages alone. False: every key is kept.
+    bool window_kv = true;
     int64_t image_max_pixels = 0;  // LoadOptions::image_max_pixels
     std::string spec;               // the kind of drafter asked for: "mtp", "dflash", "dspine", "dspark", "ngram" (empty: any)
     std::filesystem::path drafter;  // a drafter checkpoint for speculative decoding (an assistant, a block drafter)

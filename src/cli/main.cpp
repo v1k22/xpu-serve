@@ -92,6 +92,11 @@ void add_engine_options(Args& a) {
                "turbo2 (TurboQuant: 4, 3 or 2 bits a value), or <keys>:<values>, e.g. i8:turbo4",
                "auto")
         .value("ctx", "context length in tokens (prompt + output)", "8192")
+        .value("sliding-kv",
+               "a model's sliding attention layers in the KV cache: window (their window alone: a longer context "
+               "fits; a prompt's prefix is reused from the end of a chat's messages) | full (every key: any shared "
+               "prefix is reused)",
+               "window")
         .value("prefill-chunk", "tokens per prefill step", "1024")
         .value("sequences",
                "requests in flight at once, each its own cached prompt and its KV cache of --ctx tokens, their "
@@ -175,6 +180,9 @@ ServiceOptions service_options(const Args& a) {
     }
     o.session.kv = quant::parse_kv_formats(a.get("kv-dtype"));
     o.vision = !a.has("no-vision");
+    const std::string& sliding = a.get("sliding-kv");
+    if (sliding != "window" && sliding != "full") fail("--sliding-kv must be window or full, got '", sliding, "'");
+    o.window_kv = sliding == "window";
     if (a.has("image-max-pixels")) o.image_max_pixels = a.get_int("image-max-pixels");
     o.engine.max_context = a.get_int("ctx");
     o.engine.prefill_chunk = a.get_int("prefill-chunk");

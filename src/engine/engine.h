@@ -47,6 +47,10 @@ struct EngineOptions {
     // Speculating in batched steps with a chain drafter: the drafts of the requests run as one run a depth, the
     // session's program spec::kBatchDraft being the model's Speculation::batch_draft_graph.
     bool batch_draft = false;
+    // The session keeps only the window of the model's sliding KV slots (SessionOptions::window_kv), which then, as
+    // conv and recurrent state, cannot be cut back into the sequence: a prefix is kept whole or from the sequence's
+    // snapshot (GenerateRequest::snapshot_at). For a model with such slots only; the service sets both.
+    bool window_kv = false;
 };
 
 // The session's program that runs Model::batch_graph() (EngineOptions::batch), after the step graph.
@@ -115,10 +119,10 @@ private:
     // The prompt positions a request with `keys` can keep of sequence `q`'s cache (reuse_prefix).
     int64_t usable_prefix(const Sequence& q, const std::vector<PositionKey>& keys) const;
     // The prompt positions a request with `keys` could copy of another sequence `q`'s cache: its common prefix, or for
-    // a model with conv or recurrent state, the prefix up to its snapshot.
+    // a snapshot prefix (snapshot_prefix_), the prefix up to its snapshot.
     int64_t copyable_prefix(const Sequence& q, const std::vector<PositionKey>& keys) const;
     // Makes the selected sequence hold another sequence's prefix of the prompt when that one offers kCopyGain tokens
-    // more than its own does (Session::copy_prefix, and that sequence's snapshot for conv or recurrent state).
+    // more than its own does (Session::copy_prefix, and that sequence's snapshot with a snapshot prefix).
     void take_prefix(const std::vector<PositionKey>& keys);
     // The steps of advance(): the rest of the prompt's next chunk, and the next token.
     void prefill_chunk(Generation& g);
@@ -175,8 +179,8 @@ private:
     // Drops the sequence: every slot of the session, and what waits for the drafter.
     void reset_sequence();
     // Makes the session hold a prefix of the prompt and returns how many prompt positions are already cached: the
-    // longest one it shares, or with conv or recurrent state the whole cache when the prompt extends it, else the
-    // sequence's snapshot when the prompt shares its tokens, else none.
+    // longest one it shares, or with a snapshot prefix (snapshot_prefix_) the whole cache when the prompt extends it,
+    // else the sequence's snapshot when the prompt shares its tokens, else none.
     int64_t reuse_prefix(const std::vector<PositionKey>& prompt_keys);
     // The encoder rows of one media item ([num_tokens, hidden] f32), from the cache or its encoder's runs.
     std::shared_ptr<const HostTensor> encode(const MediaInput& media, GenerateStats& stats);
@@ -195,9 +199,9 @@ private:
     TensorMap outputs_;
     std::vector<float> stop_logits_;  // constrain()'s scratch
     std::vector<float> row_copy_;     // target_token()'s: a row before the sampler's penalties change it
-    // The model has conv or recurrent state: a prefix is kept whole or from the sequence's snapshot, taken at
-    // GenerateRequest::snapshot_at.
-    bool fixed_state_ = false;
+    // A prefix is kept whole or from the sequence's snapshot, taken at GenerateRequest::snapshot_at: the model has
+    // conv or recurrent state, or the session keeps its sliding KV slots' window alone (EngineOptions::window_kv).
+    bool snapshot_prefix_ = false;
     // The session's programs that prefill and verify when speculating: the model's drafter's (spec::Program), or the
     // step and batch graphs for prompt lookup.
     size_t prefill_program_ = spec::kPrefill;

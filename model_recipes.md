@@ -431,13 +431,15 @@ standardizing vision tower, an image's tokens both ways in the sliding layers. N
 
 ```bash
 xpu-serve convert -hf google/gemma-4-31B-it --out ~/models/gemma-4-31B-it-q4 --quant q4
-xpu-serve serve ~/models/gemma-4-31B-it-q4 --device GPU --kv-dtype i8 --ctx 4096
+xpu-serve serve ~/models/gemma-4-31B-it-q4 --device GPU --kv-dtype i8 --ctx 32768
 ```
 
-- Memory is tight on a 24 GB card: its 50 sliding layers keep the whole context in the KV cache (901 KB a token at
-  f16, 457 KB with `--kv-dtype i8`), since the engine keeps a sliding layer's window alone only for models with
-  convolution or recurrent state. With the vision tower, the q4 pack (20.0 GiB) leaves room for 2,048 tokens at f16;
-  Unsloth's Q4_K_M ([Gemma 4 31B GGUF](#gemma-4-31b-gguf)) for 8,192 with `--kv-dtype i8`. `--no-vision` frees 1.1 GiB.
+- Its 50 sliding layers keep their 1,024-token window alone (`--sliding-kv window`, the default): the cache grows by
+  82 KB a token at f16 (41 KB with `--kv-dtype i8`), its 10 full-attention layers', beside 1.8 GiB of windows at
+  f16 (0.9 GiB at i8). With the vision tower, Unsloth's Q4_K_M ([Gemma 4 31B GGUF](#gemma-4-31b-gguf)) leaves room
+  for 65,536 tokens with `--kv-dtype i8`, 22,528 at f16; the q4 pack (20.0 GiB) for 32,768 with `--kv-dtype i8`.
+  `--no-vision` frees 1.1 GiB. `--sliding-kv full` keeps every key (901 KB a token at f16): any shared prefix is
+  reused, but 8,192 tokens is the most that fits.
 
 Against Hugging Face fp32 on the CPU (the q4 pack at f16): six text prompts at logit cosine 0.905 to 0.9993; four
 image prompts at 0.984 to 0.992, the tower's soft tokens at 0.9996 or more, the greedy answer equal on three of four.
@@ -1230,16 +1232,19 @@ answer equal on three of four.
 full-attention layers taking their keys as values; with `-hf` the vision tower's file (`mmproj-BF16.gguf`, 1.1 GiB)
 comes along. What fits a 24 GB card (22.7 GiB):
 
-| File | Weights in use, with the tower | Context that fits | Decode | Prefill |
+| File | Weights in use, with the tower | Context that fits | Decode | Prefill (4k tokens) |
 |---|---|---|---|---|
-| Q4_K_M (17.1 GiB) | 18.9 GiB | 8,192 tokens with `--kv-dtype i8`, 4,096 at f16 | 15.7 tok/s | 670 tok/s (4k) |
-| Q5_K_M (20.2 GiB) | 22.0 GiB | none; 4,096 with `--no-vision --kv-dtype i8` | 13.9 tok/s | 700 tok/s (2k) |
+| Q4_K_M (17.1 GiB) | 18.9 GiB | 65,536 tokens with `--kv-dtype i8`, 22,528 at f16 | 15.7 tok/s | 678 tok/s |
+| Q5_K_M (20.2 GiB) | 22.0 GiB | none; 32,768 with `--no-vision --kv-dtype i8` | 13.7 tok/s | 677 tok/s |
 | Q6_K and larger | | does not fit | | |
+
+With the sliding layers keeping their window alone (`--sliding-kv window`, the default); keeping every key, Q4_K_M
+fits 8,192 tokens with an i8 cache. A 32,768-token prompt with Q4_K_M: 512 tok/s, then 12.5 tok/s.
 
 The Q4_K_S, Q4_1 and UD-Q4_K_XL files (16.2 to 17.8 GiB) are of Q4_K_M's size; they were not measured here.
 
 ```bash
-xpu-serve serve -hf unsloth/gemma-4-31B-it-GGUF:Q4_K_M --device GPU --kv-dtype i8 --ctx 8192
+xpu-serve serve -hf unsloth/gemma-4-31B-it-GGUF:Q4_K_M --device GPU --kv-dtype i8 --ctx 65536
 ```
 
 Against Hugging Face fp32 of the original: Q4_K_M at logit cosine 0.947 to 0.9994 on six text prompts and 0.987 to

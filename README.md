@@ -70,14 +70,16 @@ optimized one) and what was measured**; this page says what is supported and how
 - ✅ **Several requests at once** (`--sequences N`): each its own cached prompt, their decode steps run as one
   ([how it scales](model_recipes.md#several-requests-at-once))
 - ✅ **Prefix reuse**: a request keeps the KV cache of the longest prefix it shares with the one before on its
-  sequence
+  sequence; for a model with recurrent state, or with sliding attention layers that keep their window alone (Gemma 4,
+  `--sliding-kv window`, the default: a longer context fits), the prefix up to where the last chat's messages ended
 - ✅ **Intel Arc GPUs**, discrete (Arc Pro B60) and integrated (Arc B390), through SYCL
 
 Not yet:
 
-- A system prompt shared between users of a model with recurrent state (a prefix is copied between requests up to
-  where a conversation's messages ended: decision 0029); with `--spec` and a block drafter (DFlash, DSpine, DSpark),
-  the drafts of several requests in one run (an MTP head's already are, and every drafter's verifies).
+- A system prompt shared between users of a model with recurrent state or a window kept alone (a prefix is copied
+  between requests up to where a conversation's messages ended: decisions 0029 and 0037); with `--spec` and a block
+  drafter (DFlash, DSpine, DSpark), the drafts of several requests in one run (an MTP head's already are, and every
+  drafter's verifies).
 - One model across two GPUs.
 - Timestamps and translation of speech; speech output; video input; images for SenseNova Loop, and for a
   Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.
@@ -304,6 +306,11 @@ bits a value); `<keys>:<values>` sets the two apart, e.g. `i8:turbo4`. All of th
 `--ctx` is reserved when the model loads: the KV cache of the whole context and the memory of the largest step (a
 prefill chunk, a verify). A context that does not fit the GPU is refused there, with what each part takes and the
 most tokens that fit, rather than running out of memory halfway into a long prompt.
+
+A model's sliding attention layers (Gemma 4's) keep only their window in the cache, `--sliding-kv window` (the
+default): the cache then grows with the context only in its full-attention layers, and a prompt's prefix is reused
+from where the last chat's messages ended. `--sliding-kv full` keeps every key, so that any prefix a prompt shares
+with the last one is reused, at the cost of context ([docs/decisions/0037](docs/decisions/0037-sliding-window-kv.md)).
 
 ## APIs
 
