@@ -36,16 +36,23 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     s->tokenizer_ = tok::Tokenizer::load(model_dir);
     s->template_ = chat::ChatTemplate::load(model_dir);
     const bool speculate = options.engine.spec_k != 0;
+    // Prompt lookup drafts with no model of its own, and verifies with the batch graph.
+    const bool lookup = speculate && options.engine.ngram.has_value();
     const bool own_count = options.engine.spec_k == kDraftersCount;
     int spec_k = options.engine.spec_k;
     const bool block_drafter = options.spec == "dflash" || options.spec == "dspine";
-    if (own_count) spec_k = options.spec == "dspark" ? kDsparkDrafts : block_drafter ? kBlockDrafts : kChainDrafts;
+    if (own_count) {
+        spec_k = lookup                     ? kLookupDrafts
+                 : options.spec == "dspark" ? kDsparkDrafts
+                 : block_drafter            ? kBlockDrafts
+                                            : kChainDrafts;
+    }
     // Several requests in flight decode a step together: speculating, their rounds' verifies.
     const bool batch = options.engine.sequences > 1;
     auto model = load_model(model_dir, LoadOptions{.vision = options.vision,
                                                    .image_max_pixels = options.image_max_pixels,
-                                                   .speculation = speculate,
-                                                   .batch = batch,
+                                                   .speculation = speculate && !lookup,
+                                                   .batch = batch || lookup,
                                                    .drafter = options.drafter,
                                                    .draft_shortlist = options.draft_shortlist,
                                                    .drafts = spec_k});
@@ -74,7 +81,19 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     // Speculating, the session also runs the model's prefill, verify and draft programs (spec::Program order) and
     // cuts a verify back to its accepted tokens.
     std::vector<const graph::Graph*> programs{&model->graph()};
-    if (speculate) {
+    if (lookup) {
+        // The step graph prefills; the batch graph (kBatchProgram) verifies the drafts and cuts back to the accepted.
+        const graph::Graph* g = model->batch_graph();
+        if (g == nullptr) fail("--spec ngram: model ", info.id, " has no batch graph to verify drafts with");
+        programs.push_back(g);
+        session_options.rewind_tokens = engine_options.spec_k + 1;
+        engine_options.batch = batch;
+        log::info("speculative decoding: prompt lookup of ", engine_options.ngram->min, " to ",
+                  engine_options.ngram->max, "-grams, up to ", engine_options.spec_k, " drafts per round",
+                  batch ? str_cat(", the rounds of up to ", engine_options.sequences, " requests in flight verified ",
+                                  "as one step of up to ", engine_options.verify_rows, " rows")
+                        : std::string());
+    } else if (speculate) {
         const Speculation* spec = model->speculation();
         if (spec == nullptr) {
             fail("model ", info.id, " has no drafter: speculative decoding needs one (an MTP head in the checkpoint, or "
@@ -142,7 +161,11 @@ std::unique_ptr<EngineService> EngineService::create(const std::filesystem::path
     const int64_t chunk = engine_options.prefill_chunk;
     const int64_t rounds = engine_options.batch ? engine_options.sequences : 1;
     session_options.max_step_tokens = {chunk};
-    if (speculate) session_options.max_step_tokens = {0, chunk, rounds * (engine_options.spec_k + 1), 0};
+    if (lookup) {
+        session_options.max_step_tokens = {chunk, rounds * (engine_options.spec_k + 1)};
+    } else if (speculate) {
+        session_options.max_step_tokens = {0, chunk, rounds * (engine_options.spec_k + 1), 0};
+    }
     if (engine_options.batch && !speculate) session_options.max_step_tokens.push_back(engine_options.sequences);
     Timer compile_timer;
     std::unique_ptr<Session> session;

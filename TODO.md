@@ -178,12 +178,14 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       of KV and of conv / recurrent state (`Session::truncate` inside a step of `rewind_tokens`), sessions of several
       programs sharing weights and slots, `KvRead` (docs/design-spec-decode.md)
 - [x] Qwen3.5-family MTP head (`mtp.*`, dense and MoE) as the drafter; `convert` quantizes it
-- [ ] Prompt lookup (n-gram) drafter
+- [x] Prompt lookup (n-gram) drafter (`--spec ngram`, any model, verified by its batch graph; vLLM's options and
+      matching: the longest suffix of min to max tokens, at its first occurrence; docs/decisions/0034)
 - [x] Gemma 4 assistants (E2B and 26B-A4B, `--drafter <dir>`): query-only layers over the target's KV, centroid
       LM head; drafts equal transformers' after every parity prompt (E2B)
 - [x] A drafter checkpoint as a pack of its own (`convert <drafter> --target <model>`: an assistant, a block
       drafter); Gemma 4 26B-A4B with its assistant at q4: 88.5 to 96.2 tok/s on the B60, the same drafts accepted
-- [ ] Adaptive k from measured acceptance and per-k step cost (MoE verify cost)
+- [x] Adaptive k from measured acceptance and per-k step cost (MoE verify cost): `--spec-adaptive`
+      (`spec::DraftLength`; docs/decisions/0034)
 - [x] Spec equivalence tests: greedy spec on vs off on a stateful tiny model with a partly wrong drafter; the real
       models' greedy output; rejection sampling's distribution
 - [x] Verify cost: the q4 GEMV on the matrix engines from 4 rows (`gemv_quant_xmx`) costs about one row's (Qwen3.8
@@ -276,7 +278,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [ ] int8 KV: a larger eval on Gemma 4 (more questions, long-context tasks); per-channel key scales if it loses
 - [ ] K=V stored once on Gemma 4 global layers (where the backend allows)
 - [ ] Fusions found by profiling (residual + norm, router + top-k, PLE tail for E-series later)
-- [ ] Adaptive k tuning; tree drafts vs chain drafts
+- [ ] Tree drafts vs chain drafts (adaptive k: Phase 3, `--spec-adaptive`)
 - [ ] Per-step overhead budget (host side) measured and minimized
 - [ ] Run the decision experiments (DESIGN.md 8.2 criteria) on B390 and B60 → `docs/decisions/NNNN-main-backend.md`
 - **Done when:** the main backend is chosen with numbers, and every optimization shows its gain against the roofline.

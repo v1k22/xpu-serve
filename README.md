@@ -55,7 +55,9 @@ optimized one) and what was measured**; this page says what is supported and how
   vision tower's), `clef` and the `modern-bert` files of Laya and Julia-1, in all 19 of GGUF's block formats and
   Unsloth's NVFP4, MXFP4 and Q2_0 (expert banks included), kept as the file stores them
 - ✅ **Speculative decoding**: Qwen's MTP heads, Gemma 4's assistants, DFlash 2 and DSpine block drafters
-  (Qwen3.8-27B), a DFlash block drafter (Ornith-1.5-35B-A3B), Inkling 2's DSpark drafter
+  (Qwen3.8-27B), a DFlash block drafter (Ornith-1.5-35B-A3B), Inkling 2's DSpark drafter, and prompt lookup
+  (`--spec ngram`: drafts copied from the text itself, for any language model); drafts per round chosen by measured
+  acceptance and cost (`--spec-adaptive`)
 - ✅ **LoRA adapters** in llama.cpp's GGUF form (`--lora`): each change added where the model reads the weight, which
   stays as stored (quantized ones included)
 - ✅ **int8 KV cache** (`--kv-dtype i8`)
@@ -272,6 +274,7 @@ output stays the model's own and sampling keeps its distribution (rejection samp
 | `dflash` | a DFlash or DFlash 2 block drafter | `--drafter <z-lab/Qwen3.8-27B-DFlash2>`, `--drafter <ornith-ai/Ornith-1.5-35B-A3B-DFlash>` |
 | `dspine` | a DSpine block drafter | `--drafter <tencent/Qwen3.8-27B-DSpine-b16>` |
 | `dspark` | Inkling 2's DSpark block drafter | inside the checkpoint and its packs; `dspark-*.gguf` of its GGUF repository |
+| `ngram` | prompt lookup: the tokens that followed the first earlier occurrence of the text's last tokens | the text itself, any language model (`--ngram-min`, `--ngram-max`: 5 by default) |
 
 ```bash
 xpu-serve serve ~/models/Qwen3.8-27B-q4 --device GPU --spec mtp --spec-k 4
@@ -279,9 +282,12 @@ xpu-serve run   -hf google/gemma-4-E2B-it --device GPU --spec mtp --spec-k 1 -hf
 ```
 
 A drafter is trained for one model, so a technique works only where a drafter for that model exists (elsewhere the
-option is refused by name). `--spec-k` is the number of drafts per round; which model takes which technique, the
-value to pass and the speed it gives: [model_recipes.md](model_recipes.md#speculative-decoding). The design:
-[docs/design-spec-decode.md](docs/design-spec-decode.md).
+option is refused by name); prompt lookup needs none, and pays where the output repeats its input (code edits,
+extraction, quoting). `--spec-k` is the number of drafts per round, and with `--spec-adaptive` the most a round asks
+for: the engine then picks each round's count from the request's acceptance so far and what verifies of each width
+cost on the device. Which model takes which technique, the value to pass and the speed it gives:
+[model_recipes.md](model_recipes.md#speculative-decoding). The design:
+[docs/design-spec-decode.md](docs/design-spec-decode.md), [docs/decisions/0034](docs/decisions/0034-prompt-lookup.md).
 
 ### KV cache formats
 

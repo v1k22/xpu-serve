@@ -15,7 +15,9 @@
 
 namespace xs::spec {
 
-// The programs of a speculating session, in the order the engine compiles them.
+// The programs of a session speculating with the model's drafter (Speculation), in the order the engine compiles them.
+// A drafter without a program of its own (prompt lookup, ngram_drafter.h) prefills with the step graph and verifies
+// with the batch graph (EngineOptions::ngram).
 enum Program : size_t { kStep = 0, kPrefill = 1, kVerify = 2, kDraft = 3 };
 
 class Drafter {
@@ -35,6 +37,9 @@ public:
     // The target kept its first `n` positions.
     virtual void truncate(int64_t n) = 0;
     virtual void reset() = 0;
+    // After reset(): the sequence holds `tokens` (-1 for a media item's), copied from another without a run of the
+    // target. A drafter that reads only the tokens takes them; one that reads the target's outputs starts after them.
+    virtual void adopt(std::span<const int32_t> /*tokens*/) {}
 };
 
 // The runner of the model's way of drafting: over `session`, whose programs are in Program order.

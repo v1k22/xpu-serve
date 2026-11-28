@@ -10,7 +10,9 @@
 #include <vector>
 
 #include "backend/backend.h"
+#include "engine/spec/draft_length.h"
 #include "engine/spec/drafter.h"
+#include "engine/spec/ngram_drafter.h"
 #include "engine/types.h"
 #include "models/model.h"
 
@@ -25,6 +27,13 @@ struct EngineOptions {
     // Speculative decoding with the model's drafter: drafts per round, 0 = off. The session must hold the programs
     // of spec::Program (the model's Speculation) and rewind steps of spec_k + 1 tokens.
     int spec_k = 0;
+    // Speculating by prompt lookup (engine/spec/ngram_drafter.h) instead of with the model's drafter, which the model
+    // then needs not have: the session's programs are the step graph, which also prefills, and the batch graph
+    // (kBatchProgram, Model::batch_graph), which verifies.
+    std::optional<spec::NgramOptions> ngram;
+    // The drafts of each round chosen between 1 and spec_k by what rounds yield and cost (spec::DraftLength): the
+    // request's acceptance so far, and the time rounds of each count took on this device. Off: spec_k every round.
+    bool adaptive_k = false;
     // Requests in flight at once: the session's sequences (SessionOptions::sequences), each its own cached prompt.
     int64_t sequences = 1;
     // The decode steps of the requests in flight run as one (advance_decoding): the session's program kBatchProgram
@@ -181,6 +190,14 @@ private:
     // The model has conv or recurrent state: a prefix is kept whole or from the sequence's snapshot, taken at
     // GenerateRequest::snapshot_at.
     bool fixed_state_ = false;
+    // The session's programs that prefill and verify when speculating: the model's drafter's (spec::Program), or the
+    // step and batch graphs for prompt lookup.
+    size_t prefill_program_ = spec::kPrefill;
+    size_t verify_program_ = spec::kVerify;
+    // EngineOptions::adaptive_k: what rounds of each count of drafts cost, and the acceptance every request's rounds
+    // showed, which a new request starts from.
+    spec::DraftLength draft_length_{1};
+    spec::Acceptance acceptance_;
     bool has_argmax_ = false;   // every target program outputs "argmax" beside "logits"
     bool argmax_only_ = false;  // the running request's sampler reads no more than a row's argmax, and programs give it
 };

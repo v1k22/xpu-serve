@@ -205,8 +205,10 @@ private:
 
 // `batch`: the decode steps of the sequences in flight run as one (EngineOptions::batch): speculating, their
 // verifies, of up to `verify_rows` rows (EngineOptions::verify_rows).
+// `adaptive_k`: each round's drafts chosen by the engine (EngineOptions::adaptive_k), up to spec_k.
 inline std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bool argmax = false, bool block = false,
-                                           int64_t sequences = 1, bool batch = false, int64_t verify_rows = 64) {
+                                           int64_t sequences = 1, bool batch = false, int64_t verify_rows = 64,
+                                           bool adaptive_k = false) {
     static const auto backend = make_cpu_ref_backend();
     auto model = std::make_unique<TinySpecModel>(argmax, block, batch);
     std::vector<const Graph*> programs{&model->graph()};
@@ -227,6 +229,33 @@ inline std::unique_ptr<Engine> make_engine(int spec_k, int64_t prefill_chunk, bo
     engine.sequences = sequences;
     engine.batch = batch;
     engine.verify_rows = verify_rows;
+    engine.adaptive_k = adaptive_k;
+    return std::make_unique<Engine>(std::move(model), std::move(session), EncoderSessions{}, engine);
+}
+
+// Speculating by prompt lookup (EngineOptions::ngram): the step graph prefills and the batch graph verifies. `batch`:
+// the rounds of the sequences in flight verify as one step of up to `verify_rows` rows.
+inline std::unique_ptr<Engine> make_lookup_engine(int spec_k, int64_t prefill_chunk, spec::NgramOptions n,
+                                                  bool argmax = false, int64_t sequences = 1, bool batch = false,
+                                                  int64_t verify_rows = 64, bool adaptive_k = false) {
+    static const auto backend = make_cpu_ref_backend();
+    auto model = std::make_unique<TinySpecModel>(argmax, false, /*batch=*/true);
+    const std::vector<const Graph*> programs{&model->graph(), model->batch_graph()};
+    SessionOptions options;
+    options.precision = DType::F32;
+    options.max_context = 256;
+    options.sequences = sequences;
+    options.rewind_tokens = spec_k + 1;
+    auto session = backend->compile(programs, model->weights(), options);
+    EngineOptions engine;
+    engine.max_context = options.max_context;
+    engine.prefill_chunk = prefill_chunk;
+    engine.spec_k = spec_k;
+    engine.ngram = n;
+    engine.sequences = sequences;
+    engine.batch = batch;
+    engine.verify_rows = verify_rows;
+    engine.adaptive_k = adaptive_k;
     return std::make_unique<Engine>(std::move(model), std::move(session), EncoderSessions{}, engine);
 }
 

@@ -33,6 +33,8 @@ APIs look; the numbers live here.
   - [Inkling-2-Mini Uncensored GGUF](#inkling-2-mini-uncensored-gguf)
 - [Drafters](#drafters)
   - [Speculative decoding](#speculative-decoding)
+  - [Prompt lookup (any model)](#prompt-lookup-any-model)
+  - [Adaptive draft counts](#adaptive-draft-counts)
   - [Gemma 4 assistants](#gemma-4-assistants)
   - [DFlash 2 and DSpine drafters for Qwen3.8-27B](#dflash-2-and-dspine-drafters-for-qwen38-27b)
   - [The DFlash drafter for Ornith-1.5-35B-A3B](#the-dflash-drafter-for-ornith-15-35b-a3b)
@@ -1303,7 +1305,51 @@ reasons (102 tok/s, the median over 50 answers).
 - An MTP head picks each draft among 64 tokens that a one-bit sketch of the output layer shortlists
   (`--draft-shortlist`, 0 to read the whole layer).
 - `bench --prompts file` measures over real prompts, since acceptance depends on the text, and prints where a round's
-  time goes.
+  time goes (a line may be a JSON string, for prompts of several lines).
+- `--spec-adaptive` lets each round pick its drafts, up to `--spec-k`, from the request's acceptance and what rounds
+  cost on the device: give the largest count the drafter takes ([below](#adaptive-draft-counts)).
+
+### Prompt lookup (any model)
+
+`--spec ngram` drafts from the text itself: the tokens that followed the first earlier occurrence of the last 5 tokens
+(`--ngram-min`, `--ngram-max`), up to `--spec-k` of them (7 by default). Any language model takes it, with no drafter;
+it pays where the reply repeats the prompt or itself (code edits, JSON transforms, quoting), and costs nothing where it
+does not (a round without a match is a decode step):
+
+```bash
+xpu-serve serve -hf unsloth/Qwen3.5-4B-GGUF:Q4_K_M --device GPU --spec ngram
+xpu-serve serve -hf LiquidAI/LFM3-1.7B --device GPU --spec ngram --spec-k 7
+```
+
+Arc Pro B60, greedy decode tok/s over six copy-heavy prompts (a module returned with type hints or a class renamed, a
+C++ fix, a JSON array with a field added, sentences quoted, a table to CSV) and six chat prompts, up to 512 new tokens:
+
+| Model | copy prompts: none → ngram | chat prompts: none → ngram |
+|---|---|---|
+| Qwen3.5-4B, unsloth Q4_K_M | 82.5 → 211.3 | 87.8 → 87.7 |
+| Qwen3.5-4B, bf16 | 42.0 → 112.2 | 43.0 → 43.5 |
+| Gemma 4 E2B, unsloth Q4_K_M | 88.3 → 189.2 | 102.1 → 106.1 |
+| LFM3-1.7B, bf16 | 97.1 → 201.9 | 98.7 → 98.4 |
+| Qwen3.8-27B, unsloth Q4_0 | 23.1 → 72.3 | 23.3 → 24.1 |
+
+Where a model has its own drafter, that drafter is faster on chat (Qwen3.8-27B with MTP: 51.9) and about as fast on
+copies (82.2 at k = 4). [docs/decisions/0034](docs/decisions/0034-prompt-lookup.md).
+
+### Adaptive draft counts
+
+The best `--spec-k` depends on the text: copying accepts seven drafts in a row, chat two or three, and each draft of a
+chain drafter (an MTP head, an assistant) is a run of its own. With `--spec-adaptive` and `--spec-k` the most the
+drafter takes, each round picks the count by the request's acceptance and the measured cost of rounds:
+
+| Model, drafter | copy: recipe k / max / adaptive | chat: recipe k / max / adaptive |
+|---|---|---|
+| Qwen3.5-4B bf16, MTP (max 7) | 124.3 / 165.2 / 169.2 | 80.2 / 68.5 / 83.9 |
+| Gemma 4 E2B Q4_K_M, assistant (max 4) | 123.4 / 206.5 / 204.2 | 120.9 / 126.4 / 134.4 |
+| Qwen3.8-27B Q4_0, MTP (max 7) | 82.2 / 109.3 / 110.3 | 51.9 / 50.7 / 54.0 |
+
+```bash
+xpu-serve serve -hf unsloth/Qwen3.8-27B-GGUF:Q4_0 --device GPU --spec mtp --spec-k 7 --spec-adaptive
+```
 
 ### Gemma 4 assistants
 

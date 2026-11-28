@@ -18,10 +18,12 @@ namespace xs {
 // drafts 3 a round; a block drafter 7 (its drafts come in one run, and a verify of up to 8 tokens costs little more
 // than one of 4: docs/design-spec-decode.md), or its whole block where that is shorter. DSpark drafts 2: its target
 // is a mixture of experts whose every verify row reads experts of its own, so a row costs what its token would.
+// Prompt lookup drafts 7: its drafts cost nothing to make, and a round finds none where the text does not repeat.
 inline constexpr int kDraftersCount = -1;
 inline constexpr int kChainDrafts = 3;
 inline constexpr int kBlockDrafts = 7;
 inline constexpr int kDsparkDrafts = 2;
+inline constexpr int kLookupDrafts = 7;
 
 struct ServiceOptions {
     std::string backend = "sycl";
@@ -30,7 +32,7 @@ struct ServiceOptions {
     std::string model_id;  // empty = the model directory name
     bool vision = true;    // load the vision encoder when the checkpoint has one
     int64_t image_max_pixels = 0;  // LoadOptions::image_max_pixels
-    std::string spec;               // the kind of drafter asked for: "mtp", "dflash", "dspine" (empty: any)
+    std::string spec;               // the kind of drafter asked for: "mtp", "dflash", "dspine", "dspark", "ngram" (empty: any)
     std::filesystem::path drafter;  // a drafter checkpoint for speculative decoding (an assistant, a block drafter)
     int64_t draft_shortlist = 64;   // LoadOptions::draft_shortlist
     std::filesystem::path lora;     // a LoRA adapter (GGUF) read beside the model's weights (models/low_rank_model.h)

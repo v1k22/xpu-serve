@@ -40,6 +40,7 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
                  " input, which model ", model_->info().id, " does not take");
     }
     XS_CHECK(options_.spec_k >= 0, "spec_k must not be negative, got ", options_.spec_k);
+    if (options_.spec_k > 0) draft_length_ = spec::DraftLength(options_.spec_k);
     XS_CHECK(options_.verify_rows >= 1, "verify_rows must be positive, got ", options_.verify_rows);
     XS_CHECK(options_.sequences >= 1, "an engine of ", options_.sequences, " sequences");
     sequences_.resize(static_cast<size_t>(options_.sequences));
@@ -48,7 +49,16 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
         return std::any_of(g.outputs().begin(), g.outputs().end(), [](const auto& o) { return o.name == "argmax"; });
     };
     has_argmax_ = offers_argmax(model_->graph());
-    if (options_.spec_k > 0) {
+    if (options_.spec_k > 0 && options_.ngram) {
+        const graph::Graph* batch = model_->batch_graph();
+        XS_CHECK(batch != nullptr, "model ", model_->info().id, " was loaded without a batch graph, which verifies ",
+                 "prompt lookup's drafts (LoadOptions::batch)");
+        XS_CHECK(!options_.batch || batch->segmented(), "model ", model_->info().id, "'s batch graph takes no segments");
+        for (Sequence& q : sequences_) q.drafter = std::make_unique<spec::NgramDrafter>(*options_.ngram, options_.spec_k);
+        prefill_program_ = spec::kStep;
+        verify_program_ = kBatchProgram;
+        has_argmax_ = has_argmax_ && offers_argmax(*batch);
+    } else if (options_.spec_k > 0) {
         const Speculation* spec = model_->speculation();
         XS_CHECK(spec != nullptr, "model ", model_->info().id, " has no drafter for speculative decoding");
         for (Sequence& q : sequences_) q.drafter = spec::make_drafter(*spec, *session_);
@@ -57,10 +67,10 @@ Engine::Engine(std::unique_ptr<Model> model, std::unique_ptr<Session> session, E
                  spec->drafter_name(), " proposes");
         has_argmax_ = has_argmax_ && offers_argmax(spec->prefill_graph()) && offers_argmax(spec->verify_graph());
     }
-    if (options_.batch && options_.spec_k > 0) {
+    if (options_.batch && options_.spec_k > 0 && !options_.ngram) {
         XS_CHECK(model_->speculation()->verify_graph().segmented(), "model ", model_->info().id,
                  " was loaded without a verify graph of several requests (LoadOptions::batch)");
-    } else if (options_.batch) {
+    } else if (options_.batch && options_.spec_k == 0) {
         const graph::Graph* batch = model_->batch_graph();
         XS_CHECK(batch != nullptr, "model ", model_->info().id, " was loaded without a batch graph");
         has_argmax_ = has_argmax_ && offers_argmax(*batch);
@@ -90,6 +100,7 @@ struct Engine::Generation {
     int64_t max_new = 0;
     int32_t token = 0;           // the next token to emit
     std::deque<int32_t> ready;   // tokens a speculative round produced, not emitted yet
+    spec::Acceptance acceptance;  // of its drafts (EngineOptions::adaptive_k)
     Timer decode_timer;          // from the first emitted token
 };
 
@@ -119,7 +130,7 @@ size_t Engine::pick_sequence(const std::vector<PositionKey>& keys) const {
 }
 
 size_t Engine::state_program() const {
-    return seq().drafter ? spec::kVerify : spec::kStep;
+    return seq().drafter ? verify_program_ : spec::kStep;
 }
 
 void Engine::reset_sequence() {
@@ -158,7 +169,7 @@ void Engine::forward(std::span<const int32_t> tokens, std::span<const PositionKe
                      std::span<const RotaryPosition> positions, std::span<const float* const> embeddings) {
     const auto start = static_cast<int64_t>(seq().cached.size());
     const std::unique_ptr<spec::Drafter>& drafter = seq().drafter;
-    run_target(drafter ? spec::kPrefill : spec::kStep, tokens, keys, positions, embeddings);
+    run_target(drafter ? prefill_program_ : spec::kStep, tokens, keys, positions, embeddings);
     if (drafter) {
         drafter->add(outputs_, static_cast<int64_t>(tokens.size()), start, tokens);
         drafter->flush();
@@ -237,10 +248,12 @@ std::vector<int32_t> Engine::spec_round(Generation& g, int k) {
     std::transform(fed.begin(), fed.end(), keys.begin(), text_key);
     const auto start = static_cast<int64_t>(seq().cached.size());
     Timer timer;
-    run_target(spec::kVerify, fed, keys, text_positions(seq(), start, fed.size()), {});
+    run_target(verify_program_, fed, keys, text_positions(seq(), start, fed.size()), {});
+    const double verify_ms = timer.elapsed_ms();
     GenerateStats& stats = g.result.stats;
     stats.spec_draft_ms += draft_ms;
-    stats.spec_verify_ms += timer.elapsed_ms();
+    stats.spec_verify_ms += verify_ms;
+    draft_length_.record(static_cast<int>(fed.size()) - 1, draft_ms, verify_ms);
     return accept_round(g, fed, 0, start, outputs_);
 }
 
@@ -268,6 +281,8 @@ std::vector<int32_t> Engine::accept_round(Generation& g, std::span<const int32_t
     ++stats.spec_rounds;
     stats.spec_drafted += static_cast<int>(fed.size()) - 1;
     stats.spec_accepted += static_cast<int>(accepted);
+    g.acceptance.round(static_cast<int>(fed.size()) - 1, static_cast<int>(accepted));
+    acceptance_.round(static_cast<int>(fed.size()) - 1, static_cast<int>(accepted));
     return out;
 }
 
@@ -276,7 +291,8 @@ int Engine::round_drafts(const Generation& g) const {
     const auto emitted = static_cast<int64_t>(g.result.tokens.size());
     // Drafts past the last token wanted, or past the context, are never verified.
     const int64_t fits = options_.max_context - static_cast<int64_t>(q.cached.size()) - 1;
-    return static_cast<int>(std::min<int64_t>({options_.spec_k, g.max_new - emitted - 1, fits}));
+    const auto limit = static_cast<int>(std::min<int64_t>({options_.spec_k, g.max_new - emitted - 1, fits}));
+    return options_.adaptive_k && limit > 1 ? draft_length_.best(g.acceptance, limit) : limit;
 }
 
 int64_t Engine::usable_prefix(const Sequence& q, const std::vector<PositionKey>& keys) const {
@@ -326,6 +342,12 @@ void Engine::take_prefix(const std::vector<PositionKey>& keys) {
     if (fixed_state_) session_->restore_state(state_program(), *sequences_[donor].snapshot);
     seq().cached.assign(keys.begin(), keys.begin() + tokens);
     seq().snapshot = fixed_state_ ? sequences_[donor].snapshot : nullptr;
+    if (seq().drafter) {
+        std::vector<int32_t> copied(static_cast<size_t>(tokens));
+        std::transform(keys.begin(), keys.begin() + tokens, copied.begin(),
+                       [](PositionKey k) { return (k & kMediaKeyBit) != 0 ? -1 : static_cast<int32_t>(k); });
+        seq().drafter->adopt(copied);
+    }
     log::debug("engine: sequence ", current_, " took ", tokens, " tokens of sequence ", donor, "'s prefix in ",
                static_cast<int>(timer.elapsed_ms()), " ms");
 }
@@ -481,6 +503,7 @@ std::optional<Engine::Handle> Engine::start(const GenerateRequest& request, Toke
         select(g.sequence);
         seq().rotary_delta = rotary.next - static_cast<int64_t>(n);
         g.sampler = std::make_unique<Sampler>(g.request.sampling);
+        g.acceptance = acceptance_;  // what the requests before it showed, until its own rounds show otherwise
         if (g.request.constraint) g.constraint = g.request.constraint->start();
         g.argmax_only = has_argmax_ && !g.sampler->needs_logits() && !g.constraint;
         argmax_only_ = g.argmax_only;
@@ -528,6 +551,16 @@ GenerateResult Engine::finish(Handle h) {
     XS_CHECK(it != active_.end() && it->second->done, "request ", h, " is not done");
     GenerateResult result = std::move(it->second->result);
     result.stats.generated_tokens = static_cast<int>(result.tokens.size());
+    if (options_.adaptive_k && result.stats.spec_rounds > 0) {
+        const spec::Acceptance& a = it->second->acceptance;
+        std::string rates, costs;
+        for (int k = 1; k <= options_.spec_k; ++k) {
+            rates += str_cat(" ", static_cast<int>(a.rate(k) * 100));
+            costs += str_cat(" ", static_cast<int>(draft_length_.cost(k) * 10) / 10.0);
+        }
+        log::debug("engine: adaptive drafts, ", result.stats.spec_drafted, " in ", result.stats.spec_rounds,
+                   " rounds; acceptance % by draft", rates, "; round ms by drafts", costs);
+    }
     active_.erase(it);
     return result;
 }
@@ -720,7 +753,7 @@ void Engine::decode_together(std::span<Generation* const> gs) {
         wanted.insert(wanted.end(), drafter_outputs.begin(), drafter_outputs.end());
     }
     Timer timer;
-    session_->run_segments(speculating ? spec::kVerify : kBatchProgram, segments, inputs_, outputs_, wanted);
+    session_->run_segments(speculating ? verify_program_ : kBatchProgram, segments, inputs_, outputs_, wanted);
     const double verify_ms = timer.elapsed_ms();
     argmax_only_ = !logits;
     int64_t row = 0;

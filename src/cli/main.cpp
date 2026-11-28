@@ -101,9 +101,19 @@ void add_engine_options(Args& a) {
         .value("backend-opt", "backend options as key=value[,key=value]")
         .value("spec",
                "speculative decoding: off | mtp (the model's MTP head, or a Gemma 4 assistant with --drafter) | "
-               "dflash | dspine (a block drafter checkpoint with --drafter) | dspark (Inkling 2's own drafter)",
+               "dflash | dspine (a block drafter checkpoint with --drafter) | dspark (Inkling 2's own drafter) | "
+               "ngram (prompt lookup: drafts copied from where the last tokens occurred before; any model)",
                "off")
-        .value("spec-k", "speculative decoding: drafts per round (default: 3, 7 of a block drafter's block, 2 of DSpark's)")
+        .value("spec-k",
+               "speculative decoding: drafts per round (default: 3, 7 of a block drafter's block, 2 of DSpark's, 7 "
+               "of prompt lookup)")
+        .flag("spec-adaptive",
+              "speculative decoding: each round's drafts chosen between 1 and --spec-k by the request's acceptance "
+              "so far and what rounds of each count cost on the device")
+        .value("ngram-min",
+               "--spec ngram: the shortest suffix looked up, in tokens (default: --ngram-max, or 5 without either)")
+        .value("ngram-max",
+               "--spec ngram: the longest suffix looked up, in tokens (default: --ngram-min, or 5 without either)")
         .value("drafter",
                "speculative decoding: a drafter checkpoint (a Gemma 4 assistant, a DFlash or DSpine drafter), or a "
                "GGUF file of one (imported as <model> is)")
@@ -171,19 +181,34 @@ ServiceOptions service_options(const Args& a) {
     o.engine.sequences = a.get_int("sequences");
     if (o.engine.sequences < 1) fail("--sequences must be at least 1, got ", o.engine.sequences);
     const std::string& spec = a.get("spec");
-    if (spec == "mtp" || spec == "dflash" || spec == "dspine" || spec == "dspark") {
+    if (spec == "mtp" || spec == "dflash" || spec == "dspine" || spec == "dspark" || spec == "ngram") {
         o.spec = spec;
         o.engine.spec_k = a.get("spec-k").empty() ? kDraftersCount : a.get_int("spec-k");
         if (o.engine.spec_k != kDraftersCount && o.engine.spec_k < 1) fail("--spec-k must be at least 1, got ", o.engine.spec_k);
     } else if (spec != "off") {
-        fail("--spec must be off, mtp, dflash, dspine or dspark, got '", spec, "'");
+        fail("--spec must be off, mtp, dflash, dspine, dspark or ngram, got '", spec, "'");
+    }
+    o.engine.adaptive_k = a.has("spec-adaptive");
+    if (o.engine.adaptive_k && spec == "off") fail("--spec-adaptive chooses the drafts of --spec rounds: give --spec");
+    if (spec == "ngram") {
+        // Either length alone sets both (vLLM's prompt_lookup_min and prompt_lookup_max).
+        const bool has_min = a.has("ngram-min"), has_max = a.has("ngram-max");
+        spec::NgramOptions n;
+        if (has_min || has_max) {
+            n.min = static_cast<int>(a.get_int(has_min ? "ngram-min" : "ngram-max"));
+            n.max = static_cast<int>(a.get_int(has_max ? "ngram-max" : "ngram-min"));
+        }
+        if (n.min < 1 || n.max < n.min) fail("--ngram-min and --ngram-max: 1 <= min <= max, got ", n.min, " and ", n.max);
+        o.engine.ngram = n;
+    } else if (a.has("ngram-min") || a.has("ngram-max")) {
+        fail("--ngram-min and --ngram-max are for --spec ngram");
     }
     if (a.has("drafter") && a.has("hf-drafter")) fail("give --drafter or --hf-drafter, not both");
     if (a.has("drafter") || a.has("hf-drafter")) {
         const hub::ModelSpec drafter{.path = a.get("drafter"), .hf = a.get("hf-drafter")};
         o.drafter = hub::resolve_model(drafter, hub::FileRole::Drafter, source_options()).dir;
     }
-    if (!o.drafter.empty() && spec == "off") fail("--drafter drafts for --spec mtp, dflash or dspine");
+    if (!o.drafter.empty() && (spec == "off" || spec == "ngram")) fail("--drafter drafts for --spec mtp, dflash or dspine");
     if (o.drafter.empty() && (spec == "dflash" || spec == "dspine")) fail("--spec ", spec, " needs --drafter <its checkpoint>");
     o.draft_shortlist = a.get_int("draft-shortlist");
     if (o.draft_shortlist < 0) fail("--draft-shortlist must be 0 or more, got ", o.draft_shortlist);
@@ -879,6 +904,12 @@ int bench_prompts(EngineService& service, const std::string& path, int n_gen, in
     std::vector<std::vector<int32_t>> prompts;
     for (std::string line; std::getline(in, line);) {
         if (line.empty()) continue;
+        // A line that is a JSON string is read as one: a prompt of several lines (code) is written with its escapes.
+        if (line.front() == '"') {
+            const nlohmann::json s = nlohmann::json::parse(line, nullptr, /*allow_exceptions=*/false);
+            XS_CHECK(s.is_string(), "'", path, "': a line that starts with a quote must be a JSON string");
+            line = s.get<std::string>();
+        }
         const nlohmann::json messages = nlohmann::json::array({{{"role", "user"}, {"content", line}}});
         const std::string text = service.chat_template().render(messages, nlohmann::json::array(), true,
                                                                 nlohmann::json{{"enable_thinking", false}});
@@ -951,9 +982,9 @@ int cmd_bench(const std::vector<std::string>& argv) {
     add_engine_options(a);
     a.value("prompt-tokens", "prompt length (language models)", "512")
         .value("gen-tokens", "tokens to generate (language models)", "128")
-        .value("prompts", "language models: a file of prompts, one per line, each a user message through the chat "
-               "template (thinking off) generating up to --gen-tokens until the end of the turn; instead of "
-               "--prompt-tokens")
+        .value("prompts", "language models: a file of prompts, one per line (or a JSON string a line, for prompts of "
+               "several lines), each a user message through the chat template (thinking off) generating up to "
+               "--gen-tokens until the end of the turn; instead of --prompt-tokens")
         .value("runs", "timed runs (embedding models: per length, 20 by default)", "3")
         .value("cameras", "policies: cameras present, the first N (default: all)", "0")
         .value("steps", "policies: flow steps (default: the checkpoint's)", "0")
