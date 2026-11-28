@@ -82,7 +82,7 @@ Not yet:
 - Timestamps and translation of speech; speech output; video input; images for Gemma 4 26B-A4B and SenseNova Loop,
   and for a Qwen3.5-family model beside a block drafter (`--spec dflash|dspine`); images from remote URLs.
 - Gemma 4 26B-A4B from a GGUF file (a `gemma4` file with experts).
-- The prompt's log-probabilities (`echo`, `prompt_logprobs`), `n` above 1, a rerank API.
+- The prompt's log-probabilities (`echo`, `prompt_logprobs`), `best_of` and beam search, a rerank API.
 
 ## Supported models
 
@@ -354,7 +354,11 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/
   token's is -9999); speculating or not, they are the same. A token that leaves a character unfinished reads as
   `""` and the one that finishes it carries the whole character, as vLLM writes them; `bytes` are the token's own.
   The prompt's (`echo`, `prompt_logprobs`) are refused by name.
-- A response carries `usage` and `timings`. One choice per request (`n` is 1); audio or video parts are refused by
+- **Several choices** (`n`, up to 128, on chat and text completions): each sampled on its own (with a `seed`, choice
+  i draws with seed + i), its own parser, grammar and log-probabilities; the first is prefilled and the others copy its
+  prompt (with `--sequences` enough they decode together). Streamed chunks carry their choice's `index`; the usage
+  counts the prompt once. As vLLM, `n` above 1 needs sampling (`temperature` 0 is refused).
+- A response carries `usage` and `timings`. Audio or video parts are refused by
   name.
 
 ### Anthropic messages

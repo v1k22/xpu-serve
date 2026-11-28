@@ -47,11 +47,18 @@ nlohmann::json timings_json(const GenerateStats& stats);
 nlohmann::json chat_completion_json(const ResponseMeta& meta, const chat::ParsedDelta& message,
                                     std::string_view finish_reason, const GenerateStats& stats,
                                     nlohmann::json logprobs = nullptr);
+// A response of several choices (chat_choice_json each).
+nlohmann::json chat_completion_json(const ResponseMeta& meta, nlohmann::json choices, const GenerateStats& stats);
+nlohmann::json chat_choice_json(int index, const chat::ParsedDelta& message, std::string_view finish_reason,
+                                nlohmann::json logprobs);
+// The usage of a response of several choices: the prompt's once (its cached tokens the fewest a choice found), the
+// completion tokens of all; the first choice's timings.
+GenerateStats response_stats(std::span<const GenerationOutcome> outcomes);
 // The delta object of a chat chunk; tool calls are numbered from `first_tool_index`.
 nlohmann::json chat_delta_json(const chat::ParsedDelta& delta, int first_tool_index);
 nlohmann::json chat_chunk_json(const ResponseMeta& meta, nlohmann::json delta,
                                std::optional<std::string_view> finish_reason = std::nullopt,
-                               nlohmann::json logprobs = nullptr);
+                               nlohmann::json logprobs = nullptr, int index = 0);
 // Final chunk of a stream with stream_options.include_usage: no choices, only usage.
 nlohmann::json chat_usage_chunk_json(const ResponseMeta& meta, const GenerateStats& stats);
 
@@ -59,7 +66,7 @@ nlohmann::json text_completion_json(const ResponseMeta& meta, std::string_view t
                                     const GenerateStats& stats, nlohmann::json logprobs = nullptr);
 nlohmann::json text_chunk_json(const ResponseMeta& meta, std::string_view text,
                                std::optional<std::string_view> finish_reason = std::nullopt,
-                               nlohmann::json logprobs = nullptr);
+                               nlohmann::json logprobs = nullptr, int index = 0);
 
 // A chat choice's log-probabilities: {"content": [{"token", "logprob", "bytes", "top_logprobs": [{"token", "logprob",
 // "bytes"}]}]}, each token's most likely alternatives in order.

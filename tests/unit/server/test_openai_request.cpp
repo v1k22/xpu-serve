@@ -136,7 +136,13 @@ TEST_SUITE("server.request") {
         CHECK(rejected_param(chat_body({{"messages", json::array()}})) == "messages");
         CHECK(rejected_param(chat_body({{"messages", json::array({1})}})) == "messages[0]");
         CHECK(rejected_param(chat_body({{"messages", json::array({{{"content", "x"}}})}})) == "messages[0].role");
-        CHECK(rejected_param(chat_body({{"n", 2}})) == "n");
+        CHECK(rejected_param(chat_body({{"n", 2}, {"temperature", 0}})) == "n");  // greedy: one reply
+        CHECK(rejected_param(chat_body({{"n", 0}})) == "n");
+        CHECK(rejected_param(chat_body({{"n", 129}})) == "n");
+        CHECK(rejected_param(chat_body({{"best_of", 2}})) == "best_of");
+        CHECK(rejected_param(chat_body({{"use_beam_search", true}})) == "use_beam_search");
+        CHECK(parse_chat_request(chat_body({{"n", 3}}), {}).options.choices == 3);
+        CHECK(parse_chat_request(chat_body({{"n", 1}, {"temperature", 0}}), {}).options.choices == 1);
         CHECK(rejected_param(chat_body({{"temperature", "hot"}})) == "temperature");
         CHECK(rejected_param(chat_body({{"temperature", -1}})) == "temperature");
         CHECK(rejected_param(chat_body({{"top_p", 1.5}})) == "top_p");
@@ -144,7 +150,7 @@ TEST_SUITE("server.request") {
         CHECK(rejected_param(chat_body({{"seed", -3}})) == "seed");
         CHECK(rejected_param(chat_body({{"max_tokens", 0}})) == "max_tokens");
         CHECK(rejected_param(chat_body(parse_json_body(R"({"max_tokens": 0})"))) == "max_tokens");
-        CHECK(rejected_param(chat_body(parse_json_body(R"({"n": 3})"))) == "n");
+        CHECK(rejected_param(chat_body(parse_json_body(R"({"n": 3, "temperature": 0.0})"))) == "n");
         CHECK(rejected_param(chat_body({{"max_completion_tokens", "10"}})) == "max_completion_tokens");
         CHECK(rejected_param(chat_body({{"stop", 5}})) == "stop");
         CHECK(rejected_param(chat_body({{"stop", json::array({"a", 1})}})) == "stop");
@@ -262,7 +268,8 @@ TEST_SUITE("server.request") {
         CHECK(parse_completion_request({{"prompt", json::array({"xyz"})}}, {}).prompt == "xyz");
         CHECK_THROWS_AS(parse_completion_request({{"prompt", json::array({"a", "b"})}}, {}), InvalidRequest);
         CHECK_THROWS_AS(parse_completion_request(json::object(), {}), InvalidRequest);
-        CHECK_THROWS_AS(parse_completion_request({{"prompt", "a"}, {"n", 3}}, {}), InvalidRequest);
+        CHECK(parse_completion_request({{"prompt", "a"}, {"n", 3}}, {}).options.choices == 3);
+        CHECK_THROWS_AS(parse_completion_request({{"prompt", "a"}, {"n", 3}, {"temperature", 0}}, {}), InvalidRequest);
     }
 
     TEST_CASE("image_url parts: data URLs are decoded, the part is reduced for the template, the rest refused") {

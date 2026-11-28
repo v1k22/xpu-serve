@@ -272,21 +272,50 @@ void CompletionHandlers::respond(const Job& job, const httplib::Request& req, ht
     });
 }
 
+namespace {
+
+// The requests of a response's choices: the job's, a choice i drawing with seed + i when the request has a seed.
+std::vector<GenerateRequest> choice_requests(const GenerateRequest& request, int choices) {
+    std::vector<GenerateRequest> out(static_cast<size_t>(choices), request);
+    for (int i = 1; i < choices && request.sampling.seed.has_value(); ++i) {
+        out[static_cast<size_t>(i)].sampling.seed = *request.sampling.seed + static_cast<uint64_t>(i);
+    }
+    return out;
+}
+
+std::string choice_id(std::string_view id, size_t choice, size_t choices) {
+    return choices == 1 ? std::string(id) : str_cat(id, "#", choice);
+}
+
+}  // namespace
+
 void CompletionHandlers::write_full(const Job& job, const httplib::Request& req, httplib::Response& res) const {
-    TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail), job.options.stop,
-                       job.max_tool_calls);
-    OutputPiece message;
-    const GenerationOutcome outcome = run_generation(
-        service_, job.request, output,
-        [&](const OutputPiece& piece) {
-            append_piece(message, piece);
+    const std::vector<GenerateRequest> requests = choice_requests(job.request, job.options.choices);
+    std::vector<std::unique_ptr<TokenOutput>> outputs;
+    std::vector<TokenOutput*> raw;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        outputs.push_back(std::make_unique<TokenOutput>(service_.tokenizer(),
+                                                        chat::make_output_parser(job.dialect, job.prompt_tail),
+                                                        job.options.stop, job.max_tool_calls));
+        raw.push_back(outputs.back().get());
+    }
+    std::vector<ChoiceOutput> choices(requests.size());
+    const std::vector<GenerationOutcome> outcomes = run_choices(
+        service_, requests, raw,
+        [&](int i, const OutputPiece& piece) {
+            append_piece(choices[static_cast<size_t>(i)].output, piece);
             return true;
         },
-        [&] { return !req.is_connection_closed(); });
-    log_summary(job.id, outcome, !message.delta.tool_calls.empty());
-    if (outcome.client_gone) return;
-    if (outcome.result.finish == FinishReason::Error) fail(outcome.result.error);
-    res.set_content(job.format()->body(message, outcome).dump(), "application/json");
+        [](int, const GenerationOutcome&) {}, [&] { return !req.is_connection_closed(); });
+    for (size_t i = 0; i < choices.size(); ++i) {
+        choices[i].outcome = outcomes[i];
+        log_summary(choice_id(job.id, i, choices.size()), outcomes[i], !choices[i].output.delta.tool_calls.empty());
+    }
+    for (const GenerationOutcome& o : outcomes) {
+        if (o.client_gone) return;
+        if (o.result.finish == FinishReason::Error) fail(o.result.error);
+    }
+    res.set_content(job.format()->body(choices).dump(), "application/json");
 }
 
 bool CompletionHandlers::write_stream(const Job& job, const httplib::Request& req, httplib::DataSink& sink) const {
@@ -294,23 +323,41 @@ bool CompletionHandlers::write_stream(const Job& job, const httplib::Request& re
         return event.empty() || sink.write(event.data(), event.size());
     };
     const std::unique_ptr<ResponseFormat> format = job.format();
-    if (!send(format->opening())) return false;
+    const std::vector<GenerateRequest> requests = choice_requests(job.request, job.options.choices);
+    if (!send(format->opening(static_cast<int>(requests.size())))) return false;
 
-    GenerationOutcome outcome;
+    std::vector<GenerationOutcome> outcomes(requests.size());
+    std::string failure;  // the first choice's that failed
     try {
-        TokenOutput output(service_.tokenizer(), chat::make_output_parser(job.dialect, job.prompt_tail),
-                           job.options.stop, job.max_tool_calls);
-        outcome = run_generation(
-            service_, job.request, output, [&](const OutputPiece& piece) { return send(format->delta(piece)); },
+        std::vector<std::unique_ptr<TokenOutput>> outputs;
+        std::vector<TokenOutput*> raw;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            outputs.push_back(std::make_unique<TokenOutput>(service_.tokenizer(),
+                                                            chat::make_output_parser(job.dialect, job.prompt_tail),
+                                                            job.options.stop, job.max_tool_calls));
+            raw.push_back(outputs.back().get());
+        }
+        outcomes = run_choices(
+            service_, requests, raw, [&](int i, const OutputPiece& piece) { return send(format->delta(i, piece)); },
+            [&](int i, const GenerationOutcome& o) {
+                if (o.result.finish == FinishReason::Error) {
+                    if (failure.empty()) failure = o.result.error;
+                } else if (failure.empty()) {
+                    send(format->finished(i, o));
+                }
+            },
             [&] { return !req.is_connection_closed(); });
     } catch (const std::exception& e) {
-        outcome.result.finish = FinishReason::Error;
-        outcome.result.error = e.what();
+        failure = e.what();
     }
-    log_summary(job.id, outcome, format->has_tool_calls());
-    if (outcome.client_gone) return false;
-    if (outcome.result.finish == FinishReason::Error) return send(format->error(outcome.result.error));
-    return send(format->closing(outcome));
+    for (size_t i = 0; i < outcomes.size(); ++i) {
+        log_summary(choice_id(job.id, i, outcomes.size()), outcomes[i], format->has_tool_calls(static_cast<int>(i)));
+    }
+    if (std::any_of(outcomes.begin(), outcomes.end(), [](const GenerationOutcome& o) { return o.client_gone; })) {
+        return false;
+    }
+    if (!failure.empty()) return send(format->error(failure));
+    return send(format->closing(outcomes));
 }
 
 }  // namespace xs::server

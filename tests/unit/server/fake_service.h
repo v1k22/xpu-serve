@@ -95,6 +95,7 @@ public:
     GenerateResult generate(const GenerateRequest& request, const TokenCallback& on_token) override {
         std::lock_guard lock(serial_);
         last_request_ = request;
+        seeds_.push_back(request.sampling.seed);
         ++calls_;
         GenerateResult result;
         result.stats.prompt_tokens = int(request.prompt.size());
@@ -197,6 +198,11 @@ public:
         std::lock_guard lock(serial_);
         return calls_;
     }
+    // The seed of every generation so far, in the order they ran.
+    std::vector<std::optional<uint64_t>> seeds() const {
+        std::lock_guard lock(serial_);
+        return seeds_;
+    }
     ModelCard& card() { return card_; }
 
     // Set before requests are sent.
@@ -214,6 +220,7 @@ private:
     mutable std::mutex serial_;
     GenerateRequest last_request_;
     TranscriptionRequest last_transcription_;
+    std::vector<std::optional<uint64_t>> seeds_;
     int calls_ = 0;
 };
 

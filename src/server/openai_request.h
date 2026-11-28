@@ -42,7 +42,12 @@ struct GenerationOptions {
     // Each generated token's log-probability with this many alternatives beside it (chat: logprobs and top_logprobs;
     // text completions: logprobs); -1: none.
     int logprobs = -1;
+    // Choices to generate for the prompt (n), each sampled on its own; with a seed, choice i draws with seed + i.
+    int choices = 1;
 };
+
+// The most choices a request may ask for (n).
+inline constexpr int kMaxChoices = 128;
 
 // The most alternatives a token's log-probability is given with (vLLM's default --max-logprobs).
 inline constexpr int kMaxLogprobs = 20;

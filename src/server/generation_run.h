@@ -1,6 +1,8 @@
 #pragma once
 
 #include <functional>
+#include <span>
+#include <vector>
 
 #include "chat/output_parser.h"
 #include "engine/service.h"
@@ -35,5 +37,16 @@ struct GenerationOutcome {
 GenerationOutcome run_generation(InferenceService& service, const GenerateRequest& request, TokenOutput& output,
                                  const std::function<bool(const OutputPiece&)>& on_piece,
                                  const std::function<bool()>& client_alive);
+
+// The choices of one response (n): `requests[i]` generates choice i into `outputs[i]`. Choice 0 starts first and the
+// others once its prompt is in (its first token, or its end), so that they find the prompt cached and copy it rather
+// than each prefilling it (Engine::take_prefix); with sequences enough for all of them they then run together.
+// `on_piece(i, piece)` and `on_done(i, outcome)` run on the calling thread, in the order the engine produced them; a
+// false from `on_piece` or `client_alive` cancels every choice. Returns each choice's outcome.
+std::vector<GenerationOutcome> run_choices(InferenceService& service, std::span<const GenerateRequest> requests,
+                                           std::span<TokenOutput* const> outputs,
+                                           const std::function<bool(int, const OutputPiece&)>& on_piece,
+                                           const std::function<void(int, const GenerationOutcome&)>& on_done,
+                                           const std::function<bool()>& client_alive);
 
 }  // namespace xs::server

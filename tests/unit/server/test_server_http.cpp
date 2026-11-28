@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -312,6 +313,53 @@ TEST_SUITE("server.http") {
         CHECK(offsets == json::array({0, 1, 2, 3, 4}));  // continued across chunks
     }
 
+    TEST_CASE("n choices: each its own generation and seed, indexed, the usage of all; streamed interleaved") {
+        xs::test::FakeService service;
+        RunningServer server(service);
+        auto client = server.client();
+        const json r = post_json(client, "/v1/chat/completions", chat_body({{"n", 3}, {"seed", 10}, {"logprobs", true}}));
+        REQUIRE(r["choices"].size() == 3);
+        for (int i = 0; i < 3; ++i) {
+            CAPTURE(i);
+            CHECK(r["choices"][i]["index"] == i);
+            CHECK(r["choices"][i]["message"]["content"] == "Hello!");
+            CHECK(r["choices"][i]["finish_reason"] == "stop");
+            CHECK(r["choices"][i]["logprobs"]["content"].size() == 6);
+        }
+        CHECK(r["usage"]["prompt_tokens"] == int(std::string("user: hi\nassistant:").size()));  // the prompt once
+        CHECK(r["usage"]["completion_tokens"] == 18);
+        std::vector<std::optional<uint64_t>> seeds = service.seeds();
+        std::sort(seeds.begin(), seeds.end());
+        CHECK(seeds == std::vector<std::optional<uint64_t>>{10u, 11u, 12u});  // choice i draws with seed + i
+
+        const auto events = post_sse(client, "/v1/chat/completions",
+                                     chat_body({{"n", 2}, {"stream", true}, {"stream_options", {{"include_usage", true}}}}));
+        std::string text[2];
+        int finishes[2] = {0, 0}, roles[2] = {0, 0};
+        for (const json& e : events) {
+            if (e["choices"].empty()) continue;
+            const json& c = e["choices"][0];
+            const int i = c["index"];
+            REQUIRE((i == 0 || i == 1));
+            text[i] += c["delta"].value("content", "");
+            roles[i] += c["delta"].contains("role") ? 1 : 0;
+            finishes[i] += c["finish_reason"].is_null() ? 0 : 1;
+        }
+        CHECK(text[0] == "Hello!");
+        CHECK(text[1] == "Hello!");
+        CHECK(roles[0] == 1);
+        CHECK(roles[1] == 1);
+        CHECK(finishes[0] == 1);
+        CHECK(finishes[1] == 1);
+        CHECK(events.back()["usage"]["completion_tokens"] == 12);
+
+        service.reply = "abc";
+        const json t = post_json(client, "/v1/completions", {{"prompt", "x"}, {"n", 2}});
+        REQUIRE(t["choices"].size() == 2);
+        CHECK(t["choices"][1]["index"] == 1);
+        CHECK(t["choices"][1]["text"] == "abc");
+    }
+
     TEST_CASE("response_format: the answer held to the schema; a keyword it does not take refused by its path") {
         xs::test::FakeService service;
         service.reply = R"({"age": 7})";
@@ -385,7 +433,8 @@ TEST_SUITE("server.http") {
         CHECK(res->status == 400);
         CHECK(json::parse(res->body)["error"]["type"] == "invalid_request_error");
 
-        CHECK(post_json(client, "/v1/chat/completions", chat_body({{"n", 2}}), 400)["error"]["param"] == "n");
+        CHECK(post_json(client, "/v1/chat/completions", chat_body({{"n", 2}, {"temperature", 0}}), 400)["error"]["param"] ==
+              "n");
         CHECK(post_json(client, "/v1/chat/completions", chat_body({{"max_tokens", "ten"}}), 400)["error"]["param"] ==
               "max_tokens");
         CHECK(post_json(client, "/v1/chat/completions", chat_body({{"messages", "hi"}}), 400)["error"]["param"] ==

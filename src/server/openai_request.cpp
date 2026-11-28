@@ -59,9 +59,18 @@ std::vector<std::string> parse_stop(const json& body) {
     return stops;
 }
 
-void check_single_choice(const json& body) {
-    const auto n = fields::integer(body, "n", 1, std::numeric_limits<int32_t>::max());
-    if (n.has_value() && *n != 1) reject("n", "'n' must be 1: only one choice per request is supported");
+// n, as vLLM takes it: 1 to kMaxChoices, more than one only when sampling (a greedy reply would repeat itself).
+// best_of and beam search are refused by name.
+int parse_choices(const json& body, const SamplingParams& sampling) {
+    for (const char* name : {"best_of", "use_beam_search"}) {
+        if (fields::find(body, name) != nullptr) reject(name, str_cat("'", name, "' is not supported"));
+    }
+    const auto n = fields::integer(body, "n", 1, kMaxChoices);
+    if (!n.has_value() || *n == 1) return 1;
+    if (sampling.temperature < 1e-5f) {
+        reject("n", str_cat("n must be 1 when using greedy sampling, got ", *n));
+    }
+    return static_cast<int>(*n);
 }
 
 // response_format: {"type": "text"}, {"type": "json_object"}, or {"type": "json_schema", "json_schema": {"name",
@@ -135,9 +144,9 @@ int parse_text_logprobs(const json& body) {
 }
 
 GenerationOptions parse_generation_options(const json& body, const SamplingParams& defaults) {
-    check_single_choice(body);
     GenerationOptions o;
     o.sampling = parse_sampling(body, defaults);
+    o.choices = parse_choices(body, o.sampling);
     o.max_tokens = parse_max_tokens(body);
     o.stop = parse_stop(body);
     o.stream = fields::boolean(body, "stream", "stream");

@@ -39,7 +39,7 @@ public:
     AnthropicFormat(std::string id, std::string model, int64_t input_tokens)
         : id_(std::move(id)), model_(std::move(model)), input_tokens_(input_tokens) {}
 
-    std::string opening() override {
+    std::string opening(int) override {
         const json message{{"id", id_},
                            {"type", "message"},
                            {"role", "assistant"},
@@ -52,7 +52,7 @@ public:
                event("ping", {{"type", "ping"}});
     }
 
-    std::string delta(const OutputPiece& piece) override {
+    std::string delta(int, const OutputPiece& piece) override {
         const chat::ParsedDelta& d = piece.delta;
         std::string out;
         if (!d.reasoning.empty()) {
@@ -70,13 +70,14 @@ public:
             out += open(Block::ToolUse, start);
             out += block_delta({{"type", "input_json_delta"}, {"partial_json", call.arguments}});
             out += close();
-            ++tool_calls_;
+            ++tool_calls(0);
         }
         return out;
     }
 
-    std::string closing(const GenerationOutcome& o) override {
-        const auto [reason, sequence] = stop_of(o, has_tool_calls());
+    // A message is one choice: it ends with its stop reason.
+    std::string finished(int, const GenerationOutcome& o) override {
+        const auto [reason, sequence] = stop_of(o, has_tool_calls(0));
         return close() +
                event("message_delta", {{"type", "message_delta"},
                                        {"delta", {{"stop_reason", reason}, {"stop_sequence", sequence}}},
@@ -84,12 +85,15 @@ public:
                event("message_stop", {{"type", "message_stop"}});
     }
 
+    std::string closing(std::span<const GenerationOutcome>) override { return {}; }
+
     std::string error(std::string_view message) override {
         return close() + event("error", anthropic_error_body("api_error", message));
     }
 
-    json body(const OutputPiece& piece, const GenerationOutcome& o) override {
-        const chat::ParsedDelta& output = piece.delta;
+    json body(std::span<const ChoiceOutput> choices) override {
+        const chat::ParsedDelta& output = choices.front().output.delta;
+        const GenerationOutcome& o = choices.front().outcome;
         json content = json::array();
         if (!output.reasoning.empty()) {
             content.push_back({{"type", "thinking"}, {"thinking", output.reasoning}, {"signature", ""}});

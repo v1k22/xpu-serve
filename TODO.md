@@ -410,6 +410,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - [x] logprobs: `logprobs` / `top_logprobs` on chat, `logprobs` on text completions, streamed; vLLM's raw_logprobs
       (after a grammar's mask, before penalties); same with drafts verified
 - [ ] The prompt's log-probabilities (`echo`, `prompt_logprobs`)
+- [x] `n` choices (chat and text completions; seeds seed + i; the first prefilled, the others copying its prompt;
+      streamed by index); greedy `n` above 1, `best_of` and beam search refused as vLLM does
 - **Done when:** each item lands as one PR with its parity and E2E tests.
 
 ### Model enablement checklist
