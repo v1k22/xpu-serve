@@ -1,7 +1,7 @@
 #pragma once
 
 // A context-free grammar over bytes (docs/decisions/0033): rules of alternatives, each a sequence of items, an item a
-// byte out of a set or a whole rule. Over bytes, a byte-level token or a part of a UTF-8 character needs no special
+// byte out of a set, a whole rule, or a marker token (an added token the model writes whole, never in bytes). Over bytes, a byte-level token or a part of a UTF-8 character needs no special
 // case: a token is the bytes it decodes to. Expressions (Expr) are lowered into rules by Grammar::define; a rule may
 // refer to itself, but not before a byte (finish() refuses left recursion).
 
@@ -62,6 +62,9 @@ inline constexpr int kUnbounded = -1;
 
 Expr bytes(const ByteSet& set);
 Expr literal(std::string_view text);
+// One marker token of the vocabulary by its id (an added token such as <tool_call> or <|"|>, Vocabulary::Token::marker):
+// a grammar's bytes never spell one, so a place in a model's own syntax that holds one names it.
+Expr token(int32_t id);
 Expr rule(RuleId id);
 Expr seq(std::vector<Expr> parts);
 Expr alt(std::vector<Expr> options);
@@ -69,11 +72,17 @@ Expr repeat(Expr e, int min, int max);  // `e` min to max times (max kUnbounded:
 inline Expr optional(Expr e) { return repeat(std::move(e), 0, 1); }
 inline Expr star(Expr e) { return repeat(std::move(e), 0, kUnbounded); }
 
+class Grammar;
+// Any bytes in which `stop` (not empty) does not occur: what a model writes before a closing marker spelled in text.
+// Rules of their own in `g`, named `name`.
+Expr text_without(Grammar& g, std::string_view stop, const std::string& name);
+
 class Grammar {
 public:
-    // One item of an alternative in code(): a byte of sets()[index], a whole rules()[index], or the alternative's end.
+    // One item of an alternative in code(): a byte of sets()[index], a whole rules()[index], the marker token of id
+    // `index`, or the alternative's end.
     struct Item {
-        enum Kind : uint8_t { kBytes, kRule, kEnd };
+        enum Kind : uint8_t { kBytes, kRule, kEnd, kToken };
         Kind kind = kEnd;
         uint32_t index = 0;
     };
@@ -85,6 +94,8 @@ public:
 
     // A rule to define later, so that rules can refer to each other.
     RuleId add_rule(std::string name);
+    // The rules of `other`, a finished grammar, copied in: returns the one its root is (other's whole language).
+    RuleId embed(const Grammar& other);
     // The rule's alternatives: the options of `e` when it is an alt(), else `e` alone. Helper rules the expression
     // needs (nested alternatives, repeats) take the rule's name.
     void define(RuleId r, const Expr& e);

@@ -25,6 +25,8 @@ ByteSet byte_range(unsigned first, unsigned last) {
     return ByteSet::range(static_cast<uint8_t>(first), static_cast<uint8_t>(last));
 }
 
+}  // namespace
+
 // JSON's own rules in a grammar, each made the first time it is asked for.
 class JsonRules {
 public:
@@ -113,6 +115,8 @@ private:
     std::optional<RuleId> ws_, string_, integer_, number_, value_, object_, array_;
 };
 
+namespace {
+
 const std::set<std::string, std::less<>> kAnnotations = {
     "title", "description", "$comment", "examples", "default", "deprecated", "readOnly", "writeOnly", "$schema"};
 const std::set<std::string, std::less<>> kKeywords = {
@@ -135,7 +139,9 @@ bool is_type(const ojson& v, std::string_view type) {
 
 class SchemaCompiler {
 public:
-    SchemaCompiler(Grammar& g, const ojson& root) : g_(g), json_(g), root_(root) {}
+    // `prefix`: the path of the schema's root in the request, before the paths of its keywords.
+    SchemaCompiler(Grammar& g, JsonRules& json, const ojson& root, std::string prefix = {})
+        : g_(g), json_(json), root_(root), prefix_(std::move(prefix)) {}
 
     RuleId document() {
         const RuleId doc = g_.add_rule("");
@@ -146,7 +152,21 @@ public:
         return doc;
     }
 
+    // The values of `part`, a part of the root at `path` (below the prefix).
+    Expr part(const ojson& s, const std::string& path) {
+        try {
+            return value(s, path);
+        } catch (const GrammarError& e) {
+            throw GrammarError(join_prefix(e.path()), e.what());
+        }
+    }
+
 private:
+    std::string join_prefix(const std::string& path) const {
+        if (prefix_.empty()) return path;
+        return path.empty() ? prefix_ : str_cat(prefix_, ".", path);
+    }
+
     Expr value(const ojson& s, const std::string& path) {
         if (s.is_boolean()) {
             if (s.get<bool>()) return json_.value();
@@ -363,8 +383,9 @@ private:
     }
 
     Grammar& g_;
-    JsonRules json_;
+    JsonRules& json_;
     const ojson& root_;
+    std::string prefix_;
     std::map<std::string, RuleId> refs_;  // by JSON pointer
 };
 
@@ -381,9 +402,22 @@ std::shared_ptr<const Grammar> json_object_grammar() {
 
 std::shared_ptr<const Grammar> json_schema_grammar(const nlohmann::ordered_json& schema) {
     auto g = std::make_shared<Grammar>();
-    SchemaCompiler compiler(*g, schema);
+    JsonRules json(*g);
+    SchemaCompiler compiler(*g, json, schema);
     g->finish(compiler.document());
     return g;
+}
+
+JsonValues::JsonValues(Grammar& g) : g_(g), rules_(std::make_unique<JsonRules>(g)) {}
+JsonValues::~JsonValues() = default;
+Expr JsonValues::whitespace() { return rules_->ws(); }
+Expr JsonValues::any_value() { return rules_->value(); }
+Expr JsonValues::any_object() { return rules_->object(); }
+
+Expr JsonValues::schema(const nlohmann::ordered_json& part, const nlohmann::ordered_json& root,
+                        const std::string& path) {
+    SchemaCompiler compiler(g_, *rules_, root, path);
+    return compiler.part(part, "");
 }
 
 }  // namespace xs::grammar

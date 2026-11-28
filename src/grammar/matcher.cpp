@@ -48,6 +48,7 @@ void Automaton::expand(uint32_t pos, int32_t parent, Closure& out) {
             }
             return;
         case Grammar::Item::kBytes:
+        case Grammar::Item::kToken:
             out.tops.push_back(frame(pos, parent));
             return;
         case Grammar::Item::kRule: {
@@ -78,10 +79,28 @@ Automaton::State Automaton::compute_step(State s, uint8_t byte) {
     const StateInfo info = states_[static_cast<size_t>(s)];
     for (uint32_t i = info.first; i < info.last; ++i) {
         const Frame f = frames_[static_cast<size_t>(tops_[i])];
-        if (grammar_->sets()[grammar_->code()[f.pos].index].has(byte)) expand(f.pos + 1, f.parent, c);
+        const Grammar::Item item = grammar_->code()[f.pos];
+        if (item.kind == Grammar::Item::kBytes && grammar_->sets()[item.index].has(byte)) expand(f.pos + 1, f.parent, c);
     }
     const State t = intern(c);
     next_[static_cast<size_t>(s) * 256 + byte] = t;
+    return t;
+}
+
+Automaton::State Automaton::step_marker(State s, int32_t token) {
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(s)) << 32) | static_cast<uint32_t>(token);
+    if (const auto it = marker_next_.find(key); it != marker_next_.end()) return it->second;
+    Closure c;
+    const StateInfo info = states_[static_cast<size_t>(s)];
+    for (uint32_t i = info.first; i < info.last; ++i) {
+        const Frame f = frames_[static_cast<size_t>(tops_[i])];
+        const Grammar::Item item = grammar_->code()[f.pos];
+        if (item.kind == Grammar::Item::kToken && item.index == static_cast<uint32_t>(token)) {
+            expand(f.pos + 1, f.parent, c);
+        }
+    }
+    const State t = intern(c);
+    marker_next_.emplace(key, t);
     return t;
 }
 
@@ -94,7 +113,8 @@ Automaton::State Automaton::step(State s, std::string_view bytes) {
 }
 
 Automaton::State Automaton::step_token(State s, int32_t token) {
-    if (token < 0 || token >= vocabulary_->size() || !vocabulary_->writable(token)) return kDead;
+    if (token < 0 || token >= vocabulary_->size() || s == kDead) return kDead;
+    if (!vocabulary_->writable(token)) return step_marker(s, token);
     return step(s, vocabulary_->bytes(token));
 }
 
@@ -133,6 +153,13 @@ const TokenSet& Automaton::allowed(State s) {
     }
     for (const auto& [token, same] : t.same_bytes) {
         if (scratch_.has(token)) scratch_.set(same);
+    }
+    const StateInfo info = states_[static_cast<size_t>(s)];
+    for (uint32_t i = info.first; i < info.last; ++i) {  // the marker tokens a stack expects
+        const Grammar::Item item = grammar_->code()[frames_[static_cast<size_t>(tops_[i])].pos];
+        if (item.kind == Grammar::Item::kToken && item.index < static_cast<uint32_t>(scratch_.size())) {
+            scratch_.set(static_cast<int32_t>(item.index));
+        }
     }
     if (visited < kKeepVisits) return scratch_;
     if (kept_order_.size() == kKeepStates) {

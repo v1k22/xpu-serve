@@ -9,7 +9,8 @@
 // frame of its own (a tail position), so a repetition loops through one state instead of growing a stack.
 //
 // The tokens a state allows come from one walk of the vocabulary's trie: a subtree is skipped at the first byte the
-// state does not take, and each step of the walk is a lookup in the transition table. The tokens of a state whose
+// state does not take, and each step of the walk is a lookup in the transition table; marker tokens come from the
+// state's stacks that expect one. The tokens of a state whose
 // walk was long (the inside of a string: nearly every token) are kept, so a state that repeats costs nothing again.
 
 #include <cstdint>
@@ -40,7 +41,8 @@ public:
         return next >= 0 ? next : compute_step(s, byte);
     }
     State step(State s, std::string_view bytes);
-    // The token's bytes from `s`; dead for a token a grammar never writes.
+    // The token's bytes from `s`, or for a marker token the places `s` expects it (Grammar::Item::kToken); dead for a
+    // token the grammar does not take there.
     State step_token(State s, int32_t token);
     // The root has ended at `s`.
     bool accepting(State s) const { return states_[s].accepting; }
@@ -72,6 +74,7 @@ private:
     void expand(uint32_t pos, int32_t parent, Closure& out);
     State intern(Closure& c);
     State compute_step(State s, uint8_t byte);
+    State step_marker(State s, int32_t token);
 
     std::shared_ptr<const Grammar> grammar_;
     std::shared_ptr<const Vocabulary> vocabulary_;
@@ -81,6 +84,7 @@ private:
     std::vector<StateInfo> states_;
     std::unordered_map<std::string, State> state_ids_;
     std::vector<int32_t> next_;  // by state and byte; -1: not computed yet
+    std::unordered_map<uint64_t, State> marker_next_;  // by state and marker token
     State start_ = kDead;
 
     std::unordered_map<State, TokenSet> kept_;  // the tokens of states whose walk was long

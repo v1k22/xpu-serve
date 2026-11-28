@@ -26,4 +26,27 @@ std::shared_ptr<const Grammar> json_object_grammar();
 // Throws GrammarError naming the path of what it does not take, e.g. "properties.age.minimum".
 std::shared_ptr<const Grammar> json_schema_grammar(const nlohmann::ordered_json& schema);
 
+class JsonRules;
+
+// JSON values in a grammar that holds more than them (a tool call in a model's own syntax): JSON's rules made once a
+// grammar, and the values of schemas added to it.
+class JsonValues {
+public:
+    explicit JsonValues(Grammar& g);
+    ~JsonValues();
+    JsonValues(const JsonValues&) = delete;
+    JsonValues& operator=(const JsonValues&) = delete;
+
+    Expr whitespace();  // bounded, as between a document's tokens
+    Expr any_value();
+    Expr any_object();
+    // The values `part` describes, a part of the schema `root` (where its $refs point); a GrammarError names `path`
+    // and the keyword below it. `root` must outlive the grammar's definition.
+    Expr schema(const nlohmann::ordered_json& part, const nlohmann::ordered_json& root, const std::string& path);
+
+private:
+    Grammar& g_;
+    std::unique_ptr<JsonRules> rules_;
+};
+
 }  // namespace xs::grammar

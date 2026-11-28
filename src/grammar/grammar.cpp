@@ -6,11 +6,12 @@
 namespace xs::grammar {
 
 struct Expr::Node {
-    enum Kind { kBytes, kLiteral, kRule, kSeq, kAlt, kRepeat };
+    enum Kind { kBytes, kLiteral, kRule, kSeq, kAlt, kRepeat, kToken };
     Kind kind = kSeq;
     ByteSet set;
     std::string text;
     RuleId rule = 0;
+    int32_t token = 0;
     std::vector<Expr> parts;  // a seq's, an alt's, or the one a repeat repeats
     int min = 0, max = 0;
 };
@@ -42,6 +43,11 @@ ByteSet& ByteSet::add(const ByteSet& other) {
 Expr bytes(const ByteSet& set) { return make({.kind = Expr::Node::kBytes, .set = set}); }
 Expr literal(std::string_view text) { return make({.kind = Expr::Node::kLiteral, .text = std::string(text)}); }
 Expr rule(RuleId id) { return make({.kind = Expr::Node::kRule, .rule = id}); }
+
+Expr token(int32_t id) {
+    XS_CHECK(id >= 0, "grammar: token ", id);
+    return make({.kind = Expr::Node::kToken, .token = id});
+}
 Expr seq(std::vector<Expr> parts) { return make({.kind = Expr::Node::kSeq, .parts = std::move(parts)}); }
 
 Expr alt(std::vector<Expr> options) {
@@ -54,10 +60,61 @@ Expr repeat(Expr e, int min, int max) {
     return make({.kind = Expr::Node::kRepeat, .parts = {std::move(e)}, .min = min, .max = max});
 }
 
+Expr text_without(Grammar& g, std::string_view stop, const std::string& name) {
+    XS_CHECK(!stop.empty(), "grammar: text without an empty string");
+    // The Knuth-Morris-Pratt automaton of `stop`: state j, the longest prefix of it the text ends with. A rule a state,
+    // each byte that does not complete `stop` going to its next state's rule (in a tail position: no stack grows).
+    const size_t m = stop.size();
+    std::vector<size_t> fail(m, 0);
+    for (size_t i = 1, k = 0; i < m; ++i) {
+        while (k > 0 && stop[i] != stop[k]) k = fail[k - 1];
+        if (stop[i] == stop[k]) ++k;
+        fail[i] = k;
+    }
+    const auto next = [&](size_t j, char b) {
+        while (j > 0 && stop[j] != b) j = fail[j - 1];
+        return stop[j] == b ? j + 1 : 0;
+    };
+    std::vector<RuleId> state(m);
+    for (size_t j = 0; j < m; ++j) state[j] = g.add_rule(name);
+    for (size_t j = 0; j < m; ++j) {
+        std::vector<ByteSet> to(m);  // the bytes that lead to each state
+        for (unsigned b = 0; b < 256; ++b) {
+            const size_t k = next(j, static_cast<char>(b));
+            if (k < m) to[k].add(static_cast<uint8_t>(b), static_cast<uint8_t>(b));
+        }
+        std::vector<Expr> options{seq({})};
+        for (size_t k = 0; k < m; ++k) {
+            if (!to[k].empty()) options.push_back(seq({bytes(to[k]), rule(state[k])}));
+        }
+        g.define(state[j], alt(std::move(options)));
+    }
+    return rule(state[0]);
+}
+
 RuleId Grammar::add_rule(std::string name) {
     XS_CHECK(!finished_, "grammar: a rule added after finish()");
     rules_.push_back({std::move(name), {}, false});
     return static_cast<RuleId>(rules_.size() - 1);
+}
+
+RuleId Grammar::embed(const Grammar& other) {
+    XS_CHECK(!finished_ && other.finished(), "grammar: embedding needs a finished grammar into an open one");
+    const auto offset = static_cast<RuleId>(rules_.size());
+    for (const Rule& r : other.rules()) rules_.push_back({r.name, {}, true});
+    for (RuleId r = 0; r < other.rules().size(); ++r) {
+        for (uint32_t at : other.rules()[r].alternatives) {
+            std::vector<Item> items;
+            for (; other.code()[at].kind != Item::kEnd; ++at) {
+                Item it = other.code()[at];
+                if (it.kind == Item::kBytes) it.index = set_index(other.sets()[it.index]);
+                if (it.kind == Item::kRule) it.index += offset;
+                items.push_back(it);
+            }
+            add_alternative(offset + r, std::move(items));
+        }
+    }
+    return offset + other.root();
 }
 
 void Grammar::define(RuleId r, const Expr& e) {
@@ -97,6 +154,9 @@ std::vector<Grammar::Item> Grammar::lower(const Expr::Node& n, const std::string
             break;
         case Expr::Node::kRule:
             out.push_back({Item::kRule, n.rule});
+            break;
+        case Expr::Node::kToken:
+            out.push_back({Item::kToken, static_cast<uint32_t>(n.token)});
             break;
         case Expr::Node::kSeq:
             for (const Expr& part : n.parts) append(lower(part.node(), name));
@@ -156,6 +216,7 @@ void Grammar::finish(RuleId root) {
     const auto alternative_ends = [&](uint32_t at) {
         for (; code_[at].kind != Item::kEnd; ++at) {
             const Item& it = code_[at];
+            if (it.kind == Item::kToken) continue;
             if (it.kind == Item::kBytes ? sets_[it.index].empty() : !ends[it.index]) return false;
         }
         return true;
@@ -196,7 +257,7 @@ void Grammar::finish(RuleId root) {
     std::vector<bool> nullable(n, false);
     const auto alternative_nullable = [&](uint32_t at) {
         for (; code_[at].kind != Item::kEnd; ++at) {
-            if (code_[at].kind == Item::kBytes || !nullable[code_[at].index]) return false;
+            if (code_[at].kind != Item::kRule || !nullable[code_[at].index]) return false;
         }
         return true;
     };

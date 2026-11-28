@@ -4,9 +4,11 @@
 // and the trie of their byte strings that a matcher walks to find the tokens a state allows.
 
 #include <bit>
+#include <optional>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -49,6 +51,8 @@ public:
     }
     // A grammar may write it: a token of the model's vocabulary with bytes.
     bool writable(int32_t id) const { return !marker_[id] && offsets_[id + 1] > offsets_[id]; }
+    // The marker token whose bytes are `text` (the lowest id of several), if there is one.
+    std::optional<int32_t> marker(std::string_view text) const;
 
     // The byte strings of the writable tokens as a trie, its nodes in depth-first order (each node one byte below its
     // parent, children in byte order). Node i is at depth depth[i] (1 below the root), its subtree ends before node
@@ -67,6 +71,7 @@ public:
 
 private:
     std::string bytes_;  // every token's bytes, one after another
+    std::unordered_map<std::string, int32_t> markers_;  // by bytes
     std::vector<uint32_t> offsets_;
     std::vector<uint8_t> marker_;
     Trie trie_;

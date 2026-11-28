@@ -16,6 +16,7 @@ Vocabulary::Vocabulary(std::vector<Token> tokens) {
         XS_CHECK(bytes_.size() <= UINT32_MAX, "grammar: a vocabulary of more than 4 GiB of bytes");
         offsets_.push_back(static_cast<uint32_t>(bytes_.size()));
         marker_.push_back(t.marker ? 1 : 0);
+        if (t.marker && !t.bytes.empty()) markers_.emplace(t.bytes, static_cast<int32_t>(marker_.size() - 1));
     }
 
     // Sorted by bytes (std::string_view compares them unsigned, as memcmp does), the tokens come in the trie's
@@ -51,6 +52,12 @@ Vocabulary::Vocabulary(std::vector<Token> tokens) {
         previous = b;
     }
     for (; !path.empty(); path.pop_back()) t.end[path.back()] = static_cast<uint32_t>(t.nodes());
+}
+
+std::optional<int32_t> Vocabulary::marker(std::string_view text) const {
+    const auto it = markers_.find(std::string(text));
+    if (it == markers_.end()) return std::nullopt;
+    return it->second;
 }
 
 }  // namespace xs::grammar
