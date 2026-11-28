@@ -23,6 +23,7 @@ APIs look; the numbers live here.
   - [Qwen3.8-27B](#qwen38-27b)
   - [LFM3-1.7B](#lfm3-17b)
   - [Qwen3 (0.6B to 32B, 30B-A3B)](#qwen3-06b-to-32b-30b-a3b)
+  - [Llama 3 (3.1, 3.2, 3.3)](#llama-3-31-32-33)
   - [Inkling-2-Mini](#inkling-2-mini)
 - [GGUF imports](#gguf-imports)
   - [Importing a GGUF file](#importing-a-gguf-file)
@@ -796,6 +797,60 @@ Against Hugging Face fp32 on the CPU, six prompts (last-token logits; greedy tok
 | Qwen3-30B-A3B, q4 pack | 0.770 to 0.997 | 13 to 32 |
 
 The model code: tiny dense and MoE checkpoints against Hugging Face at cosine 1 (cpu-ref and the GPU, f32).
+
+### Llama 3 (3.1, 3.2, 3.3)
+
+`meta-llama/Llama-3.1-8B-Instruct`, `Llama-3.2-1B-Instruct`, `Llama-3.2-3B-Instruct` (`llama`; gated: request
+access on Hugging Face and pass a token, or use Unsloth's ungated copies `unsloth/Llama-3.1-8B-Instruct`,
+`unsloth/Llama-3.2-1B-Instruct`, ...). Llama 3.3-70B is the same model type, but needs more memory than a 24 GB card
+even at q4. Text. Llama 3's RoPE scaling (`rope_type` `llama3`) and the head tied (3.2) or not (3.1). No drafter here;
+prompt lookup (`--spec ngram`) works.
+
+Reference:
+
+```bash
+xpu-serve serve -hf unsloth/Llama-3.1-8B-Instruct --device GPU
+```
+
+Optimized:
+
+```bash
+xpu-serve convert -hf unsloth/Llama-3.1-8B-Instruct --out ~/models/Llama-3.1-8B-Instruct-q8 --quant q8
+xpu-serve serve ~/models/Llama-3.1-8B-Instruct-q8 --device GPU --kv-dtype i8
+```
+
+- Less VRAM: `--kv-dtype i8:turbo4`, then `turbo4`, `turbo3` and `turbo2` store the KV cache in fewer bits, each at a
+  growing cost in accuracy ([KV cache formats](#kv-cache-formats)).
+- Tool calls: the template asks for a JSON object `{"name": ..., "parameters": {...}}` as the whole reply. A reply
+  that starts with `{` (or holds `<|python_tag|>`) is read as calls only when the request has tools (vLLM's
+  `llama3_json` rule); otherwise it is content. `tool_choice` required or named holds the reply to that syntax, `"; "`
+  between calls. The 3.2 template renders one call per assistant turn in the history and refuses more.
+- The template writes today's date into the system turn; `"chat_template_kwargs": {"date_string": "26 Jul 2024"}`
+  fixes it (a prompt that changes each day is not reused from the prefix cache across days).
+
+Measured on the Arc Pro B60 (decode of 128 tokens after a 4,096-token prompt, and that prompt's prefill):
+
+| | Decode | Prefill (4k tokens) |
+|---|---|---|
+| Llama-3.2-1B-Instruct, f16 | 127 tok/s | 12,260 tok/s |
+| Llama-3.2-3B-Instruct, f16 | 47.9 tok/s | 5,880 tok/s |
+| Llama-3.1-8B-Instruct, f16 | 23.7 tok/s | 3,130 tok/s |
+| Llama-3.1-8B-Instruct, q8 pack | 40.9 tok/s | 2,700 tok/s |
+| Llama-3.1-8B-Instruct, q4 pack | 56.2 tok/s | 2,760 tok/s |
+
+Against Hugging Face fp32 on the CPU, six prompts (last-token logits; greedy tokens, 32 or the reply's end):
+
+| | Logits cosine | Greedy tokens equal |
+|---|---|---|
+| Llama-3.2-1B-Instruct, f16 and f32 | 0.999999 or more | all, on all six |
+| Llama-3.1-8B-Instruct, f16 | 0.999999 or more | all, on all six |
+| Llama-3.1-8B-Instruct, q8 pack | 0.99977 to 0.99994 | all on five; 9 of 32 on one |
+| Llama-3.1-8B-Instruct, q4 pack | 0.970 to 0.991 | 0 to 32 |
+
+The model code: a tiny checkpoint with Llama 3's RoPE scaling against Hugging Face at cosine 1 (cpu-ref and the GPU,
+f32); the tokenizer (47 texts, the begin-of-text token) and the chat template (38 conversations) as transformers'.
+Through the server, Llama-3.1-8B-Instruct (q4) called the tool itself under `auto`, and every forced choice
+(required, named, two in parallel and one, streamed, Anthropic's `any`) gave well-formed calls.
 
 ### Inkling-2-Mini
 

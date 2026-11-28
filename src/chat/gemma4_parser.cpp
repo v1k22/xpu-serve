@@ -4,7 +4,6 @@
 // stripped by the engine before text reaches here.
 
 #include <optional>
-#include <random>
 #include <span>
 #include <string>
 
@@ -75,18 +74,9 @@ MarkerHit find_marker(std::string_view buffer, std::span<const Marker> markers, 
     return {};
 }
 
-std::string random_hex(size_t digits) {
-    std::random_device rd;
-    std::uniform_int_distribution<int> nibble(0, 15);
-    std::string out;
-    for (size_t i = 0; i < digits; ++i)
-        out += "0123456789abcdef"[nibble(rd)];
-    return out;
-}
-
 class Gemma4Parser final : public OutputParser {
 public:
-    explicit Gemma4Parser(std::string_view prompt_tail) : id_prefix_("call_" + random_hex(8)) {
+    explicit Gemma4Parser(std::string_view prompt_tail) : id_prefix_(call_id_prefix()) {
         start_after(prompt_tail);
     }
 

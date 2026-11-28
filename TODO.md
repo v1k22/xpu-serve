@@ -364,7 +364,13 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       the "add a model in one PR" test, written up in `docs/adding-a-model.md`; a thought Qwen 3 opens itself before a
       forced tool call or a format (`OutputParser::own_thought`, `AnswerGate`)
 - [ ] Qwen 3: its GGUF files (`qwen3`, `qwen3moe` architectures of the importer)
-- [ ] Llama 3
+- [x] Llama 3 (`llama`: 3.1, 3.2, 3.3): Llama 3's RoPE scaling, its tokenizer's post-processor Sequence, the
+      `llama3` dialect (JSON calls read only when the request offers tools, as vLLM's `llama3_json`), forced calls in
+      its syntax; parity with transformers (tiny, 1B, 8B), its tokenizer and chat template
+- [ ] Llama 3: its GGUF files (`llama` architecture of the importer); Llama 3.1's built-in tools (`<|python_tag|>`
+      code and `brave_search` / `wolfram_alpha` calls) come back as content
+- [ ] Raw completions: the tokenizer's special tokens around the prompt (vLLM's `add_special_tokens`, on by default:
+      Llama 3's and Gemma's begin-of-text token); `/v1/completions` sends the prompt's tokens alone today
 - [ ] Import MLX-affine packs
 - [x] Import GGUF files (`convert <file.gguf> <out-dir>`): architecture `qwen35`, tensors kept in their block formats
 - [x] GGUF: architecture `gemma4` (Gemma 4 E2B / E4B, text): per-layer embeddings and KV-shared layers, the `gemma4`

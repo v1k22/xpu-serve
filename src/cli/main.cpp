@@ -533,7 +533,7 @@ std::string run_turn(EngineService& service, std::string_view prompt_text, const
     req.max_new_tokens = max_tokens;
     req.stop_token_ids = service.model().stop_token_ids;
     tok::StreamDecoder decoder(service.tokenizer(), false);
-    auto parser = chat::make_output_parser(service.model().dialect, chat::prompt_tail(prompt_text));
+    auto parser = chat::make_output_parser(service.model().dialect, chat::prompt_tail(prompt_text), /*tools=*/false);
     std::string raw;
     bool in_reasoning = false;
     auto print = [&](const chat::ParsedDelta& d) {
@@ -700,7 +700,7 @@ int cmd_run(const std::vector<std::string>& argv) {
         messages.push_back({{"role", "user"}, {"content", content}});
         const std::string text = service->chat_template().render(messages, nullptr, true, extra);
         const std::string reply = run_turn(*service, text, media, sampling, max_tokens);
-        auto parser = chat::make_output_parser(service->model().dialect, chat::prompt_tail(text));
+        auto parser = chat::make_output_parser(service->model().dialect, chat::prompt_tail(text), /*tools=*/false);
         chat::ParsedDelta d = parser->feed(reply);
         const chat::ParsedDelta end = parser->finish();
         messages.push_back({{"role", "assistant"}, {"content", d.content + end.content}});

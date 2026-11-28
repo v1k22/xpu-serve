@@ -1,6 +1,7 @@
 """Renders chat-template parity cases with Hugging Face for the C++ ChatTemplate test.
 
-Usage: python -I tests/parity/chat/gen_cases.py gemma4=<model_dir> qwen3_5=<model_dir> qwen3=<model_dir> lfm3=<model_dir> ...
+Usage: python -I tests/parity/chat/gen_cases.py gemma4=<model_dir> qwen3_5=<model_dir> qwen3=<model_dir> llama3=<model_dir>
+    lfm3=<model_dir> ...
 Writes tests/fixtures/chat/<set>_cases.json for each set named. A model dir needs only its chat template
 (chat_template.jinja, or chat_template.json) and tokenizer_config.json (plus tokenizer.json, or vocab.json and
 merges.txt, for AutoTokenizer): the Hugging Face checkpoint named in tests/fixtures/chat/<set>/SOURCE, or for lfm3
@@ -660,10 +661,28 @@ def qwen3_cases():
             yield case
 
 
+def llama3_cases():
+    """Llama 3.2's template: Qwen 3's turns and the OpenAI round trips it renders, each on a fixed date (the template
+    renders today's when given none); tools in the system turn as well as in the first user message (its default); a
+    tool's reply as an ipython turn; another date."""
+    date = {"date_string": "26 Jul 2024"}
+    for name, messages, tools, add_gen, extra in itertools.chain(qwen3_cases(), openai_cases()):
+        yield name, messages, tools, add_gen, {**extra, **date}
+    u = {"role": "user", "content": "What is the weather in Paris?"}
+    sys_msg = {"role": "system", "content": "  You are a helpful assistant.\n"}
+    weather_call = call("call_1", "get_weather", {"city": "Paris", "unit": "celsius"})
+    yield "llama_tools_in_system", [sys_msg, u], [WEATHER, SEARCH], True, {**date, "tools_in_user_message": False}
+    yield "llama_ipython_reply", [
+        u, {"role": "assistant", "tool_calls": [weather_call]}, {"role": "ipython", "content": "18 C, cloudy"},
+    ], [WEATHER], True, date
+    yield "llama_another_date", [sys_msg, u], None, True, {"date_string": "01 Jan 2030"}
+
+
 SETS = {
     "gemma4": lambda: itertools.chain(cases(), openai_cases()),
     "qwen3_5": qwen3_5_cases,
     "qwen3": qwen3_cases,
+    "llama3": llama3_cases,
     "lfm3": lfm3_cases,
     "qwen3_asr": qwen3_asr_cases,
 }

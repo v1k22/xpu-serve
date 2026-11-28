@@ -23,7 +23,8 @@ std::string tool_path(size_t i) { return str_cat("tools[", i, "].function.parame
 }  // namespace
 
 bool writes_tool_calls(std::string_view dialect) {
-    return dialect == "qwen3_5" || dialect == "qwen3" || dialect == "gemma4" || dialect == "inkling2";
+    return dialect == "qwen3_5" || dialect == "qwen3" || dialect == "gemma4" || dialect == "inkling2" ||
+           dialect == "llama3";
 }
 
 namespace {
@@ -46,16 +47,21 @@ public:
             return seq({marker("<|message_model|>"), literal(function.at("name").get<std::string>()),
                         marker(opener()), rest(function, index)});
         }
+        if (dialect_ == "llama3") return rest(function, index);  // no opener: the reply's first "{"
         return seq({marker(opener()), rest(function, index)});
     }
 
-    // The marker a call starts with, after which (Inkling 2: after its header) a call of any tool may follow.
+    // The marker a call starts with, after which (Inkling 2: after its header) a call of any tool may follow; none
+    // for Llama 3, whose calls are the reply's JSON.
     std::string_view opener() const {
         if (dialect_ == "gemma4") return "<|tool_call>";
         if (dialect_ == "inkling2") return "<|content_invoke_tool_json|>";
+        if (dialect_ == "llama3") return "";
         return "<tool_call>";
     }
-    std::optional<int32_t> opener_token() const { return vocabulary_.marker(opener()); }
+    std::optional<int32_t> opener_token() const {
+        return opener().empty() ? std::nullopt : vocabulary_.marker(opener());
+    }
 
     // A call of the tool `function` past the opener, to its closer.
     Expr rest(const RequestJson& function, size_t index) {
@@ -81,15 +87,23 @@ public:
             return seq({literal("call:" + name), strict ? gemma_parameters(schema, path) : gemma_object(),
                         marker("<tool_call|>")});
         }
+        if (dialect_ == "llama3") {  // as the template writes a call
+            return seq({literal("{\"name\": " + ojson(name).dump() + ", \"parameters\": "),
+                        strict ? json_.schema(schema, schema, path) : json_.any_object(), literal("}")});
+        }
         // inkling2: the body {"name": ..., "args": ...} of a message of its own.
         return seq({literal("{\"name\":" + ojson(name).dump() + ",\"args\":"),
                     strict ? json_.schema(schema, schema, path) : json_.any_object(), literal("}"),
                     marker("<|end_message|>")});
     }
 
-    // What separates two calls, and what may come before the first (after a thought, a newline or two).
-    Expr between() { return dialect_ == "qwen3_5" || dialect_ == "qwen3" ? repeat(bytes(ByteSet::of("\n")), 0, 2) : seq({}); }
-    Expr lead() { return repeat(bytes(ByteSet::of(" \n")), 0, 3); }
+    // What separates two calls, and what may come before the first (after a thought, a newline or two; nothing before
+    // Llama 3's, whose parser reads a reply as calls only when its first character is "{").
+    Expr between() {
+        if (dialect_ == "llama3") return literal("; ");
+        return dialect_ == "qwen3_5" || dialect_ == "qwen3" ? repeat(bytes(ByteSet::of("\n")), 0, 2) : seq({});
+    }
+    Expr lead() { return dialect_ == "llama3" ? seq({}) : repeat(bytes(ByteSet::of(" \n")), 0, 3); }
 
     // `text` with the marker tokens it spells as their tokens (an answer's opening: Inkling 2's message header).
     Expr text_with_markers(std::string_view text) {

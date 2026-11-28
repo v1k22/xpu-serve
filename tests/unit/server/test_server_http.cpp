@@ -424,6 +424,27 @@ TEST_SUITE("server.http") {
         CHECK(c->allowed_prefix(xs::test::ByteTokenizer::tokens("</think>\n\nNo.")) == 10);
     }
 
+    // Llama 3's calls look like any JSON reply: read as calls only when the request offers tools (vLLM's rule).
+    TEST_CASE("a Llama 3 reply of JSON: tool calls with tools offered, content without them or with tool_choice none") {
+        xs::test::FakeService service;
+        service.card().dialect = "llama3";
+        service.reply = R"({"name": "f", "parameters": {"x": 1}})";
+        RunningServer server(service);
+        auto client = server.client();
+        const json tools = json::array({{{"type", "function"}, {"function", {{"name", "f"}}}}});
+        json r = post_json(client, "/v1/chat/completions", chat_body({{"tools", tools}}));
+        CHECK(r["choices"][0]["finish_reason"] == "tool_calls");
+        REQUIRE(r["choices"][0]["message"]["tool_calls"].size() == 1);
+        CHECK(r["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "f");
+        CHECK(json::parse(r["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].get<std::string>()) ==
+              json{{"x", 1}});
+        r = post_json(client, "/v1/chat/completions", chat_body(json::object()));
+        CHECK(r["choices"][0]["message"]["content"] == service.reply);
+        CHECK_FALSE(r["choices"][0]["message"].contains("tool_calls"));
+        r = post_json(client, "/v1/chat/completions", chat_body({{"tools", tools}, {"tool_choice", "none"}}));
+        CHECK(r["choices"][0]["message"]["content"] == service.reply);
+    }
+
     TEST_CASE("invalid requests get 400 naming the field") {
         xs::test::FakeService service;
         RunningServer server(service);

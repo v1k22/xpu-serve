@@ -36,9 +36,13 @@ struct CompletionHandlers::Job {
     std::string dialect;  // output parser; raw completions are always "plain"
     std::string prompt_tail;  // chat::prompt_tail of the prompt text: the parser's start state
     size_t max_tool_calls = kAnyCalls;  // parallel_tool_calls false: the first call alone
+    bool tools = false;                 // the request offers tools (make_output_parser)
 };
 
 namespace {
+
+// tool_choice none leaves the request no tools (parse_chat_request).
+bool offers_tools(const ChatRequest& chat) { return chat.tools.is_array() && !chat.tools.empty(); }
 
 std::string random_id(std::string_view prefix) {
     thread_local std::mt19937_64 rng{std::random_device{}()};
@@ -224,7 +228,8 @@ void CompletionHandlers::chat(const httplib::Request& req, httplib::Response& re
             .options = std::move(chat.options),
             .dialect = card.dialect,
             .prompt_tail = std::string(tail),
-            .max_tool_calls = chat.parallel_tool_calls ? kAnyCalls : 1};
+            .max_tool_calls = chat.parallel_tool_calls ? kAnyCalls : 1,
+            .tools = offers_tools(chat)};
     respond(job, req, res);
 }
 
@@ -245,7 +250,8 @@ void CompletionHandlers::messages(const httplib::Request& req, httplib::Response
             .options = std::move(chat.options),
             .dialect = card.dialect,
             .prompt_tail = std::string(tail),
-            .max_tool_calls = chat.parallel_tool_calls ? kAnyCalls : 1};
+            .max_tool_calls = chat.parallel_tool_calls ? kAnyCalls : 1,
+            .tools = offers_tools(chat)};
     respond(job, req, res);
 }
 
@@ -313,7 +319,7 @@ void CompletionHandlers::write_full(const Job& job, const httplib::Request& req,
     std::vector<TokenOutput*> raw;
     for (size_t i = 0; i < requests.size(); ++i) {
         outputs.push_back(std::make_unique<TokenOutput>(service_.tokenizer(),
-                                                        chat::make_output_parser(job.dialect, job.prompt_tail),
+                                                        chat::make_output_parser(job.dialect, job.prompt_tail, job.tools),
                                                         job.options.stop, job.max_tool_calls));
         raw.push_back(outputs.back().get());
     }
@@ -351,7 +357,7 @@ bool CompletionHandlers::write_stream(const Job& job, const httplib::Request& re
         std::vector<TokenOutput*> raw;
         for (size_t i = 0; i < requests.size(); ++i) {
             outputs.push_back(std::make_unique<TokenOutput>(service_.tokenizer(),
-                                                            chat::make_output_parser(job.dialect, job.prompt_tail),
+                                                            chat::make_output_parser(job.dialect, job.prompt_tail, job.tools),
                                                             job.options.stop, job.max_tool_calls));
             raw.push_back(outputs.back().get());
         }

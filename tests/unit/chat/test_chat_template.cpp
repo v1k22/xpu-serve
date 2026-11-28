@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -102,6 +103,32 @@ TEST_SUITE("chat template") {
                 rendered = tmpl->render(c["messages"], c["tools"], c["add_generation_prompt"].get<bool>(), c["extra"]));
             CHECK(rendered == c["expected"].get<std::string>());
         }
+    }
+
+    // Llama 3.2's: on a fixed date_string, as the cases give one; without one it renders today's (strftime_now).
+    TEST_CASE("llama3 renders byte-identical to Hugging Face, and today's date without a date_string") {
+        const auto tmpl = xs::chat::ChatTemplate::load(kChatFixtures / "llama3");
+        const ordered_json cases = read_ordered_json(kChatFixtures / "llama3_cases.json");
+        REQUIRE(cases.size() >= 35);
+        for (const ordered_json& c : cases) {
+            const std::string name = c["name"].get<std::string>();
+            CAPTURE(name);
+            std::string rendered;
+            CHECK_NOTHROW(
+                rendered = tmpl->render(c["messages"], c["tools"], c["add_generation_prompt"].get<bool>(), c["extra"]));
+            CHECK(rendered == c["expected"].get<std::string>());
+        }
+        const ordered_json user = ordered_json::parse(R"([{"role": "user", "content": "Hi"}])");
+        const auto today = [] {
+            const std::time_t now = std::time(nullptr);
+            char date[32];
+            std::strftime(date, sizeof(date), "%d %b %Y", std::localtime(&now));
+            return std::string("Today Date: ") + date + "\n";
+        };
+        const std::string before = today();
+        const std::string rendered = tmpl->render(user, nullptr, true, ordered_json::object());
+        CHECK((rendered.find(before) != std::string::npos || rendered.find(today()) != std::string::npos));
+        CHECK(rendered.starts_with("<|begin_of_text|><|start_header_id|>system<|end_header_id|>"));
     }
 
     // Qwen3-ASR's template comes as chat_template.json; image and audio parts reach it as {"type": "image"} and

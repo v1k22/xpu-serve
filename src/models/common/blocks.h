@@ -113,6 +113,16 @@ Value gated_rms_norm(Graph& g, Value x, Value w, Value gate, float eps);
 // RoPE over the first R channels: (theta, R, R / 2, R / 2). Gemma 4's proportional RoPE keeps the full head layout:
 // (theta, head_dim, rotated pairs, head_dim / 2). Axial 2-D RoPE (vision): (theta, head_dim / 2, head_dim / 4, same).
 HostTensor rope_inv_freq(double theta, int64_t dim, int64_t pairs, int64_t length);
+// Llama 3's RoPE scaling (rope_type "llama3"; transformers' _compute_llama3_parameters): plain RoPE over `dim`
+// channels, then each frequency whose wavelength exceeds original_max_position / low_freq_factor divided by `factor`,
+// those under original_max_position / high_freq_factor kept, and those between blended smoothly.
+struct Llama3RopeScaling {
+    double factor = 0.0;
+    double low_freq_factor = 0.0;
+    double high_freq_factor = 0.0;
+    double original_max_position = 0.0;
+};
+HostTensor llama3_rope_inv_freq(double theta, int64_t dim, const Llama3RopeScaling& s);
 // Multimodal RoPE's frequencies laid out as Qwen3-VL interleaves them (an mrope_section of three counts, time, height
 // and width, adding up to `pairs`): the position axis each of the `pairs` frequencies reads. Frequency i reads height
 // (1) when i % 3 == 1 and i < 3 * section[1], width (2) when i % 3 == 2 and i < 3 * section[2], else time (0).

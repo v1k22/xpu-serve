@@ -12,6 +12,7 @@
 #include "models/laya/laya.h"
 #include "models/inkling2/inkling2.h"
 #include "models/lfm3/lfm3.h"
+#include "models/llama/llama.h"
 #include "models/model.h"
 #include "models/nomic_bert/nomic_bert.h"
 #include "models/pi05/pi05.h"
@@ -69,9 +70,9 @@ const MediaEncoder* Model::encoder(Modality m) const {
 }
 
 std::vector<std::string> supported_model_types() {
-    return {"gemma4",      "gemma4_text",  "inkling2_loop",    "lfm3",      "qwen3",          "qwen3_moe",
-            "qwen3_5",     "qwen3_5_text", "qwen3_5_moe",      "qwen3_5_moe_text", "qwen3_asr", "qwen3_omni_moe",
-            "sensenova_loop"};
+    return {"gemma4",      "gemma4_text",  "inkling2_loop",    "lfm3",      "llama",          "qwen3",
+            "qwen3_moe",   "qwen3_5",      "qwen3_5_text",     "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_asr",
+            "qwen3_omni_moe", "sensenova_loop"};
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOptions& options) {
@@ -94,6 +95,7 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& dir, const LoadOp
         return qwen3_5::load(dir, config, options);
     }
     if (type == "lfm3") return lfm3::load(dir, config, options);
+    if (type == "llama") return llama::load(dir, config, options);
     if (type == "qwen3" || type == "qwen3_moe") return qwen3::load(dir, config, options);
     if (type == "inkling2_loop") return inkling2::load(dir, config, options);
     if (type == "qwen3_asr") return qwen3_asr::load(dir, config, options);

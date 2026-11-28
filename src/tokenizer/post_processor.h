@@ -1,7 +1,8 @@
 #pragma once
 
-// tokenizer.json post-processors, for one sequence: TemplateProcessing (its `single` template) and ByteLevel (which
-// only adjusts offsets, so adds nothing here). Others are refused by name.
+// tokenizer.json post-processors, for one sequence: TemplateProcessing (its `single` template), ByteLevel (which
+// only adjusts offsets, so adds nothing here) and a Sequence of them with one that adds tokens at most (Llama 3's).
+// Others are refused by name.
 
 #include <cstdint>
 #include <memory>

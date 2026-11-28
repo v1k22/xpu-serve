@@ -143,8 +143,16 @@ TEST_SUITE("tokenizer") {
                                "<end>": {"id": "<end>", "ids": [2, 3], "tokens": ["</s>", "<mark>"]}}})");
         CHECK(with_special(j, hello) == Ids{1, 21, 26, 2, 3});
         CHECK(with_special(j, {}) == Ids{1, 2, 3});
-        j["post_processor"] = {
+        const nlohmann::json bos = nlohmann::json::parse(R"({"type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}}, {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [], "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}}})");
+        const nlohmann::json byte_level = {
             {"type", "ByteLevel"}, {"add_prefix_space", false}, {"trim_offsets", false}, {"use_regex", false}};
+        j["post_processor"] = byte_level;
+        CHECK(with_special(j, hello) == hello);
+        j["post_processor"] = {{"type", "Sequence"}, {"processors", {byte_level, bos}}};  // Llama 3's
+        CHECK(with_special(j, hello) == Ids{1, 21, 26});
+        j["post_processor"] = {{"type", "Sequence"}, {"processors", {byte_level}}};
         CHECK(with_special(j, hello) == hello);
         j["post_processor"] = nullptr;
         CHECK(with_special(j, hello) == hello);
@@ -213,6 +221,10 @@ TEST_SUITE("tokenizer") {
         j = tiny_json();
         j["post_processor"] = {{"type", "RobertaProcessing"}};
         CHECK(load_error(j) == "tokenizer.json post_processor 'RobertaProcessing' is not supported");
+        j["post_processor"] = {{"type", "Sequence"}, {"processors", {{{"type", "RobertaProcessing"}}}}};
+        CHECK(load_error(j) == "tokenizer.json post_processor 'RobertaProcessing' is not supported");
+        j["post_processor"] = {{"type", "Sequence"}};
+        CHECK(load_error(j) == "tokenizer.json post_processor 'Sequence' has no array 'processors'");
 
         const std::string kTemplate = "tokenizer.json post_processor 'TemplateProcessing': ";
         j = tiny_json();

@@ -163,6 +163,37 @@ TEST_SUITE("server.tool_grammar") {
                                    "\"args\":{}}<|end_message|>"));
     }
 
+    // Llama 3's calls are the reply's JSON, as its template writes one: no opener, "; " between two.
+    TEST_CASE("Llama 3's JSON calls: the reply's first character a call's, several with \"; \", read back") {
+        const auto llama = grammar("llama3", ToolChoice::Mode::required);
+        const std::string weather = R"({"name": "get_weather", "parameters": {"city": "Paris", "days": 2}})";
+        const std::string search = R"({"name": "search", "parameters": {"q": "rain"}})";
+        CHECK(takes(llama, weather));
+        CHECK(takes(llama, weather + "; " + search));
+        CHECK_FALSE(takes(llama, " " + weather));  // the parser reads a call only from the first character
+        CHECK_FALSE(takes(llama, R"({"name": "get_weather", "parameters": {"days": 2}})"));  // strict: city required
+        CHECK_FALSE(takes(llama, R"({"name": "get_weather", "arguments": {"city": "Paris"}})"));
+        CHECK_FALSE(takes(grammar("llama3", ToolChoice::Mode::required, {}, false), weather + "; " + search));
+        const auto named = grammar("llama3", ToolChoice::Mode::named, "search");
+        CHECK(takes(named, search));
+        CHECK_FALSE(takes(named, weather));
+        auto parser = xs::chat::make_output_parser("llama3", "", /*tools=*/true);
+        xs::chat::ParsedDelta d = parser->feed(weather + "; " + search);
+        const xs::chat::ParsedDelta rest = parser->finish();
+        d.tool_calls.insert(d.tool_calls.end(), rest.tool_calls.begin(), rest.tool_calls.end());
+        REQUIRE(d.tool_calls.size() == 2);
+        CHECK(d.tool_calls[0].name == "get_weather");
+        CHECK(json::parse(d.tool_calls[0].arguments) == json{{"city", "Paris"}, {"days", 2}});
+        CHECK(d.tool_calls[1].name == "search");
+        CHECK(d.content.empty());
+        // Beside a format: the calls, or the answer.
+        const auto either = grammar("llama3", ToolChoice::Mode::automatic, {}, true, json_object_grammar());
+        CHECK(takes(either, weather));
+        CHECK(takes(either, "{\"answer\": 42}"));
+        // No opener to hold a strict call from under auto.
+        CHECK_FALSE(xs::server::strict_calls("llama3", kTools, *vocabulary()).has_value());
+    }
+
     TEST_CASE("auto beside a response_format: the calls, or the answer held to the format after its opening") {
         const auto answer = json_object_grammar();
         const auto qwen = grammar("qwen3_5", ToolChoice::Mode::automatic, {}, true, answer);

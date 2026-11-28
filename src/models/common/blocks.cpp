@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 #include <tuple>
 
 #include "util/error.h"
@@ -146,6 +147,29 @@ HostTensor rope_inv_freq(double theta, int64_t dim, int64_t pairs, int64_t lengt
     for (int64_t i = 0; i < length; ++i) {
         f[i] = i < pairs ? static_cast<float>(1.0 / std::pow(theta, static_cast<double>(2 * i) / static_cast<double>(dim)))
                          : 0.0f;
+    }
+    return t;
+}
+
+HostTensor llama3_rope_inv_freq(double theta, int64_t dim, const Llama3RopeScaling& s) {
+    XS_CHECK(s.factor > 0 && s.high_freq_factor > s.low_freq_factor && s.low_freq_factor > 0 &&
+                 s.original_max_position > 0,
+             "llama3 RoPE scaling: factor ", s.factor, ", low_freq_factor ", s.low_freq_factor, ", high_freq_factor ",
+             s.high_freq_factor, ", original_max_position_embeddings ", s.original_max_position);
+    HostTensor t = rope_inv_freq(theta, dim, dim / 2, dim / 2);
+    const double low_freq_wavelen = s.original_max_position / s.low_freq_factor;
+    const double high_freq_wavelen = s.original_max_position / s.high_freq_factor;
+    float* f = t.data<float>();
+    for (int64_t i = 0; i < dim / 2; ++i) {
+        const double inv_freq = f[i];
+        const double wavelen = 2.0 * std::numbers::pi / inv_freq;
+        if (wavelen > low_freq_wavelen) {
+            f[i] = static_cast<float>(inv_freq / s.factor);
+        } else if (wavelen >= high_freq_wavelen) {
+            const double smooth =
+                (s.original_max_position / wavelen - s.low_freq_factor) / (s.high_freq_factor - s.low_freq_factor);
+            f[i] = static_cast<float>((1.0 - smooth) * inv_freq / s.factor + smooth * inv_freq);
+        }
     }
     return t;
 }

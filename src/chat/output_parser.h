@@ -42,10 +42,14 @@ public:
 };
 
 // Dialects: "gemma4", "qwen3" (Qwen 3's JSON tool calls), "qwen3_5" (Qwen 3.5's XML ones), "inkling2" (messages of
-// a kind each), "plain" (everything is content). Throws xs::Error naming the known dialects otherwise.
+// a kind each), "llama3" (Llama 3's JSON calls, read only when the request offers tools), "plain" (everything is
+// content). Throws xs::Error naming the known dialects otherwise.
 // prompt_tail: the end of the rendered prompt (see prompt_tail()); the parser starts in the state it leaves open, e.g.
 // in reasoning when the prompt ends inside an opened thought channel (Gemma 4) or an open <think> (Qwen 3.5).
-std::unique_ptr<OutputParser> make_output_parser(std::string_view dialect, std::string_view prompt_tail = {});
+// `tools`: the request offers tools. Calls spelled with markers (<tool_call>, ...) are read either way; Llama 3's,
+// which look like any JSON reply, only with tools (vLLM runs no tool parser without them).
+std::unique_ptr<OutputParser> make_output_parser(std::string_view dialect, std::string_view prompt_tail = {},
+                                                 bool tools = true);
 
 // How a prompt asks a model of `dialect` for its answer at once, without thinking: the chat template's kwargs, and
 // the text the model writes after the generation prompt before its answer's text, which such a prompt ends with
@@ -69,6 +73,9 @@ struct AnswerStart {
     std::string opening;
 };
 AnswerStart answer_start(std::string_view dialect, std::string_view prompt_tail);
+
+// "call_" and 8 random hex digits: the start of a reply's tool call ids, which a counter after it makes unique.
+std::string call_id_prefix();
 
 // The end of a rendered prompt that make_output_parser needs; keeping only this avoids copying whole prompts.
 inline std::string_view prompt_tail(std::string_view rendered_prompt) {

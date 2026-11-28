@@ -132,6 +132,35 @@ call. vLLM's Qwen 3 parser does the same (it starts in reasoning and waits for `
   (`XS_TEST_MODEL_DIR=<pack>`).
 - Speed: `xpu-serve bench <model> --device GPU.1 --prompt-tokens 4096 --gen-tokens 128 --runs 2`.
 
+## Llama 3: the second model, with less to reuse
+
+Llama 3 had no decoder here, so it took the parts Qwen 3 found ready:
+
+| Part | Where | Lines |
+|---|---|---|
+| Config, model, graph (layers from `blocks::attention` and `blocks::gated_mlp`) | `src/models/llama/` | 260 |
+| Llama 3's RoPE scaling (frequencies in three bands) | `blocks::llama3_rope_inv_freq` | 30 |
+| A post-processor `Sequence` (ByteLevel, then TemplateProcessing adding `<|begin_of_text|>`) | `src/tokenizer/post_processor.cpp` | 15 |
+| The `llama3` dialect: JSON calls with no marker before them | `src/chat/llama3_parser.cpp` | 155 |
+| Its forced calls (`{"name": ..., "parameters": ...}`, `"; "` between) | `src/server/tool_grammar.cpp` | 20 |
+| Whether the request offers tools, for the parser | `make_output_parser(..., tools)` | 15 |
+
+What was different:
+
+- The tokenizer: run its parity first (`gen_llama3_cases.py`, `XS_LLAMA3_DIR`). The Split regex and `ignore_merges`
+  were there from LFM3; the post-processor was not, and only `with_special_tokens` (the begin-of-text token) showed it.
+- The chat template writes today's date (`strftime_now`): the fixtures pass `date_string`, and one test checks today's
+  date is rendered without it.
+- The calls are bare JSON. With markers a call cannot be mistaken for an answer; here a JSON answer and a call look
+  alike, so the parser reads calls only when the request offers tools (vLLM runs no tool parser without them), and
+  only from the reply's first character, as vLLM does. A forced call's grammar starts the reply with `{` for that
+  reason.
+- Gated checkpoints: Unsloth's copies (`unsloth/Llama-3.2-1B-Instruct`) are the same files without the gate; the
+  fixtures name the copy they came from.
+
+Results: the tiny checkpoint at cosine 1 (cpu-ref and the GPU, f32, a rope_parameters config as transformers 5 writes
+it); Llama-3.2-1B and Llama-3.1-8B (the released config layout) equal to transformers on all six prompts at f16.
+
 ## 8. Write it down
 
 - README: the model table (name, what it does, repositories, forms).

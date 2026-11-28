@@ -5,7 +5,6 @@
 // its <|message_model|> included, and this parser inverts it one feed() at a time.
 
 #include <cctype>
-#include <random>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -21,18 +20,9 @@ constexpr std::string_view kEndTurn = "<|content_model_end_sampling|>";
 constexpr std::string_view kKindOpen = "<|content_";
 constexpr std::string_view kClose = "|>";
 
-std::string random_hex(size_t digits) {
-    std::random_device rd;
-    std::uniform_int_distribution<int> nibble(0, 15);
-    std::string out;
-    for (size_t i = 0; i < digits; ++i)
-        out += "0123456789abcdef"[nibble(rd)];
-    return out;
-}
-
 class Inkling2Parser final : public OutputParser {
 public:
-    explicit Inkling2Parser(std::string_view prompt_tail) : id_prefix_("call_" + random_hex(8)) {
+    explicit Inkling2Parser(std::string_view prompt_tail) : id_prefix_(call_id_prefix()) {
         // A prompt that ends inside a message the model continues: its header, or a body of some kind.
         const size_t message = prompt_tail.rfind(kMessage);
         if (message == std::string_view::npos || prompt_tail.find(kEnd, message) != std::string_view::npos) return;

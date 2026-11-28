@@ -6,7 +6,8 @@
 //
 // A call's arguments follow the tool's parameters schema when the tool is strict (`function.strict: true`), as vLLM
 // holds them; any arguments otherwise. Dialects: qwen3_5 (Qwen 3.5's XML parameters; LFM3 writes them too), qwen3
-// (a JSON object a call), gemma4 (Gemma 4's own argument syntax), inkling2 (a message a call, its body JSON).
+// (a JSON object a call), gemma4 (Gemma 4's own argument syntax), inkling2 (a message a call, its body JSON), llama3
+// (the reply's JSON objects {"name": ..., "parameters": ...}, "; " between two).
 
 #include <memory>
 #include <optional>

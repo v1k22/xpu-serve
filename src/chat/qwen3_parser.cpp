@@ -15,7 +15,6 @@
 // follows.
 
 #include <optional>
-#include <random>
 #include <span>
 #include <string>
 
@@ -154,15 +153,6 @@ std::optional<std::pair<std::string, std::string>> parse_function(std::string_vi
     return std::pair{std::string(name), arguments.dump(-1, ' ', false, ordered_json::error_handler_t::replace)};
 }
 
-std::string random_hex(size_t digits) {
-    std::random_device rd;
-    std::uniform_int_distribution<int> nibble(0, 15);
-    std::string out;
-    for (size_t i = 0; i < digits; ++i)
-        out += "0123456789abcdef"[nibble(rd)];
-    return out;
-}
-
 // <tool_call>'s body as JSON: {"name": NAME, "arguments": OBJECT} (arguments as an object, or a string holding one;
 // none: {}), as vLLM's hermes parser reads it. Returns the name and the arguments as JSON text.
 std::optional<std::pair<std::string, std::string>> parse_json_call(std::string_view body) {
@@ -187,7 +177,7 @@ enum class Lead { keep, newlines, whitespace };
 
 class QwenParser final : public OutputParser {
 public:
-    QwenParser(std::string_view prompt_tail, CallFormat format) : format_(format), id_prefix_("call_" + random_hex(8)) {
+    QwenParser(std::string_view prompt_tail, CallFormat format) : format_(format), id_prefix_(call_id_prefix()) {
         start_after(prompt_tail);
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A tiny random checkpoint of a supported architecture, for parity tests (test-only).
 
-    python -I tests/parity/model/make_tiny.py --arch qwen3|qwen3_moe|qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|lfm3|
+    python -I tests/parity/model/make_tiny.py --arch llama|qwen3|qwen3_moe|qwen3_5|qwen3_5_moe|qwen3_5_vl|qwen3_5_moe_vl|gemma4_moe|lfm3|
         sensenova_loop|qwen3_asr|inkling2_loop --tokenizer-from <dir> --out <dir>
     python -I tests/parity/model/make_tiny.py --arch bert|nomic_bert --tokenizer-from <dir> --out <dir>
         [--pooling mean|cls] [--normalize] [--max-seq-length N]
@@ -76,6 +76,21 @@ def qwen3_moe(vocab_size, source):
                             head_dim=32, max_position_embeddings=4096, rope_theta=1000000.0, rms_norm_eps=1e-6,
                             tie_word_embeddings=False, initializer_range=0.05)
     return decisive_routers(off_one_norms(Qwen3MoeForCausalLM(config)))
+
+
+def llama(vocab_size, source):
+    """Llama 3.2-1B's ratios (four query heads per KV head, the head tied to the embedding) and its RoPE: theta 500000
+    and Llama 3's scaling, whose three bands of wavelengths (divided by the factor, blended, kept) a head of 32
+    channels all reaches; norms away from 1."""
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    config = LlamaConfig(vocab_size=vocab_size, hidden_size=128, intermediate_size=256, num_hidden_layers=3,
+                         num_attention_heads=4, num_key_value_heads=1, head_dim=32, max_position_embeddings=4096,
+                         rms_norm_eps=1e-5, tie_word_embeddings=True, initializer_range=0.05,
+                         rope_parameters={"rope_type": "llama3", "rope_theta": 500000.0, "factor": 32.0,
+                                          "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+                                          "original_max_position_embeddings": 8192})
+    return off_one_norms(LlamaForCausalLM(config))
 
 
 def off_one_norms(model):
@@ -570,7 +585,7 @@ def perturbed(model):
     return model.eval()
 
 
-ARCHS = {"qwen3": qwen3, "qwen3_moe": qwen3_moe, "qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "qwen3_5_vl": qwen3_5_vl, "qwen3_5_moe_vl": qwen3_5_moe_vl,
+ARCHS = {"llama": llama, "qwen3": qwen3, "qwen3_moe": qwen3_moe, "qwen3_5": qwen3_5, "qwen3_5_moe": qwen3_5_moe, "qwen3_5_vl": qwen3_5_vl, "qwen3_5_moe_vl": qwen3_5_moe_vl,
          "gemma4_moe": gemma4_moe, "lfm3": lfm3, "sensenova_loop": sensenova_loop, "qwen3_asr": qwen3_asr,
          "qwen3_omni": qwen3_omni, "inkling2_loop": inkling2_loop, "bert": bert, "nomic_bert": nomic_bert}
 ENCODERS = {"bert", "nomic_bert"}

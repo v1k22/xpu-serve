@@ -91,6 +91,19 @@ std::unique_ptr<PostProcessor> make_post_processor(const nlohmann::json& config)
     const std::string type = component_type(config, "post_processor");
     if (type == "TemplateProcessing") return make_template(config);
     if (type == "ByteLevel") return nullptr;
+    if (type == "Sequence") {  // Llama 3's: ByteLevel (offsets only), then TemplateProcessing
+        if (!config.contains("processors") || !config.at("processors").is_array()) {
+            fail("tokenizer.json post_processor 'Sequence' has no array 'processors'");
+        }
+        std::unique_ptr<PostProcessor> out;
+        for (const nlohmann::json& p : config.at("processors")) {
+            std::unique_ptr<PostProcessor> one = make_post_processor(p);
+            if (!one) continue;
+            if (out) fail("tokenizer.json post_processor 'Sequence' with two processors that add tokens");
+            out = std::move(one);
+        }
+        return out;
+    }
     refuse_component("post_processor", type);
 }
 

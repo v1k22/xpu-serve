@@ -21,6 +21,14 @@ inline std::optional<std::filesystem::path> lfm3_dir() {
     return std::filesystem::path(p);
 }
 
+// Directory of a Llama 3.x checkpoint (unsloth/Llama-3.2-1B-Instruct, or its tokenizer.json alone; not kept in this
+// repository), for the parity of its tokenizer; nullopt when XS_LLAMA3_DIR is unset.
+inline std::optional<std::filesystem::path> llama3_dir() {
+    const char* p = std::getenv("XS_LLAMA3_DIR");
+    if (p == nullptr || *p == '\0') return std::nullopt;
+    return std::filesystem::path(p);
+}
+
 // Directory of a thinkingmachines/Inkling-2-Mini checkpoint, or of its tokenizer.json alone (not kept in this
 // repository), for the parity of its tokenizer; nullopt when XS_INKLING2_DIR is unset.
 inline std::optional<std::filesystem::path> inkling2_dir() {
