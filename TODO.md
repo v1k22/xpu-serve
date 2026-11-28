@@ -34,10 +34,12 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 
 ### 0.1 Skeleton
 - [x] CMake project (C++20), one `xpu-serve` binary, options `XS_WITH_SYCL` (on with icpx), `XS_SYCL_TARGETS`
-- [ ] CLI dispatcher: `convert`, `serve`, `run`, `bench`, `check`, `info` (stubs that refuse by name)
+- [x] CLI dispatcher: `convert`, `serve`, `run`, `bench`, `info` (`src/cli/main.cpp`)
+- [ ] `check`: validate a pack (manifest, every tensor's format and shape, the memory bill) without loading it
 - [x] Vendored deps in `third_party/`: nlohmann/json, cpp-httplib; `NOTICE` started
-- [ ] CTest wiring + GitHub Actions job (Linux, CPU): build + unit tests
-- [ ] `.clang-format`, `.gitignore`
+- [x] CTest wiring (`ctest` runs `xs_tests`)
+- [ ] GitHub Actions job (Linux, CPU): build + unit tests
+- [x] `.clang-format`, `.gitignore`
 - **Done when:** a clean checkout builds and `ctest` passes in CI.
 
 ### 0.2 Measurement setup (before writing any kernel)
@@ -62,7 +64,7 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
 - **Done when:** quantize → dequantize error matches the analytic bound for each format.
 
 ### 0.5 `convert`
-- [ ] Hugging Face download: resumable, `HF_TOKEN`, pinned revision, sha256 recorded
+- [x] Hugging Face download: resumable, `HF_TOKEN`, pinned revision, sha256 checked (`-hf`, docs/decisions/0021)
 - [x] Local-directory input
 - [x] What to quantize comes from the model's own step graph (matmul weights; gather tables at q8), no per-arch code;
       `--q8 name,...` keeps chosen weights at q8
@@ -90,7 +92,8 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       (three) and Julia-1
 - [x] Slow tokenizer files without tokenizer.json (vocab.json, merges.txt, tokenizer_config.json) read as the
       tokenizer.json transformers builds from them: Qwen2Tokenizer, parity on Qwen3-ASR
-- [ ] Decide regex engine (PCRE2 vs port) → `docs/decisions/`
+- [x] Regex engine: none; the pre-tokenizers' patterns (GPT-2, Qwen, Llama 3, o200k) are written by hand
+      (`tokenizer/regex_split.h`), checked over every code point against Hugging Face `tokenizers`
 - [x] Parity corpus vs Hugging Face (code, CJK, emoji, whitespace runs, special tokens)
 - [x] Jinja renderer (minja candidate) → `docs/decisions/`; parity vs `apply_chat_template` incl. tools
 - **Done when:** both parity suites pass for Gemma 4 (and Qwen 3 as the second family).
@@ -159,8 +162,9 @@ Everything that does not depend on a GPU backend. All tests run on the CPU refer
       that grows with a kernel's needs is not billed)
 - [x] Sampling: temperature, top-k, top-p, min-p, penalties, seed; device-side argmax / top-k
 - [x] OpenAI API: `/v1/chat/completions` (stream + non-stream, tools, reasoning), `/v1/completions`, `/v1/models`,
-      `/health`, `/metrics`
-- [x] Gemma 4 tool-call and reasoning dialect (`chat/dialects/`)
+      `/health`
+- [ ] `/metrics` (Prometheus): requests, tokens, latency, speculative acceptance
+- [x] Gemma 4 tool-call and reasoning dialect (`chat/`)
 - [x] One summary log line per request
 - [x] E2E tests with an OpenAI client: streaming, tools, stop strings, cancellation, concurrency
 - **Done when:** E2E suite passes; a multi-turn agent session shows prefix-cache hits; 64k context runs on B390
